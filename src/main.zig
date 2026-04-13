@@ -178,6 +178,10 @@ fn runGui(allocator: std.mem.Allocator, lua: *zlua.Lua, cli_files: []const []con
     });
     defer win.deinit();
 
+    // Use SDL3/DVUI native clipboard (works on Wayland where wl-paste subprocess may not).
+    editor.clipboard_get_fn = &dvui.clipboardText;
+    editor.clipboard_set_fn = &dvui.clipboardTextSet;
+
     var interrupted = false;
 
     main_loop: while (editor.running) {

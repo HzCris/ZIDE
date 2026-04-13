@@ -23,6 +23,9 @@ pub const Editor = struct {
 
     /// Internal clipboard (used when system clipboard unavailable).
     clipboard: []const u8 = "",
+    /// Optional frontend-provided clipboard (e.g. SDL3 native clipboard on Wayland).
+    clipboard_get_fn: ?*const fn () []const u8 = null,
+    clipboard_set_fn: ?*const fn ([]const u8) void = null,
     /// Number of visible lines for page up/down.
     page_size: usize = 30,
 
@@ -281,14 +284,28 @@ pub const Editor = struct {
             self.allocator.free(self.clipboard);
         }
         self.clipboard = self.allocator.dupe(u8, text) catch "";
-        // Also copy to system clipboard
-        _ = SystemClipboard.setText(text);
+        // Use frontend clipboard if available, otherwise system clipboard
+        if (self.clipboard_set_fn) |setFn| {
+            setFn(text);
+        } else {
+            _ = SystemClipboard.setText(text);
+        }
     }
 
     /// Get clipboard text (prefer system clipboard, fall back to internal).
     pub fn getClipboard(self: *Editor) []const u8 {
-        // Try system clipboard first
-        if (SystemClipboard.getText(self.allocator)) |sys_text| {
+        // Use frontend clipboard if available, otherwise system clipboard
+        if (self.clipboard_get_fn) |getFn| {
+            const text = getFn();
+            if (text.len > 0) {
+                // Update internal clipboard (don't free — frontend owns this memory)
+                if (self.clipboard.len > 0) {
+                    self.allocator.free(self.clipboard);
+                }
+                self.clipboard = self.allocator.dupe(u8, text) catch return self.clipboard;
+                return self.clipboard;
+            }
+        } else if (SystemClipboard.getText(self.allocator)) |sys_text| {
             // Update internal clipboard with system contents
             if (self.clipboard.len > 0) {
                 self.allocator.free(self.clipboard);
