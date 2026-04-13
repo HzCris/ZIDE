@@ -79,32 +79,32 @@ pub const SystemClipboard = struct {
         child.stderr_behavior = .Pipe;
         child.spawn() catch return null;
 
-        var stdout = std.ArrayList(u8).init(allocator);
-        var stderr = std.ArrayList(u8).init(allocator);
-        defer stderr.deinit();
+        var stdout: std.ArrayList(u8) = .empty;
+        var stderr: std.ArrayList(u8) = .empty;
+        defer stderr.deinit(allocator);
 
         child.collectOutput(allocator, &stdout, &stderr, 1024 * 1024) catch {
-            stdout.deinit();
+            stdout.deinit(allocator);
             return null;
         };
 
         const term = child.wait() catch {
-            stdout.deinit();
+            stdout.deinit(allocator);
             return null;
         };
 
         if (term != .Exited or term.Exited != 0) {
-            stdout.deinit();
+            stdout.deinit(allocator);
             return null;
         }
 
         if (stdout.items.len == 0) {
-            stdout.deinit();
+            stdout.deinit(allocator);
             return null;
         }
 
-        return stdout.toOwnedSlice() catch {
-            stdout.deinit();
+        return stdout.toOwnedSlice(allocator) catch {
+            stdout.deinit(allocator);
             return null;
         };
     }
