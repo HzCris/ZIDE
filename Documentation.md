@@ -62,7 +62,7 @@ All Ctrl/Alt shortcuts are remappable via `~/.config/zide/init.lua`.
 - Auto-closing brackets and quotes (skip-over, smart quote detection)
 - UTF-8 aware cursor movement
 - Selection (Shift+arrows, Shift+Home/End, Ctrl+A select all)
-- Copy/Cut/Paste with system clipboard (Windows Win32 API)
+- Copy/Cut/Paste with system clipboard (Windows Win32 API, Linux wl-copy/xclip/xsel)
 
 **Navigation:**
 - Incremental/live search (jumps to matches as you type, Escape restores cursor)
@@ -166,7 +166,7 @@ All Ctrl/Alt shortcuts are remappable via `~/.config/zide/init.lua`.
 | `src/core/commands.zig` | Command registry and all built-in commands |
 | `src/core/editor.zig` | Editor state (documents, mode, settings) |
 | `src/core/keybind.zig` | Data-driven keybinding map |
-| `src/core/clipboard.zig` | System clipboard (Win32 API) |
+| `src/core/clipboard.zig` | System clipboard (Win32 API, Linux wl-copy/xclip/xsel) |
 | `src/core/lua_settings.zig` | Lua settings bridge (zide.set/get/bind/unbind) |
 | `src/frontend/tui.zig` | TUI frontend (libvaxis) |
 | `src/frontend/gui.zig` | GUI frontend (DVUI + SDL3) |

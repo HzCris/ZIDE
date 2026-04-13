@@ -4,7 +4,7 @@ const builtin = @import("builtin");
 
 /// Cross-platform system clipboard access.
 /// Windows: Win32 OpenClipboard/GetClipboardData/SetClipboardData
-/// Other: falls back to internal clipboard only (TODO: OSC 52 / xclip)
+/// Linux: wl-copy/wl-paste (Wayland) or xclip/xsel (X11)
 pub const SystemClipboard = struct {
     /// Get text from the system clipboard. Caller owns returned slice.
     /// Returns null if clipboard is empty or unavailable.
@@ -12,7 +12,10 @@ pub const SystemClipboard = struct {
         if (builtin.os.tag == .windows) {
             return getTextWindows(allocator);
         }
-        return null; // No system clipboard on other platforms yet
+        if (builtin.os.tag == .linux) {
+            return getTextLinux(allocator);
+        }
+        return null;
     }
 
     /// Set text to the system clipboard.
@@ -21,7 +24,109 @@ pub const SystemClipboard = struct {
         if (builtin.os.tag == .windows) {
             return setTextWindows(text);
         }
+        if (builtin.os.tag == .linux) {
+            return setTextLinux(text);
+        }
         return false;
+    }
+
+    // =========================================================================
+    // Linux implementation (Wayland: wl-copy/wl-paste, X11: xclip/xsel)
+    // =========================================================================
+
+    const LinuxBackend = enum { wayland, x11, none };
+
+    fn detectLinuxBackend() LinuxBackend {
+        if (std.process.hasEnvVarConstant("WAYLAND_DISPLAY")) return .wayland;
+        if (std.process.hasEnvVarConstant("DISPLAY")) return .x11;
+        return .none;
+    }
+
+    fn getTextLinux(allocator: Allocator) ?[]const u8 {
+        const backend = detectLinuxBackend();
+        switch (backend) {
+            .wayland => {
+                return runClipboardRead(allocator, &.{ "wl-paste", "--no-newline" });
+            },
+            .x11 => {
+                // Try xclip first, then xsel
+                return runClipboardRead(allocator, &.{ "xclip", "-selection", "clipboard", "-o" }) orelse
+                    runClipboardRead(allocator, &.{ "xsel", "--clipboard", "--output" });
+            },
+            .none => return null,
+        }
+    }
+
+    fn setTextLinux(text: []const u8) bool {
+        const backend = detectLinuxBackend();
+        switch (backend) {
+            .wayland => {
+                return runClipboardWrite(&.{"wl-copy"}, text);
+            },
+            .x11 => {
+                // Try xclip first, then xsel
+                if (runClipboardWrite(&.{ "xclip", "-selection", "clipboard" }, text)) return true;
+                return runClipboardWrite(&.{ "xsel", "--clipboard", "--input" }, text);
+            },
+            .none => return false,
+        }
+    }
+
+    /// Spawn a command and capture its stdout as clipboard text.
+    fn runClipboardRead(allocator: Allocator, argv: []const []const u8) ?[]const u8 {
+        var child = std.process.Child.init(argv, allocator);
+        child.stdout_behavior = .Pipe;
+        child.stderr_behavior = .Pipe;
+        child.spawn() catch return null;
+
+        var stdout = std.ArrayList(u8).init(allocator);
+        var stderr = std.ArrayList(u8).init(allocator);
+        defer stderr.deinit();
+
+        child.collectOutput(allocator, &stdout, &stderr, 1024 * 1024) catch {
+            stdout.deinit();
+            return null;
+        };
+
+        const term = child.wait() catch {
+            stdout.deinit();
+            return null;
+        };
+
+        if (term != .Exited or term.Exited != 0) {
+            stdout.deinit();
+            return null;
+        }
+
+        if (stdout.items.len == 0) {
+            stdout.deinit();
+            return null;
+        }
+
+        return stdout.toOwnedSlice() catch {
+            stdout.deinit();
+            return null;
+        };
+    }
+
+    /// Spawn a command and write text to its stdin.
+    fn runClipboardWrite(argv: []const []const u8, text: []const u8) bool {
+        // Use page_allocator since we don't store the result and this is a short-lived operation.
+        var child = std.process.Child.init(argv, std.heap.page_allocator);
+        child.stdin_behavior = .Pipe;
+        child.stdout_behavior = .Pipe;
+        child.stderr_behavior = .Pipe;
+        child.spawn() catch return false;
+
+        // Write text to child's stdin, then close it so the child sees EOF.
+        if (child.stdin) |stdin| {
+            stdin.writeAll(text) catch {};
+            stdin.close();
+            child.stdin = null;
+        }
+
+        const term = child.wait() catch return false;
+        return term == .Exited and term.Exited == 0;
     }
 
     // =========================================================================
