@@ -1,0 +1,295 @@
+// Example: Button states, focus handling, and click callbacks.
+
+const std = @import("std");
+const zit = @import("zit");
+const Button = zit.widget.Button;
+const Container = zit.widget.Container;
+const Label = zit.widget.Label;
+const render = zit.render;
+const input = zit.input;
+const layout = zit.layout;
+const memory = zit.memory;
+const widget = zit.widget;
+const term = zit.terminal;
+const theme = zit.widget.theme;
+
+var counter_state: u32 = 0;
+var button_status_label: ?*Label = null;
+var button_status_buf: [96]u8 = undefined;
+
+fn setStatus(comptime fmt: []const u8, args: anytype) void {
+    const label = button_status_label orelse return;
+    const text = std.fmt.bufPrint(&button_status_buf, fmt, args) catch return;
+    label.setText(text) catch {};
+}
+
+const LayoutWidget = struct {
+    widget: widget.Widget,
+    layout_element: layout.LayoutElement,
+
+    pub fn init(layout_element: layout.LayoutElement) LayoutWidget {
+        return .{
+            .widget = widget.Widget.init(&.{
+                .draw = drawFn,
+                .handle_event = handleEventFn,
+                .layout = layoutFn,
+                .get_preferred_size = getPreferredSizeFn,
+                .can_focus = canFocusFn,
+            }),
+            .layout_element = layout_element,
+        };
+    }
+
+    fn drawFn(widget_ptr: *anyopaque, r: *render.Renderer) anyerror!void {
+        const self = @as(*LayoutWidget, @ptrCast(@alignCast(widget_ptr)));
+        self.layout_element.render(r, self.widget.rect);
+    }
+
+    fn handleEventFn(widget_ptr: *anyopaque, event: input.Event) anyerror!bool {
+        _ = widget_ptr;
+        _ = event;
+        return false;
+    }
+
+    fn layoutFn(widget_ptr: *anyopaque, rect: layout.Rect) anyerror!void {
+        const self = @as(*LayoutWidget, @ptrCast(@alignCast(widget_ptr)));
+        self.widget.rect = rect;
+    }
+
+    fn getPreferredSizeFn(widget_ptr: *anyopaque) anyerror!layout.Size {
+        const self = @as(*LayoutWidget, @ptrCast(@alignCast(widget_ptr)));
+        // Use loose constraints to get the preferred size
+        return self.layout_element.layout(layout.Constraints.loose(65535, 65535));
+    }
+
+    fn canFocusFn(widget_ptr: *anyopaque) bool {
+        _ = widget_ptr;
+        return false;
+    }
+};
+
+pub fn main() !void {
+    // Create an allocator
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // Initialize memory manager
+    var memory_manager = try memory.MemoryManager.init(allocator, 1024 * 1024, 100);
+    defer memory_manager.deinit();
+
+    // Initialize terminal with the parent allocator
+    var terminal = try zit.terminal.init(allocator);
+    defer terminal.deinit() catch {};
+
+    // Initialize input handler with the parent allocator
+    var input_handler = zit.input.InputHandler.init(allocator, &terminal);
+
+    // Create a root container using widget pool allocator
+    var root = try Container.init(memory_manager.getWidgetPoolAllocator());
+    defer root.deinit();
+    const ui_theme = theme.Theme.dark();
+    const bg = ui_theme.color(.background);
+    const fg = ui_theme.color(.text);
+    const muted = ui_theme.color(.muted);
+    const accent = ui_theme.color(.accent);
+    root.setTheme(ui_theme);
+    root.setBorder(.single);
+
+    // Create a renderer with the parent allocator
+    var renderer = try render.Renderer.init(allocator, terminal.width, terminal.height);
+    defer renderer.deinit();
+
+    // Create a title label using widget pool allocator
+    const title = try Label.init(memory_manager.getWidgetPoolAllocator(), "Zit Button Widget Demo");
+    defer title.deinit();
+    title.setTheme(ui_theme);
+    title.setStyle(render.Style{ .bold = true });
+    try root.addChild(@as(*zit.widget.Widget, @ptrCast(title)));
+
+    // Create a flex layout for buttons
+    var flex_layout = try layout.FlexLayout.init(allocator, .column);
+    defer flex_layout.deinit();
+    _ = flex_layout.mainAlignment(.center);
+    _ = flex_layout.crossAlignment(.center);
+    _ = flex_layout.gap(1);
+    _ = flex_layout.padding(layout.EdgeInsets.all(1));
+
+    // Section 1: Basic Buttons
+    const basic_label = try Label.init(memory_manager.getWidgetPoolAllocator(), "Basic Buttons");
+    defer basic_label.deinit();
+    basic_label.setTheme(ui_theme);
+    basic_label.setColor(accent, bg);
+    try flex_layout.addChild(layout.FlexChild.init(basic_label.widget.asLayoutElement(), 0));
+
+    // Standard button
+    const standard_button = try Button.init(memory_manager.getWidgetPoolAllocator(), "Standard Button");
+    defer standard_button.deinit();
+    standard_button.setTheme(ui_theme);
+    standard_button.setOnClick(struct {
+        fn callback() void {
+            setStatus("Standard button pressed", .{});
+        }
+    }.callback);
+    try flex_layout.addChild(layout.FlexChild.init(standard_button.widget.asLayoutElement(), 0));
+
+    // Disabled button
+    const disabled_button = try Button.init(memory_manager.getWidgetPoolAllocator(), "Disabled Button");
+    defer disabled_button.deinit();
+    disabled_button.widget.setEnabled(false);
+    try flex_layout.addChild(layout.FlexChild.init(disabled_button.widget.asLayoutElement(), 0));
+
+    // Section 2: Styled Buttons
+    const styled_label = try Label.init(memory_manager.getWidgetPoolAllocator(), "Styled Buttons");
+    defer styled_label.deinit();
+    styled_label.setTheme(ui_theme);
+    styled_label.setColor(accent, bg);
+    try flex_layout.addChild(layout.FlexChild.init(styled_label.widget.asLayoutElement(), 0));
+
+    // Colored button
+    const colored_button = try Button.init(memory_manager.getWidgetPoolAllocator(), "Colored Button");
+    defer colored_button.deinit();
+    colored_button.setColors(
+        render.Color{ .named_color = render.NamedColor.green },
+        render.Color{ .named_color = render.NamedColor.black },
+        render.Color{ .named_color = render.NamedColor.black },
+        render.Color{ .named_color = render.NamedColor.green },
+    );
+    colored_button.setOnClick(struct {
+        fn callback() void {
+            setStatus("Colored button pressed", .{});
+        }
+    }.callback);
+    try flex_layout.addChild(layout.FlexChild.init(colored_button.widget.asLayoutElement(), 0));
+
+    // Highlighted button
+    const highlight_button = try Button.init(memory_manager.getWidgetPoolAllocator(), "Highlight Button");
+    defer highlight_button.deinit();
+    highlight_button.setColors(
+        render.Color{ .named_color = render.NamedColor.yellow },
+        render.Color{ .named_color = render.NamedColor.black },
+        render.Color{ .named_color = render.NamedColor.black },
+        render.Color{ .named_color = render.NamedColor.yellow },
+    );
+    highlight_button.setOnClick(struct {
+        fn callback() void {
+            setStatus("Highlight button pressed", .{});
+        }
+    }.callback);
+    try flex_layout.addChild(layout.FlexChild.init(highlight_button.widget.asLayoutElement(), 0));
+
+    // Section 3: Interactive Buttons
+    const interactive_label = try Label.init(memory_manager.getWidgetPoolAllocator(), "Interactive Buttons");
+    defer interactive_label.deinit();
+    interactive_label.setTheme(ui_theme);
+    interactive_label.setColor(accent, bg);
+    try flex_layout.addChild(layout.FlexChild.init(interactive_label.widget.asLayoutElement(), 0));
+
+    // Counter button
+    const counter_button = try Button.init(memory_manager.getWidgetPoolAllocator(), "Counter: 0");
+    defer counter_button.deinit();
+    const counter_data = struct {
+        var button: *Button = undefined;
+        var label_buf: [32]u8 = undefined;
+    };
+    counter_data.button = counter_button;
+    counter_button.setOnClick(struct {
+        fn callback() void {
+            counter_state += 1;
+            const text = std.fmt.bufPrint(&counter_data.label_buf, "Counter: {}", .{counter_state}) catch return;
+            counter_data.button.setText(text) catch {};
+            setStatus("Counter updated to {d}", .{counter_state});
+        }
+    }.callback);
+    try flex_layout.addChild(layout.FlexChild.init(counter_button.widget.asLayoutElement(), 0));
+
+    // Toggle button
+    const toggle_button = try Button.init(memory_manager.getWidgetPoolAllocator(), "Toggle: Off");
+    defer toggle_button.deinit();
+    const toggle_data = struct {
+        var button: *Button = undefined;
+        var state: bool = false;
+        var label_buf: [32]u8 = undefined;
+    };
+    toggle_data.button = toggle_button;
+    toggle_button.setOnClick(struct {
+        fn callback() void {
+            toggle_data.state = !toggle_data.state;
+            const text = std.fmt.bufPrint(&toggle_data.label_buf, "Toggle: {s}", .{if (toggle_data.state) "On" else "Off"}) catch return;
+            toggle_data.button.setText(text) catch {};
+            setStatus("Toggle switched {s}", .{if (toggle_data.state) "On" else "Off"});
+        }
+    }.callback);
+    try flex_layout.addChild(layout.FlexChild.init(toggle_button.widget.asLayoutElement(), 0));
+
+    const status_label = try Label.init(memory_manager.getWidgetPoolAllocator(), "Press buttons to see actions");
+    defer status_label.deinit();
+    status_label.setTheme(ui_theme);
+    status_label.setColor(muted, bg);
+    status_label.setAlignment(.center);
+    button_status_label = status_label;
+    try flex_layout.addChild(layout.FlexChild.init(status_label.widget.asLayoutElement(), 0));
+
+    // Create a layout widget for the flex layout
+    var layout_widget = LayoutWidget.init(flex_layout.asElement());
+
+    // Add layout widget to root
+    try root.addChild(&layout_widget.widget);
+
+    // Set up the terminal
+    try terminal.enableRawMode();
+    try terminal.hideCursor();
+    try input_handler.enableMouse();
+    defer {
+        input_handler.disableMouse() catch {};
+        terminal.showCursor() catch {};
+        terminal.disableRawMode() catch {};
+    }
+
+    // Clear screen initially
+    try terminal.clear();
+
+    // Main event loop
+    var running = true;
+    while (running) {
+        const width = renderer.back.width;
+        const height = renderer.back.height;
+
+        renderer.back.clear();
+
+        // Fill the background
+        renderer.fillRect(0, 0, width, height, ' ', fg, bg, render.Style{});
+
+        // Layout and render the root container
+        try root.widget.layout(layout.Rect.init(0, 0, width, height));
+        try root.widget.draw(&renderer);
+
+        // Present the frame
+        try renderer.render();
+
+        // Handle input with a 100ms timeout
+        const event = try input_handler.pollEvent(100);
+        if (event) |e| {
+            switch (e) {
+                .key => |key| {
+                    if (key.key == 'q' and !key.modifiers.ctrl and !key.modifiers.alt) {
+                        running = false;
+                    } else {
+                        _ = try root.widget.handleEvent(e);
+                    }
+                },
+                .resize => |resize| {
+                    try renderer.resize(resize.width, resize.height);
+                },
+                .mouse => {
+                    _ = try root.widget.handleEvent(e);
+                },
+                else => {},
+            }
+        }
+    }
+
+    // Clean up
+    try terminal.clear();
+    try terminal.moveCursor(0, 0);
+}
