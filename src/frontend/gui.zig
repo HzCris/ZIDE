@@ -41,23 +41,52 @@ pub fn frame(editor: *Editor) bool {
     if (!build_options.has_gui) return false;
 
     // --- Global keyboard shortcuts (before widgets consume events) ---
+    // Process keybinds here so DVUI widgets (menus, etc.) cannot consume them first.
     for (dvui.events()) |*e| {
         if (e.handled) continue;
         if (e.evt != .key) continue;
         const key = e.evt.key;
         if (key.action != .down and key.action != .repeat) continue;
 
-        if (key.mod.control()) {
-            switch (key.code) {
-                .tab => {
-                    e.handled = true;
-                    if (key.mod.shift()) {
-                        editor.prevDoc();
-                    } else {
-                        editor.nextDoc();
+        if (key.mod.control() or key.mod.alt()) {
+            // Tab switching always works (even during modals)
+            if (key.mod.control() and key.code == .tab) {
+                e.handled = true;
+                if (key.mod.shift()) editor.prevDoc() else editor.nextDoc();
+                continue;
+            }
+
+            // Keybinds only in normal mode (not during find/replace/palette)
+            if (editor.mode == .normal) {
+                // Skip modifier-only keys
+                if (key.code == .left_shift or key.code == .right_shift or
+                    key.code == .left_control or key.code == .right_control or
+                    key.code == .left_alt or key.code == .right_alt or
+                    key.code == .left_command or key.code == .right_command) continue;
+
+                var kbuf: [64]u8 = undefined;
+                const key_str = dvuiKeyToStr(key, &kbuf);
+                if (key_str.len > 0) {
+                    if (editor.keybinds.get(key_str)) |action| {
+                        e.handled = true;
+                        scroll_pinned = false;
+                        execGuiAction(editor, action);
+                        continue;
                     }
-                },
-                else => {},
+                    // Fallback without shift
+                    if (key.mod.shift()) {
+                        var kbuf2: [64]u8 = undefined;
+                        const fallback_str = dvuiKeyToStrNoShift(key, &kbuf2);
+                        if (fallback_str.len > 0) {
+                            if (editor.keybinds.get(fallback_str)) |action| {
+                                e.handled = true;
+                                scroll_pinned = false;
+                                execGuiAction(editor, action);
+                                continue;
+                            }
+                        }
+                    }
+                }
             }
         }
     }
@@ -373,7 +402,7 @@ fn editorPane(editor: *Editor) void {
                 .h = area.h,
             };
         }
-        handleMouseEvents(doc, wd, drag_area, font, line_height, scale, editor.tab_width);
+        handleMouseEvents(editor, wd, drag_area, font, line_height, scale);
     }
 
     // --- Ensure cursor visible (unless user is scrolling with wheel or dragging) ---
@@ -666,7 +695,9 @@ fn editorPane(editor: *Editor) void {
 }
 
 /// Handle mouse events for the custom editor pane.
-fn handleMouseEvents(doc: *Document, wd: *dvui.WidgetData, area: dvui.Rect.Physical, font: dvui.Font, line_height: f32, scale: f32, tab_width: usize) void {
+fn handleMouseEvents(editor: *Editor, wd: *dvui.WidgetData, area: dvui.Rect.Physical, font: dvui.Font, line_height: f32, scale: f32) void {
+    const doc = editor.activeDoc();
+    const tab_width = editor.tab_width;
     const double_click_threshold_ms: u64 = 400;
     const double_click_distance: f32 = 5; // pixels
 
@@ -693,7 +724,19 @@ fn handleMouseEvents(doc: *Document, wd: *dvui.WidgetData, area: dvui.Rect.Physi
                 dvui.focusWidget(wd.id, null, e.num);
                 scroll_pinned = false;
                 const offset = screenToOffset(doc, area, font, line_height, scale, me.p, tab_width);
+
+                // Alt+click: add a cursor at click position
+                if (me.mod.alt()) {
+                    doc.cursors.addCursor(offset) catch {};
+                    continue;
+                }
+
                 const c = doc.cursors.primary();
+
+                // Regular click clears secondary cursors
+                if (editor.click_clears_cursors and doc.cursors.count() > 1) {
+                    doc.cursors.clearSecondary();
+                }
 
                 // Detect multi-click (double/triple)
                 const now_ns = std.time.nanoTimestamp();
@@ -990,32 +1033,8 @@ fn handleGuiKeyEvents(editor: *Editor, wd: *dvui.WidgetData) bool {
                 // Any real key press un-pins scroll (cursor tracking resumes)
                 scroll_pinned = false;
 
-                // Ctrl/Alt shortcuts — look up in keybind map
-                if (key.mod.control() or key.mod.alt()) {
-                    var kbuf: [64]u8 = undefined;
-                    const key_str = dvuiKeyToStr(key, &kbuf);
-                    if (key_str.len > 0) {
-                        if (editor.keybinds.get(key_str)) |action| {
-                            e.handle(@src(), wd);
-                            handled_any = true;
-                            execGuiAction(editor, action);
-                            continue;
-                        }
-                        // Fallback without shift
-                        if (key.mod.shift()) {
-                            var kbuf2: [64]u8 = undefined;
-                            const fallback_str = dvuiKeyToStrNoShift(key, &kbuf2);
-                            if (fallback_str.len > 0) {
-                                if (editor.keybinds.get(fallback_str)) |action| {
-                                    e.handle(@src(), wd);
-                                    execGuiAction(editor, action);
-                                    continue;
-                                }
-                            }
-                        }
-                    }
-                    continue;
-                }
+                // Ctrl/Alt shortcuts handled by the early event loop in frame()
+                if (key.mod.control() or key.mod.alt()) continue;
 
                 // Movement and special keys — only when focused
                 if (!is_focused) continue;
@@ -1326,62 +1345,58 @@ fn guiMoveVisualVertical(editor: *Editor, direction: enum { up, down }, extend_s
     if (!build_options.has_gui) return;
 
     const doc = editor.activeDoc();
-    const c = doc.cursors.primary();
     const buf = &doc.buffer;
     const font = dvui.Font.theme(.mono);
     const total_lines = buf.lineCount();
     const tw = editor.tab_width;
-
-    // editor.text_width is set by editorPane to logical text area width (pixels / scale)
     const text_w: f32 = @floatFromInt(editor.text_width);
 
-    const pos = buf.offsetToPos(c.offset);
-    const orig_cur = buf.lineContent(pos.line);
-    var exp_buf1: [16384]u8 = undefined;
-    const cur_line = expandTabs(orig_cur, tw, &exp_buf1);
-    const exp_col = bufColToExpCol(orig_cur, pos.col, tw);
+    for (doc.cursors.cursors.items) |*c| {
+        const pos = buf.offsetToPos(c.offset);
+        const orig_cur = buf.lineContent(pos.line);
+        var exp_buf1: [16384]u8 = undefined;
+        const cur_line = expandTabs(orig_cur, tw, &exp_buf1);
+        const exp_col = bufColToExpCol(orig_cur, pos.col, tw);
 
-    // Find which visual wrap row the cursor is on
-    const wrap_info = guiWrapColToVisual(cur_line, font, text_w, exp_col);
-    const cur_rows = guiWrapLineRows(cur_line, font, text_w);
+        const wrap_info = guiWrapColToVisual(cur_line, font, text_w, exp_col);
+        const cur_rows = guiWrapLineRows(cur_line, font, text_w);
+        const preferred_px = c.preferred_col;
 
-    // Use preferred_col as pixel x position for vertical movement stability
-    const preferred_px = c.preferred_col;
+        if (extend_selection) {
+            if (c.anchor == null) c.anchor = c.offset;
+        } else {
+            c.clearSelection();
+        }
 
-    if (extend_selection) {
-        if (c.anchor == null) c.anchor = c.offset;
-    } else {
-        c.clearSelection();
+        switch (direction) {
+            .up => {
+                if (wrap_info.row > 0) {
+                    const target_exp = guiWrapVisualToCol(cur_line, font, text_w, wrap_info.row - 1, preferred_px);
+                    c.offset = buf.posToOffset(pos.line, expColToBufCol(orig_cur, target_exp, tw));
+                } else if (pos.line > 0) {
+                    const orig_prev = buf.lineContent(pos.line - 1);
+                    var exp_buf2: [16384]u8 = undefined;
+                    const prev_line = expandTabs(orig_prev, tw, &exp_buf2);
+                    const prev_rows = guiWrapLineRows(prev_line, font, text_w);
+                    const target_exp = guiWrapVisualToCol(prev_line, font, text_w, prev_rows - 1, preferred_px);
+                    c.offset = buf.posToOffset(pos.line - 1, expColToBufCol(orig_prev, target_exp, tw));
+                }
+            },
+            .down => {
+                if (wrap_info.row + 1 < cur_rows) {
+                    const target_exp = guiWrapVisualToCol(cur_line, font, text_w, wrap_info.row + 1, preferred_px);
+                    c.offset = buf.posToOffset(pos.line, expColToBufCol(orig_cur, target_exp, tw));
+                } else if (pos.line + 1 < total_lines) {
+                    const orig_next = buf.lineContent(pos.line + 1);
+                    var exp_buf2: [16384]u8 = undefined;
+                    const next_line = expandTabs(orig_next, tw, &exp_buf2);
+                    const target_exp = guiWrapVisualToCol(next_line, font, text_w, 0, preferred_px);
+                    c.offset = buf.posToOffset(pos.line + 1, expColToBufCol(orig_next, target_exp, tw));
+                }
+            },
+        }
     }
-
-    switch (direction) {
-        .up => {
-            if (wrap_info.row > 0) {
-                const target_exp = guiWrapVisualToCol(cur_line, font, text_w, wrap_info.row - 1, preferred_px);
-                c.offset = buf.posToOffset(pos.line, expColToBufCol(orig_cur, target_exp, tw));
-            } else if (pos.line > 0) {
-                const orig_prev = buf.lineContent(pos.line - 1);
-                var exp_buf2: [16384]u8 = undefined;
-                const prev_line = expandTabs(orig_prev, tw, &exp_buf2);
-                const prev_rows = guiWrapLineRows(prev_line, font, text_w);
-                const target_exp = guiWrapVisualToCol(prev_line, font, text_w, prev_rows - 1, preferred_px);
-                c.offset = buf.posToOffset(pos.line - 1, expColToBufCol(orig_prev, target_exp, tw));
-            }
-        },
-        .down => {
-            if (wrap_info.row + 1 < cur_rows) {
-                const target_exp = guiWrapVisualToCol(cur_line, font, text_w, wrap_info.row + 1, preferred_px);
-                c.offset = buf.posToOffset(pos.line, expColToBufCol(orig_cur, target_exp, tw));
-            } else if (pos.line + 1 < total_lines) {
-                const orig_next = buf.lineContent(pos.line + 1);
-                var exp_buf2: [16384]u8 = undefined;
-                const next_line = expandTabs(orig_next, tw, &exp_buf2);
-                const target_exp = guiWrapVisualToCol(next_line, font, text_w, 0, preferred_px);
-                c.offset = buf.posToOffset(pos.line + 1, expColToBufCol(orig_next, target_exp, tw));
-            }
-        },
-    }
-    // Don't update preferred_col — preserve it for stable vertical movement
+    doc.cursors.mergeCursors();
 }
 
 /// Find which visual wrap row a byte column falls on, and its pixel x offset within that row.
@@ -1786,6 +1801,7 @@ const settings_defs = [_]SettingDef{
     .{ .key = "auto_save_interval_ms", .label = "Auto Save Interval (ms)", .kind = .number, .desc = "Delay before auto-save (500-300000)" },
     .{ .key = "gutter_min_digits", .label = "Gutter Min Digits", .kind = .number, .desc = "Minimum width of line number gutter (1-10)" },
     .{ .key = "page_size", .label = "Page Size", .kind = .number, .desc = "Lines to scroll on Page Up/Down (5-200)" },
+    .{ .key = "click_clears_cursors", .label = "Click Clears Cursors", .kind = .boolean, .desc = "Left-click clears secondary cursors" },
 };
 
 /// Handle mouse clicks in the settings panel overlay.
@@ -1913,6 +1929,7 @@ fn getSettingBool(editor: *const Editor, key: []const u8) bool {
     if (std.mem.eql(u8, key, "word_wrap")) return editor.word_wrap;
     if (std.mem.eql(u8, key, "auto_close_brackets")) return editor.auto_close_brackets;
     if (std.mem.eql(u8, key, "auto_save")) return editor.auto_save;
+    if (std.mem.eql(u8, key, "click_clears_cursors")) return editor.click_clears_cursors;
     return false;
 }
 
@@ -1921,6 +1938,7 @@ fn applySettingBool(editor: *Editor, key: []const u8, val: bool) void {
     if (std.mem.eql(u8, key, "word_wrap")) editor.word_wrap = val;
     if (std.mem.eql(u8, key, "auto_close_brackets")) editor.auto_close_brackets = val;
     if (std.mem.eql(u8, key, "auto_save")) editor.auto_save = val;
+    if (std.mem.eql(u8, key, "click_clears_cursors")) editor.click_clears_cursors = val;
 }
 
 fn getSettingNumber(editor: *const Editor, key: []const u8) i64 {

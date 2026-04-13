@@ -226,6 +226,8 @@ fn luaSet(state: ?*zlua.LuaState) callconv(.c) c_int {
         if (val >= 1 and val <= 10) {
             editor.gutter_min_digits = @intCast(val);
         }
+    } else if (std.mem.eql(u8, key_str, "click_clears_cursors")) {
+        editor.click_clears_cursors = lua.toBoolean(2);
     } else {
         std.log.warn("zide.set: unknown key '{s}'", .{key_str});
     }
@@ -264,6 +266,9 @@ fn luaGet(state: ?*zlua.LuaState) callconv(.c) c_int {
         return 1;
     } else if (std.mem.eql(u8, key_str, "gutter_min_digits")) {
         lua.pushInteger(@intCast(editor.gutter_min_digits));
+        return 1;
+    } else if (std.mem.eql(u8, key_str, "click_clears_cursors")) {
+        lua.pushBoolean(editor.click_clears_cursors);
         return 1;
     }
 

@@ -530,38 +530,76 @@ fn cmdInsertNewlineAuto(editor: *Editor, _: ?[]const u8) void {
 
 fn cmdAddCursorBelow(editor: *Editor, _: ?[]const u8) void {
     const doc = editor.activeDoc();
-    const c = doc.cursors.primary();
-    const p = doc.buffer.offsetToPos(c.offset);
-    if (p.line + 1 >= doc.buffer.lineCount()) return;
-    const target_line_len = doc.buffer.lineContent(p.line + 1).len;
-    const col = @min(c.preferred_col, target_line_len);
-    const new_offset = doc.buffer.posToOffset(p.line + 1, col);
+    // Find the cursor on the lowest (highest line number) line
+    var max_line: usize = 0;
+    var ref_col: usize = doc.cursors.primary().preferred_col;
+    for (doc.cursors.cursors.items) |c| {
+        const p = doc.buffer.offsetToPos(c.offset);
+        if (p.line > max_line) {
+            max_line = p.line;
+            ref_col = c.preferred_col;
+        }
+    }
+    if (max_line + 1 >= doc.buffer.lineCount()) return;
+    const target_line_len = doc.buffer.lineContent(max_line + 1).len;
+    const col = @min(ref_col, target_line_len);
+    const new_offset = doc.buffer.posToOffset(max_line + 1, col);
     doc.cursors.addCursor(new_offset) catch {};
 }
 
 fn cmdAddCursorAbove(editor: *Editor, _: ?[]const u8) void {
     const doc = editor.activeDoc();
-    const c = doc.cursors.primary();
-    const p = doc.buffer.offsetToPos(c.offset);
-    if (p.line == 0) return;
-    const target_line_len = doc.buffer.lineContent(p.line - 1).len;
-    const col = @min(c.preferred_col, target_line_len);
-    const new_offset = doc.buffer.posToOffset(p.line - 1, col);
+    // Find the cursor on the highest (lowest line number) line
+    var min_line: usize = std.math.maxInt(usize);
+    var ref_col: usize = doc.cursors.primary().preferred_col;
+    for (doc.cursors.cursors.items) |c| {
+        const p = doc.buffer.offsetToPos(c.offset);
+        if (p.line < min_line) {
+            min_line = p.line;
+            ref_col = c.preferred_col;
+        }
+    }
+    if (min_line == 0) return;
+    const target_line_len = doc.buffer.lineContent(min_line - 1).len;
+    const col = @min(ref_col, target_line_len);
+    const new_offset = doc.buffer.posToOffset(min_line - 1, col);
     doc.cursors.addCursor(new_offset) catch {};
 }
 
 fn cmdAddNextOccurrence(editor: *Editor, _: ?[]const u8) void {
     const doc = editor.activeDoc();
     const c = doc.cursors.primary();
+
+    // If no selection, select the word under cursor first
+    if (!c.hasSelection()) {
+        const content = doc.buffer.slice(0, doc.buffer.byteLen());
+        if (c.offset >= content.len) return;
+        if (!isWordCharByte(content[c.offset])) return;
+        // Find word boundaries
+        var word_start = c.offset;
+        while (word_start > 0 and isWordCharByte(content[word_start - 1])) word_start -= 1;
+        var word_end = c.offset;
+        while (word_end < content.len and isWordCharByte(content[word_end])) word_end += 1;
+        if (word_end == word_start) return;
+        c.anchor = word_start;
+        c.offset = word_end;
+        return;
+    }
+
     const range = c.selectionRange() orelse return;
     const needle = doc.buffer.slice(range.start, range.end);
     if (needle.len == 0) return;
 
-    // Search from end of current selection
-    const content = doc.buffer.slice(0, doc.buffer.byteLen());
-    const search_start = range.end;
+    // Find the furthest selection end among all cursors to search from there
+    var search_start: usize = range.end;
+    for (doc.cursors.cursors.items) |sc| {
+        if (sc.selectionRange()) |sr| {
+            if (sr.end > search_start) search_start = sr.end;
+        }
+    }
 
-    // Search forward from selection end, then wrap around
+    // Search forward from furthest selection end, then wrap around
+    const content = doc.buffer.slice(0, doc.buffer.byteLen());
     var found: ?usize = null;
     if (search_start < content.len) {
         if (std.mem.indexOf(u8, content[search_start..], needle)) |idx| {
@@ -569,7 +607,7 @@ fn cmdAddNextOccurrence(editor: *Editor, _: ?[]const u8) void {
         }
     }
     // Wrap around
-    if (found == null and range.start > 0) {
+    if (found == null) {
         if (std.mem.indexOf(u8, content[0..range.start], needle)) |idx| {
             found = idx;
         }
@@ -591,4 +629,36 @@ fn cmdAddNextOccurrence(editor: *Editor, _: ?[]const u8) void {
 
 fn cmdEscapeMulticursor(editor: *Editor, _: ?[]const u8) void {
     editor.activeDoc().cursors.clearSecondary();
+}
+
+fn isWordCharByte(byte: u8) bool {
+    return std.ascii.isAlphanumeric(byte) or byte == '_';
+}
+
+// ---- Tests ----
+
+test "add_next_occurrence selects word then finds next" {
+    const allocator = std.testing.allocator;
+    var editor = try Editor.init(allocator);
+    defer editor.deinit();
+    try editor.activeDoc().loadText("hello world hello there");
+
+    // Place cursor on "hello" (offset 0)
+    editor.activeDoc().cursors.primary().offset = 0;
+    editor.activeDoc().cursors.primary().clearSelection();
+
+    // First Ctrl+D: should select the word "hello"
+    cmdAddNextOccurrence(&editor, null);
+    try std.testing.expect(editor.activeDoc().cursors.primary().hasSelection());
+    const r1 = editor.activeDoc().cursors.primary().selectionRange().?;
+    try std.testing.expectEqual(@as(usize, 0), r1.start);
+    try std.testing.expectEqual(@as(usize, 5), r1.end);
+
+    // Second Ctrl+D: should add cursor at second "hello"
+    cmdAddNextOccurrence(&editor, null);
+    try std.testing.expectEqual(@as(usize, 2), editor.activeDoc().cursors.count());
+    // New cursor should be at end of second "hello" (offset 17) with selection
+    const new_c = &editor.activeDoc().cursors.cursors.items[1];
+    try std.testing.expectEqual(@as(usize, 17), new_c.offset);
+    try std.testing.expectEqual(@as(usize, 12), new_c.anchor.?);
 }

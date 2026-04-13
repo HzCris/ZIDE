@@ -85,9 +85,11 @@ pub const KeybindMap = struct {
         // Alt shortcuts
         try self.set("alt+up", "move_line_up");
         try self.set("alt+down", "move_line_down");
-        // Multi-cursor
+        // Multi-cursor (ctrl+shift may be eaten by some terminals, ctrl+alt as fallback)
         try self.set("ctrl+shift+up", "add_cursor_above");
         try self.set("ctrl+shift+down", "add_cursor_below");
+        try self.set("ctrl+alt+up", "add_cursor_above");
+        try self.set("ctrl+alt+down", "add_cursor_below");
         try self.set("ctrl+d", "add_next_occurrence");
     }
 };
@@ -121,4 +123,8 @@ test "keybind defaults" {
     try std.testing.expectEqualStrings("undo", kb.get("ctrl+z").?);
     try std.testing.expectEqualStrings("delete_line", kb.get("ctrl+k").?);
     try std.testing.expectEqualStrings("move_line_up", kb.get("alt+up").?);
+    try std.testing.expectEqualStrings("add_next_occurrence", kb.get("ctrl+d").?);
+    try std.testing.expectEqualStrings("duplicate_line", kb.get("ctrl+shift+d").?);
+    try std.testing.expectEqualStrings("add_cursor_above", kb.get("ctrl+shift+up").?);
+    try std.testing.expectEqualStrings("add_cursor_below", kb.get("ctrl+alt+down").?);
 }

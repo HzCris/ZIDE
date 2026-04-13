@@ -405,60 +405,49 @@ fn wrapColToVisual(line: []const u8, text_width: u16, byte_col: usize) struct { 
 /// When word wrap is on, this moves through screen rows rather than logical lines.
 fn moveVisualVertical(editor: *Editor, direction: enum { up, down }, extend_selection: bool) void {
     const doc = editor.activeDoc();
-    const c = doc.cursors.primary();
     const buf = &doc.buffer;
     const total_lines = doc.lineCount();
-    const gutter_width = lineNumberWidth(total_lines);
-    const text_start_x = gutter_width + 1;
-    // Use page_size as a proxy for terminal width (we don't store width in editor)
-    // Actually we need the real width. Compute from a reasonable default or use stored value.
-    // For now, compute text_width from a 80-col fallback — but we need the real width.
-    // The editor stores page_size (height-based), not width. Let's store text_width.
     const text_width: u16 = editor.text_width;
-    _ = text_start_x;
 
     if (text_width == 0) return;
 
-    const pos = buf.offsetToPos(c.offset);
-    const cur_line = doc.lineContent(pos.line);
-    const wrap_pos = wrapColToVisual(cur_line, text_width, pos.col);
+    for (doc.cursors.cursors.items) |*c| {
+        const pos = buf.offsetToPos(c.offset);
+        const cur_line = doc.lineContent(pos.line);
+        const wrap_pos = wrapColToVisual(cur_line, text_width, pos.col);
 
-    if (!extend_selection) {
-        c.clearSelection();
-    } else if (!c.hasSelection()) {
-        c.startSelection();
-    }
+        if (!extend_selection) {
+            c.clearSelection();
+        } else if (!c.hasSelection()) {
+            c.startSelection();
+        }
 
-    switch (direction) {
-        .up => {
-            if (wrap_pos.row > 0) {
-                // Move up within the same logical line (to previous wrap row)
-                const target_col = wrapVisualToCol(cur_line, text_width, wrap_pos.row - 1, c.preferred_col);
-                c.offset = buf.posToOffset(pos.line, target_col);
-            } else {
-                // Move to the last wrap row of the previous logical line
-                if (pos.line == 0) return;
-                const prev_line = doc.lineContent(pos.line - 1);
-                const prev_rows = wrapLineRows(prev_line, text_width);
-                const target_col = wrapVisualToCol(prev_line, text_width, prev_rows - 1, c.preferred_col);
-                c.offset = buf.posToOffset(pos.line - 1, target_col);
-            }
-        },
-        .down => {
-            const cur_rows = wrapLineRows(cur_line, text_width);
-            if (wrap_pos.row + 1 < cur_rows) {
-                // Move down within the same logical line (to next wrap row)
-                const target_col = wrapVisualToCol(cur_line, text_width, wrap_pos.row + 1, c.preferred_col);
-                c.offset = buf.posToOffset(pos.line, target_col);
-            } else {
-                // Move to the first wrap row of the next logical line
-                if (pos.line + 1 >= total_lines) return;
-                const next_line = doc.lineContent(pos.line + 1);
-                const target_col = wrapVisualToCol(next_line, text_width, 0, c.preferred_col);
-                c.offset = buf.posToOffset(pos.line + 1, target_col);
-            }
-        },
+        switch (direction) {
+            .up => {
+                if (wrap_pos.row > 0) {
+                    const target_col = wrapVisualToCol(cur_line, text_width, wrap_pos.row - 1, c.preferred_col);
+                    c.offset = buf.posToOffset(pos.line, target_col);
+                } else if (pos.line > 0) {
+                    const prev_line = doc.lineContent(pos.line - 1);
+                    const prev_rows = wrapLineRows(prev_line, text_width);
+                    const target_col = wrapVisualToCol(prev_line, text_width, prev_rows - 1, c.preferred_col);
+                    c.offset = buf.posToOffset(pos.line - 1, target_col);
+                }
+            },
+            .down => {
+                const cur_rows = wrapLineRows(cur_line, text_width);
+                if (wrap_pos.row + 1 < cur_rows) {
+                    const target_col = wrapVisualToCol(cur_line, text_width, wrap_pos.row + 1, c.preferred_col);
+                    c.offset = buf.posToOffset(pos.line, target_col);
+                } else if (pos.line + 1 < total_lines) {
+                    const next_line = doc.lineContent(pos.line + 1);
+                    const target_col = wrapVisualToCol(next_line, text_width, 0, c.preferred_col);
+                    c.offset = buf.posToOffset(pos.line + 1, target_col);
+                }
+            },
+        }
     }
+    doc.cursors.mergeCursors();
 }
 
 /// Convert a visual row and preferred display column to a byte column within a line.
@@ -849,10 +838,20 @@ fn handleMouse(editor: *Editor, mouse: vaxis.Mouse) void {
                 // Click: position cursor — also un-pin scroll
                 scroll_pinned = false;
                 if (screenToOffset(editor, mouse.col, mouse.row)) |offset| {
-                    const c = editor.activeDoc().cursors.primary();
-                    c.clearSelection();
-                    c.offset = offset;
-                    c.preferred_col = editor.activeDoc().buffer.offsetToPos(offset).col;
+                    const doc = editor.activeDoc();
+                    if (mouse.mods.alt) {
+                        // Alt+click: add cursor at click position
+                        doc.cursors.addCursor(offset) catch {};
+                    } else {
+                        // Regular click: clear secondary cursors if enabled
+                        if (editor.click_clears_cursors and doc.cursors.count() > 1) {
+                            doc.cursors.clearSecondary();
+                        }
+                        const c = doc.cursors.primary();
+                        c.clearSelection();
+                        c.offset = offset;
+                        c.preferred_col = doc.buffer.offsetToPos(offset).col;
+                    }
                 }
             } else if (mouse.type == .drag) {
                 // Drag: extend selection

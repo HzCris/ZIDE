@@ -63,6 +63,8 @@ pub const Editor = struct {
     auto_save_interval_ms: u32 = 5000,
     /// Minimum digit width for line number gutter (default 3).
     gutter_min_digits: usize = 3,
+    /// Left-click clears secondary cursors (default true).
+    click_clears_cursors: bool = true,
     /// Command palette selection index (for Tab cycling).
     palette_selected: usize = 0,
 

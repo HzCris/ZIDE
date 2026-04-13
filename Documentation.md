@@ -20,11 +20,13 @@
 | Ctrl+H | Find and Replace |
 | Ctrl+G | Go to line |
 | Ctrl+P | Command palette |
-| Ctrl+D | Add next occurrence (multi-cursor) |
+| Ctrl+D | Add next occurrence (multi-cursor); selects word first if no selection |
 | Ctrl+Shift+D | Duplicate line |
 | Ctrl+Shift+Up/Down | Add cursor above/below |
+| Alt+Shift+Up/Down | Add cursor above/below (TUI fallback) |
+| Alt+Click | Add cursor at click position |
 | Ctrl+K | Delete line |
-| Escape | Remove secondary cursors |
+| Escape / Left-click | Remove secondary cursors |
 | Ctrl+Left/Right | Word movement |
 | Ctrl+Shift+Left/Right | Word selection |
 | Ctrl+Backspace | Delete word backward |
@@ -82,7 +84,8 @@ All Ctrl/Alt shortcuts are remappable via `~/.config/zide/init.lua`.
 - Wrap continuation markers (`.`)
 
 **Mouse:**
-- Left click to position cursor
+- Left click to position cursor (clears secondary cursors, configurable)
+- Alt+click to add cursor at position
 - Left drag to select text
 - Scroll wheel to scroll viewport (independent of cursor position)
 
@@ -96,14 +99,14 @@ All Ctrl/Alt shortcuts are remappable via `~/.config/zide/init.lua`.
 
 **Configuration:**
 - Lua settings file (`~/.config/zide/init.lua`)
-  - `zide.set(key, value)` — tab_width, use_tabs, word_wrap, auto_close_brackets, page_size, auto_save, auto_save_interval_ms
+  - `zide.set(key, value)` — tab_width, use_tabs, word_wrap, auto_close_brackets, page_size, auto_save, auto_save_interval_ms, click_clears_cursors
   - `zide.get(key)` — read current settings
   - `zide.bind(key_combo, command)` — remap keybindings
   - `zide.unbind(key_combo)` — remove a keybinding
 - Data-driven keybinding map (all Ctrl/Alt shortcuts remappable)
 - Auto-save (saves dirty documents with file paths after configurable interval, default 5s)
 - Application icon embedded in exe
-- Multiple cursor editing (Ctrl+Shift+Up/Down to add cursors, Ctrl+D for next occurrence, Escape to clear)
+- Multiple cursor editing (Ctrl+Shift or Alt+Shift+Up/Down, Ctrl+D, Alt+click, Escape/click to clear)
 
 ### TUI — Not Yet Implemented
 - Theme system (Lua and however Windows wants to fight)
@@ -135,13 +138,13 @@ All Ctrl/Alt shortcuts are remappable via `~/.config/zide/init.lua`.
 - Find/Replace match count display (shows "N matches" in overlay bar)
 - Command palette Tab/arrow cycling with highlighted selection (Enter executes selected)
 - Configurable line number gutter width (`zide.set("gutter_min_digits", N)` in init.lua, default 3)
-- Mouse selection: double-click selects word, triple-click selects line, drag extends by word/line accordingly, Shift+click extends selection
+- Mouse selection: double-click selects word, triple-click selects line, drag extends by word/line accordingly, Shift+click extends selection, Alt+click adds cursor
 
 - Settings panel (Edit menu — visual editor for all settings, mouse-clickable, writes to init.lua)
 - Open Settings File (Edit menu — opens init.lua directly in the editor for power users)
 - Tab character display (expands `\t` to spaces for rendering, cursor, selection, and wrapping)
 - Blinking caret (530ms cycle, resets on cursor movement)
-- Multiple cursor editing (Ctrl+Shift+Up/Down to add cursors, Ctrl+D for next occurrence, Escape to clear)
+- Multiple cursor editing (Ctrl+Shift or Alt+Shift+Up/Down, Ctrl+D, Alt+click, Escape/click to clear)
 
 ### GUI — Not Yet Implemented
 - GUI block adjusting (Think how you can move the editor/terminal/filetree around in neovim/vs code)
