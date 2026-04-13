@@ -450,6 +450,80 @@ fn moveVisualVertical(editor: *Editor, direction: enum { up, down }, extend_sele
     doc.cursors.mergeCursors();
 }
 
+/// Dispatch a keybind action with TUI-specific overrides (visual-row multi-cursor).
+fn execTuiAction(editor: *Editor, action: []const u8) void {
+    if (editor.word_wrap) {
+        if (std.mem.eql(u8, action, "add_cursor_above")) {
+            tuiAddCursorVisual(editor, .up);
+            return;
+        }
+        if (std.mem.eql(u8, action, "add_cursor_below")) {
+            tuiAddCursorVisual(editor, .down);
+            return;
+        }
+    }
+    _ = editor.execAction(action);
+}
+
+/// Add a new cursor one visual (wrapped) row above or below the outermost cursor.
+fn tuiAddCursorVisual(editor: *Editor, direction: enum { up, down }) void {
+    const doc = editor.activeDoc();
+    const buf = &doc.buffer;
+    const total_lines = doc.lineCount();
+    const text_width: u16 = editor.text_width;
+
+    if (text_width == 0) return;
+
+    // Find the outermost cursor in the given direction
+    var edge_idx: usize = 0;
+    var edge_line: usize = if (direction == .up) std.math.maxInt(usize) else 0;
+    var edge_wrap_row: u16 = 0;
+    for (doc.cursors.cursors.items, 0..) |c, i| {
+        const pos = buf.offsetToPos(c.offset);
+        const wrap_pos = wrapColToVisual(doc.lineContent(pos.line), text_width, pos.col);
+        switch (direction) {
+            .up => if (pos.line < edge_line or (pos.line == edge_line and wrap_pos.row < edge_wrap_row)) {
+                edge_line = pos.line;
+                edge_wrap_row = wrap_pos.row;
+                edge_idx = i;
+            },
+            .down => if (pos.line > edge_line or (pos.line == edge_line and wrap_pos.row > edge_wrap_row)) {
+                edge_line = pos.line;
+                edge_wrap_row = wrap_pos.row;
+                edge_idx = i;
+            },
+        }
+    }
+
+    const ref_cursor = doc.cursors.cursors.items[edge_idx];
+    const cur_line = doc.lineContent(edge_line);
+
+    switch (direction) {
+        .up => {
+            if (edge_wrap_row > 0) {
+                const target_col = wrapVisualToCol(cur_line, text_width, edge_wrap_row - 1, ref_cursor.preferred_col);
+                doc.cursors.addCursor(buf.posToOffset(edge_line, target_col)) catch {};
+            } else if (edge_line > 0) {
+                const prev_line = doc.lineContent(edge_line - 1);
+                const prev_rows = wrapLineRows(prev_line, text_width);
+                const target_col = wrapVisualToCol(prev_line, text_width, prev_rows - 1, ref_cursor.preferred_col);
+                doc.cursors.addCursor(buf.posToOffset(edge_line - 1, target_col)) catch {};
+            }
+        },
+        .down => {
+            const cur_rows = wrapLineRows(cur_line, text_width);
+            if (edge_wrap_row + 1 < cur_rows) {
+                const target_col = wrapVisualToCol(cur_line, text_width, edge_wrap_row + 1, ref_cursor.preferred_col);
+                doc.cursors.addCursor(buf.posToOffset(edge_line, target_col)) catch {};
+            } else if (edge_line + 1 < total_lines) {
+                const next_line = doc.lineContent(edge_line + 1);
+                const target_col = wrapVisualToCol(next_line, text_width, 0, ref_cursor.preferred_col);
+                doc.cursors.addCursor(buf.posToOffset(edge_line + 1, target_col)) catch {};
+            }
+        },
+    }
+}
+
 /// Convert a visual row and preferred display column to a byte column within a line.
 /// Finds the byte offset at the given visual wrap row that corresponds to the
 /// desired display column.
@@ -472,7 +546,15 @@ fn wrapVisualToCol(line: []const u8, text_width: u16, target_row: u16, preferred
                 if ((line[byte_pos] & 0xC0) != 0x80) dcol += 1;
                 byte_pos += 1;
             }
-            // Clamp to end of this row's content
+            // For non-final rows, clamp to the last character start within
+            // the row so wrapColToVisual maps it to this row, not the next.
+            if (pos < line.len and byte_pos > row_start) {
+                byte_pos -= 1;
+                while (byte_pos > row_start and (line[byte_pos] & 0xC0) == 0x80) {
+                    byte_pos -= 1;
+                }
+                return byte_pos;
+            }
             return @min(byte_pos, line.len);
         }
         row += 1;
@@ -956,7 +1038,7 @@ fn handleKey(editor: *Editor, key: Key) void {
         const key_str = keyToStr(key, &kbuf);
         if (key_str.len > 0) {
             if (editor.keybinds.get(key_str)) |action| {
-                _ = editor.execAction(action);
+                execTuiAction(editor, action);
                 return;
             }
             // Fallback: if shift was held, try without shift
@@ -968,7 +1050,7 @@ fn handleKey(editor: *Editor, key: Key) void {
                 const fallback_str = keyToStr(fallback_key, &kbuf2);
                 if (fallback_str.len > 0) {
                     if (editor.keybinds.get(fallback_str)) |action| {
-                        _ = editor.execAction(action);
+                        execTuiAction(editor, action);
                         return;
                     }
                 }

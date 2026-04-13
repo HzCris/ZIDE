@@ -1143,6 +1143,17 @@ fn execGuiAction(editor: *Editor, action: []const u8) void {
         openFileDialog(editor);
         return;
     }
+    // Visual-row-aware multi-cursor add when word wrap is on
+    if (editor.word_wrap) {
+        if (std.mem.eql(u8, action, "add_cursor_above")) {
+            guiAddCursorVisual(editor, .up);
+            return;
+        }
+        if (std.mem.eql(u8, action, "add_cursor_below")) {
+            guiAddCursorVisual(editor, .down);
+            return;
+        }
+    }
     // Everything else goes through the core editor
     _ = editor.execAction(action);
 }
@@ -1360,7 +1371,9 @@ fn guiMoveVisualVertical(editor: *Editor, direction: enum { up, down }, extend_s
 
         const wrap_info = guiWrapColToVisual(cur_line, font, text_w, exp_col);
         const cur_rows = guiWrapLineRows(cur_line, font, text_w);
-        const preferred_px = c.preferred_col;
+        // Use the cursor's actual pixel X within its visual row, not the
+        // byte column from line start which is a different unit entirely.
+        const preferred_px: usize = @intFromFloat(wrap_info.px);
 
         if (extend_selection) {
             if (c.anchor == null) c.anchor = c.offset;
@@ -1397,6 +1410,84 @@ fn guiMoveVisualVertical(editor: *Editor, direction: enum { up, down }, extend_s
         }
     }
     doc.cursors.mergeCursors();
+}
+
+/// Add a new cursor one visual (wrapped) row above or below the outermost cursor.
+fn guiAddCursorVisual(editor: *Editor, direction: enum { up, down }) void {
+    if (!build_options.has_gui) return;
+
+    const doc = editor.activeDoc();
+    const buf = &doc.buffer;
+    const font = dvui.Font.theme(.mono);
+    const total_lines = buf.lineCount();
+    const tw = editor.tab_width;
+    const text_w: f32 = @floatFromInt(editor.text_width);
+
+    // Find the outermost cursor in the given direction
+    var edge_idx: usize = 0;
+    var edge_line: usize = if (direction == .up) std.math.maxInt(usize) else 0;
+    var edge_wrap_row: usize = 0;
+    for (doc.cursors.cursors.items, 0..) |c, i| {
+        const pos = buf.offsetToPos(c.offset);
+        const orig_line = buf.lineContent(pos.line);
+        var exp_buf: [16384]u8 = undefined;
+        const exp_line = expandTabs(orig_line, tw, &exp_buf);
+        const wrap_info = guiWrapColToVisual(exp_line, font, text_w, bufColToExpCol(orig_line, pos.col, tw));
+        switch (direction) {
+            .up => if (pos.line < edge_line or (pos.line == edge_line and wrap_info.row < edge_wrap_row)) {
+                edge_line = pos.line;
+                edge_wrap_row = wrap_info.row;
+                edge_idx = i;
+            },
+            .down => if (pos.line > edge_line or (pos.line == edge_line and wrap_info.row > edge_wrap_row)) {
+                edge_line = pos.line;
+                edge_wrap_row = wrap_info.row;
+                edge_idx = i;
+            },
+        }
+    }
+
+    const ref_cursor = doc.cursors.cursors.items[edge_idx];
+    const orig_line = buf.lineContent(edge_line);
+    var exp_buf1: [16384]u8 = undefined;
+    const cur_line = expandTabs(orig_line, tw, &exp_buf1);
+    const ref_pos = buf.offsetToPos(ref_cursor.offset);
+    const ref_exp_col = bufColToExpCol(orig_line, ref_pos.col, tw);
+    const ref_wrap = guiWrapColToVisual(cur_line, font, text_w, ref_exp_col);
+    const preferred_px: usize = @intFromFloat(ref_wrap.px);
+
+    switch (direction) {
+        .up => {
+            if (edge_wrap_row > 0) {
+                const target_exp = guiWrapVisualToCol(cur_line, font, text_w, edge_wrap_row - 1, preferred_px);
+                const new_offset = buf.posToOffset(edge_line, expColToBufCol(orig_line, target_exp, tw));
+                doc.cursors.addCursor(new_offset) catch {};
+            } else if (edge_line > 0) {
+                const orig_prev = buf.lineContent(edge_line - 1);
+                var exp_buf2: [16384]u8 = undefined;
+                const prev_line = expandTabs(orig_prev, tw, &exp_buf2);
+                const prev_rows = guiWrapLineRows(prev_line, font, text_w);
+                const target_exp = guiWrapVisualToCol(prev_line, font, text_w, prev_rows - 1, preferred_px);
+                const new_offset = buf.posToOffset(edge_line - 1, expColToBufCol(orig_prev, target_exp, tw));
+                doc.cursors.addCursor(new_offset) catch {};
+            }
+        },
+        .down => {
+            const cur_rows = guiWrapLineRows(cur_line, font, text_w);
+            if (edge_wrap_row + 1 < cur_rows) {
+                const target_exp = guiWrapVisualToCol(cur_line, font, text_w, edge_wrap_row + 1, preferred_px);
+                const new_offset = buf.posToOffset(edge_line, expColToBufCol(orig_line, target_exp, tw));
+                doc.cursors.addCursor(new_offset) catch {};
+            } else if (edge_line + 1 < total_lines) {
+                const orig_next = buf.lineContent(edge_line + 1);
+                var exp_buf2: [16384]u8 = undefined;
+                const next_line = expandTabs(orig_next, tw, &exp_buf2);
+                const target_exp = guiWrapVisualToCol(next_line, font, text_w, 0, preferred_px);
+                const new_offset = buf.posToOffset(edge_line + 1, expColToBufCol(orig_next, target_exp, tw));
+                doc.cursors.addCursor(new_offset) catch {};
+            }
+        },
+    }
 }
 
 /// Find which visual wrap row a byte column falls on, and its pixel x offset within that row.
@@ -1447,7 +1538,15 @@ fn guiWrapVisualToCol(line: []const u8, font: dvui.Font, max_width: f32, target_
         .end_metric = .nearest,
     });
 
-    return row_start + end_idx;
+    const result = row_start + end_idx;
+    // For non-final rows, ensure we don't return the start of the next row
+    // so that guiWrapColToVisual maps back to this row, not the next.
+    if (result >= row_end and row_end < line.len and end_idx > 0) {
+        var adj = end_idx - 1;
+        while (adj > 0 and (segment[adj] & 0xC0) == 0x80) adj -= 1;
+        return row_start + adj;
+    }
+    return result;
 }
 
 /// Count how many visual rows a line occupies with pixel-based wrapping.
