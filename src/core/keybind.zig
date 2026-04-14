@@ -95,6 +95,9 @@ pub const KeybindMap = struct {
         try self.set("alt+backslash", "split_vertical");
         try self.set("alt+shift+backslash", "split_horizontal");
         try self.set("ctrl+shift+w", "close_pane");
+        // LSP shortcuts
+        try self.set("ctrl+space", "lsp_completion");
+        try self.set("f12", "lsp_goto_definition");
     }
 };
 

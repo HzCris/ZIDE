@@ -6,10 +6,10 @@ Before fully implementing, be sure to make it as efficient as possible resource-
 # TUI
 - [] Terminal Splitting
 - [] Block/column selection
-- [] Syntax highlighting
+- [x] Syntax highlighting
 - [] File tree / project browser (Including a Starting Directory option)
 - [] Git integration (gutter signs)
-- [] LSP support
+- [x] LSP support
 - [] LLM support using OpenAI API for various cloud providers and local LLMs (And claude if allowed)
 - [] Ctrl+/ to comment highlighted text (Requires a lot of language/file maintenance/upkeeping)
 - [] Debug Support
@@ -21,10 +21,10 @@ Before fully implementing, be sure to make it as efficient as possible resource-
 
 # GUI
 - [] Block/column selection
-- [] Syntax highlighting
+- [x] Syntax highlighting
 - [] File tree / project browser (Including a Starting Directory option)
 - [] Git integration (gutter signs)
-- [] LSP support
+- [x] LSP support
 - [] Embedded Terminal
 - [] LLM support using OpenAI API for various cloud providers and local LLMs (And claude if allowed)
 - [] Ctrl+/ to comment highlighted text (Requires a lot of language/file maintenance/upkeeping)

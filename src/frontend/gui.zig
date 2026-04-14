@@ -6,10 +6,39 @@ const Document = @import("../core/document.zig").Document;
 const LayoutNode = @import("../core/layout.zig").LayoutNode;
 const ThemeColor = @import("../core/theme.zig").ThemeColor;
 const theme_mod = @import("../core/theme.zig");
+const syntax = @import("../core/syntax.zig");
+const lsp = @import("../core/lsp.zig");
 
 /// Convert a ThemeColor to a dvui.Color.
 fn toDvui(c: ThemeColor) dvui.Color {
     return .{ .r = c.r, .g = c.g, .b = c.b, .a = c.a };
+}
+
+/// Get the color for a diagnostic severity.
+fn diagnosticColor(severity: lsp.DiagnosticSeverity) dvui.Color {
+    return switch (severity) {
+        .err => .{ .r = 0xE0, .g = 0x40, .b = 0x40, .a = 0xFF },
+        .warning => .{ .r = 0xE0, .g = 0xC0, .b = 0x40, .a = 0xFF },
+        .information => .{ .r = 0x40, .g = 0xA0, .b = 0xE0, .a = 0xFF },
+        .hint => .{ .r = 0x80, .g = 0x80, .b = 0xA0, .a = 0xFF },
+    };
+}
+
+/// Get the worst severity diagnostic on a given line (lowest enum = worst).
+fn worstDiagnosticOnLine(doc: *Document, line: usize) ?*const lsp.Diagnostic {
+    var worst: ?*const lsp.Diagnostic = null;
+    for (doc.diagnostics.items) |*d| {
+        if (d.start_line <= line and d.end_line >= line) {
+            if (worst) |w| {
+                if (@intFromEnum(d.severity) < @intFromEnum(w.severity)) {
+                    worst = d;
+                }
+            } else {
+                worst = d;
+            }
+        }
+    }
+    return worst;
 }
 
 // ---------------------------------------------------------------------------
@@ -432,6 +461,8 @@ pub fn frame(editor: *Editor) bool {
 
     // --- Tab bar (if multiple documents) ---
     if (editor.docCount() > 1) {
+        var close_tab_idx: ?usize = null;
+
         var tab_box = dvui.box(@src(), .{ .dir = .horizontal }, .{
             .expand = .horizontal,
             .background = true,
@@ -445,15 +476,44 @@ pub fn frame(editor: *Editor) bool {
             var label_buf: [256]u8 = undefined;
             const dirty_marker: []const u8 = if (doc.dirty) " *" else "";
             const label = std.fmt.bufPrint(&label_buf, "{s}{s}", .{ doc.display_name, dirty_marker }) catch doc.display_name;
-            if (dvui.button(@src(), label, .{}, .{
+
+            // Tab container: label + close button
+            var tab = dvui.box(@src(), .{ .dir = .horizontal }, .{
                 .id_extra = @intCast(i),
                 .background = true,
                 .style = if (is_active) .highlight else .control,
                 .margin = .{ .x = 1, .y = 0, .w = 1, .h = 0 },
                 .border = .{ .x = 1, .y = 1, .w = 1, .h = 1 },
+                .padding = .{ .x = 0, .y = 0, .w = 0, .h = 0 },
+            });
+            defer tab.deinit();
+
+            // Tab label button (switches to this doc)
+            if (dvui.button(@src(), label, .{}, .{
+                .id_extra = @intCast(i),
+                .background = false,
+                .border = .{ .x = 0, .y = 0, .w = 0, .h = 0 },
+                .margin = .{ .x = 0, .y = 0, .w = 0, .h = 0 },
             })) {
                 editor.switchToDoc(i);
             }
+
+            // Close button (x)
+            if (dvui.button(@src(), "\xc3\x97", .{}, .{ // × (multiplication sign)
+                .id_extra = @intCast(i),
+                .background = false,
+                .border = .{ .x = 0, .y = 0, .w = 0, .h = 0 },
+                .margin = .{ .x = 0, .y = 0, .w = 2, .h = 0 },
+                .padding = .{ .x = 2, .y = 0, .w = 2, .h = 0 },
+            })) {
+                close_tab_idx = i;
+            }
+        }
+
+        // Handle deferred tab close (after iteration is complete)
+        if (close_tab_idx) |idx| {
+            editor.switchToDoc(idx);
+            _ = editor.closeActiveDoc();
         }
     }
 
@@ -471,7 +531,7 @@ pub fn frame(editor: *Editor) bool {
         });
         defer status_box.deinit();
 
-        const doc = editor.activeDocConst();
+        const doc = editor.activeDoc();
         const pos = doc.cursorPos();
 
         const swd = status_box.data();
@@ -494,6 +554,31 @@ pub fn frame(editor: *Editor) bool {
             .p = .{ .x = sarea.x, .y = sarea.y },
             .color = status_text_color,
         }) catch {};
+
+        // Center: diagnostic message for cursor line
+        if (worstDiagnosticOnLine(doc, pos.line)) |diag| {
+            const diag_color = diagnosticColor(diag.severity);
+            const prefix: []const u8 = switch (diag.severity) {
+                .err => "Error: ",
+                .warning => "Warning: ",
+                .information => "Info: ",
+                .hint => "Hint: ",
+            };
+            var diag_buf: [256]u8 = undefined;
+            const max_msg = @min(diag.message.len, diag_buf.len - prefix.len);
+            @memcpy(diag_buf[0..prefix.len], prefix);
+            @memcpy(diag_buf[prefix.len..][0..max_msg], diag.message[0..max_msg]);
+            const diag_str = diag_buf[0 .. prefix.len + max_msg];
+            // Position after cursor info with some padding
+            const pos_w = status_font.textSize(pos_str).w * sscale;
+            dvui.renderText(.{
+                .font = status_font,
+                .text = diag_str,
+                .rs = srs,
+                .p = .{ .x = sarea.x + pos_w + 20 * sscale, .y = sarea.y },
+                .color = diag_color,
+            }) catch {};
+        }
 
         // Right: filename + dirty marker
         const dirty_str: []const u8 = if (doc.dirty) " [Modified]" else "";
@@ -755,7 +840,69 @@ fn editorPane(editor: *Editor, pane_id: u8) void {
         const line_start_offset = doc.buffer.line_starts.items[line_idx];
         var tab_exp_buf: [16384]u8 = undefined;
         const line_text = expandTabs(orig_line, editor.tab_width, &tab_exp_buf);
+        const has_tabs = line_text.ptr != orig_line.ptr;
         const needs_wrap = do_wrap and line_text.len > 0 and @as(f32, @floatFromInt(line_text.len)) * char_width > text_area_w;
+
+        // Pre-compute expanded columns for selection (constant across wrap rows)
+        const sel_start_exp: usize, const sel_end_exp: usize, const has_sel_on_line: bool = blk: {
+            if (sel_range) |sel| {
+                if (sel.end > line_start_offset and sel.start <= line_start_offset + orig_line.len) {
+                    const s_in: usize = if (sel.start > line_start_offset)
+                        @min(sel.start - line_start_offset, orig_line.len)
+                    else
+                        0;
+                    const e_in: usize = if (sel.end > line_start_offset)
+                        @min(sel.end - line_start_offset, orig_line.len)
+                    else
+                        0;
+                    const s_exp = if (has_tabs) bufColToExpCol(orig_line, s_in, editor.tab_width) else s_in;
+                    const e_exp = if (sel.end > line_start_offset + orig_line.len)
+                        line_text.len + 1
+                    else if (has_tabs)
+                        bufColToExpCol(orig_line, e_in, editor.tab_width)
+                    else
+                        e_in;
+                    break :blk .{ s_exp, e_exp, true };
+                }
+            }
+            break :blk .{ 0, 0, false };
+        };
+
+        // Pre-compute expanded column for primary cursor on this line
+        const cursor_on_line = focused and cursor_pos.line == line_idx;
+        const cursor_exp: usize = if (cursor_on_line)
+            (if (has_tabs) bufColToExpCol(orig_line, cursor_pos.col, editor.tab_width) else cursor_pos.col)
+        else
+            0;
+
+        // Pre-compute expanded columns for secondary cursors on this line
+        var sc_exp_cols: [64]usize = undefined;
+        var sc_count: usize = 0;
+        if (focused and doc.cursors.count() > 1) {
+            for (doc.cursors.cursors.items[1..]) |sc| {
+                const sc_pos = doc.buffer.offsetToPos(sc.offset);
+                if (sc_pos.line != line_idx) continue;
+                if (sc_count >= 64) break;
+                sc_exp_cols[sc_count] = if (has_tabs) bufColToExpCol(orig_line, sc_pos.col, editor.tab_width) else sc_pos.col;
+                sc_count += 1;
+            }
+        }
+
+        // Tokenize line for syntax highlighting
+        var span_buf: [syntax.MAX_SPANS]syntax.HighlightSpan = undefined;
+        var span_count: usize = 0;
+        var exp_starts: [syntax.MAX_SPANS]usize = undefined;
+        var exp_ends: [syntax.MAX_SPANS]usize = undefined;
+        const lang_name: ?[]const u8 = if (doc.language) |l| l.name else null;
+        if (doc.language) |lang| {
+            const state = doc.ensureLineState(line_idx);
+            const result = syntax.tokenizeLine(orig_line, lang, state, &span_buf);
+            span_count = result.count;
+            for (0..span_count) |si| {
+                exp_starts[si] = if (has_tabs) bufColToExpCol(orig_line, span_buf[si].start, editor.tab_width) else span_buf[si].start;
+                exp_ends[si] = if (has_tabs) bufColToExpCol(orig_line, span_buf[si].end, editor.tab_width) else span_buf[si].end;
+            }
+        }
 
         var wrap_row: usize = 0;
         var byte_pos: usize = 0;
@@ -795,6 +942,22 @@ fn editorPane(editor: *Editor, pane_id: u8) void {
                         .color = wrap_marker_color,
                     }) catch {};
                 }
+                // Diagnostic marker: colored dot at left edge of gutter
+                if (wrap_row == 0) {
+                    if (worstDiagnosticOnLine(doc, line_idx)) |diag| {
+                        const diag_color = diagnosticColor(diag.severity);
+                        const dot_r: f32 = 3 * scale;
+                        const dot_cx = render_area.x + gutter_padding * 0.5;
+                        const dot_cy = y + line_height * 0.5;
+                        const dot_rect: dvui.Rect.Physical = .{
+                            .x = dot_cx - dot_r,
+                            .y = dot_cy - dot_r,
+                            .w = dot_r * 2,
+                            .h = dot_r * 2,
+                        };
+                        dot_rect.fill(.{ .x = dot_r, .y = dot_r, .w = dot_r, .h = dot_r }, .{ .color = diag_color, .fade = 1.0 });
+                    }
+                }
             }
 
             // --- Text content (clipped to text area) ---
@@ -806,30 +969,16 @@ fn editorPane(editor: *Editor, pane_id: u8) void {
                 // For wrapped rows, x is always text_area_x (no scroll)
                 const row_x = if (needs_wrap) text_area_x else base_x;
 
-                // Selection highlight (convert buffer offsets to expanded coordinates)
-                if (sel_range) |sel| {
-                    const sel_start_in_line: usize = if (sel.start > line_start_offset)
-                        @min(sel.start - line_start_offset, orig_line.len)
-                    else
-                        0;
-                    const sel_end_in_line: usize = if (sel.end > line_start_offset)
-                        @min(sel.end - line_start_offset, orig_line.len)
-                    else
-                        0;
-                    const sel_start_exp = bufColToExpCol(orig_line, sel_start_in_line, editor.tab_width);
-                    const sel_end_exp = if (sel.end > line_start_offset + orig_line.len)
-                        line_text.len + 1
-                    else
-                        bufColToExpCol(orig_line, sel_end_in_line, editor.tab_width);
-
+                // Selection highlight (using pre-computed expanded coordinates)
+                if (has_sel_on_line) {
                     if (sel_start_exp < row_end and sel_end_exp > row_start) {
                         const sel_byte_start = if (sel_start_exp > row_start) sel_start_exp - row_start else 0;
                         const sel_byte_end = if (sel_end_exp < row_end) sel_end_exp - row_start else segment.len;
 
-                        const sx_start = @as(f32, @floatFromInt(sel_byte_start)) * char_width;
-                        const sx_end = @as(f32, @floatFromInt(@min(sel_byte_end, segment.len))) * char_width;
+                        const sx_start = font.textSize(segment[0..sel_byte_start]).w * scale;
+                        const sx_end = font.textSize(segment[0..@min(sel_byte_end, segment.len)]).w * scale;
 
-                        const sw = if (sel.end > line_start_offset + orig_line.len and row_end >= line_text.len)
+                        const sw = if (sel_range != null and sel_range.?.end > line_start_offset + orig_line.len and row_end >= line_text.len)
                             text_area_w - sx_start
                         else
                             sx_end - sx_start;
@@ -841,22 +990,92 @@ fn editorPane(editor: *Editor, pane_id: u8) void {
                     }
                 }
 
-                // Text
+                // Text (syntax-highlighted or plain)
                 if (segment.len > 0) {
-                    dvui.renderText(.{
-                        .font = font,
-                        .text = segment,
-                        .rs = render_rs,
-                        .p = .{ .x = row_x, .y = y },
-                        .color = text_color,
-                    }) catch {};
+                    if (span_count > 0) {
+                        // Per-span syntax-colored rendering (accumulated x position)
+                        const syn_theme = editor.syntaxThemeFor(lang_name);
+                        var seg_pos: usize = 0;
+                        var draw_x: f32 = row_x;
+                        for (0..span_count) |si| {
+                            if (exp_ends[si] <= row_start or exp_starts[si] >= row_end) continue;
+                            const vis_start = if (exp_starts[si] > row_start) exp_starts[si] - row_start else 0;
+                            const vis_end = if (exp_ends[si] < row_end) exp_ends[si] - row_start else segment.len;
+                            // Gap before span → default text color
+                            if (vis_start > seg_pos) {
+                                const gap = segment[seg_pos..vis_start];
+                                dvui.renderText(.{
+                                    .font = font,
+                                    .text = gap,
+                                    .rs = render_rs,
+                                    .p = .{ .x = draw_x, .y = y },
+                                    .color = text_color,
+                                }) catch {};
+                                draw_x += font.textSize(gap).w * scale;
+                            }
+                            // Span → syntax color
+                            if (vis_end > vis_start) {
+                                const span_text = segment[vis_start..vis_end];
+                                const token_color = if (syn_theme.colorForToken(span_buf[si].token)) |tc| toDvui(tc) else text_color;
+                                dvui.renderText(.{
+                                    .font = font,
+                                    .text = span_text,
+                                    .rs = render_rs,
+                                    .p = .{ .x = draw_x, .y = y },
+                                    .color = token_color,
+                                }) catch {};
+                                draw_x += font.textSize(span_text).w * scale;
+                            }
+                            if (vis_end > seg_pos) seg_pos = vis_end;
+                        }
+                        // Trailing text after last span → default text color
+                        if (seg_pos < segment.len) {
+                            dvui.renderText(.{
+                                .font = font,
+                                .text = segment[seg_pos..],
+                                .rs = render_rs,
+                                .p = .{ .x = draw_x, .y = y },
+                                .color = text_color,
+                            }) catch {};
+                        }
+                    } else {
+                        dvui.renderText(.{
+                            .font = font,
+                            .text = segment,
+                            .rs = render_rs,
+                            .p = .{ .x = row_x, .y = y },
+                            .color = text_color,
+                        }) catch {};
+                    }
                 }
 
-                // Cursor (convert buffer col to expanded col, with blink)
-                if (focused and cursor_pos.line == line_idx) {
-                    const cc = bufColToExpCol(orig_line, cursor_pos.col, editor.tab_width);
+                // Diagnostic underlines
+                for (doc.diagnostics.items) |*diag| {
+                    if (diag.start_line == line_idx) {
+                        // Compute underline range within this row
+                        const ul_start = if (diag.start_col > row_start) diag.start_col - @as(u32, @intCast(row_start)) else 0;
+                        const ul_end_col = if (diag.end_line == line_idx) diag.end_col else @as(u32, @intCast(segment.len));
+                        const ul_end = if (ul_end_col > row_start) ul_end_col - @as(u32, @intCast(row_start)) else 0;
+                        const clamped_start = @min(ul_start, segment.len);
+                        const clamped_end = @min(ul_end, segment.len);
+                        if (clamped_end > clamped_start) {
+                            const ux_start = font.textSize(segment[0..clamped_start]).w * scale;
+                            const ux_end = font.textSize(segment[0..clamped_end]).w * scale;
+                            const ul_rect: dvui.Rect.Physical = .{
+                                .x = row_x + ux_start,
+                                .y = y + line_height - 2 * scale,
+                                .w = ux_end - ux_start,
+                                .h = 2 * scale,
+                            };
+                            ul_rect.fill(.{}, .{ .color = diagnosticColor(diag.severity), .fade = 0.8 });
+                        }
+                    }
+                }
+
+                // Cursor (using pre-computed expanded col, with blink)
+                if (cursor_on_line) {
                     const on_last_seg = row_end >= line_text.len;
-                    if (cc >= row_start and (cc < row_end or (on_last_seg and cc == row_end))) {
+                    if (cursor_exp >= row_start and (cursor_exp < row_end or (on_last_seg and cursor_exp == row_end))) {
                         // Blink: reset timer when cursor moves, then toggle visibility
                         const now_ns = std.time.nanoTimestamp();
                         const cur_offset = doc.cursors.primary().offset;
@@ -869,9 +1088,9 @@ fn editorPane(editor: *Editor, pane_id: u8) void {
                         const blink_on = cycle < blink_interval_ms;
 
                         if (blink_on) {
-                            const col_in_seg = cc - row_start;
+                            const col_in_seg = cursor_exp - row_start;
                             const clamped = @min(col_in_seg, segment.len);
-                            const cx = @as(f32, @floatFromInt(clamped)) * char_width;
+                            const cx = font.textSize(segment[0..clamped]).w * scale;
                             const cr: dvui.Rect.Physical = .{ .x = row_x + cx - 1, .y = y, .w = 3, .h = line_height };
                             cr.fill(.{}, .{ .color = sel_color, .fade = 1.0 });
                         }
@@ -889,17 +1108,14 @@ fn editorPane(editor: *Editor, pane_id: u8) void {
                     }
                 }
 
-                // Secondary cursors (no blink, always visible)
-                if (focused and doc.cursors.count() > 1) {
-                    for (doc.cursors.cursors.items[1..]) |sc| {
-                        const sc_pos = doc.buffer.offsetToPos(sc.offset);
-                        if (sc_pos.line != line_idx) continue;
-                        const sc_col = bufColToExpCol(orig_line, sc_pos.col, editor.tab_width);
+                // Secondary cursors (using pre-computed expanded cols, no blink)
+                if (sc_count > 0) {
+                    for (sc_exp_cols[0..sc_count]) |sc_col| {
                         const sc_on_last = row_end >= line_text.len;
                         if (sc_col >= row_start and (sc_col < row_end or (sc_on_last and sc_col == row_end))) {
                             const sc_in_seg = sc_col - row_start;
                             const sc_clamped = @min(sc_in_seg, segment.len);
-                            const sc_cx = @as(f32, @floatFromInt(sc_clamped)) * char_width;
+                            const sc_cx = font.textSize(segment[0..sc_clamped]).w * scale;
                             const sc_r: dvui.Rect.Physical = .{ .x = row_x + sc_cx - 1, .y = y, .w = 3, .h = line_height };
                             sc_r.fill(.{}, .{ .color = sel_color, .fade = 0.7 });
                         }
@@ -953,6 +1169,11 @@ fn editorPane(editor: *Editor, pane_id: u8) void {
     // Only render modals in the focused pane.
     if (is_active_pane and editor.mode != .normal) {
         drawModalOverlay(editor, render_area, render_rs, scale);
+    }
+
+    // --- Completion popup (renders on top, only in active pane) ---
+    if (is_active_pane and editor.completion_active and editor.completion_items.items.len > 0) {
+        drawCompletionPopupGui(editor, render_area, font, line_height, scale);
     }
 }
 
@@ -1152,7 +1373,7 @@ fn handleMouseEvents(editor: *Editor, pane_id: u8, wd: *dvui.WidgetData, area: d
 }
 
 /// Find word boundaries around a byte offset (for double-click selection).
-fn wordBoundaryAt(doc: *const Document, offset: usize) struct { start: usize, end: usize } {
+fn wordBoundaryAt(doc: *Document, offset: usize) struct { start: usize, end: usize } {
     const buf_len = doc.buffer.byteLen();
     const content = doc.buffer.slice(0, buf_len);
     if (content.len == 0) return .{ .start = 0, .end = 0 };
@@ -1193,7 +1414,7 @@ fn isWordCharGui(byte: u8) bool {
 
 /// Convert a screen position (physical pixels) to a byte offset in the buffer.
 /// When word_wrap is true, walks through wrapped visual rows to find the correct position.
-fn screenToOffset(doc: *const Document, area: dvui.Rect.Physical, font: dvui.Font, line_height: f32, scale: f32, p: dvui.Point.Physical, tab_width: usize) usize {
+fn screenToOffset(doc: *Document, area: dvui.Rect.Physical, font: dvui.Font, line_height: f32, scale: f32, p: dvui.Point.Physical, tab_width: usize) usize {
     const rel_y = p.y - area.y;
     const clicked_visual_row: usize = if (rel_y >= 0) @intFromFloat(@floor(rel_y / line_height)) else 0;
 
@@ -1281,6 +1502,51 @@ fn handleGuiKeyEvents(editor: *Editor, wd: *dvui.WidgetData) bool {
             }
         }
         return handled_any;
+    }
+
+    // --- Completion popup input handling ---
+    if (editor.completion_active) {
+        for (dvui.events()) |*e| {
+            if (e.handled) continue;
+            if (e.evt != .key) continue;
+            const key = e.evt.key;
+            if (key.action != .down and key.action != .repeat) continue;
+
+            const item_count = editor.completion_items.items.len;
+            switch (key.code) {
+                .escape => {
+                    e.handle(@src(), wd);
+                    handled_any = true;
+                    editor.clearCompletionItems();
+                },
+                .enter, .tab => {
+                    e.handle(@src(), wd);
+                    handled_any = true;
+                    editor.acceptCompletion();
+                },
+                .up => {
+                    e.handle(@src(), wd);
+                    handled_any = true;
+                    if (editor.completion_selected > 0) {
+                        editor.completion_selected -= 1;
+                    } else if (item_count > 0) {
+                        editor.completion_selected = item_count - 1;
+                    }
+                },
+                .down => {
+                    e.handle(@src(), wd);
+                    handled_any = true;
+                    if (item_count > 0) {
+                        editor.completion_selected = (editor.completion_selected + 1) % item_count;
+                    }
+                },
+                else => {
+                    // Any other key dismisses completion (don't consume the event)
+                    editor.clearCompletionItems();
+                },
+            }
+        }
+        if (handled_any) return handled_any;
     }
 
     for (dvui.events()) |*e| {
@@ -1578,6 +1844,7 @@ fn saveAs(editor: *Editor) void {
             editor.status_message = @errorName(err);
             return;
         };
+        editor.activeDoc().detectLanguage(editor);
         editor.status_message = "Saved";
     }
 }
@@ -2630,6 +2897,132 @@ fn guiFuzzyMatch(haystack: []const u8, needle: []const u8) bool {
 // ===========================================================================
 
 /// Draw modal overlays inside the editor pane using renderText (no DVUI widgets).
+/// Draw the LSP completion popup near the cursor position.
+fn drawCompletionPopupGui(editor: *Editor, render_area: dvui.Rect.Physical, font: dvui.Font, line_height: f32, scale: f32) void {
+    if (!build_options.has_gui) return;
+
+    const items = editor.completion_items.items;
+    if (items.len == 0) return;
+
+    const max_visible: usize = @min(items.len, 10);
+    const pad: f32 = 4 * scale;
+    const row_h = line_height;
+
+    // Calculate popup dimensions
+    var max_label_w: f32 = 0;
+    for (items) |item| {
+        const w = font.textSize(item.label).w * scale;
+        if (w > max_label_w) max_label_w = w;
+    }
+    const popup_w = @min(max_label_w + pad * 4, render_area.w * 0.6);
+    const popup_h = @as(f32, @floatFromInt(max_visible)) * row_h + pad;
+
+    // Position near cursor
+    const doc = editor.activeDoc();
+    const cursor = doc.cursors.primaryConst();
+    const cursor_pos = doc.buffer.offsetToPos(cursor.offset);
+    const tab_width = editor.tab_width;
+
+    // Gutter width
+    const line_count = doc.lineCount();
+    const min_digits = editor.gutter_min_digits;
+    const gutter_digits = guiLineNumberDigits(line_count, min_digits);
+    const gutter_padding: f32 = 8 * scale;
+    const char_w = font.textSize("0").w * scale;
+    const gutter_w = @as(f32, @floatFromInt(gutter_digits + 1)) * char_w + gutter_padding;
+
+    // Cursor X position (approximate: use col with tab expansion)
+    const col = cursor_pos.col;
+    // Get line content to count tabs before cursor for width calculation
+    const line_text = doc.lineContent(cursor_pos.line);
+    var visual_col: usize = 0;
+    var byte_col: usize = 0;
+    while (byte_col < col and byte_col < line_text.len) : (byte_col += 1) {
+        if (line_text[byte_col] == '\t') {
+            visual_col = (visual_col / tab_width + 1) * tab_width;
+        } else {
+            visual_col += 1;
+        }
+    }
+    const cursor_x = render_area.x + gutter_w + @as(f32, @floatFromInt(visual_col)) * char_w;
+
+    // Cursor Y — approximate from scroll offset
+    const cursor_line = cursor_pos.line;
+    const scroll_top = doc.scroll_top;
+    const cursor_y_rel: f32 = if (cursor_line >= scroll_top)
+        @as(f32, @floatFromInt(cursor_line - scroll_top)) * line_height
+    else
+        0;
+    const cursor_y = render_area.y + cursor_y_rel + line_height;
+
+    // Position popup below cursor, shift up if near bottom
+    var popup_x = @min(cursor_x, render_area.x + render_area.w - popup_w);
+    _ = &popup_x;
+    var popup_y = cursor_y;
+    if (popup_y + popup_h > render_area.y + render_area.h) {
+        // Show above cursor
+        popup_y = render_area.y + cursor_y_rel - popup_h;
+    }
+
+    // Background
+    const bg = toDvui(editor.theme.overlay_bg);
+    const fg = toDvui(editor.theme.overlay_fg);
+    const sel_bg = toDvui(editor.theme.overlay_selection);
+    const dim = toDvui(editor.theme.overlay_dim);
+
+    const bg_rect: dvui.Rect.Physical = .{
+        .x = popup_x,
+        .y = popup_y,
+        .w = popup_w,
+        .h = popup_h,
+    };
+    bg_rect.fill(.{}, .{ .color = bg, .fade = 1.0 });
+
+    // RectScale for text rendering
+    const rs: dvui.RectScale = .{
+        .r = .{ .x = popup_x, .y = popup_y, .w = popup_w, .h = popup_h },
+        .s = scale,
+    };
+
+    // Scroll offset for visible window
+    const scroll_off: usize = if (editor.completion_selected >= max_visible)
+        editor.completion_selected - max_visible + 1
+    else
+        0;
+
+    var row: usize = 0;
+    while (row < max_visible) : (row += 1) {
+        const idx = scroll_off + row;
+        if (idx >= items.len) break;
+        const item = items[idx];
+        const is_selected = idx == editor.completion_selected;
+
+        const row_y = popup_y + @as(f32, @floatFromInt(row)) * row_h;
+
+        // Selection highlight
+        if (is_selected) {
+            const sel_rect: dvui.Rect.Physical = .{
+                .x = popup_x,
+                .y = row_y,
+                .w = popup_w,
+                .h = row_h,
+            };
+            sel_rect.fill(.{}, .{ .color = sel_bg, .fade = 1.0 });
+        }
+
+        // Label text
+        renderOverlayText(font, item.label, popup_x + pad, row_y, rs, fg);
+
+        // Detail text (dimmed, after label)
+        if (item.detail) |detail| {
+            if (detail.len > 0) {
+                const label_w = font.textSize(item.label).w * scale;
+                renderOverlayText(font, detail, popup_x + pad + label_w + pad * 2, row_y, rs, dim);
+            }
+        }
+    }
+}
+
 fn drawModalOverlay(editor: *Editor, render_area: dvui.Rect.Physical, render_rs: dvui.RectScale, scale: f32) void {
     if (!build_options.has_gui) return;
 

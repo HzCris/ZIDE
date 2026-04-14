@@ -1,4 +1,5 @@
 const std = @import("std");
+const syntax = @import("syntax.zig");
 
 // ---------------------------------------------------------------------------
 // ThemeColor — frontend-agnostic RGBA color
@@ -422,6 +423,260 @@ pub fn setTuiColor(tt: *TuiTheme, field_name: []const u8, color: ThemeColor) boo
 }
 
 // ---------------------------------------------------------------------------
+// SyntaxTheme — GUI syntax highlight colors (separate from EditorTheme)
+// ---------------------------------------------------------------------------
+
+pub const SyntaxTheme = struct {
+    keyword: ThemeColor,
+    type_name: ThemeColor,
+    string: ThemeColor,
+    char_literal: ThemeColor,
+    number: ThemeColor,
+    comment: ThemeColor,
+    function: ThemeColor,
+    builtin: ThemeColor,
+    constant: ThemeColor,
+    operator: ThemeColor,
+    punctuation: ThemeColor,
+    preprocessor: ThemeColor,
+    attribute: ThemeColor,
+
+    /// Returns the color for a token type, or null for plain text (use default).
+    pub fn colorForToken(self: *const SyntaxTheme, token: syntax.TokenType) ?ThemeColor {
+        return switch (token) {
+            .text => null,
+            .keyword => self.keyword,
+            .type_name => self.type_name,
+            .string => self.string,
+            .char_literal => self.char_literal,
+            .number => self.number,
+            .comment => self.comment,
+            .function => self.function,
+            .builtin => self.builtin,
+            .constant => self.constant,
+            .operator => self.operator,
+            .punctuation => self.punctuation,
+            .preprocessor => self.preprocessor,
+            .attribute => self.attribute,
+        };
+    }
+};
+
+// ---------------------------------------------------------------------------
+// TuiSyntaxTheme — TUI syntax highlight colors
+// ---------------------------------------------------------------------------
+
+pub const TuiSyntaxTheme = struct {
+    keyword: TuiColor,
+    type_name: TuiColor,
+    string: TuiColor,
+    char_literal: TuiColor,
+    number: TuiColor,
+    comment: TuiColor,
+    function: TuiColor,
+    builtin: TuiColor,
+    constant: TuiColor,
+    operator: TuiColor,
+    punctuation: TuiColor,
+    preprocessor: TuiColor,
+    attribute: TuiColor,
+
+    /// Returns the color for a token type, or null for plain text (use default).
+    pub fn colorForToken(self: *const TuiSyntaxTheme, token: syntax.TokenType) ?TuiColor {
+        return switch (token) {
+            .text => null,
+            .keyword => self.keyword,
+            .type_name => self.type_name,
+            .string => self.string,
+            .char_literal => self.char_literal,
+            .number => self.number,
+            .comment => self.comment,
+            .function => self.function,
+            .builtin => self.builtin,
+            .constant => self.constant,
+            .operator => self.operator,
+            .punctuation => self.punctuation,
+            .preprocessor => self.preprocessor,
+            .attribute => self.attribute,
+        };
+    }
+};
+
+// ---------------------------------------------------------------------------
+// Built-in syntax theme presets — GUI
+// ---------------------------------------------------------------------------
+
+/// Dark syntax theme (One Dark inspired).
+pub const syn_gui_dark = SyntaxTheme{
+    .keyword = .{ .r = 198, .g = 120, .b = 221 }, // #c678dd purple
+    .type_name = .{ .r = 86, .g = 182, .b = 194 }, // #56b6c2 teal
+    .string = .{ .r = 152, .g = 195, .b = 121 }, // #98c379 green
+    .char_literal = .{ .r = 152, .g = 195, .b = 121 }, // #98c379 green
+    .number = .{ .r = 209, .g = 154, .b = 102 }, // #d19a66 orange
+    .comment = .{ .r = 92, .g = 99, .b = 112 }, // #5c6370 gray
+    .function = .{ .r = 97, .g = 175, .b = 239 }, // #61afef blue
+    .builtin = .{ .r = 229, .g = 192, .b = 123 }, // #e5c07b gold
+    .constant = .{ .r = 209, .g = 154, .b = 102 }, // #d19a66 orange
+    .operator = .{ .r = 225, .g = 225, .b = 230 }, // text color
+    .punctuation = .{ .r = 171, .g = 178, .b = 191 }, // #abb2bf light gray
+    .preprocessor = .{ .r = 190, .g = 132, .b = 210 }, // #be84d2 light purple
+    .attribute = .{ .r = 229, .g = 192, .b = 123 }, // #e5c07b gold
+};
+
+/// Light syntax theme (One Light inspired).
+pub const syn_gui_light = SyntaxTheme{
+    .keyword = .{ .r = 166, .g = 38, .b = 164 }, // #a626a4 purple
+    .type_name = .{ .r = 1, .g = 132, .b = 188 }, // #0184bc teal
+    .string = .{ .r = 80, .g = 161, .b = 79 }, // #50a14f green
+    .char_literal = .{ .r = 80, .g = 161, .b = 79 }, // #50a14f green
+    .number = .{ .r = 152, .g = 104, .b = 1 }, // #986801 dark orange
+    .comment = .{ .r = 160, .g = 161, .b = 167 }, // #a0a1a7 gray
+    .function = .{ .r = 64, .g = 120, .b = 242 }, // #4078f2 blue
+    .builtin = .{ .r = 152, .g = 104, .b = 1 }, // #986801 dark orange
+    .constant = .{ .r = 152, .g = 104, .b = 1 }, // #986801 dark orange
+    .operator = .{ .r = 30, .g = 30, .b = 30 }, // text color
+    .punctuation = .{ .r = 56, .g = 58, .b = 66 }, // #383a42 dark gray
+    .preprocessor = .{ .r = 166, .g = 38, .b = 164 }, // #a626a4 purple
+    .attribute = .{ .r = 152, .g = 104, .b = 1 }, // #986801 dark orange
+};
+
+/// High-contrast syntax theme.
+pub const syn_gui_high_contrast = SyntaxTheme{
+    .keyword = .{ .r = 255, .g = 100, .b = 255 }, // bright magenta
+    .type_name = .{ .r = 100, .g = 255, .b = 255 }, // bright cyan
+    .string = .{ .r = 100, .g = 255, .b = 100 }, // bright green
+    .char_literal = .{ .r = 100, .g = 255, .b = 100 }, // bright green
+    .number = .{ .r = 255, .g = 200, .b = 100 }, // bright orange
+    .comment = .{ .r = 150, .g = 150, .b = 150 }, // gray
+    .function = .{ .r = 100, .g = 180, .b = 255 }, // bright blue
+    .builtin = .{ .r = 255, .g = 255, .b = 100 }, // bright yellow
+    .constant = .{ .r = 255, .g = 200, .b = 100 }, // bright orange
+    .operator = .{ .r = 255, .g = 255, .b = 255 }, // white
+    .punctuation = .{ .r = 200, .g = 200, .b = 200 }, // light gray
+    .preprocessor = .{ .r = 255, .g = 100, .b = 255 }, // bright magenta
+    .attribute = .{ .r = 255, .g = 255, .b = 100 }, // bright yellow
+};
+
+// ---------------------------------------------------------------------------
+// Built-in syntax theme presets — TUI
+// ---------------------------------------------------------------------------
+
+/// Terminal syntax theme — ANSI indices, respects terminal palette.
+pub const syn_tui_terminal = TuiSyntaxTheme{
+    .keyword = .{ .ansi = 5 }, // magenta
+    .type_name = .{ .ansi = 6 }, // cyan
+    .string = .{ .ansi = 2 }, // green
+    .char_literal = .{ .ansi = 2 }, // green
+    .number = .{ .ansi = 3 }, // yellow
+    .comment = .{ .ansi = 8 }, // bright black
+    .function = .{ .ansi = 4 }, // blue
+    .builtin = .{ .ansi = 3 }, // yellow
+    .constant = .{ .ansi = 3 }, // yellow
+    .operator = .default,
+    .punctuation = .default,
+    .preprocessor = .{ .ansi = 5 }, // magenta
+    .attribute = .{ .ansi = 3 }, // yellow
+};
+
+/// Dark TUI syntax theme — RGB colors.
+pub const syn_tui_dark = TuiSyntaxTheme{
+    .keyword = .{ .rgb = .{ .r = 198, .g = 120, .b = 221 } },
+    .type_name = .{ .rgb = .{ .r = 86, .g = 182, .b = 194 } },
+    .string = .{ .rgb = .{ .r = 152, .g = 195, .b = 121 } },
+    .char_literal = .{ .rgb = .{ .r = 152, .g = 195, .b = 121 } },
+    .number = .{ .rgb = .{ .r = 209, .g = 154, .b = 102 } },
+    .comment = .{ .rgb = .{ .r = 92, .g = 99, .b = 112 } },
+    .function = .{ .rgb = .{ .r = 97, .g = 175, .b = 239 } },
+    .builtin = .{ .rgb = .{ .r = 229, .g = 192, .b = 123 } },
+    .constant = .{ .rgb = .{ .r = 209, .g = 154, .b = 102 } },
+    .operator = .{ .rgb = .{ .r = 225, .g = 225, .b = 230 } },
+    .punctuation = .{ .rgb = .{ .r = 171, .g = 178, .b = 191 } },
+    .preprocessor = .{ .rgb = .{ .r = 190, .g = 132, .b = 210 } },
+    .attribute = .{ .rgb = .{ .r = 229, .g = 192, .b = 123 } },
+};
+
+/// Light TUI syntax theme — ANSI-256 colors.
+pub const syn_tui_light = TuiSyntaxTheme{
+    .keyword = .{ .ansi = 128 }, // dark magenta
+    .type_name = .{ .ansi = 30 }, // dark cyan
+    .string = .{ .ansi = 28 }, // dark green
+    .char_literal = .{ .ansi = 28 }, // dark green
+    .number = .{ .ansi = 130 }, // dark orange
+    .comment = .{ .ansi = 246 }, // gray
+    .function = .{ .ansi = 33 }, // blue
+    .builtin = .{ .ansi = 130 }, // dark orange
+    .constant = .{ .ansi = 130 }, // dark orange
+    .operator = .{ .ansi = 16 }, // black
+    .punctuation = .{ .ansi = 238 }, // dark gray
+    .preprocessor = .{ .ansi = 128 }, // dark magenta
+    .attribute = .{ .ansi = 130 }, // dark orange
+};
+
+/// High-contrast TUI syntax theme — RGB colors.
+pub const syn_tui_high_contrast = TuiSyntaxTheme{
+    .keyword = .{ .rgb = .{ .r = 255, .g = 100, .b = 255 } },
+    .type_name = .{ .rgb = .{ .r = 100, .g = 255, .b = 255 } },
+    .string = .{ .rgb = .{ .r = 100, .g = 255, .b = 100 } },
+    .char_literal = .{ .rgb = .{ .r = 100, .g = 255, .b = 100 } },
+    .number = .{ .rgb = .{ .r = 255, .g = 200, .b = 100 } },
+    .comment = .{ .rgb = .{ .r = 150, .g = 150, .b = 150 } },
+    .function = .{ .rgb = .{ .r = 100, .g = 180, .b = 255 } },
+    .builtin = .{ .rgb = .{ .r = 255, .g = 255, .b = 100 } },
+    .constant = .{ .rgb = .{ .r = 255, .g = 200, .b = 100 } },
+    .operator = .{ .rgb = .{ .r = 255, .g = 255, .b = 255 } },
+    .punctuation = .{ .rgb = .{ .r = 200, .g = 200, .b = 200 } },
+    .preprocessor = .{ .rgb = .{ .r = 255, .g = 100, .b = 255 } },
+    .attribute = .{ .rgb = .{ .r = 255, .g = 255, .b = 100 } },
+};
+
+// ---------------------------------------------------------------------------
+// Syntax theme preset lookups
+// ---------------------------------------------------------------------------
+
+pub fn synGuiPreset(preset: ThemePreset) SyntaxTheme {
+    return switch (preset) {
+        .dark => syn_gui_dark,
+        .light => syn_gui_light,
+        .high_contrast => syn_gui_high_contrast,
+    };
+}
+
+pub fn synTuiPreset(preset: TuiPreset) TuiSyntaxTheme {
+    return switch (preset) {
+        .terminal => syn_tui_terminal,
+        .dark => syn_tui_dark,
+        .light => syn_tui_light,
+        .high_contrast => syn_tui_high_contrast,
+    };
+}
+
+// ---------------------------------------------------------------------------
+// Runtime field-by-name setters for syntax themes
+// ---------------------------------------------------------------------------
+
+/// Set a SyntaxTheme color field by name. Returns true if field was found.
+pub fn setSyntaxColor(st: *SyntaxTheme, field_name: []const u8, color: ThemeColor) bool {
+    inline for (std.meta.fields(SyntaxTheme)) |f| {
+        if (std.mem.eql(u8, field_name, f.name)) {
+            @field(st, f.name) = color;
+            return true;
+        }
+    }
+    return false;
+}
+
+/// Set a TuiSyntaxTheme color field by name (stores as RGB). Returns true if field was found.
+pub fn setTuiSyntaxColor(st: *TuiSyntaxTheme, field_name: []const u8, color: ThemeColor) bool {
+    inline for (std.meta.fields(TuiSyntaxTheme)) |f| {
+        if (std.mem.eql(u8, field_name, f.name)) {
+            @field(st, f.name) = TuiColor.fromThemeColor(color);
+            return true;
+        }
+    }
+    return false;
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -463,4 +718,22 @@ test "tui presets exist" {
     try std.testing.expectEqual(@as(u8, 225), dark.text_fg.rgb.r);
     const light = tuiPreset(.light);
     try std.testing.expectEqual(@as(u8, 16), light.text_fg.ansi);
+}
+
+test "syntax theme colorForToken" {
+    const st = syn_gui_dark;
+    // keyword should return purple
+    const kw = st.colorForToken(.keyword).?;
+    try std.testing.expectEqual(@as(u8, 198), kw.r);
+    // text should return null
+    try std.testing.expect(st.colorForToken(.text) == null);
+}
+
+test "syntax theme preset lookups" {
+    const dark = synGuiPreset(.dark);
+    try std.testing.expectEqual(@as(u8, 198), dark.keyword.r);
+    const light = synGuiPreset(.light);
+    try std.testing.expectEqual(@as(u8, 166), light.keyword.r);
+    const term = synTuiPreset(.terminal);
+    try std.testing.expectEqual(@as(u8, 5), term.keyword.ansi);
 }

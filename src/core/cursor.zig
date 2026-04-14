@@ -29,7 +29,7 @@ pub const Cursor = struct {
     /// Move right by one byte (UTF-8 aware: skip continuation bytes).
     pub fn moveRight(self: *Cursor, buf: *const Buffer) void {
         if (self.offset >= buf.byteLen()) return;
-        self.offset += utf8ByteLen(buf.content.items[self.offset]);
+        self.offset += utf8ByteLen(buf.byteAt(self.offset) orelse return);
         self.offset = @min(self.offset, buf.byteLen());
         self.preferred_col = buf.offsetToPos(self.offset).col;
     }
@@ -39,14 +39,14 @@ pub const Cursor = struct {
         if (self.offset == 0) return;
         self.offset -= 1;
         // Skip UTF-8 continuation bytes (10xxxxxx)
-        while (self.offset > 0 and (buf.content.items[self.offset] & 0xC0) == 0x80) {
+        while (self.offset > 0 and ((buf.byteAt(self.offset) orelse 0) & 0xC0) == 0x80) {
             self.offset -= 1;
         }
         self.preferred_col = buf.offsetToPos(self.offset).col;
     }
 
     /// Move up one line, preserving preferred column.
-    pub fn moveUp(self: *Cursor, buf: *const Buffer) void {
+    pub fn moveUp(self: *Cursor, buf: *Buffer) void {
         const p = buf.offsetToPos(self.offset);
         if (p.line == 0) return;
         self.offset = buf.posToOffset(p.line - 1, self.preferred_col);
@@ -58,7 +58,7 @@ pub const Cursor = struct {
     }
 
     /// Move down one line, preserving preferred column.
-    pub fn moveDown(self: *Cursor, buf: *const Buffer) void {
+    pub fn moveDown(self: *Cursor, buf: *Buffer) void {
         const p = buf.offsetToPos(self.offset);
         if (p.line + 1 >= buf.lineCount()) return;
         self.offset = buf.posToOffset(p.line + 1, self.preferred_col);
@@ -77,7 +77,7 @@ pub const Cursor = struct {
     }
 
     /// Move up N lines (for Page Up).
-    pub fn moveUpN(self: *Cursor, buf: *const Buffer, n: usize) void {
+    pub fn moveUpN(self: *Cursor, buf: *Buffer, n: usize) void {
         const p = buf.offsetToPos(self.offset);
         const target_line = p.line -| n;
         self.offset = buf.posToOffset(target_line, self.preferred_col);
@@ -88,7 +88,7 @@ pub const Cursor = struct {
     }
 
     /// Move down N lines (for Page Down).
-    pub fn moveDownN(self: *Cursor, buf: *const Buffer, n: usize) void {
+    pub fn moveDownN(self: *Cursor, buf: *Buffer, n: usize) void {
         const p = buf.offsetToPos(self.offset);
         const max_line = buf.lineCount() -| 1;
         const target_line = @min(p.line + n, max_line);
@@ -100,7 +100,7 @@ pub const Cursor = struct {
     }
 
     /// Move right by one word.
-    pub fn moveWordRight(self: *Cursor, buf: *const Buffer) void {
+    pub fn moveWordRight(self: *Cursor, buf: *Buffer) void {
         const content = buf.slice(0, buf.byteLen());
         var off = self.offset;
         // Skip current word chars
@@ -112,7 +112,7 @@ pub const Cursor = struct {
     }
 
     /// Move left by one word.
-    pub fn moveWordLeft(self: *Cursor, buf: *const Buffer) void {
+    pub fn moveWordLeft(self: *Cursor, buf: *Buffer) void {
         const content = buf.slice(0, buf.byteLen());
         if (self.offset == 0) return;
         var off = self.offset - 1;
@@ -126,7 +126,7 @@ pub const Cursor = struct {
 
     /// Smart Home: move to first non-whitespace on the line,
     /// or to column 0 if already there.
-    pub fn moveSmartHome(self: *Cursor, buf: *const Buffer) void {
+    pub fn moveSmartHome(self: *Cursor, buf: *Buffer) void {
         const p = buf.offsetToPos(self.offset);
         const line = buf.lineContent(p.line);
         var first_non_ws: usize = 0;
@@ -157,7 +157,7 @@ pub const Cursor = struct {
     }
 
     /// Move to end of current line.
-    pub fn moveEnd(self: *Cursor, buf: *const Buffer) void {
+    pub fn moveEnd(self: *Cursor, buf: *Buffer) void {
         const p = buf.offsetToPos(self.offset);
         const line_len = buf.lineContent(p.line).len;
         self.offset = buf.posToOffset(p.line, line_len);

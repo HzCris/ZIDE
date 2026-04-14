@@ -15,6 +15,7 @@ const dvui = if (build_options.has_gui) @import("dvui") else struct {};
 const SDLBackend = if (build_options.has_gui) @import("sdl-backend") else struct {};
 
 const Editor = @import("core/editor.zig").Editor;
+const LspClient = @import("core/editor.zig").lsp_mod.LspClient;
 const lua_settings = @import("core/lua_settings.zig");
 const gui = @import("frontend/gui.zig");
 const tui = @import("frontend/tui.zig");
@@ -123,12 +124,23 @@ fn runGui(allocator: std.mem.Allocator, lua: *zlua.Lua, cli_files: []const []con
     var editor = try Editor.init(allocator);
     defer editor.deinit();
 
+    // Start LSP client (ZLS)
+    var lsp_client = LspClient.init(allocator);
+    defer lsp_client.deinit();
+    lsp_client.start("zls") catch |err| {
+        std.log.warn("Failed to start ZLS: {}", .{err});
+    };
+    editor.lsp = &lsp_client;
+
     // Register Lua API and load user config
     lua_settings.registerApi(lua, &editor);
     if (lua_settings.loadConfig(lua)) {
         std.log.info("Loaded user config (init.lua)", .{});
     }
     lua_settings.loadThemeFiles(lua);
+    lua_settings.loadSyntaxTheme(lua);
+    lua_settings.loadExtensions(lua);
+    lua_settings.loadLangSyntaxThemes(lua);
 
     // Open CLI files, or show welcome text
     if (cli_files.len > 0) {
@@ -136,6 +148,9 @@ fn runGui(allocator: std.mem.Allocator, lua: *zlua.Lua, cli_files: []const []con
         editor.activeDoc().open(cli_files[0]) catch |err| {
             std.log.err("Failed to open {s}: {}", .{ cli_files[0], err });
         };
+        editor.activeDoc().detectLanguage(&editor);
+        // Notify LSP about the first file
+        editor.lspNotifyOpen(editor.activeDoc());
         // Open additional files as new tabs
         for (cli_files[1..]) |path| {
             _ = editor.openFile(path) catch |err| {
@@ -194,6 +209,10 @@ fn runGui(allocator: std.mem.Allocator, lua: *zlua.Lua, cli_files: []const []con
         }
         // SDL3GPU handles clearing via render pass (LOAD_OP_CLEAR)
 
+        // Poll LSP messages and sync documents
+        if (editor.lsp) |l| l.pollMessages(&editor);
+        editor.syncLspDocuments();
+
         if (!gui.frame(&editor)) break :main_loop;
 
         const end_micros = try win.end(.{});
@@ -210,18 +229,32 @@ fn runTui(allocator: std.mem.Allocator, lua: *zlua.Lua, cli_files: []const []con
     var editor = try Editor.init(allocator);
     defer editor.deinit();
 
+    // Start LSP client (ZLS)
+    var lsp_client = LspClient.init(allocator);
+    defer lsp_client.deinit();
+    lsp_client.start("zls") catch |err| {
+        std.log.warn("Failed to start ZLS: {}", .{err});
+    };
+    editor.lsp = &lsp_client;
+
     // Register Lua API and load user config
     lua_settings.registerApi(lua, &editor);
     if (lua_settings.loadConfig(lua)) {
         std.log.info("Loaded user config (init.lua)", .{});
     }
     lua_settings.loadThemeFiles(lua);
+    lua_settings.loadSyntaxTheme(lua);
+    lua_settings.loadExtensions(lua);
+    lua_settings.loadLangSyntaxThemes(lua);
 
     // Open CLI files, or show welcome text
     if (cli_files.len > 0) {
         editor.activeDoc().open(cli_files[0]) catch |err| {
             std.log.err("Failed to open {s}: {}", .{ cli_files[0], err });
         };
+        editor.activeDoc().detectLanguage(&editor);
+        // Notify LSP about the first file
+        editor.lspNotifyOpen(editor.activeDoc());
         for (cli_files[1..]) |path| {
             _ = editor.openFile(path) catch |err| {
                 std.log.err("Failed to open {s}: {}", .{ path, err });
@@ -284,6 +317,9 @@ comptime {
     _ = @import("core/commands.zig");
     _ = @import("core/editor.zig");
     _ = @import("core/keybind.zig");
+    _ = @import("core/syntax.zig");
+    _ = @import("core/theme.zig");
+    _ = @import("core/lsp.zig");
     _ = @import("frontend/gui.zig");
     _ = @import("frontend/tui.zig");
 }

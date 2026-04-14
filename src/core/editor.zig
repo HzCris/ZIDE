@@ -10,6 +10,10 @@ const SplitDirection = @import("layout.zig").SplitDirection;
 const theme_mod = @import("theme.zig");
 const EditorTheme = theme_mod.EditorTheme;
 const TuiTheme = theme_mod.TuiTheme;
+const SyntaxTheme = theme_mod.SyntaxTheme;
+const TuiSyntaxTheme = theme_mod.TuiSyntaxTheme;
+const syntax = @import("syntax.zig");
+pub const lsp_mod = @import("lsp.zig");
 
 /// The central editor state. NOT a global singleton — passed explicitly.
 /// Owns open documents, the command registry, and global editor settings.
@@ -103,6 +107,45 @@ pub const Editor = struct {
     settings_num_buf: [16]u8 = undefined,
     settings_num_len: usize = 0,
 
+    /// LSP client (null if not started).
+    lsp: ?*lsp_mod.LspClient = null,
+
+    /// Completion items from LSP.
+    completion_items: std.ArrayList(EditorCompletionItem),
+    /// Whether the completion popup is active.
+    completion_active: bool = false,
+    /// Currently selected completion item index.
+    completion_selected: usize = 0,
+
+    /// Lua-registered LSP server configs (language → command).
+    lsp_configs: std.ArrayList(LspConfig),
+
+    /// Registered languages (Zig built-in + Lua-loaded extensions).
+    languages: std.ArrayList(syntax.LanguageDef),
+    /// GUI syntax highlight colors.
+    syntax_theme: SyntaxTheme = theme_mod.syn_gui_dark,
+    /// TUI syntax highlight colors.
+    tui_syntax_theme: TuiSyntaxTheme = theme_mod.syn_tui_terminal,
+    /// Per-language GUI syntax theme overrides (keyed by language name).
+    lang_syntax_overrides: std.ArrayList(LangSyntaxOverride),
+
+    pub const EditorCompletionItem = struct {
+        label: []const u8,
+        detail: ?[]const u8 = null,
+        insert_text: ?[]const u8 = null,
+    };
+
+    pub const LspConfig = struct {
+        language: []const u8,
+        command: []const u8,
+    };
+
+    pub const LangSyntaxOverride = struct {
+        name: []const u8,
+        gui_theme: SyntaxTheme,
+        tui_theme: TuiSyntaxTheme,
+    };
+
     pub const Mode = enum {
         normal,
         find,
@@ -122,7 +165,13 @@ pub const Editor = struct {
             .allocator = allocator,
             .keybinds = KeybindMap.init(allocator),
             .layout = try Layout.init(allocator),
+            .completion_items = .empty,
+            .lsp_configs = .empty,
+            .languages = .empty,
+            .lang_syntax_overrides = .empty,
         };
+        // Register built-in Zig language
+        try editor.languages.append(allocator, syntax.lang_zig);
         // Always have at least one empty document
         var doc = Document.init(allocator);
         doc.history.max_size = editor.max_undo_history;
@@ -143,6 +192,19 @@ pub const Editor = struct {
         self.commands.deinit();
         self.keybinds.deinit();
         self.layout.deinit();
+        // Free Lua-registered languages (built-in Zig has null arena)
+        for (self.languages.items) |*lang| {
+            lang.deinit();
+        }
+        self.clearCompletionItems();
+        self.completion_items.deinit(self.allocator);
+        for (self.lsp_configs.items) |cfg| {
+            self.allocator.free(cfg.language);
+            self.allocator.free(cfg.command);
+        }
+        self.lsp_configs.deinit(self.allocator);
+        self.languages.deinit(self.allocator);
+        self.lang_syntax_overrides.deinit(self.allocator);
         if (self.clipboard.len > 0) {
             self.allocator.free(self.clipboard);
         }
@@ -188,14 +250,18 @@ pub const Editor = struct {
         const idx = self.documents.items.len - 1;
         self.active_doc_idx = idx;
         self.paneShowDoc(idx);
-        return self.activeDoc();
+        const active = self.activeDoc();
+        active.detectLanguage(self);
+        self.lspNotifyOpen(active);
+        return active;
     }
 
     /// Close the active document. Returns false if it was the last one
     /// (creates a new empty document in that case).
     pub fn closeActiveDoc(self: *Editor) bool {
         if (self.documents.items.len <= 1) {
-            // Reset to empty document
+            // Send didClose before resetting
+            self.lspDidClose(&self.documents.items[0]);
             self.documents.items[0].deinit();
             self.documents.items[0] = Document.init(self.allocator);
             self.documents.items[0].loadText("") catch {};
@@ -204,6 +270,7 @@ pub const Editor = struct {
             return false;
         }
         const removed_idx = self.active_doc_idx;
+        self.lspDidClose(&self.documents.items[removed_idx]);
         self.documents.items[removed_idx].deinit();
         _ = self.documents.orderedRemove(removed_idx);
         if (self.active_doc_idx >= self.documents.items.len) {
@@ -266,7 +333,9 @@ pub const Editor = struct {
             return true;
         }
         if (std.mem.eql(u8, action, "save")) {
-            self.activeDoc().save() catch {};
+            const doc = self.activeDoc();
+            doc.save() catch {};
+            self.lspDidSave(doc);
             return true;
         }
         if (std.mem.eql(u8, action, "find")) {
@@ -344,6 +413,15 @@ pub const Editor = struct {
         }
         if (std.mem.eql(u8, action, "focus_prev_pane")) {
             self.focusPrevPane();
+            return true;
+        }
+        // LSP actions
+        if (std.mem.eql(u8, action, "lsp_completion")) {
+            self.triggerCompletion();
+            return true;
+        }
+        if (std.mem.eql(u8, action, "lsp_goto_definition")) {
+            self.triggerGotoDefinition();
             return true;
         }
         // Fall back to command registry
@@ -473,6 +551,207 @@ pub const Editor = struct {
             self.layout.panes.items[self.active_pane].doc_idx = doc_idx;
             self.active_doc_idx = doc_idx;
         }
+    }
+
+    // ---- Language / syntax theme operations ----
+
+    /// Find a registered language by file extension.
+    pub fn findLanguage(self: *const Editor, ext: []const u8) ?*const syntax.LanguageDef {
+        for (self.languages.items) |*lang| {
+            if (lang.matchesExtension(ext)) return lang;
+        }
+        return null;
+    }
+
+    /// Get the resolved GUI syntax theme for a language (per-lang override or global).
+    pub fn syntaxThemeFor(self: *const Editor, lang_name: ?[]const u8) *const SyntaxTheme {
+        if (lang_name) |name| {
+            for (self.lang_syntax_overrides.items) |*ov| {
+                if (std.mem.eql(u8, ov.name, name)) return &ov.gui_theme;
+            }
+        }
+        return &self.syntax_theme;
+    }
+
+    /// Get the resolved TUI syntax theme for a language (per-lang override or global).
+    pub fn tuiSyntaxThemeFor(self: *const Editor, lang_name: ?[]const u8) *const TuiSyntaxTheme {
+        if (lang_name) |name| {
+            for (self.lang_syntax_overrides.items) |*ov| {
+                if (std.mem.eql(u8, ov.name, name)) return &ov.tui_theme;
+            }
+        }
+        return &self.tui_syntax_theme;
+    }
+
+    // ---- LSP integration ----
+
+    /// Send didOpen notification if LSP is ready and the document has a file path.
+    pub fn lspNotifyOpen(self: *Editor, doc: *Document) void {
+        const lsp_client = self.lsp orelse return;
+        if (!lsp_client.isReady()) return;
+        const path = doc.file_path orelse return;
+        if (doc.lsp_opened) return;
+
+        const uri = lsp_mod.pathToUri(self.allocator, path) catch return;
+        defer self.allocator.free(uri);
+
+        const lang_id: []const u8 = if (doc.language) |lang| lang.name else "plaintext";
+        const text = doc.buffer.slice(0, doc.buffer.byteLen());
+
+        lsp_client.sendDidOpen(uri, lang_id, doc.lsp_version, text) catch return;
+        doc.lsp_opened = true;
+        doc.lsp_last_synced = doc.lsp_version;
+        std.log.info("LSP didOpen: {s} (lang={s})", .{ uri, lang_id });
+    }
+
+    /// Send didClose notification if the document was opened with LSP.
+    fn lspDidClose(self: *Editor, doc: *Document) void {
+        const lsp_client = self.lsp orelse return;
+        if (!doc.lsp_opened) return;
+        const path = doc.file_path orelse return;
+
+        const uri = lsp_mod.pathToUri(self.allocator, path) catch return;
+        defer self.allocator.free(uri);
+
+        lsp_client.sendDidClose(uri) catch {};
+        doc.lsp_opened = false;
+    }
+
+    /// Send didSave notification.
+    fn lspDidSave(self: *Editor, doc: *Document) void {
+        const lsp_client = self.lsp orelse return;
+        if (!doc.lsp_opened) return;
+        const path = doc.file_path orelse return;
+
+        const uri = lsp_mod.pathToUri(self.allocator, path) catch return;
+        defer self.allocator.free(uri);
+
+        lsp_client.sendDidSave(uri) catch {};
+    }
+
+    /// Sync dirty documents with the LSP server (send didChange for modified docs).
+    /// Also sends didOpen for documents that were opened before the LSP finished initializing.
+    pub fn syncLspDocuments(self: *Editor) void {
+        const lsp_client = self.lsp orelse return;
+        if (!lsp_client.isReady()) return;
+
+        for (self.documents.items) |*doc| {
+            // Send didOpen for docs that haven't been registered with LSP yet
+            if (!doc.lsp_opened) {
+                self.lspNotifyOpen(doc);
+                continue; // didOpen includes the full text, so no didChange needed
+            }
+
+            if (doc.lsp_version == doc.lsp_last_synced) continue;
+
+            const path = doc.file_path orelse continue;
+            const uri = lsp_mod.pathToUri(self.allocator, path) catch continue;
+            defer self.allocator.free(uri);
+
+            const text = doc.buffer.slice(0, doc.buffer.byteLen());
+            lsp_client.sendDidChange(uri, doc.lsp_version, text) catch continue;
+            doc.lsp_last_synced = doc.lsp_version;
+        }
+    }
+
+    /// Clear all completion items (frees memory).
+    pub fn clearCompletionItems(self: *Editor) void {
+        for (self.completion_items.items) |*item| {
+            self.allocator.free(item.label);
+            if (item.detail) |d| self.allocator.free(d);
+            if (item.insert_text) |t| self.allocator.free(t);
+        }
+        self.completion_items.clearRetainingCapacity();
+        self.completion_active = false;
+        self.completion_selected = 0;
+    }
+
+    /// Add a completion item (called from LSP response handler).
+    pub fn addCompletionItem(self: *Editor, label: []const u8, detail: ?[]const u8, insert_text: ?[]const u8) !void {
+        try self.completion_items.append(self.allocator, .{
+            .label = label,
+            .detail = detail,
+            .insert_text = insert_text,
+        });
+        self.completion_active = true;
+    }
+
+    /// Trigger LSP completion at the current cursor position.
+    pub fn triggerCompletion(self: *Editor) void {
+        const lsp_client = self.lsp orelse return;
+        if (!lsp_client.isReady()) return;
+        const doc = self.activeDoc();
+        const path = doc.file_path orelse return;
+        if (!doc.lsp_opened) return;
+
+        const uri = lsp_mod.pathToUri(self.allocator, path) catch return;
+        defer self.allocator.free(uri);
+
+        const cursor = doc.cursors.primary();
+        const pos = doc.buffer.offsetToPos(cursor.offset);
+
+        _ = lsp_client.sendCompletion(uri, @intCast(pos.line), @intCast(pos.col)) catch return;
+    }
+
+    /// Trigger LSP go-to-definition at the current cursor position.
+    pub fn triggerGotoDefinition(self: *Editor) void {
+        const lsp_client = self.lsp orelse return;
+        if (!lsp_client.isReady()) return;
+        const doc = self.activeDoc();
+        const path = doc.file_path orelse return;
+        if (!doc.lsp_opened) return;
+
+        const uri = lsp_mod.pathToUri(self.allocator, path) catch return;
+        defer self.allocator.free(uri);
+
+        const cursor = doc.cursors.primary();
+        const pos = doc.buffer.offsetToPos(cursor.offset);
+
+        _ = lsp_client.sendGotoDefinition(uri, @intCast(pos.line), @intCast(pos.col)) catch return;
+    }
+
+    /// Accept the currently selected completion item.
+    /// Replaces the word prefix (characters before cursor back to word boundary) with the completion text.
+    pub fn acceptCompletion(self: *Editor) void {
+        if (!self.completion_active) return;
+        if (self.completion_selected >= self.completion_items.items.len) {
+            self.clearCompletionItems();
+            return;
+        }
+
+        const item = self.completion_items.items[self.completion_selected];
+        const text = item.insert_text orelse item.label;
+
+        const doc = self.activeDoc();
+        const cursor = doc.cursors.primary();
+
+        // Find the start of the word prefix (scan back from cursor)
+        var prefix_start = cursor.offset;
+        while (prefix_start > 0) {
+            const prev = doc.buffer.byteAt(prefix_start - 1) orelse break;
+            if (isIdentChar(prev)) {
+                prefix_start -= 1;
+            } else {
+                break;
+            }
+        }
+
+        // Delete the prefix
+        const prefix_len = cursor.offset - prefix_start;
+        if (prefix_len > 0) {
+            // Move cursor to start of prefix, then delete forward
+            doc.cursors.primary().offset = prefix_start;
+            doc.deleteForward(prefix_len) catch {};
+        }
+
+        // Insert completion text
+        doc.insertAtCursor(text) catch {};
+
+        self.clearCompletionItems();
+    }
+
+    fn isIdentChar(c: u8) bool {
+        return (c >= 'a' and c <= 'z') or (c >= 'A' and c <= 'Z') or (c >= '0' and c <= '9') or c == '_' or c == '@';
     }
 };
 

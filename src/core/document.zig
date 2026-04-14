@@ -5,6 +5,8 @@ const cursor_mod = @import("cursor.zig");
 const Cursor = cursor_mod.Cursor;
 const CursorSet = cursor_mod.CursorSet;
 const UndoHistory = @import("undo.zig").UndoHistory;
+const syntax = @import("syntax.zig");
+const lsp = @import("lsp.zig");
 
 /// A document represents an open file (or unsaved buffer) being edited.
 /// It owns the text buffer, cursor state, file metadata, and undo history.
@@ -31,12 +33,28 @@ pub const Document = struct {
     /// Scroll state: left horizontal offset (in columns).
     scroll_left: usize = 0,
 
+    /// LSP document version (incremented on each edit).
+    lsp_version: i32 = 0,
+    /// Last version sent to LSP via didChange.
+    lsp_last_synced: i32 = 0,
+    /// Whether didOpen was sent for this document.
+    lsp_opened: bool = false,
+    /// LSP diagnostics from the language server.
+    diagnostics: std.ArrayList(lsp.Diagnostic),
+
+    /// Detected language for syntax highlighting (null = plain text).
+    language: ?*const syntax.LanguageDef = null,
+    /// Cached line states for syntax highlighting (state entering each line).
+    line_states: std.ArrayList(syntax.LineState),
+
     pub fn init(allocator: Allocator) Document {
         return .{
             .buffer = Buffer.init(allocator),
             .cursors = CursorSet.init(allocator),
             .history = UndoHistory.init(allocator),
             .allocator = allocator,
+            .diagnostics = .empty,
+            .line_states = .empty,
         };
     }
 
@@ -44,6 +62,11 @@ pub const Document = struct {
         self.history.deinit();
         self.cursors.deinit();
         self.buffer.deinit();
+        self.line_states.deinit(self.allocator);
+        for (self.diagnostics.items) |*d| {
+            d.deinit(self.allocator);
+        }
+        self.diagnostics.deinit(self.allocator);
         if (self.file_path) |p| {
             self.allocator.free(p);
         }
@@ -75,6 +98,7 @@ pub const Document = struct {
         self.dirty = false;
         self.resetCursors();
         self.detectLineEndings();
+        self.invalidateLineStates(0);
     }
 
     /// Save the document to its file path.
@@ -102,7 +126,8 @@ pub const Document = struct {
         const len = try self.buffer.insert(c.offset, text);
         self.cursors.adjustAfterInsert(cursor_before, len);
         try self.history.recordInsert(cursor_before, text, cursor_before, c.offset);
-        self.dirty = true;
+        self.markDirty();
+        self.invalidateLineStates(self.buffer.offsetToPos(cursor_before).line);
     }
 
     /// Delete `count` bytes forward from the primary cursor (like pressing Delete).
@@ -117,7 +142,8 @@ pub const Document = struct {
         try self.history.recordDelete(cursor_before, deleted_text, cursor_before, cursor_before);
         _ = self.buffer.delete(c.offset, actual_count);
         self.cursors.adjustAfterDelete(cursor_before, actual_count);
-        self.dirty = true;
+        self.markDirty();
+        self.invalidateLineStates(self.buffer.offsetToPos(cursor_before).line);
     }
 
     /// Delete `count` bytes backward from the primary cursor (like pressing Backspace).
@@ -132,7 +158,8 @@ pub const Document = struct {
         try self.history.recordDelete(del_pos, deleted_text, cursor_before, del_pos);
         _ = self.buffer.delete(del_pos, del_count);
         self.cursors.adjustAfterDelete(del_pos, del_count);
-        self.dirty = true;
+        self.markDirty();
+        self.invalidateLineStates(self.buffer.offsetToPos(del_pos).line);
     }
 
     /// Delete the current selection (if any) for the primary cursor.
@@ -148,7 +175,7 @@ pub const Document = struct {
         self.cursors.adjustAfterDelete(range.start, del_len);
         c.offset = range.start;
         c.clearSelection();
-        self.dirty = true;
+        self.markDirty();
     }
 
     // ======================================================================
@@ -180,7 +207,7 @@ pub const Document = struct {
             try self.history.recordInsert(pos, text, pos, c.offset);
         }
         self.cursors.mergeCursors();
-        self.dirty = true;
+        self.markDirty();
     }
 
     /// Delete one unit forward from every cursor.
@@ -212,7 +239,7 @@ pub const Document = struct {
             }
         }
         self.cursors.mergeCursors();
-        self.dirty = true;
+        self.markDirty();
     }
 
     /// Delete one unit backward from every cursor.
@@ -246,7 +273,7 @@ pub const Document = struct {
             }
         }
         self.cursors.mergeCursors();
-        self.dirty = true;
+        self.markDirty();
     }
 
     /// Undo the last edit group. Returns true if something was undone.
@@ -255,6 +282,8 @@ pub const Document = struct {
         self.cursors.primary().offset = cursor_pos;
         self.cursors.primary().preferred_col = self.buffer.offsetToPos(cursor_pos).col;
         self.dirty = self.history.canUndo();
+        self.lsp_version +%= 1;
+        self.invalidateLineStates(0);
         return true;
     }
 
@@ -263,12 +292,13 @@ pub const Document = struct {
         const cursor_pos = try self.history.redo(&self.buffer) orelse return false;
         self.cursors.primary().offset = cursor_pos;
         self.cursors.primary().preferred_col = self.buffer.offsetToPos(cursor_pos).col;
-        self.dirty = true;
+        self.markDirty();
+        self.invalidateLineStates(0);
         return true;
     }
 
     /// Get the selected text for the primary cursor, or null if no selection.
-    pub fn selectedText(self: *const Document) ?[]const u8 {
+    pub fn selectedText(self: *Document) ?[]const u8 {
         const c = self.cursors.primaryConst();
         const range = c.selectionRange() orelse return null;
         return self.buffer.slice(range.start, range.end);
@@ -285,7 +315,7 @@ pub const Document = struct {
     }
 
     /// Get content of a specific line.
-    pub fn lineContent(self: *const Document, line: usize) []const u8 {
+    pub fn lineContent(self: *Document, line: usize) []const u8 {
         return self.buffer.lineContent(line);
     }
 
@@ -327,7 +357,7 @@ pub const Document = struct {
         c.offset = @min(line_start, self.buffer.byteLen());
         c.preferred_col = self.buffer.offsetToPos(c.offset).col;
         c.clearSelection();
-        self.dirty = true;
+        self.markDirty();
     }
 
     /// Duplicate the current line below.
@@ -346,7 +376,7 @@ pub const Document = struct {
         const len = try self.buffer.insert(line_end, dup);
         self.cursors.adjustAfterInsert(line_end, len);
         try self.history.recordInsert(line_end, dup, cursor_before, c.offset);
-        self.dirty = true;
+        self.markDirty();
     }
 
     /// Move the current line up.
@@ -372,7 +402,7 @@ pub const Document = struct {
         const c = self.cursors.primary();
         c.offset = self.buffer.posToOffset(pos.line - 1, pos.col);
         c.preferred_col = pos.col;
-        self.dirty = true;
+        self.markDirty();
     }
 
     /// Move the current line down.
@@ -398,7 +428,7 @@ pub const Document = struct {
         const c = self.cursors.primary();
         c.offset = self.buffer.posToOffset(pos.line + 1, pos.col);
         c.preferred_col = pos.col;
-        self.dirty = true;
+        self.markDirty();
     }
 
     /// Delete a word forward from cursor (Ctrl+Delete).
@@ -414,7 +444,7 @@ pub const Document = struct {
             try self.history.recordDelete(start, deleted, start, start);
             _ = self.buffer.delete(start, del_len);
             self.cursors.adjustAfterDelete(start, del_len);
-            self.dirty = true;
+            self.markDirty();
         }
     }
 
@@ -432,7 +462,7 @@ pub const Document = struct {
             try self.history.recordDelete(start, deleted, end, start);
             _ = self.buffer.delete(start, del_len);
             self.cursors.adjustAfterDelete(start, del_len);
-            self.dirty = true;
+            self.markDirty();
         }
     }
 
@@ -460,7 +490,7 @@ pub const Document = struct {
         try self.history.recordDelete(line_start, deleted, cursor_before, cursor_after);
         _ = self.buffer.delete(line_start, remove);
         self.cursors.adjustAfterDelete(line_start, remove);
-        self.dirty = true;
+        self.markDirty();
     }
 
     /// Go to a specific line number (1-based), placing cursor at start.
@@ -474,6 +504,12 @@ pub const Document = struct {
     }
 
     // --- Internal helpers ---
+
+    /// Mark the document as dirty and increment LSP version.
+    fn markDirty(self: *Document) void {
+        self.dirty = true;
+        self.lsp_version +%= 1;
+    }
 
     fn resetCursors(self: *Document) void {
         self.cursors.clearSecondary();
@@ -509,6 +545,53 @@ pub const Document = struct {
                 return;
             }
         }
+    }
+
+    /// Detect language from the file extension using the editor's language registry.
+    pub fn detectLanguage(self: *Document, editor: anytype) void {
+        const path = self.file_path orelse return;
+        const ext = std.fs.path.extension(path);
+        // Strip leading '.' from extension
+        const ext_clean = if (ext.len > 0 and ext[0] == '.') ext[1..] else ext;
+        if (ext_clean.len == 0) return;
+        self.language = editor.findLanguage(ext_clean);
+        self.invalidateLineStates(0);
+    }
+
+    /// Invalidate cached line states from `from_line` onward.
+    pub fn invalidateLineStates(self: *Document, from_line: usize) void {
+        if (from_line < self.line_states.items.len) {
+            self.line_states.items.len = from_line;
+        }
+    }
+
+    /// Ensure line states are computed up to (and including) `target_line`.
+    /// Returns the state entering `target_line`.
+    pub fn ensureLineState(self: *Document, target_line: usize) syntax.LineState {
+        const lang = self.language orelse return .normal;
+
+        // Compute states from where we left off
+        var line_idx = self.line_states.items.len;
+        var state: syntax.LineState = if (line_idx > 0)
+            self.line_states.items[line_idx - 1]
+        else
+            .normal;
+
+        var span_buf: [syntax.MAX_SPANS]syntax.HighlightSpan = undefined;
+
+        while (line_idx <= target_line) : (line_idx += 1) {
+            // Store state entering this line
+            self.line_states.append(self.allocator, state) catch return .normal;
+            // Tokenize to get state exiting this line
+            const line_content = self.buffer.lineContent(line_idx);
+            const result = syntax.tokenizeLine(line_content, lang, state, &span_buf);
+            state = result.state;
+        }
+
+        if (target_line < self.line_states.items.len) {
+            return self.line_states.items[target_line];
+        }
+        return .normal;
     }
 };
 

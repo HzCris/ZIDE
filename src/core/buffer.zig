@@ -1,37 +1,68 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 
-/// A text buffer storing content as a contiguous byte array with a cached line index.
-/// Designed for correctness and clean API first; can be upgraded to a block-based
-/// rope (dte pattern) later for large file performance.
+/// A text buffer using a gap buffer for efficient insert/delete at the cursor.
+/// The logical content is `data[0..gap_start] ++ data[gapEnd()..data.len]`.
+/// The gap sits at the last edit point; edits near the gap are O(1).
 pub const Buffer = struct {
-    /// Raw text bytes (UTF-8)
-    content: std.ArrayList(u8),
+    /// Physical storage including the gap.
+    data: []u8 = &[_]u8{},
+    /// Total logical content bytes (excludes gap).
+    content_len: usize = 0,
+    /// Byte position in data[] where the gap starts.
+    gap_start: usize = 0,
     /// Cached byte offsets of each line start. line_starts[0] == 0 always.
-    /// line_starts[n] is the byte offset where line n begins.
+    /// line_starts[n] is the logical byte offset where line n begins.
     line_starts: std.ArrayList(usize),
     allocator: Allocator,
+    /// Scratch buffer for lineContent/slice when the requested range spans the gap.
+    scratch: std.ArrayList(u8),
+
+    // -- Gap helpers --
+
+    /// Size of the gap in bytes.
+    fn gapLen(self: *const Buffer) usize {
+        return self.data.len - self.content_len;
+    }
+
+    /// Physical index where post-gap content begins.
+    fn gapEnd(self: *const Buffer) usize {
+        return self.gap_start + self.gapLen();
+    }
+
+    /// Convert a logical byte offset to its physical index in data[].
+    fn logToPhys(self: *const Buffer, logical: usize) usize {
+        if (logical < self.gap_start) return logical;
+        return logical + self.gapLen();
+    }
 
     pub fn init(allocator: Allocator) Buffer {
         var line_starts: std.ArrayList(usize) = .empty;
-        // Line 0 always starts at offset 0
         line_starts.append(allocator, 0) catch {};
         return .{
-            .content = .empty,
             .line_starts = line_starts,
             .allocator = allocator,
+            .scratch = .empty,
         };
     }
 
     pub fn deinit(self: *Buffer) void {
-        self.content.deinit(self.allocator);
+        if (self.data.len > 0) self.allocator.free(self.data);
         self.line_starts.deinit(self.allocator);
+        self.scratch.deinit(self.allocator);
     }
 
     /// Load text into the buffer, replacing existing content.
     pub fn loadText(self: *Buffer, text: []const u8) !void {
-        self.content.clearRetainingCapacity();
-        try self.content.appendSlice(self.allocator, text);
+        const gap_size: usize = @max(text.len / 4, 256);
+        const total = text.len + gap_size;
+        if (self.data.len < total) {
+            if (self.data.len > 0) self.allocator.free(self.data);
+            self.data = try self.allocator.alloc(u8, total);
+        }
+        @memcpy(self.data[0..text.len], text);
+        self.content_len = text.len;
+        self.gap_start = text.len;
         self.rebuildLineIndex();
     }
 
@@ -42,10 +73,15 @@ pub const Buffer = struct {
         const stat = try file.stat();
         const size = stat.size;
 
-        self.content.clearRetainingCapacity();
-        try self.content.ensureTotalCapacity(self.allocator, size);
-        const bytes = try file.readAll(self.content.allocatedSlice()[0..size]);
-        self.content.items.len = bytes;
+        const gap_size: usize = @max(size / 4, 1024);
+        const total = size + gap_size;
+        if (self.data.len < total) {
+            if (self.data.len > 0) self.allocator.free(self.data);
+            self.data = try self.allocator.alloc(u8, total);
+        }
+        const bytes = try file.readAll(self.data[0..size]);
+        self.content_len = bytes;
+        self.gap_start = bytes;
         self.rebuildLineIndex();
     }
 
@@ -53,12 +89,20 @@ pub const Buffer = struct {
     pub fn saveFile(self: *const Buffer, path: []const u8) !void {
         const file = try std.fs.cwd().createFile(path, .{});
         defer file.close();
-        try file.writeAll(self.content.items);
+        // Write pre-gap content
+        if (self.gap_start > 0) {
+            try file.writeAll(self.data[0..self.gap_start]);
+        }
+        // Write post-gap content
+        const ge = self.gapEnd();
+        if (ge < self.data.len) {
+            try file.writeAll(self.data[ge..]);
+        }
     }
 
     /// Total number of bytes in the buffer.
     pub fn byteLen(self: *const Buffer) usize {
-        return self.content.items.len;
+        return self.content_len;
     }
 
     /// Number of lines. Always >= 1 (empty buffer has 1 empty line).
@@ -67,38 +111,36 @@ pub const Buffer = struct {
     }
 
     /// Get the content of a single line (without newline). Returns empty slice for out-of-bounds.
-    pub fn lineContent(self: *const Buffer, line: usize) []const u8 {
+    pub fn lineContent(self: *Buffer, line: usize) []const u8 {
         if (line >= self.line_starts.items.len) return "";
         const start = self.line_starts.items[line];
         const end = if (line + 1 < self.line_starts.items.len)
             self.line_starts.items[line + 1] - 1 // exclude the \n
         else
-            self.content.items.len;
-        if (start > self.content.items.len) return "";
-        const actual_end = @min(end, self.content.items.len);
-        if (start >= actual_end) return "";
+            self.content_len;
+        if (start >= end) return "";
+        const raw = self.getRange(start, end);
         // Strip trailing \r for CRLF support
-        const line_bytes = self.content.items[start..actual_end];
-        if (line_bytes.len > 0 and line_bytes[line_bytes.len - 1] == '\r') {
-            return line_bytes[0 .. line_bytes.len - 1];
+        if (raw.len > 0 and raw[raw.len - 1] == '\r') {
+            return raw[0 .. raw.len - 1];
         }
-        return line_bytes;
+        return raw;
     }
 
     /// Get the byte offset for a (line, col) position. Col is in bytes, not characters.
     pub fn posToOffset(self: *const Buffer, line: usize, col: usize) usize {
-        if (line >= self.line_starts.items.len) return self.content.items.len;
+        if (line >= self.line_starts.items.len) return self.content_len;
         const line_start = self.line_starts.items[line];
         const line_end = if (line + 1 < self.line_starts.items.len)
             self.line_starts.items[line + 1]
         else
-            self.content.items.len;
+            self.content_len;
         return @min(line_start + col, line_end);
     }
 
     /// Convert a byte offset to (line, col).
     pub fn offsetToPos(self: *const Buffer, offset: usize) struct { line: usize, col: usize } {
-        const clamped = @min(offset, self.content.items.len);
+        const clamped = @min(offset, self.content_len);
         // Binary search for the line
         var lo: usize = 0;
         var hi: usize = self.line_starts.items.len;
@@ -118,8 +160,15 @@ pub const Buffer = struct {
     /// Insert text at byte offset. Returns the number of bytes inserted.
     pub fn insert(self: *Buffer, offset: usize, text: []const u8) !usize {
         if (text.len == 0) return 0;
-        const pos = @min(offset, self.content.items.len);
-        try self.content.insertSlice(self.allocator, pos, text);
+        const pos = @min(offset, self.content_len);
+        // Ensure gap is large enough
+        if (text.len > self.gapLen()) {
+            try self.grow(text.len);
+        }
+        self.moveGap(pos);
+        @memcpy(self.data[self.gap_start .. self.gap_start + text.len], text);
+        self.gap_start += text.len;
+        self.content_len += text.len;
         self.updateLineIndexAfterInsert(pos, text);
         return text.len;
     }
@@ -127,36 +176,116 @@ pub const Buffer = struct {
     /// Delete `count` bytes starting at `offset`. Returns actual bytes deleted.
     pub fn delete(self: *Buffer, offset: usize, count: usize) usize {
         if (count == 0) return 0;
-        const pos = @min(offset, self.content.items.len);
-        const actual = @min(count, self.content.items.len - pos);
+        const pos = @min(offset, self.content_len);
+        const actual = @min(count, self.content_len - pos);
         if (actual == 0) return 0;
-        const deleted = self.content.items[pos .. pos + actual];
+        // Move gap to deletion point
+        self.moveGap(pos);
+        // Text to delete is now contiguous right after the gap
+        const ge = self.gapEnd();
+        const deleted = self.data[ge .. ge + actual];
         self.updateLineIndexAfterDelete(pos, deleted);
-        self.content.replaceRange(self.allocator, pos, actual, &.{}) catch {};
+        // Expand gap to absorb deleted text (no data movement)
+        self.content_len -= actual;
         return actual;
     }
 
-    /// Get a slice of the raw content.
-    pub fn slice(self: *const Buffer, start: usize, end: usize) []const u8 {
-        const s = @min(start, self.content.items.len);
-        const e = @min(end, self.content.items.len);
+    /// Get a slice of the logical content.
+    pub fn slice(self: *Buffer, start: usize, end: usize) []const u8 {
+        const s = @min(start, self.content_len);
+        const e = @min(end, self.content_len);
         if (s >= e) return "";
-        return self.content.items[s..e];
+        return self.getRange(s, e);
     }
 
-    /// Get the byte at an offset, or null if out of bounds.
+    /// Get the byte at a logical offset, or null if out of bounds.
     pub fn byteAt(self: *const Buffer, offset: usize) ?u8 {
-        if (offset >= self.content.items.len) return null;
-        return self.content.items[offset];
+        if (offset >= self.content_len) return null;
+        return self.data[self.logToPhys(offset)];
+    }
+
+    // -- Internal helpers --
+
+    /// Return a contiguous view of logical bytes [start..end).
+    /// If the range doesn't span the gap, returns a direct slice into data[].
+    /// If it spans the gap, assembles into the scratch buffer.
+    fn getRange(self: *Buffer, start: usize, end: usize) []const u8 {
+        if (start >= end) return "";
+        const gl = self.gapLen();
+
+        if (end <= self.gap_start) {
+            // Entirely before gap
+            return self.data[start..end];
+        } else if (start >= self.gap_start) {
+            // Entirely after gap
+            return self.data[start + gl .. end + gl];
+        } else {
+            // Spans the gap: assemble in scratch buffer
+            const pre_len = self.gap_start - start;
+            const post_start = self.gapEnd();
+            const post_len = end - self.gap_start;
+            self.scratch.clearRetainingCapacity();
+            self.scratch.ensureTotalCapacity(self.allocator, pre_len + post_len) catch return "";
+            self.scratch.appendSlice(self.allocator, self.data[start..self.gap_start]) catch return "";
+            self.scratch.appendSlice(self.allocator, self.data[post_start .. post_start + post_len]) catch return "";
+            return self.scratch.items;
+        }
+    }
+
+    /// Move the gap so it starts at logical position `pos`.
+    fn moveGap(self: *Buffer, pos: usize) void {
+        if (pos == self.gap_start) return;
+        const gl = self.gapLen();
+        if (pos < self.gap_start) {
+            // Move gap left: shift data[pos..gap_start] right by gap_len
+            const count = self.gap_start - pos;
+            std.mem.copyBackwards(u8, self.data[pos + gl .. pos + gl + count], self.data[pos .. pos + count]);
+        } else {
+            // Move gap right: shift data[gap_end..pos+gap_len] left by gap_len
+            const count = pos - self.gap_start;
+            const ge = self.gap_start + gl;
+            std.mem.copyForwards(u8, self.data[self.gap_start .. self.gap_start + count], self.data[ge .. ge + count]);
+        }
+        self.gap_start = pos;
+    }
+
+    /// Grow the buffer so the gap has at least `min_extra` bytes.
+    fn grow(self: *Buffer, min_extra: usize) !void {
+        const new_gap = @max(min_extra * 2, 1024);
+        const new_cap = self.content_len + new_gap;
+        const new_data = try self.allocator.alloc(u8, new_cap);
+
+        // Copy pre-gap content
+        if (self.gap_start > 0) {
+            @memcpy(new_data[0..self.gap_start], self.data[0..self.gap_start]);
+        }
+        // Copy post-gap content to end of new buffer
+        const post_len = self.content_len - self.gap_start;
+        if (post_len > 0) {
+            const old_ge = self.gapEnd();
+            @memcpy(new_data[new_cap - post_len .. new_cap], self.data[old_ge .. old_ge + post_len]);
+        }
+
+        if (self.data.len > 0) self.allocator.free(self.data);
+        self.data = new_data;
+        // gap_start stays the same; gap_len = data.len - content_len (now larger)
     }
 
     /// Rebuild the entire line index from scratch.
     fn rebuildLineIndex(self: *Buffer) void {
         self.line_starts.clearRetainingCapacity();
         self.line_starts.append(self.allocator, 0) catch {};
-        for (self.content.items, 0..) |byte, i| {
+        // Pre-gap content
+        for (self.data[0..self.gap_start], 0..) |byte, i| {
             if (byte == '\n') {
                 self.line_starts.append(self.allocator, i + 1) catch {};
+            }
+        }
+        // Post-gap content
+        const ge = self.gapEnd();
+        for (self.data[ge..], 0..) |byte, i| {
+            if (byte == '\n') {
+                self.line_starts.append(self.allocator, self.gap_start + i + 1) catch {};
             }
         }
     }
@@ -298,4 +427,69 @@ test "insert multiline text" {
     try std.testing.expectEqualStrings("ax", buf.lineContent(0));
     try std.testing.expectEqualStrings("y", buf.lineContent(1));
     try std.testing.expectEqualStrings("zb", buf.lineContent(2));
+}
+
+test "gap buffer insert at different positions" {
+    const allocator = std.testing.allocator;
+    var buf = Buffer.init(allocator);
+    defer buf.deinit();
+
+    try buf.loadText("abcdef");
+    // Insert at end (gap is already at end after load)
+    _ = try buf.insert(6, "g");
+    try std.testing.expectEqualStrings("abcdefg", buf.lineContent(0));
+    // Insert at beginning (moves gap)
+    _ = try buf.insert(0, "Z");
+    try std.testing.expectEqualStrings("Zabcdefg", buf.lineContent(0));
+    // Insert in middle
+    _ = try buf.insert(4, "!");
+    try std.testing.expectEqualStrings("Zabc!defg", buf.lineContent(0));
+    try std.testing.expectEqual(@as(usize, 9), buf.byteLen());
+}
+
+test "gap buffer delete and re-insert" {
+    const allocator = std.testing.allocator;
+    var buf = Buffer.init(allocator);
+    defer buf.deinit();
+
+    try buf.loadText("hello world");
+    // Delete "world"
+    _ = buf.delete(6, 5);
+    try std.testing.expectEqualStrings("hello ", buf.lineContent(0));
+    // Re-insert
+    _ = try buf.insert(6, "zig");
+    try std.testing.expectEqualStrings("hello zig", buf.lineContent(0));
+}
+
+test "gap buffer byteAt" {
+    const allocator = std.testing.allocator;
+    var buf = Buffer.init(allocator);
+    defer buf.deinit();
+
+    try buf.loadText("abc");
+    try std.testing.expectEqual(@as(u8, 'a'), buf.byteAt(0).?);
+    try std.testing.expectEqual(@as(u8, 'b'), buf.byteAt(1).?);
+    try std.testing.expectEqual(@as(u8, 'c'), buf.byteAt(2).?);
+    try std.testing.expect(buf.byteAt(3) == null);
+
+    // Insert in middle — byteAt should still work across gap
+    _ = try buf.insert(1, "X");
+    try std.testing.expectEqual(@as(u8, 'a'), buf.byteAt(0).?);
+    try std.testing.expectEqual(@as(u8, 'X'), buf.byteAt(1).?);
+    try std.testing.expectEqual(@as(u8, 'b'), buf.byteAt(2).?);
+    try std.testing.expectEqual(@as(u8, 'c'), buf.byteAt(3).?);
+}
+
+test "gap buffer slice spanning gap" {
+    const allocator = std.testing.allocator;
+    var buf = Buffer.init(allocator);
+    defer buf.deinit();
+
+    try buf.loadText("abcdefghij");
+    // Insert in middle to create gap at position 5
+    _ = try buf.insert(5, "X");
+    // Content: "abcdeXfghij"
+    // Slice spanning the gap
+    try std.testing.expectEqualStrings("deXfg", buf.slice(3, 8));
+    try std.testing.expectEqualStrings("abcdeXfghij", buf.slice(0, 11));
 }

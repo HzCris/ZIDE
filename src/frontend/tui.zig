@@ -3,6 +3,8 @@ const vaxis = @import("vaxis");
 const Editor = @import("../core/editor.zig").Editor;
 const Document = @import("../core/document.zig").Document;
 const TuiColor = @import("../core/theme.zig").TuiColor;
+const syntax = @import("../core/syntax.zig");
+const lsp = @import("../core/lsp.zig");
 
 const Key = vaxis.Key;
 const Cell = vaxis.Cell;
@@ -81,7 +83,18 @@ const Event = union(enum) {
     winsize: vaxis.Winsize,
     focus_in,
     focus_out,
+    lsp_data,
 };
+
+/// Module-level loop pointer for LSP wake callback.
+var global_loop: ?*vaxis.Loop(Event) = null;
+
+/// Wake function called from LSP reader thread to unblock nextEvent.
+fn lspWakeFn() void {
+    if (global_loop) |loop_ptr| {
+        loop_ptr.postEvent(.lsp_data);
+    }
+}
 
 /// When true, the user explicitly scrolled (wheel) so ensureCursorVisible is skipped.
 /// Cleared when the cursor moves (key press, click, etc.).
@@ -103,6 +116,12 @@ pub fn run(allocator: std.mem.Allocator, editor: *Editor) !void {
     try loop.init();
     try loop.start();
     defer loop.stop();
+
+    // Set up LSP TUI wake
+    global_loop = &loop;
+    if (editor.lsp) |lsp_client| {
+        lsp_client.tui_wake_fn = &lspWakeFn;
+    }
 
     // Enter alternate screen
     try vx.enterAltScreen(tty.writer());
@@ -149,6 +168,10 @@ pub fn run(allocator: std.mem.Allocator, editor: *Editor) !void {
                 else => {},
             }
         }
+
+        // Poll LSP messages and sync documents
+        if (editor.lsp) |lsp_client| lsp_client.pollMessages(editor);
+        editor.syncLspDocuments();
 
         // Auto-save check
         if (editor.auto_save and editor.hasUnsavedChanges()) {
@@ -227,6 +250,11 @@ pub fn run(allocator: std.mem.Allocator, editor: *Editor) !void {
             .normal => positionCursor(win, editor, width, height),
         }
 
+        // Draw completion popup on top of everything (when active)
+        if (editor.completion_active) {
+            drawCompletionPopup(win, editor, width, height);
+        }
+
         try vx.render(tty.writer());
 
         // Block until next event
@@ -245,6 +273,11 @@ pub fn run(allocator: std.mem.Allocator, editor: *Editor) !void {
 
 /// Dispatch key based on current editor mode.
 fn dispatchKey(editor: *Editor, key: Key) void {
+    // Completion popup intercepts keys when active (regardless of mode)
+    if (editor.completion_active) {
+        handleCompletionKey(editor, key);
+        return;
+    }
     switch (editor.mode) {
         .normal => handleKey(editor, key),
         .find => handleFindKey(editor, key),
@@ -656,6 +689,15 @@ fn drawContent(win: Window, doc: *Document, editor: *Editor, width: u16, height:
         const is_current = (line_idx == cursor_pos.line);
         const num_style = if (is_current) line_num_active_style else line_num_style;
 
+        // Tokenize line for syntax highlighting
+        var span_buf: [syntax.MAX_SPANS]syntax.HighlightSpan = undefined;
+        var span_count: usize = 0;
+        if (doc.language) |lang| {
+            const state = doc.ensureLineState(line_idx);
+            const result = syntax.tokenizeLine(line, lang, state, &span_buf);
+            span_count = result.count;
+        }
+
         // Iterate visual rows for this logical line
         var wrap_row: u16 = 0;
         var byte_pos: usize = 0;
@@ -680,8 +722,25 @@ fn drawContent(win: Window, doc: *Document, editor: *Editor, width: u16, height:
                 _ = writeStr(win, gutter_width -| 1, y, ".", wrap_marker_style);
             }
 
-            // Gutter separator
-            _ = writeStr(win, gutter_width, y, " ", gutter_sep_style);
+            // Gutter separator (or diagnostic marker)
+            if (wrap_row == 0) {
+                const has_diag = for (doc.diagnostics.items) |*d| {
+                    if (d.start_line <= line_idx and d.end_line >= line_idx) break d;
+                } else null;
+                if (has_diag) |diag| {
+                    const diag_fg: Color = switch (diag.severity) {
+                        .err => .{ .rgb = .{ 0xE0, 0x40, 0x40 } },
+                        .warning => .{ .rgb = .{ 0xE0, 0xC0, 0x40 } },
+                        .information => .{ .rgb = .{ 0x40, 0xA0, 0xE0 } },
+                        .hint => .{ .rgb = .{ 0x80, 0x80, 0xA0 } },
+                    };
+                    _ = writeStr(win, gutter_width, y, "!", .{ .fg = diag_fg, .bg = bg });
+                } else {
+                    _ = writeStr(win, gutter_width, y, " ", gutter_sep_style);
+                }
+            } else {
+                _ = writeStr(win, gutter_width, y, " ", gutter_sep_style);
+            }
 
             // Text content for this row
             if (text_start_x < width) {
@@ -698,35 +757,117 @@ fn drawContent(win: Window, doc: *Document, editor: *Editor, width: u16, height:
                         .height = 1,
                     });
 
-                    // Check if any part of this segment is selected
+                    // Compute selection range for this segment (if any)
+                    var sel_begin: usize = 0;
+                    var sel_end_local: usize = 0;
+                    var has_sel = false;
                     if (sel) |s| {
                         const line_start_offset = doc.buffer.posToOffset(line_idx, 0);
                         const abs_seg_start = line_start_offset + segment_start;
                         const abs_seg_end = line_start_offset + segment_end;
-
                         if (s.start < abs_seg_end and s.end > abs_seg_start) {
-                            // Map selection to segment-local byte offsets
-                            const sel_begin = if (s.start > abs_seg_start) s.start - abs_seg_start else 0;
-                            const sel_end_local = if (s.end < abs_seg_end) s.end - abs_seg_start else segment.len;
+                            sel_begin = if (s.start > abs_seg_start) s.start - abs_seg_start else 0;
+                            sel_end_local = if (s.end < abs_seg_end) s.end - abs_seg_start else segment.len;
+                            has_sel = true;
+                        }
+                    }
 
-                            var col: u16 = 0;
-                            if (sel_begin > 0) {
-                                col = @intCast(@min(displayWidth(segment[0..sel_begin]), text_width));
-                                _ = writeStr(text_win, 0, 0, segment[0..sel_begin], text_style);
+                    if (span_count > 0) {
+                        // Syntax-highlighted rendering with selection support
+                        const syn_theme = editor.tuiSyntaxThemeFor(if (doc.language) |l| l.name else null);
+                        var col: u16 = 0;
+                        var seg_pos: usize = 0;
+
+                        for (0..span_count) |si| {
+                            const sp_start: usize = span_buf[si].start;
+                            const sp_end: usize = span_buf[si].end;
+                            // Map span to segment-local offsets
+                            if (sp_end <= segment_start or sp_start >= segment_end) continue;
+                            const vis_start = if (sp_start > segment_start) sp_start - segment_start else 0;
+                            const vis_end = if (sp_end < segment_end) sp_end - segment_start else segment.len;
+
+                            // Gap before span → default style (or selection)
+                            if (vis_start > seg_pos) {
+                                const gap = segment[seg_pos..vis_start];
+                                const gap_style = if (has_sel and seg_pos < sel_end_local and vis_start > sel_begin)
+                                    sel_style
+                                else
+                                    text_style;
+                                col = writeStr(text_win, col, 0, gap, gap_style);
                             }
-                            if (sel_end_local > sel_begin) {
-                                const sel_w: u16 = @intCast(@min(displayWidth(segment[sel_begin..sel_end_local]), text_width -| col));
-                                _ = writeStr(text_win, col, 0, segment[sel_begin..sel_end_local], sel_style);
-                                col +|= sel_w;
+
+                            // Span → syntax color (selection overrides)
+                            if (vis_end > vis_start) {
+                                const span_text = segment[vis_start..vis_end];
+                                // If fully inside selection, use sel_style; otherwise syntax color
+                                if (has_sel and vis_start >= sel_begin and vis_end <= sel_end_local) {
+                                    col = writeStr(text_win, col, 0, span_text, sel_style);
+                                } else if (has_sel and vis_start < sel_end_local and vis_end > sel_begin) {
+                                    // Partial overlap — split into pre-sel, sel, post-sel
+                                    const pre_end = @max(vis_start, sel_begin);
+                                    const post_start = @min(vis_end, sel_end_local);
+                                    const token_fg = syn_theme.colorForToken(span_buf[si].token);
+                                    const syn_style: Style = .{ .fg = if (token_fg) |tc| toVaxis(tc) else text_style.fg, .bg = bg };
+                                    if (pre_end > vis_start) col = writeStr(text_win, col, 0, span_text[0 .. pre_end - vis_start], syn_style);
+                                    if (post_start > pre_end) col = writeStr(text_win, col, 0, span_text[pre_end - vis_start .. post_start - vis_start], sel_style);
+                                    if (vis_end > post_start) col = writeStr(text_win, col, 0, span_text[post_start - vis_start ..], syn_style);
+                                } else {
+                                    const token_fg = syn_theme.colorForToken(span_buf[si].token);
+                                    const syn_style: Style = .{ .fg = if (token_fg) |tc| toVaxis(tc) else text_style.fg, .bg = bg };
+                                    col = writeStr(text_win, col, 0, span_text, syn_style);
+                                }
                             }
-                            if (sel_end_local < segment.len) {
-                                _ = writeStr(text_win, col, 0, segment[sel_end_local..], text_style);
-                            }
-                        } else {
-                            _ = writeStr(text_win, 0, 0, segment, text_style);
+                            if (vis_end > seg_pos) seg_pos = vis_end;
+                        }
+
+                        // Trailing text after last span
+                        if (seg_pos < segment.len) {
+                            const trail = segment[seg_pos..];
+                            const trail_style = if (has_sel and seg_pos < sel_end_local) sel_style else text_style;
+                            _ = writeStr(text_win, col, 0, trail, trail_style);
+                        }
+                    } else if (has_sel) {
+                        // No syntax highlighting, but has selection
+                        var col: u16 = 0;
+                        if (sel_begin > 0) {
+                            col = @intCast(@min(displayWidth(segment[0..sel_begin]), text_width));
+                            _ = writeStr(text_win, 0, 0, segment[0..sel_begin], text_style);
+                        }
+                        if (sel_end_local > sel_begin) {
+                            const sel_w: u16 = @intCast(@min(displayWidth(segment[sel_begin..sel_end_local]), text_width -| col));
+                            _ = writeStr(text_win, col, 0, segment[sel_begin..sel_end_local], sel_style);
+                            col +|= sel_w;
+                        }
+                        if (sel_end_local < segment.len) {
+                            _ = writeStr(text_win, col, 0, segment[sel_end_local..], text_style);
                         }
                     } else {
                         _ = writeStr(text_win, 0, 0, segment, text_style);
+                    }
+                }
+            }
+
+            // Apply diagnostic underlines to rendered text cells
+            for (doc.diagnostics.items) |*diag| {
+                if (diag.start_line == line_idx and wrap_row == 0) {
+                    const visible_start_offset: usize = if (do_wrap) row_start else doc.scroll_left;
+                    const ul_start = if (diag.start_col >= visible_start_offset) diag.start_col - @as(u32, @intCast(visible_start_offset)) else 0;
+                    const ul_end_col = if (diag.end_line == line_idx) diag.end_col else @as(u32, @intCast(line.len));
+                    const ul_end = if (ul_end_col >= visible_start_offset) ul_end_col - @as(u32, @intCast(visible_start_offset)) else 0;
+                    const diag_fg: Color = switch (diag.severity) {
+                        .err => .{ .rgb = .{ 0xE0, 0x40, 0x40 } },
+                        .warning => .{ .rgb = .{ 0xE0, 0xC0, 0x40 } },
+                        .information => .{ .rgb = .{ 0x40, 0xA0, 0xE0 } },
+                        .hint => .{ .rgb = .{ 0x80, 0x80, 0xA0 } },
+                    };
+                    var cx: u16 = @intCast(@min(ul_start, text_width));
+                    while (cx < @min(ul_end, text_width)) : (cx += 1) {
+                        if (win.readCell(text_start_x + cx, y)) |cell| {
+                            var new_cell = cell;
+                            new_cell.style.ul = diag_fg;
+                            new_cell.style.ul_style = .single;
+                            win.writeCell(text_start_x + cx, y, new_cell);
+                        }
                     }
                 }
             }
@@ -807,7 +948,7 @@ fn drawStatusBar(win: Window, editor: *Editor, width: u16) void {
     // Fill background
     win.fill(.{ .style = style });
 
-    const doc = editor.activeDocConst();
+    const doc = editor.activeDoc();
     const pos = doc.cursorPos();
 
     // Left side: " filename [+]" — use writeStr for formatted parts
@@ -817,6 +958,24 @@ fn drawStatusBar(win: Window, editor: *Editor, width: u16) void {
     x +|= @intCast(@min(doc.display_name.len, width -| x));
     if (doc.dirty) {
         _ = writeStr(win, x, 0, " [+]", style);
+    }
+
+    // Center: diagnostic message for cursor line
+    for (doc.diagnostics.items) |*diag| {
+        if (diag.start_line <= pos.line and diag.end_line >= pos.line) {
+            const diag_fg: Color = switch (diag.severity) {
+                .err => .{ .rgb = .{ 0xE0, 0x40, 0x40 } },
+                .warning => .{ .rgb = .{ 0xE0, 0xC0, 0x40 } },
+                .information => .{ .rgb = .{ 0x40, 0xA0, 0xE0 } },
+                .hint => .{ .rgb = .{ 0x80, 0x80, 0xA0 } },
+            };
+            const diag_style: Style = .{ .fg = diag_fg, .bg = style.bg };
+            const max_len = width / 2;
+            const msg_len: u16 = @intCast(@min(diag.message.len, max_len));
+            const center_x = (width -| msg_len) / 2;
+            _ = writeStr(win, center_x, 0, diag.message[0..msg_len], diag_style);
+            break;
+        }
     }
 
     // Right side: cursor position — use writeStr (stack buffer)
@@ -844,7 +1003,7 @@ fn lineNumberWidth(total_lines: usize) u16 {
 
 /// Position the real terminal cursor at the editor cursor location.
 fn positionCursor(win: Window, editor: *Editor, width: u16, height: u16) void {
-    const doc = editor.activeDocConst();
+    const doc = editor.activeDoc();
     const pos = doc.cursorPos();
 
     const tab_bar_height: u16 = if (editor.docCount() > 1) 1 else 0;
@@ -893,8 +1052,8 @@ fn positionCursor(win: Window, editor: *Editor, width: u16, height: u16) void {
 
 /// Convert a screen position (x, y) in the editor area to a buffer offset.
 /// Returns null if the position is outside the editor content area.
-fn screenToOffset(editor: *const Editor, screen_x: i16, screen_y: i16) ?usize {
-    const doc = editor.activeDocConst();
+fn screenToOffset(editor: *Editor, screen_x: i16, screen_y: i16) ?usize {
+    const doc = editor.activeDoc();
     const total_lines = doc.lineCount();
     const tab_bar_height: i16 = if (editor.docCount() > 1) 1 else 0;
     const gutter_width = lineNumberWidth(total_lines);
@@ -1279,6 +1438,92 @@ fn fuzzyMatch(haystack: []const u8, needle: []const u8) bool {
     return true;
 }
 
+/// Draw the completion popup near the cursor position.
+fn drawCompletionPopup(win: Window, editor: *Editor, width: u16, height: u16) void {
+    if (!editor.completion_active) return;
+    const items = editor.completion_items.items;
+    if (items.len == 0) return;
+
+    const max_visible: u16 = @min(@as(u16, @intCast(items.len)), @min(height / 3, 10));
+    if (max_visible == 0) return;
+
+    // Calculate popup position relative to cursor
+    const doc = editor.activeDoc();
+    const cursor = doc.cursors.primaryConst();
+    const cursor_pos = doc.buffer.offsetToPos(cursor.offset);
+
+    // Gutter width
+    const line_count = doc.lineCount();
+    var digits: u16 = 1;
+    {
+        var n = line_count;
+        while (n >= 10) : (digits += 1) n /= 10;
+    }
+    const gutter_w: u16 = digits + 2;
+
+    // Cursor screen position (approximate — does not account for scroll offset perfectly)
+    const cursor_screen_col: u16 = gutter_w + @as(u16, @intCast(@min(cursor_pos.col, width -| gutter_w -| 1)));
+    const cursor_screen_row: u16 = blk: {
+        const cl = cursor_pos.line;
+        const sv = doc.scroll_top;
+        if (cl < sv) break :blk 1; // tab bar row
+        const row = @as(u16, @intCast(@min(cl - sv, height -| 3)));
+        break :blk row + 1; // +1 for tab bar
+    };
+
+    // Position popup below cursor, or above if near bottom
+    const popup_width: u16 = @min(width -| 2, 40);
+    var popup_x: u16 = @min(cursor_screen_col, width -| popup_width);
+    _ = &popup_x;
+    var popup_y: u16 = cursor_screen_row + 1;
+    if (popup_y + max_visible >= height -| 1) {
+        // Not enough space below — show above cursor
+        popup_y = cursor_screen_row -| max_visible;
+    }
+
+    const item_style: Style = .{ .bg = toVaxis(editor.tui_theme.overlay_bg), .fg = toVaxis(editor.tui_theme.overlay_fg) };
+    const selected_style: Style = .{ .bg = toVaxis(editor.tui_theme.overlay_selection_bg), .fg = toVaxis(editor.tui_theme.overlay_selection_fg), .bold = true, .reverse = true };
+
+    // Scroll the completion list if selected item is past visible range
+    const scroll_off: usize = if (editor.completion_selected >= max_visible)
+        editor.completion_selected - max_visible + 1
+    else
+        0;
+
+    var row: u16 = 0;
+    while (row < max_visible) : (row += 1) {
+        const idx = scroll_off + row;
+        if (idx >= items.len) break;
+        const item = items[idx];
+        const is_selected = idx == editor.completion_selected;
+        const style = if (is_selected) selected_style else item_style;
+
+        const row_win = win.child(.{
+            .x_off = popup_x,
+            .y_off = popup_y + row,
+            .width = popup_width,
+            .height = 1,
+        });
+        row_win.fill(.{ .style = style });
+        _ = row_win.printSegment(.{ .text = " ", .style = style }, .{ .wrap = .none });
+        const label_win = row_win.child(.{ .x_off = 1, .width = popup_width -| 1 });
+        _ = label_win.printSegment(.{ .text = item.label, .style = style }, .{ .wrap = .none });
+
+        // Show detail if present (right-aligned or after label)
+        if (item.detail) |detail| {
+            if (detail.len > 0 and detail.len + item.label.len + 3 < popup_width) {
+                const detail_x: u16 = @intCast(item.label.len + 2);
+                const dim_style: Style = .{
+                    .bg = style.bg,
+                    .fg = toVaxis(editor.tui_theme.overlay_dim),
+                };
+                const detail_win = row_win.child(.{ .x_off = detail_x + 1, .width = popup_width -| detail_x -| 1 });
+                _ = detail_win.printSegment(.{ .text = detail, .style = dim_style }, .{ .wrap = .none });
+            }
+        }
+    }
+}
+
 // ===========================================================================
 // Overlay key handlers
 // ===========================================================================
@@ -1622,6 +1867,7 @@ fn handleSaveAsKey(editor: *Editor, key: Key) void {
             editor.activeDoc().saveAs(path) catch {
                 editor.status_message = "Save failed";
             };
+            editor.activeDoc().detectLanguage(editor);
         }
         editor.mode = .normal;
         return;
@@ -1713,5 +1959,37 @@ fn handleGotoLineKey(editor: *Editor, key: Key) void {
             editor.goto_buf[editor.goto_buf_len] = @intCast(key.codepoint);
             editor.goto_buf_len += 1;
         }
+    }
+}
+
+/// Handle keys when the completion popup is active.
+fn handleCompletionKey(editor: *Editor, key: Key) void {
+    if (key.isModifier()) return;
+
+    const item_count = editor.completion_items.items.len;
+    switch (key.codepoint) {
+        Key.escape => {
+            editor.clearCompletionItems();
+        },
+        Key.enter, Key.tab => {
+            editor.acceptCompletion();
+        },
+        Key.up => {
+            if (editor.completion_selected > 0) {
+                editor.completion_selected -= 1;
+            } else if (item_count > 0) {
+                editor.completion_selected = item_count - 1;
+            }
+        },
+        Key.down => {
+            if (item_count > 0) {
+                editor.completion_selected = (editor.completion_selected + 1) % item_count;
+            }
+        },
+        else => {
+            // Any other key dismisses completion and passes through to normal handler
+            editor.clearCompletionItems();
+            handleKey(editor, key);
+        },
     }
 }

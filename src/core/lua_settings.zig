@@ -3,6 +3,7 @@ const zlua = @import("zlua");
 const Editor = @import("editor.zig").Editor;
 const theme_mod = @import("theme.zig");
 const ThemeColor = theme_mod.ThemeColor;
+const syntax = @import("syntax.zig");
 
 const Lua = zlua.Lua;
 
@@ -38,6 +39,14 @@ pub fn registerApi(lua: *Lua, editor: *Editor) void {
     // zide.unbind
     lua.pushFunction(&luaUnbind);
     lua.setField(-2, "unbind");
+
+    // zide.register_language
+    lua.pushFunction(&luaRegisterLanguage);
+    lua.setField(-2, "register_language");
+
+    // zide.register_lsp
+    lua.pushFunction(&luaRegisterLsp);
+    lua.setField(-2, "register_lsp");
 
     // Set as global
     lua.setGlobal("zide");
@@ -392,12 +401,15 @@ fn luaSet(state: ?*zlua.LuaState) callconv(.c) c_int {
         const val_str: []const u8 = val;
         if (std.mem.eql(u8, val_str, "dark")) {
             editor.theme = theme_mod.gui_dark;
+            editor.syntax_theme = theme_mod.syn_gui_dark;
             editor.theme_name = "dark";
         } else if (std.mem.eql(u8, val_str, "light")) {
             editor.theme = theme_mod.gui_light;
+            editor.syntax_theme = theme_mod.syn_gui_light;
             editor.theme_name = "light";
         } else if (std.mem.eql(u8, val_str, "high_contrast")) {
             editor.theme = theme_mod.gui_high_contrast;
+            editor.syntax_theme = theme_mod.syn_gui_high_contrast;
             editor.theme_name = "high_contrast";
         } else {
             std.log.warn("zide.set: unknown theme '{s}'", .{val_str});
@@ -408,15 +420,19 @@ fn luaSet(state: ?*zlua.LuaState) callconv(.c) c_int {
         const val_str: []const u8 = val;
         if (std.mem.eql(u8, val_str, "terminal")) {
             editor.tui_theme = theme_mod.tui_terminal;
+            editor.tui_syntax_theme = theme_mod.syn_tui_terminal;
             editor.tui_theme_name = "terminal";
         } else if (std.mem.eql(u8, val_str, "dark")) {
             editor.tui_theme = theme_mod.tui_dark;
+            editor.tui_syntax_theme = theme_mod.syn_tui_dark;
             editor.tui_theme_name = "dark";
         } else if (std.mem.eql(u8, val_str, "light")) {
             editor.tui_theme = theme_mod.tui_light;
+            editor.tui_syntax_theme = theme_mod.syn_tui_light;
             editor.tui_theme_name = "light";
         } else if (std.mem.eql(u8, val_str, "high_contrast")) {
             editor.tui_theme = theme_mod.tui_high_contrast;
+            editor.tui_syntax_theme = theme_mod.syn_tui_high_contrast;
             editor.tui_theme_name = "high_contrast";
         } else {
             std.log.warn("zide.set: unknown tui_theme '{s}'", .{val_str});
@@ -446,6 +462,27 @@ fn luaSet(state: ?*zlua.LuaState) callconv(.c) c_int {
             } else {
                 editor.tui_theme_name = "custom";
             }
+        } else {
+            std.log.warn("zide.set: invalid hex color '{s}'", .{val_str});
+        }
+    } else if (std.mem.startsWith(u8, key_str, "syn_")) {
+        // zide.set("syn_keyword", "#c678dd") — override syntax theme color (GUI + TUI)
+        const val = lua.toString(2) catch return 0;
+        const val_str: []const u8 = val;
+        const field_name = key_str["syn_".len..];
+        if (ThemeColor.fromHex(val_str)) |color| {
+            _ = theme_mod.setSyntaxColor(&editor.syntax_theme, field_name, color);
+            _ = theme_mod.setTuiSyntaxColor(&editor.tui_syntax_theme, field_name, color);
+        } else {
+            std.log.warn("zide.set: invalid hex color '{s}'", .{val_str});
+        }
+    } else if (std.mem.startsWith(u8, key_str, "tui_syn_")) {
+        // zide.set("tui_syn_keyword", "#c678dd") — override TUI syntax color only
+        const val = lua.toString(2) catch return 0;
+        const val_str: []const u8 = val;
+        const field_name = key_str["tui_syn_".len..];
+        if (ThemeColor.fromHex(val_str)) |color| {
+            _ = theme_mod.setTuiSyntaxColor(&editor.tui_syntax_theme, field_name, color);
         } else {
             std.log.warn("zide.set: invalid hex color '{s}'", .{val_str});
         }
@@ -536,4 +573,295 @@ fn luaUnbind(state: ?*zlua.LuaState) callconv(.c) c_int {
     editor.keybinds.remove(key_str);
 
     return 0;
+}
+
+// ---------------------------------------------------------------------------
+// zide.register_language(table) — register a language from Lua
+// ---------------------------------------------------------------------------
+
+/// zide.register_language({ name="python", extensions={"py","pyw"}, keywords={...}, ... })
+fn luaRegisterLanguage(state: ?*zlua.LuaState) callconv(.c) c_int {
+    var lua: *Lua = @ptrCast(@alignCast(state orelse return 0));
+    const editor = getEditor(state) orelse return 0;
+
+    // Argument must be a table at stack position 1
+    if (lua.typeOf(1) != .table) {
+        std.log.err("zide.register_language: argument must be a table", .{});
+        return 0;
+    }
+
+    var arena = std.heap.ArenaAllocator.init(editor.allocator);
+    const alloc = arena.allocator();
+
+    // Read fields from the Lua table
+    const name = readTableString(lua, alloc, "name") orelse {
+        std.log.err("zide.register_language: 'name' field required", .{});
+        arena.deinit();
+        return 0;
+    };
+
+    const lang = syntax.LanguageDef{
+        .name = name,
+        .extensions = readTableStringArray(lua, alloc, "extensions"),
+        .keywords = readTableStringArray(lua, alloc, "keywords"),
+        .types = readTableStringArray(lua, alloc, "types"),
+        .constants = readTableStringArray(lua, alloc, "constants"),
+        .builtins = readTableStringArray(lua, alloc, "builtins"),
+        .line_comment = readTableString(lua, alloc, "line_comment"),
+        .block_comment_start = readTableString(lua, alloc, "block_comment_start"),
+        .block_comment_end = readTableString(lua, alloc, "block_comment_end"),
+        .string_delimiters = readTableString(lua, alloc, "string_delimiters") orelse "\"",
+        .has_char_literals = readTableBool(lua, "has_char_literals"),
+        .builtin_prefix = readTableChar(lua, "builtin_prefix"),
+        .preproc_prefix = readTableChar(lua, "preproc_prefix"),
+        .arena = arena,
+    };
+
+    editor.languages.append(editor.allocator, lang) catch {
+        std.log.err("zide.register_language: failed to register '{s}'", .{name});
+        return 0;
+    };
+
+    std.log.info("Registered language: {s}", .{name});
+    return 0;
+}
+
+/// Register an LSP server for a language.
+/// Usage: zide.register_lsp({ language = "Python", command = "pyright-langserver" })
+fn luaRegisterLsp(state: ?*zlua.LuaState) callconv(.c) c_int {
+    var lua: *Lua = @ptrCast(@alignCast(state orelse return 0));
+    const editor = getEditor(state) orelse return 0;
+
+    // Argument must be a table at stack position 1
+    if (lua.typeOf(1) != .table) {
+        std.log.err("zide.register_lsp: argument must be a table", .{});
+        return 0;
+    }
+
+    const language = blk: {
+        _ = lua.getField(1, "language");
+        defer lua.pop(1);
+        const s = lua.toString(-1) catch {
+            std.log.err("zide.register_lsp: 'language' field required", .{});
+            return 0;
+        };
+        break :blk editor.allocator.dupe(u8, s) catch return 0;
+    };
+
+    const command = blk: {
+        _ = lua.getField(1, "command");
+        defer lua.pop(1);
+        const s = lua.toString(-1) catch {
+            std.log.err("zide.register_lsp: 'command' field required", .{});
+            editor.allocator.free(language);
+            return 0;
+        };
+        break :blk editor.allocator.dupe(u8, s) catch {
+            editor.allocator.free(language);
+            return 0;
+        };
+    };
+
+    editor.lsp_configs.append(editor.allocator, .{
+        .language = language,
+        .command = command,
+    }) catch {
+        editor.allocator.free(language);
+        editor.allocator.free(command);
+        return 0;
+    };
+
+    std.log.info("Registered LSP: {s} -> {s}", .{ language, command });
+    return 0;
+}
+
+/// Read a string field from the Lua table at stack position 1.
+fn readTableString(lua: *Lua, alloc: std.mem.Allocator, field: [:0]const u8) ?[]const u8 {
+    _ = lua.getField(1, field);
+    defer lua.pop(1);
+    const s = lua.toString(-1) catch return null;
+    const str: []const u8 = s;
+    if (str.len == 0) return null;
+    return alloc.dupe(u8, str) catch null;
+}
+
+/// Read a string array field from the Lua table at stack position 1.
+fn readTableStringArray(lua: *Lua, alloc: std.mem.Allocator, field: [:0]const u8) []const []const u8 {
+    _ = lua.getField(1, field);
+    defer lua.pop(1);
+    if (lua.typeOf(-1) != .table) return &.{};
+
+    const len = lua.rawLen(-1);
+    if (len == 0) return &.{};
+
+    var list = std.ArrayList([]const u8).initCapacity(alloc, len) catch return &.{};
+    var i: usize = 1;
+    while (i <= len) : (i += 1) {
+        _ = lua.rawGetIndex(-1, @intCast(i));
+        const s = lua.toString(-1) catch {
+            lua.pop(1);
+            continue;
+        };
+        const str: []const u8 = s;
+        if (alloc.dupe(u8, str)) |duped| {
+            list.append(alloc, duped) catch {};
+        } else |_| {}
+        lua.pop(1);
+    }
+    return list.items;
+}
+
+/// Read a boolean field from the Lua table at stack position 1.
+fn readTableBool(lua: *Lua, field: [:0]const u8) bool {
+    _ = lua.getField(1, field);
+    defer lua.pop(1);
+    return lua.toBoolean(-1);
+}
+
+/// Read a single-character field from the Lua table at stack position 1.
+fn readTableChar(lua: *Lua, field: [:0]const u8) ?u8 {
+    _ = lua.getField(1, field);
+    defer lua.pop(1);
+    const s = lua.toString(-1) catch return null;
+    const str: []const u8 = s;
+    if (str.len == 1) return str[0];
+    return null;
+}
+
+// ---------------------------------------------------------------------------
+// Extension and syntax theme loading
+// ---------------------------------------------------------------------------
+
+/// Load extension files from ~/.config/zide/extensions/*.lua.
+/// Each file should call zide.register_language({...}) to add language support.
+pub fn loadExtensions(lua: *Lua) void {
+    const dir = getConfigDir() orelse return;
+    var ext_buf: [512]u8 = undefined;
+    const ext_path = std.fmt.bufPrint(&ext_buf, "{s}/extensions", .{dir}) catch return;
+
+    var iter_dir = std.fs.cwd().openDir(ext_path, .{ .iterate = true }) catch return;
+    defer iter_dir.close();
+
+    var iter = iter_dir.iterate();
+    while (iter.next() catch null) |entry| {
+        if (entry.kind != .file) continue;
+        if (!std.mem.endsWith(u8, entry.name, ".lua")) continue;
+
+        var path_buf: [512]u8 = undefined;
+        const full_path = std.fmt.bufPrint(&path_buf, "{s}/extensions/{s}", .{ dir, entry.name }) catch continue;
+        if (full_path.len < path_buf.len) {
+            path_buf[full_path.len] = 0;
+            const z_path: [:0]const u8 = path_buf[0..full_path.len :0];
+            lua.doFile(z_path) catch |err| {
+                std.log.err("Error loading extension {s}: {}", .{ entry.name, err });
+                continue;
+            };
+            std.log.info("Loaded extension: {s}", .{entry.name});
+        }
+    }
+}
+
+/// Load the global syntax theme from ~/.config/zide/themes/syntax-theme.lua.
+/// Creates a commented template on first run.
+pub fn loadSyntaxTheme(lua: *Lua) void {
+    const dir = getConfigDir() orelse return;
+    var path_buf: [512]u8 = undefined;
+    const path = std.fmt.bufPrint(&path_buf, "{s}/themes/syntax-theme.lua", .{dir}) catch return;
+    if (path.len >= path_buf.len) return;
+    path_buf[path.len] = 0;
+    const z_path: [:0]const u8 = path_buf[0..path.len :0];
+
+    createSyntaxThemeTemplate(z_path);
+
+    if (std.fs.cwd().access(z_path, .{})) |_| {
+        lua.doFile(z_path) catch |err| {
+            std.log.err("Error loading syntax-theme.lua: {}", .{err});
+        };
+    } else |_| {}
+}
+
+/// Load per-language syntax theme files from ~/.config/zide/themes/syn_theme_*.lua.
+pub fn loadLangSyntaxThemes(lua: *Lua) void {
+    const editor = blk: {
+        var l = lua;
+        _ = l.getField(zlua.registry_index, EDITOR_KEY);
+        const e = l.toUserdata(Editor, -1) catch {
+            l.pop(1);
+            break :blk null;
+        };
+        l.pop(1);
+        break :blk e;
+    } orelse return;
+    _ = editor;
+
+    const dir = getConfigDir() orelse return;
+    var themes_buf: [512]u8 = undefined;
+    const themes_path = std.fmt.bufPrint(&themes_buf, "{s}/themes", .{dir}) catch return;
+
+    var iter_dir = std.fs.cwd().openDir(themes_path, .{ .iterate = true }) catch return;
+    defer iter_dir.close();
+
+    var iter = iter_dir.iterate();
+    while (iter.next() catch null) |entry| {
+        if (entry.kind != .file) continue;
+        if (!std.mem.startsWith(u8, entry.name, "syn_theme_")) continue;
+        if (!std.mem.endsWith(u8, entry.name, ".lua")) continue;
+
+        var path_buf: [512]u8 = undefined;
+        const full_path = std.fmt.bufPrint(&path_buf, "{s}/themes/{s}", .{ dir, entry.name }) catch continue;
+        if (full_path.len < path_buf.len) {
+            path_buf[full_path.len] = 0;
+            const z_path: [:0]const u8 = path_buf[0..full_path.len :0];
+
+            // Extract language name: syn_theme_<name>.lua → <name>
+            const prefix_len = "syn_theme_".len;
+            const suffix_len = ".lua".len;
+            if (entry.name.len <= prefix_len + suffix_len) continue;
+            const lang_name = entry.name[prefix_len .. entry.name.len - suffix_len];
+
+            // Set a temporary global so zide.set("syn_*") routes to per-language override
+            _ = lua.pushString(lang_name);
+            lua.setField(zlua.registry_index, "_zide_syn_lang");
+
+            lua.doFile(z_path) catch |err| {
+                std.log.err("Error loading {s}: {}", .{ entry.name, err });
+            };
+
+            // Clear the temporary lang context
+            lua.pushNil();
+            lua.setField(zlua.registry_index, "_zide_syn_lang");
+
+            std.log.info("Loaded syntax theme: {s}", .{entry.name});
+        }
+    }
+}
+
+/// Create syntax-theme.lua template with commented defaults if the file doesn't exist.
+fn createSyntaxThemeTemplate(path: [:0]const u8) void {
+    if (std.fs.cwd().access(path, .{})) |_| return else |_| {}
+    const f = std.fs.cwd().createFile(path, .{}) catch return;
+    defer f.close();
+    f.writeAll(
+        \\-- ZIDE Syntax Theme
+        \\-- Colors use #RRGGBB format.
+        \\-- Uncomment and edit the colors you want to change.
+        \\-- These apply to ALL languages (use syn_theme_<lang>.lua for per-language overrides).
+        \\--
+        \\-- Default values shown are from the "dark" syntax theme.
+        \\
+        \\-- zide.set("syn_keyword", "#c678dd")       -- Keywords (pub, fn, const, if, etc.)
+        \\-- zide.set("syn_type_name", "#56b6c2")     -- Type names (u32, bool, void, etc.)
+        \\-- zide.set("syn_string", "#98c379")         -- String literals ("...")
+        \\-- zide.set("syn_char_literal", "#98c379")   -- Character literals ('a')
+        \\-- zide.set("syn_number", "#d19a66")         -- Number literals (42, 0xff)
+        \\-- zide.set("syn_comment", "#5c6370")        -- Comments (// ...)
+        \\-- zide.set("syn_function", "#61afef")       -- Function calls (foo(...))
+        \\-- zide.set("syn_builtin", "#e5c07b")        -- Builtins (@import, etc.)
+        \\-- zide.set("syn_constant", "#d19a66")       -- Constants (true, false, null)
+        \\-- zide.set("syn_operator", "#e1e1e6")       -- Operators (+, -, =, etc.)
+        \\-- zide.set("syn_punctuation", "#abb2bf")    -- Punctuation ({, }, ;, etc.)
+        \\-- zide.set("syn_preprocessor", "#be84d2")   -- Preprocessor (#include, etc.)
+        \\-- zide.set("syn_attribute", "#e5c07b")      -- Attributes / decorators
+        \\
+    ) catch {};
 }
