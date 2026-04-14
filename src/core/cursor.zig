@@ -248,21 +248,32 @@ pub const CursorSet = struct {
     /// Merge cursors that ended up at the same offset. Keeps primary (index 0) if duplicated.
     pub fn mergeCursors(self: *CursorSet) void {
         if (self.cursors.items.len <= 1) return;
-        var i: usize = 1;
-        while (i < self.cursors.items.len) {
-            var dup = false;
-            for (self.cursors.items[0..i]) |existing| {
-                if (self.cursors.items[i].offset == existing.offset) {
-                    dup = true;
-                    break;
+        // Sort secondary cursors (index 1+) by offset for O(n log n) dedup
+        if (self.cursors.items.len > 2) {
+            std.mem.sort(Cursor, self.cursors.items[1..], {}, struct {
+                fn lessThan(_: void, a: Cursor, b: Cursor) bool {
+                    return a.offset < b.offset;
                 }
-            }
-            if (dup) {
-                _ = self.cursors.orderedRemove(i);
-            } else {
-                i += 1;
-            }
+            }.lessThan);
         }
+        // Linear scan: remove duplicates (same offset as primary or as previous cursor)
+        const primary_offset = self.cursors.items[0].offset;
+        var write: usize = 1;
+        var prev_offset: usize = self.cursors.items[1].offset;
+        const is_first_dup = (prev_offset == primary_offset);
+        if (!is_first_dup) {
+            write = 2;
+        }
+        var read: usize = 2;
+        while (read < self.cursors.items.len) : (read += 1) {
+            const cur_offset = self.cursors.items[read].offset;
+            if (cur_offset != prev_offset and cur_offset != primary_offset) {
+                self.cursors.items[write] = self.cursors.items[read];
+                write += 1;
+            }
+            prev_offset = cur_offset;
+        }
+        self.cursors.items.len = write;
     }
 
     /// Fill `buf` with cursor indices sorted by offset descending (highest first).

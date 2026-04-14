@@ -128,6 +128,7 @@ fn runGui(allocator: std.mem.Allocator, lua: *zlua.Lua, cli_files: []const []con
     if (lua_settings.loadConfig(lua)) {
         std.log.info("Loaded user config (init.lua)", .{});
     }
+    lua_settings.loadThemeFiles(lua);
 
     // Open CLI files, or show welcome text
     if (cli_files.len > 0) {
@@ -169,12 +170,9 @@ fn runGui(allocator: std.mem.Allocator, lua: *zlua.Lua, cli_files: []const []con
     });
     defer backend.deinit();
 
-    // Init DVUI window
+    // Init DVUI window with custom theme matching editor theme preset
     var win = try dvui.Window.init(@src(), allocator, backend.backend(), .{
-        .theme = switch (backend.preferredColorScheme() orelse .dark) {
-            .light => dvui.Theme.builtin.adwaita_light,
-            .dark => dvui.Theme.builtin.adwaita_dark,
-        },
+        .theme = gui.dvuiThemeForPreset(editor.theme_name),
     });
     defer win.deinit();
 
@@ -217,6 +215,7 @@ fn runTui(allocator: std.mem.Allocator, lua: *zlua.Lua, cli_files: []const []con
     if (lua_settings.loadConfig(lua)) {
         std.log.info("Loaded user config (init.lua)", .{});
     }
+    lua_settings.loadThemeFiles(lua);
 
     // Open CLI files, or show welcome text
     if (cli_files.len > 0) {

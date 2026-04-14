@@ -181,15 +181,18 @@ pub const Buffer = struct {
 
         // Insert new line starts
         if (new_lines.items.len > 0) {
-            // Find insertion point in line_starts
-            var insert_idx: usize = self.line_starts.items.len;
-            for (self.line_starts.items, 0..) |ls, i| {
-                if (ls > pos) {
-                    insert_idx = i;
-                    break;
+            // Binary search for insertion point in line_starts (sorted by offset)
+            var lo: usize = 0;
+            var hi: usize = self.line_starts.items.len;
+            while (lo < hi) {
+                const mid = lo + (hi - lo) / 2;
+                if (self.line_starts.items[mid] <= pos) {
+                    lo = mid + 1;
+                } else {
+                    hi = mid;
                 }
             }
-            self.line_starts.insertSlice(self.allocator, insert_idx, new_lines.items) catch {};
+            self.line_starts.insertSlice(self.allocator, lo, new_lines.items) catch {};
         }
     }
 

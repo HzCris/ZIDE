@@ -34,7 +34,10 @@
 | Ctrl+Home/End | Jump to file start/end |
 | Ctrl+Shift+Home/End | Select to file start/end |
 | Ctrl+W | Close tab |
+| Ctrl+Shift+W | Close pane |
 | Ctrl+Shift+S | Save As |
+| Alt+\ | Split pane vertically (side by side) |
+| Alt+Shift+\ | Split pane horizontally (top/bottom) |
 | Alt+Up/Down | Move line up/down |
 | Home | Smart home (first non-ws / col 0) |
 | End | End of line |
@@ -98,8 +101,11 @@ All Ctrl/Alt shortcuts are remappable via `~/.config/zide/init.lua`.
 - Unsaved changes prompt on quit (Save/Discard/Cancel)
 
 **Configuration:**
+- Config folder hierarchy: `~/.config/zide/` with `themes/` and `extensions/` subfolders
 - Lua settings file (`~/.config/zide/init.lua`)
-  - `zide.set(key, value)` — tab_width, use_tabs, word_wrap, auto_close_brackets, page_size, auto_save, auto_save_interval_ms, click_clears_cursors
+  - `zide.set(key, value)` — tab_width, use_tabs, word_wrap, auto_close_brackets, page_size, auto_save, auto_save_interval_ms, click_clears_cursors, max_undo_history
+  - `zide.set("tui_theme", name)` — switch TUI theme ("terminal", "dark", "light", "high_contrast")
+  - `zide.set("tui_color_*", "#hex")` — override individual TUI color (e.g. `tui_color_text_fg`)
   - `zide.get(key)` — read current settings
   - `zide.bind(key_combo, command)` — remap keybindings
   - `zide.unbind(key_combo)` — remove a keybinding
@@ -107,9 +113,14 @@ All Ctrl/Alt shortcuts are remappable via `~/.config/zide/init.lua`.
 - Auto-save (saves dirty documents with file paths after configurable interval, default 5s)
 - Application icon embedded in exe
 - Multiple cursor editing (Ctrl+Shift or Alt+Shift+Up/Down, Ctrl+D, Alt+click, Escape/click to clear)
+- Theme system: 3 built-in themes (dark, light, high-contrast)
+  - "terminal" mode (default): uses ANSI indices, respects terminal color scheme
+  - Named themes use direct RGB colors for a consistent look
+  - Custom overrides via `~/.config/zide/themes/tui-theme.lua` (auto-created with commented defaults on first run)
+  - 24 named TUI color fields across editor, gutter, tab bar, status bar, and overlay panels
 
 ### TUI — Not Yet Implemented
-- Theme system (Lua and however Windows wants to fight)
+- Syntax highlighting themes
 
 ---
 
@@ -140,15 +151,38 @@ All Ctrl/Alt shortcuts are remappable via `~/.config/zide/init.lua`.
 - Configurable line number gutter width (`zide.set("gutter_min_digits", N)` in init.lua, default 3)
 - Mouse selection: double-click selects word, triple-click selects line, drag extends by word/line accordingly, Shift+click extends selection, Alt+click adds cursor
 
-- Settings panel (Edit menu — visual editor for all settings, mouse-clickable, writes to init.lua)
-- Open Settings File (Edit menu — opens init.lua directly in the editor for power users)
+- Settings panel (Preferences menu — visual editor for all settings including theme, mouse-clickable, writes to init.lua)
+- Open Settings File (Preferences menu — opens init.lua directly in the editor for power users)
 - Tab character display (expands `\t` to spaces for rendering, cursor, selection, and wrapping)
 - Blinking caret (530ms cycle, resets on cursor movement)
 - Multiple cursor editing (Ctrl+Shift or Alt+Shift+Up/Down, Ctrl+D, Alt+click, Escape/click to clear)
+- Split panes: vertical (Alt+\) and horizontal (Alt+Shift+\) splits with draggable dividers
+  - Binary layout tree — nested splits supported (split a split)
+  - Click to focus pane, focused pane highlighted with border
+  - Close pane (Ctrl+Shift+W), navigate via command palette (`focus_next_pane`, `focus_prev_pane`)
+  - Each pane shows its own document independently, keyboard input goes to focused pane only
+  - Modal overlays (find/replace, palette, etc.) render in focused pane
+  - Split/close/focus commands available in View menu and command palette
+- Theme system: 3 built-in themes (dark, light, high-contrast) with custom DVUI themes
+  - `zide.set("theme", "dark")` / `"light"` / `"high_contrast"` — switch preset
+  - `zide.set("color_*", "#RRGGBB")` or `"#RRGGBBAA"` — override individual colors
+  - Custom overrides via `~/.config/zide/themes/gui-theme.lua`
+  - 18 named editor color fields: text, selection, cursor, gutter_bg, gutter_text, gutter_text_active, gutter_separator, wrap_marker, tilde, overlay_bg, overlay_fg, overlay_dim, overlay_warn, overlay_selection, overlay_hint, bool_true, bool_false, status_bg, status_fg
+- Menu bar reorganized:
+  - File: New, Open File, Save, Save As, Close Tab, Exit
+  - Edit: Undo, Redo, Cut, Copy, Paste, Select All, Find, Replace, Go to Line
+  - View: Command Palette, Next Tab, Prev Tab, Split Vertical, Split Horizontal, Close Pane
+  - Preferences: Settings, Open Settings File, Theme > (Dark / Light / High Contrast), Open Theme File, Open Theme Folder
+  - Help: Documentation, About ZIDE
+- Theme switcher: Preferences > Theme submenu switches themes live (updates editor + DVUI chrome, persists to init.lua)
+- Theme setting in Settings panel: cycleable enum (Enter/Space/Click cycles through dark/light/high_contrast)
+- Open Theme File: opens `~/.config/zide/themes/gui-theme.lua` in editor (creates commented template with per-field descriptions if missing)
+- Open Theme Folder: opens `~/.config/zide/themes/` in OS file explorer
+- Help > Documentation: opens Documentation.md in the editor
+- Tab bar styling: inactive tabs have visible borders and control-style background
 
 ### GUI — Not Yet Implemented
-- GUI block adjusting (Think how you can move the editor/terminal/filetree around in neovim/vs code)
-- Theme system (DVUI theme integration or Lua)
+- Syntax highlighting themes
 
 ---
 
@@ -166,6 +200,8 @@ All Ctrl/Alt shortcuts are remappable via `~/.config/zide/init.lua`.
 | `src/core/commands.zig` | Command registry and all built-in commands |
 | `src/core/editor.zig` | Editor state (documents, mode, settings) |
 | `src/core/keybind.zig` | Data-driven keybinding map |
+| `src/core/theme.zig` | Theme system (ThemeColor, EditorTheme, TuiTheme, presets) |
+| `src/core/layout.zig` | Split pane layout tree (binary tree of panes + splits) |
 | `src/core/clipboard.zig` | System clipboard (Win32 API, Linux wl-copy/xclip/xsel) |
 | `src/core/lua_settings.zig` | Lua settings bridge (zide.set/get/bind/unbind) |
 | `src/frontend/tui.zig` | TUI frontend (libvaxis) |
@@ -187,4 +223,9 @@ All editing actions go through named commands in `CommandRegistry`. Commands can
 - Command palette (fuzzy search)
 - Lua scripting: `zide.bind("ctrl+d", "delete_line")`
 
-40+ registered commands covering cursor movement, editing, selection, clipboard, and line operations. Additional "actions" (quit, save, find, find_replace, file_open, save_as, command_palette, goto_line, new_document, close_tab) are handled by the frontend but bindable via the keybind map.
+50+ registered commands covering cursor movement, editing, selection, clipboard, line operations, and theme switching. Theme commands: `theme_dark`, `theme_light`, `theme_high_contrast`, `theme_terminal` (set both frontends); `gui_theme_dark/light/high_contrast` (GUI only); `tui_theme_dark/light/high_contrast` (TUI only). Additional "actions" (quit, save, find, find_replace, file_open, save_as, command_palette, goto_line, new_document, close_tab) are handled by the frontend but bindable via the keybind map.
+
+### Performance
+- Undo history capped at 100 operations per document (configurable via `zide.set("max_undo_history", N)`, 0 = unlimited)
+- Command palette names cached (no per-frame allocation)
+- Delete operations record history before modifying buffer (single allocation instead of double-copy)

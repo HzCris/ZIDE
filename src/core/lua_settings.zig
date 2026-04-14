@@ -1,6 +1,8 @@
 const std = @import("std");
 const zlua = @import("zlua");
 const Editor = @import("editor.zig").Editor;
+const theme_mod = @import("theme.zig");
+const ThemeColor = theme_mod.ThemeColor;
 
 const Lua = zlua.Lua;
 
@@ -50,6 +52,153 @@ pub fn loadConfig(lua: *Lua) bool {
         return false;
     };
     return true;
+}
+
+/// Load optional theme override files after init.lua.
+/// Looks for ~/.config/zide/themes/gui-theme.lua and ~/.config/zide/themes/tui-theme.lua.
+/// Also ensures the folder hierarchy exists (themes/, extensions/).
+pub fn loadThemeFiles(lua: *Lua) void {
+    const dir = getConfigDir() orelse return;
+
+    // Ensure subdirectory hierarchy exists
+    var sub_buf: [512]u8 = undefined;
+    if (std.fmt.bufPrint(&sub_buf, "{s}/themes", .{dir})) |p| {
+        std.fs.cwd().makePath(p) catch {};
+    } else |_| {}
+    if (std.fmt.bufPrint(&sub_buf, "{s}/extensions", .{dir})) |p| {
+        std.fs.cwd().makePath(p) catch {};
+    } else |_| {}
+
+    // gui-theme.lua — create template if missing, then load
+    var gui_buf: [512]u8 = undefined;
+    if (std.fmt.bufPrint(&gui_buf, "{s}/themes/gui-theme.lua", .{dir})) |path| {
+        if (path.len < gui_buf.len) {
+            gui_buf[path.len] = 0;
+            const z_path: [:0]const u8 = gui_buf[0..path.len :0];
+            createGuiThemeTemplate(z_path);
+            if (std.fs.cwd().access(z_path, .{})) |_| {
+                lua.doFile(z_path) catch |err| {
+                    std.log.err("Error loading gui-theme.lua: {}", .{err});
+                };
+            } else |_| {}
+        }
+    } else |_| {}
+
+    // tui-theme.lua — create template if missing, then load
+    var tui_buf: [512]u8 = undefined;
+    if (std.fmt.bufPrint(&tui_buf, "{s}/themes/tui-theme.lua", .{dir})) |path| {
+        if (path.len < tui_buf.len) {
+            tui_buf[path.len] = 0;
+            const z_path: [:0]const u8 = tui_buf[0..path.len :0];
+            createTuiThemeTemplate(z_path);
+            if (std.fs.cwd().access(z_path, .{})) |_| {
+                lua.doFile(z_path) catch |err| {
+                    std.log.err("Error loading tui-theme.lua: {}", .{err});
+                };
+            } else |_| {}
+        }
+    } else |_| {}
+}
+
+/// Create gui-theme.lua template with commented defaults if the file doesn't exist.
+fn createGuiThemeTemplate(path: [:0]const u8) void {
+    if (std.fs.cwd().access(path, .{})) |_| return else |_| {}
+    const f = std.fs.cwd().createFile(path, .{}) catch return;
+    defer f.close();
+    f.writeAll(
+        \\-- ZIDE GUI Theme Overrides
+        \\-- Colors use #RRGGBB or #RRGGBBAA format.
+        \\-- Uncomment and edit the colors you want to change.
+        \\-- These are applied AFTER the base theme selected in Settings.
+        \\--
+        \\-- Default values shown are from the "dark" theme.
+        \\
+        \\-- === Editor text area ===
+        \\-- zide.set("color_text", "#e1e1e6")           -- Main editor text color
+        \\-- zide.set("color_selection", "#326098")       -- Selected text highlight
+        \\-- zide.set("color_cursor", "#93DDFA")          -- Cursor / caret color
+        \\
+        \\-- === Gutter (line numbers) ===
+        \\-- zide.set("color_gutter_bg", "#28283c")       -- Gutter background
+        \\-- zide.set("color_gutter_text", "#828282c8")   -- Inactive line numbers
+        \\-- zide.set("color_gutter_text_active", "#e1e1e6") -- Active line number
+        \\-- zide.set("color_gutter_separator", "#50505064") -- Gutter/editor border line
+        \\
+        \\-- === Decorations ===
+        \\-- zide.set("color_wrap_marker", "#64646496")   -- Soft-wrap continuation dot
+        \\-- zide.set("color_tilde", "#64646480")         -- Tilde (~) past end of file
+        \\
+        \\-- === Overlay panels (find, palette, settings) ===
+        \\-- zide.set("color_overlay_bg", "#32323ce6")    -- Panel background
+        \\-- zide.set("color_overlay_fg", "#ffffff")      -- Panel primary text
+        \\-- zide.set("color_overlay_dim", "#969696c8")   -- Panel secondary / dimmed text
+        \\-- zide.set("color_overlay_warn", "#ff6464")    -- Warning text (e.g. "No matches")
+        \\-- zide.set("color_overlay_selection", "#505078c8") -- Highlighted row in panel
+        \\-- zide.set("color_overlay_hint", "#646478b4")  -- Hint bar / descriptions
+        \\
+        \\-- === Settings panel indicators ===
+        \\-- zide.set("color_bool_true", "#64dc64")       -- Boolean ON indicator
+        \\-- zide.set("color_bool_false", "#b45050")      -- Boolean OFF indicator
+        \\
+        \\-- === Status bar ===
+        \\-- zide.set("color_status_bg", "#1e1e1e")       -- Status bar background
+        \\-- zide.set("color_status_fg", "#e1e1e6")       -- Status bar text
+        \\
+    ) catch {};
+}
+
+/// Create tui-theme.lua template with commented defaults if the file doesn't exist.
+fn createTuiThemeTemplate(path: [:0]const u8) void {
+    if (std.fs.cwd().access(path, .{})) |_| return else |_| {}
+    const f = std.fs.cwd().createFile(path, .{}) catch return;
+    defer f.close();
+    f.writeAll(
+        \\-- ZIDE TUI Theme Overrides
+        \\-- Colors use #RRGGBB format (no alpha — terminals don't support it).
+        \\-- Uncomment and edit the colors you want to change.
+        \\-- These are applied AFTER the base theme selected via zide.set("tui_theme", name).
+        \\--
+        \\-- Default values shown are from the "dark" theme.
+        \\-- The default "terminal" theme uses ANSI indices instead (respects your terminal colors).
+        \\
+        \\-- === Editor text area ===
+        \\-- zide.set("tui_color_text_fg", "#e1e1e6")        -- Main text foreground
+        \\-- zide.set("tui_color_text_bg", "#1e1e1e")        -- Main text background
+        \\-- zide.set("tui_color_selection_fg", "#ffffff")    -- Selected text foreground
+        \\-- zide.set("tui_color_selection_bg", "#326098")    -- Selected text background
+        \\-- zide.set("tui_color_cursor_fg", "#1e1e1e")      -- Cursor foreground (char under cursor)
+        \\-- zide.set("tui_color_cursor_bg", "#93DDFA")      -- Cursor background (block color)
+        \\
+        \\-- === Gutter (line numbers) ===
+        \\-- zide.set("tui_color_gutter_text", "#646464")    -- Inactive line numbers
+        \\-- zide.set("tui_color_gutter_text_active", "#e1e1e6") -- Active line number
+        \\-- zide.set("tui_color_gutter_separator", "#505050")   -- Gutter/editor border
+        \\
+        \\-- === Decorations ===
+        \\-- zide.set("tui_color_tilde", "#505050")          -- Tilde (~) past end of file
+        \\-- zide.set("tui_color_wrap_marker", "#505050")    -- Soft-wrap continuation dot
+        \\
+        \\-- === Tab bar ===
+        \\-- zide.set("tui_color_tab_bg", "#323237")         -- Inactive tab background
+        \\-- zide.set("tui_color_tab_fg", "#b4b4b4")         -- Inactive tab text
+        \\-- zide.set("tui_color_tab_active_bg", "#326098")  -- Active tab background
+        \\-- zide.set("tui_color_tab_active_fg", "#ffffff")  -- Active tab text
+        \\
+        \\-- === Status bar ===
+        \\-- zide.set("tui_color_status_bg", "#326098")      -- Status bar background
+        \\-- zide.set("tui_color_status_fg", "#ffffff")      -- Status bar text
+        \\
+        \\-- === Overlay panels (find, palette, go-to-line) ===
+        \\-- zide.set("tui_color_overlay_bg", "#282830")     -- Panel background
+        \\-- zide.set("tui_color_overlay_fg", "#e1e1e6")     -- Panel primary text
+        \\-- zide.set("tui_color_overlay_accent", "#93DDFA") -- Accent color (labels, borders)
+        \\-- zide.set("tui_color_overlay_dim", "#787878")    -- Dimmed / secondary text
+        \\-- zide.set("tui_color_overlay_selection_bg", "#3c3c5a") -- Highlighted row background
+        \\-- zide.set("tui_color_overlay_selection_fg", "#ffffff") -- Highlighted row text
+        \\-- zide.set("tui_color_overlay_warn", "#ff6464")   -- Warning text (e.g. "No matches")
+        \\-- zide.set("tui_color_overlay_border", "#50A0C8") -- Panel border color
+        \\
+    ) catch {};
 }
 
 /// Get the path to init.lua (only if it exists).
@@ -228,6 +377,78 @@ fn luaSet(state: ?*zlua.LuaState) callconv(.c) c_int {
         }
     } else if (std.mem.eql(u8, key_str, "click_clears_cursors")) {
         editor.click_clears_cursors = lua.toBoolean(2);
+    } else if (std.mem.eql(u8, key_str, "max_undo_history")) {
+        const val = lua.toInteger(2) catch return 0;
+        if (val >= 0 and val <= 100000) {
+            editor.max_undo_history = @intCast(val);
+            // Update all open documents
+            for (editor.documents.items) |*doc| {
+                doc.history.max_size = editor.max_undo_history;
+            }
+        }
+    } else if (std.mem.eql(u8, key_str, "theme")) {
+        // zide.set("theme", "dark") / "light" / "high_contrast"
+        const val = lua.toString(2) catch return 0;
+        const val_str: []const u8 = val;
+        if (std.mem.eql(u8, val_str, "dark")) {
+            editor.theme = theme_mod.gui_dark;
+            editor.theme_name = "dark";
+        } else if (std.mem.eql(u8, val_str, "light")) {
+            editor.theme = theme_mod.gui_light;
+            editor.theme_name = "light";
+        } else if (std.mem.eql(u8, val_str, "high_contrast")) {
+            editor.theme = theme_mod.gui_high_contrast;
+            editor.theme_name = "high_contrast";
+        } else {
+            std.log.warn("zide.set: unknown theme '{s}'", .{val_str});
+        }
+    } else if (std.mem.eql(u8, key_str, "tui_theme")) {
+        // zide.set("tui_theme", "terminal") / "dark" / "light" / "high_contrast"
+        const val = lua.toString(2) catch return 0;
+        const val_str: []const u8 = val;
+        if (std.mem.eql(u8, val_str, "terminal")) {
+            editor.tui_theme = theme_mod.tui_terminal;
+            editor.tui_theme_name = "terminal";
+        } else if (std.mem.eql(u8, val_str, "dark")) {
+            editor.tui_theme = theme_mod.tui_dark;
+            editor.tui_theme_name = "dark";
+        } else if (std.mem.eql(u8, val_str, "light")) {
+            editor.tui_theme = theme_mod.tui_light;
+            editor.tui_theme_name = "light";
+        } else if (std.mem.eql(u8, val_str, "high_contrast")) {
+            editor.tui_theme = theme_mod.tui_high_contrast;
+            editor.tui_theme_name = "high_contrast";
+        } else {
+            std.log.warn("zide.set: unknown tui_theme '{s}'", .{val_str});
+        }
+    } else if (std.mem.startsWith(u8, key_str, "color_")) {
+        // zide.set("color_text", "#ff8040") — override individual GUI theme color
+        const val = lua.toString(2) catch return 0;
+        const val_str: []const u8 = val;
+        const field_name = key_str["color_".len..];
+        if (ThemeColor.fromHex(val_str)) |color| {
+            if (!theme_mod.setEditorColor(&editor.theme, field_name, color)) {
+                std.log.warn("zide.set: unknown color field '{s}'", .{field_name});
+            } else {
+                editor.theme_name = "custom";
+            }
+        } else {
+            std.log.warn("zide.set: invalid hex color '{s}'", .{val_str});
+        }
+    } else if (std.mem.startsWith(u8, key_str, "tui_color_")) {
+        // zide.set("tui_color_text_fg", "#ff8040") — override individual TUI theme color
+        const val = lua.toString(2) catch return 0;
+        const val_str: []const u8 = val;
+        const field_name = key_str["tui_color_".len..];
+        if (ThemeColor.fromHex(val_str)) |color| {
+            if (!theme_mod.setTuiColor(&editor.tui_theme, field_name, color)) {
+                std.log.warn("zide.set: unknown tui color field '{s}'", .{field_name});
+            } else {
+                editor.tui_theme_name = "custom";
+            }
+        } else {
+            std.log.warn("zide.set: invalid hex color '{s}'", .{val_str});
+        }
     } else {
         std.log.warn("zide.set: unknown key '{s}'", .{key_str});
     }
@@ -269,6 +490,15 @@ fn luaGet(state: ?*zlua.LuaState) callconv(.c) c_int {
         return 1;
     } else if (std.mem.eql(u8, key_str, "click_clears_cursors")) {
         lua.pushBoolean(editor.click_clears_cursors);
+        return 1;
+    } else if (std.mem.eql(u8, key_str, "max_undo_history")) {
+        lua.pushInteger(@intCast(editor.max_undo_history));
+        return 1;
+    } else if (std.mem.eql(u8, key_str, "theme")) {
+        _ = lua.pushString(editor.theme_name);
+        return 1;
+    } else if (std.mem.eql(u8, key_str, "tui_theme")) {
+        _ = lua.pushString(editor.tui_theme_name);
         return 1;
     }
 

@@ -3,6 +3,162 @@ const build_options = @import("build_options");
 const dvui = if (build_options.has_gui) @import("dvui") else struct {};
 const Editor = @import("../core/editor.zig").Editor;
 const Document = @import("../core/document.zig").Document;
+const LayoutNode = @import("../core/layout.zig").LayoutNode;
+const ThemeColor = @import("../core/theme.zig").ThemeColor;
+const theme_mod = @import("../core/theme.zig");
+
+/// Convert a ThemeColor to a dvui.Color.
+fn toDvui(c: ThemeColor) dvui.Color {
+    return .{ .r = c.r, .g = c.g, .b = c.b, .a = c.a };
+}
+
+// ---------------------------------------------------------------------------
+// Custom DVUI themes — control the app chrome (menus, tabs, scrollbars, etc.)
+// These use the same Vera Sans fonts as DVUI's built-in Adwaita themes.
+// ---------------------------------------------------------------------------
+
+/// Return the DVUI theme matching the current editor theme preset.
+pub fn dvuiThemeForPreset(preset_name: []const u8) dvui.Theme {
+    if (std.mem.eql(u8, preset_name, "light")) return dvui_light;
+    if (std.mem.eql(u8, preset_name, "high_contrast")) return dvui_high_contrast;
+    return dvui_dark;
+}
+
+const dvui_dark: dvui.Theme = blk: {
+    @setEvalBranchQuota(3200);
+    break :blk .{
+        .name = "ZIDE Dark",
+        .dark = true,
+
+        .font_body = .find(.{ .family = "Vera Sans" }),
+        .font_heading = .find(.{ .family = "Vera Sans", .weight = .bold }),
+        .font_title = .find(.{ .family = "Vera Sans", .size = dvui.Font.DefaultSize + 2 }),
+        .font_mono = .find(.{ .family = "Vera Sans Mono" }),
+
+        .focus = .{ .r = 0x35, .g = 0x84, .b = 0xe4 }, // accent blue
+        .fill = .{ .r = 0x1e, .g = 0x1e, .b = 0x24 },
+        .text = .{ .r = 0xe1, .g = 0xe1, .b = 0xe6 },
+        .text_select = .{ .r = 0x32, .g = 0x60, .b = 0x98 },
+        .border = .{ .r = 0x50, .g = 0x50, .b = 0x5a },
+
+        .control = .{
+            .fill = .{ .r = 0x3a, .g = 0x3a, .b = 0x44 },
+            .fill_hover = .{ .r = 0x48, .g = 0x48, .b = 0x54 },
+            .fill_press = .{ .r = 0x56, .g = 0x56, .b = 0x64 },
+            .border = .{ .r = 0x60, .g = 0x60, .b = 0x6a },
+        },
+
+        .window = .{
+            .fill = .{ .r = 0x28, .g = 0x28, .b = 0x30 },
+            .border = .{ .r = 0x50, .g = 0x50, .b = 0x5a },
+        },
+
+        .highlight = .{
+            .fill = .{ .r = 0x35, .g = 0x84, .b = 0xe4 },
+            .fill_hover = .{ .r = 0x40, .g = 0x90, .b = 0xf0 },
+            .fill_press = .{ .r = 0x2a, .g = 0x74, .b = 0xd4 },
+            .text = dvui.Color.white,
+        },
+
+        .err = .{
+            .fill = .{ .r = 0xc0, .g = 0x1c, .b = 0x28 },
+            .text = dvui.Color.white,
+            .border = .{ .r = 0xe0, .g = 0x40, .b = 0x40 },
+        },
+    };
+};
+
+const dvui_light: dvui.Theme = blk: {
+    @setEvalBranchQuota(3200);
+    break :blk .{
+        .name = "ZIDE Light",
+        .dark = false,
+
+        .font_body = .find(.{ .family = "Vera Sans" }),
+        .font_heading = .find(.{ .family = "Vera Sans", .weight = .bold }),
+        .font_title = .find(.{ .family = "Vera Sans", .size = dvui.Font.DefaultSize + 2 }),
+        .font_mono = .find(.{ .family = "Vera Sans Mono" }),
+
+        .focus = .{ .r = 0x35, .g = 0x84, .b = 0xe4 },
+        .fill = dvui.Color.white,
+        .fill_hover = .{ .r = 0xd2, .g = 0xd2, .b = 0xd2 },
+        .fill_press = .{ .r = 0xb8, .g = 0xb8, .b = 0xb8 },
+        .text = .{ .r = 0x1e, .g = 0x1e, .b = 0x1e },
+        .text_select = .{ .r = 0x91, .g = 0xbc, .b = 0xf0 },
+        .border = .{ .r = 0xa0, .g = 0xa0, .b = 0xa0 },
+
+        .control = .{
+            .fill = .{ .r = 0xe0, .g = 0xe0, .b = 0xe0 },
+            .fill_hover = .{ .r = 0xd0, .g = 0xd0, .b = 0xd0 },
+            .fill_press = .{ .r = 0xc0, .g = 0xc0, .b = 0xc0 },
+            .border = .{ .r = 0xa0, .g = 0xa0, .b = 0xa0 },
+        },
+
+        .window = .{
+            .fill = .{ .r = 0xf0, .g = 0xf0, .b = 0xf0 },
+            .border = .{ .r = 0xb0, .g = 0xb0, .b = 0xb0 },
+        },
+
+        .highlight = .{
+            .fill = .{ .r = 0x35, .g = 0x84, .b = 0xe4 },
+            .fill_hover = .{ .r = 0x40, .g = 0x90, .b = 0xf0 },
+            .fill_press = .{ .r = 0x2a, .g = 0x74, .b = 0xd4 },
+            .text = dvui.Color.white,
+            .border = .{ .r = 0x2a, .g = 0x6a, .b = 0xc0 },
+        },
+
+        .err = .{
+            .fill = .{ .r = 0xe0, .g = 0x1b, .b = 0x24 },
+            .text = dvui.Color.white,
+            .border = .{ .r = 0xc0, .g = 0x10, .b = 0x18 },
+        },
+    };
+};
+
+const dvui_high_contrast: dvui.Theme = blk: {
+    @setEvalBranchQuota(3200);
+    break :blk .{
+        .name = "ZIDE High Contrast",
+        .dark = true,
+
+        .font_body = .find(.{ .family = "Vera Sans" }),
+        .font_heading = .find(.{ .family = "Vera Sans", .weight = .bold }),
+        .font_title = .find(.{ .family = "Vera Sans", .size = dvui.Font.DefaultSize + 2 }),
+        .font_mono = .find(.{ .family = "Vera Sans Mono" }),
+
+        .focus = .{ .r = 0xff, .g = 0xff, .b = 0x00 }, // yellow
+        .fill = dvui.Color.black,
+        .text = dvui.Color.white,
+        .text_select = .{ .r = 0x00, .g = 0x5a, .b = 0xc8 },
+        .border = .{ .r = 0x80, .g = 0x80, .b = 0x80 },
+
+        .control = .{
+            .fill = .{ .r = 0x28, .g = 0x28, .b = 0x28 },
+            .fill_hover = .{ .r = 0x40, .g = 0x40, .b = 0x40 },
+            .fill_press = .{ .r = 0x58, .g = 0x58, .b = 0x58 },
+            .border = .{ .r = 0xc0, .g = 0xc0, .b = 0xc0 },
+        },
+
+        .window = .{
+            .fill = .{ .r = 0x0a, .g = 0x0a, .b = 0x0a },
+            .border = .{ .r = 0xc0, .g = 0xc0, .b = 0xc0 },
+        },
+
+        .highlight = .{
+            .fill = .{ .r = 0x00, .g = 0x5a, .b = 0xc8 },
+            .fill_hover = .{ .r = 0x00, .g = 0x70, .b = 0xe0 },
+            .fill_press = .{ .r = 0x00, .g = 0x50, .b = 0xb0 },
+            .text = dvui.Color.white,
+            .border = .{ .r = 0xff, .g = 0xff, .b = 0x00 },
+        },
+
+        .err = .{
+            .fill = .{ .r = 0xff, .g = 0x00, .b = 0x00 },
+            .text = dvui.Color.white,
+            .border = .{ .r = 0xff, .g = 0x80, .b = 0x80 },
+        },
+    };
+};
 
 /// Persistent state across frames for mouse drag tracking.
 var drag_active: bool = false;
@@ -120,78 +276,111 @@ pub fn frame(editor: *Editor) bool {
         var m = dvui.menu(@src(), .horizontal, .{});
         defer m.deinit();
 
+        // ---- File ----
         if (dvui.menuItemLabel(@src(), "File", .{ .submenu = true }, .{})) |r| {
             var fw = dvui.floatingMenu(@src(), .{ .from = r }, .{});
             defer fw.deinit();
-
-            if (dvui.menuItemLabel(@src(), "New           Ctrl+N", .{}, .{ .expand = .horizontal }) != null) {
+            if (dvui.menuItemLabel(@src(), "New              Ctrl+N", .{}, .{ .expand = .horizontal }) != null) {
                 _ = editor.newDocument() catch {};
                 m.close();
             }
-            if (dvui.menuItemLabel(@src(), "Open File     Ctrl+O", .{}, .{ .expand = .horizontal }) != null) {
+            if (dvui.menuItemLabel(@src(), "Open File        Ctrl+O", .{}, .{ .expand = .horizontal }) != null) {
                 openFileDialog(editor);
                 m.close();
             }
-            if (dvui.menuItemLabel(@src(), "Save          Ctrl+S", .{}, .{ .expand = .horizontal }) != null) {
+            if (dvui.menuItemLabel(@src(), "Save             Ctrl+S", .{}, .{ .expand = .horizontal }) != null) {
                 save(editor);
                 m.close();
             }
-            if (dvui.menuItemLabel(@src(), "Save As       Ctrl+Shift+S", .{}, .{ .expand = .horizontal }) != null) {
+            if (dvui.menuItemLabel(@src(), "Save As          Ctrl+Shift+S", .{}, .{ .expand = .horizontal }) != null) {
                 saveAs(editor);
                 m.close();
             }
-            if (dvui.menuItemLabel(@src(), "Close Tab     Ctrl+W", .{}, .{ .expand = .horizontal }) != null) {
+            if (dvui.menuItemLabel(@src(), "Close Tab        Ctrl+W", .{}, .{ .expand = .horizontal }) != null) {
                 _ = editor.closeActiveDoc();
                 m.close();
             }
-            if (dvui.menuItemLabel(@src(), "Exit          Ctrl+Q", .{}, .{ .expand = .horizontal }) != null) {
+            if (dvui.menuItemLabel(@src(), "Exit             Ctrl+Q", .{}, .{ .expand = .horizontal }) != null) {
                 return false;
             }
         }
 
+        // ---- Edit ----
         if (dvui.menuItemLabel(@src(), "Edit", .{ .submenu = true }, .{})) |r| {
             var fw = dvui.floatingMenu(@src(), .{ .from = r }, .{});
             defer fw.deinit();
-            if (dvui.menuItemLabel(@src(), "Undo          Ctrl+Z", .{}, .{ .expand = .horizontal }) != null) {
+            if (dvui.menuItemLabel(@src(), "Undo             Ctrl+Z", .{}, .{ .expand = .horizontal }) != null) {
                 _ = editor.execCommand("undo", null);
                 m.close();
             }
-            if (dvui.menuItemLabel(@src(), "Redo          Ctrl+Y", .{}, .{ .expand = .horizontal }) != null) {
+            if (dvui.menuItemLabel(@src(), "Redo             Ctrl+Y", .{}, .{ .expand = .horizontal }) != null) {
                 _ = editor.execCommand("redo", null);
                 m.close();
             }
-            if (dvui.menuItemLabel(@src(), "Cut           Ctrl+X", .{}, .{ .expand = .horizontal }) != null) {
+            if (dvui.menuItemLabel(@src(), "Cut              Ctrl+X", .{}, .{ .expand = .horizontal }) != null) {
                 _ = editor.execCommand("cut", null);
                 m.close();
             }
-            if (dvui.menuItemLabel(@src(), "Copy          Ctrl+C", .{}, .{ .expand = .horizontal }) != null) {
+            if (dvui.menuItemLabel(@src(), "Copy             Ctrl+C", .{}, .{ .expand = .horizontal }) != null) {
                 _ = editor.execCommand("copy", null);
                 m.close();
             }
-            if (dvui.menuItemLabel(@src(), "Paste         Ctrl+V", .{}, .{ .expand = .horizontal }) != null) {
+            if (dvui.menuItemLabel(@src(), "Paste            Ctrl+V", .{}, .{ .expand = .horizontal }) != null) {
                 _ = editor.execCommand("paste", null);
                 m.close();
             }
-            if (dvui.menuItemLabel(@src(), "Select All    Ctrl+A", .{}, .{ .expand = .horizontal }) != null) {
+            if (dvui.menuItemLabel(@src(), "Select All       Ctrl+A", .{}, .{ .expand = .horizontal }) != null) {
                 _ = editor.execCommand("select_all", null);
                 m.close();
             }
-            if (dvui.menuItemLabel(@src(), "Go to Line    Ctrl+G", .{}, .{ .expand = .horizontal }) != null) {
-                _ = editor.execAction("goto_line");
-                m.close();
-            }
-            if (dvui.menuItemLabel(@src(), "Find          Ctrl+F", .{}, .{ .expand = .horizontal }) != null) {
+            if (dvui.menuItemLabel(@src(), "Find             Ctrl+F", .{}, .{ .expand = .horizontal }) != null) {
                 _ = editor.execAction("find");
                 m.close();
             }
-            if (dvui.menuItemLabel(@src(), "Replace       Ctrl+H", .{}, .{ .expand = .horizontal }) != null) {
+            if (dvui.menuItemLabel(@src(), "Replace          Ctrl+H", .{}, .{ .expand = .horizontal }) != null) {
                 _ = editor.execAction("find_replace");
                 m.close();
             }
-            if (dvui.menuItemLabel(@src(), "Command       Ctrl+P", .{}, .{ .expand = .horizontal }) != null) {
+            if (dvui.menuItemLabel(@src(), "Go to Line       Ctrl+G", .{}, .{ .expand = .horizontal }) != null) {
+                _ = editor.execAction("goto_line");
+                m.close();
+            }
+        }
+
+        // ---- View ----
+        if (dvui.menuItemLabel(@src(), "View", .{ .submenu = true }, .{})) |r| {
+            var fw = dvui.floatingMenu(@src(), .{ .from = r }, .{});
+            defer fw.deinit();
+            if (dvui.menuItemLabel(@src(), "Command Palette  Ctrl+P", .{}, .{ .expand = .horizontal }) != null) {
                 _ = editor.execAction("command_palette");
                 m.close();
             }
+            if (dvui.menuItemLabel(@src(), "Next Tab         Ctrl+Tab", .{}, .{ .expand = .horizontal }) != null) {
+                editor.nextDoc();
+                m.close();
+            }
+            if (dvui.menuItemLabel(@src(), "Prev Tab         Ctrl+Shift+Tab", .{}, .{ .expand = .horizontal }) != null) {
+                editor.prevDoc();
+                m.close();
+            }
+            if (dvui.menuItemLabel(@src(), "Split Vertical   Alt+\\", .{}, .{ .expand = .horizontal }) != null) {
+                _ = editor.execAction("split_vertical");
+                m.close();
+            }
+            if (dvui.menuItemLabel(@src(), "Split Horizontal Alt+Shift+\\", .{}, .{ .expand = .horizontal }) != null) {
+                _ = editor.execAction("split_horizontal");
+                m.close();
+            }
+            if (dvui.menuItemLabel(@src(), "Close Pane       Ctrl+Shift+W", .{}, .{ .expand = .horizontal }) != null) {
+                _ = editor.execAction("close_pane");
+                m.close();
+            }
+        }
+
+        // ---- Preferences ----
+        if (dvui.menuItemLabel(@src(), "Preferences", .{ .submenu = true }, .{})) |r| {
+            var fw = dvui.floatingMenu(@src(), .{ .from = r }, .{});
+            defer fw.deinit();
             if (dvui.menuItemLabel(@src(), "Settings", .{}, .{ .expand = .horizontal }) != null) {
                 editor.mode = .settings;
                 editor.settings_selected = 0;
@@ -202,24 +391,41 @@ pub fn frame(editor: *Editor) bool {
                 openSettingsFile(editor);
                 m.close();
             }
-        }
-
-        if (dvui.menuItemLabel(@src(), "View", .{ .submenu = true }, .{})) |r| {
-            var fw = dvui.floatingMenu(@src(), .{ .from = r }, .{});
-            defer fw.deinit();
-            if (dvui.menuItemLabel(@src(), "Next Tab      Ctrl+Tab", .{}, .{ .expand = .horizontal }) != null) {
-                editor.nextDoc();
+            // Theme submenu
+            if (dvui.menuItemLabel(@src(), "Theme", .{ .submenu = true }, .{ .expand = .horizontal })) |r2| {
+                var tw = dvui.floatingMenu(@src(), .{ .from = r2 }, .{});
+                defer tw.deinit();
+                if (dvui.menuItemLabel(@src(), "Dark — deep grays, soft white text", .{}, .{ .expand = .horizontal }) != null) {
+                    switchTheme(editor, "dark");
+                    m.close();
+                }
+                if (dvui.menuItemLabel(@src(), "Light — white background, dark text", .{}, .{ .expand = .horizontal }) != null) {
+                    switchTheme(editor, "light");
+                    m.close();
+                }
+                if (dvui.menuItemLabel(@src(), "High Contrast — black background, bright text", .{}, .{ .expand = .horizontal }) != null) {
+                    switchTheme(editor, "high_contrast");
+                    m.close();
+                }
+            }
+            if (dvui.menuItemLabel(@src(), "Open Theme File", .{}, .{ .expand = .horizontal }) != null) {
+                openThemeFile(editor);
                 m.close();
             }
-            if (dvui.menuItemLabel(@src(), "Prev Tab      Ctrl+Shift+Tab", .{}, .{ .expand = .horizontal }) != null) {
-                editor.prevDoc();
+            if (dvui.menuItemLabel(@src(), "Open Theme Folder", .{}, .{ .expand = .horizontal }) != null) {
+                openThemeFolder();
                 m.close();
             }
         }
 
+        // ---- Help ----
         if (dvui.menuItemLabel(@src(), "Help", .{ .submenu = true }, .{})) |r| {
             var fw = dvui.floatingMenu(@src(), .{ .from = r }, .{});
             defer fw.deinit();
+            if (dvui.menuItemLabel(@src(), "Documentation", .{}, .{ .expand = .horizontal }) != null) {
+                openDocumentation(editor);
+                m.close();
+            }
             _ = dvui.menuItemLabel(@src(), "About ZIDE v0.0.1", .{}, .{ .expand = .horizontal });
         }
     }
@@ -241,9 +447,10 @@ pub fn frame(editor: *Editor) bool {
             const label = std.fmt.bufPrint(&label_buf, "{s}{s}", .{ doc.display_name, dirty_marker }) catch doc.display_name;
             if (dvui.button(@src(), label, .{}, .{
                 .id_extra = @intCast(i),
-                .background = is_active,
-                .style = if (is_active) .highlight else .content,
+                .background = true,
+                .style = if (is_active) .highlight else .control,
                 .margin = .{ .x = 1, .y = 0, .w = 1, .h = 0 },
+                .border = .{ .x = 1, .y = 1, .w = 1, .h = 1 },
             })) {
                 editor.switchToDoc(i);
             }
@@ -271,7 +478,7 @@ pub fn frame(editor: *Editor) bool {
         const srs = swd.contentRectScale();
         const sarea = srs.r;
         const sscale = srs.s;
-        const status_text_color = dvui.themeGet().color(.content, .text);
+        const status_text_color = toDvui(editor.theme.status_fg);
 
         // Left: Ln/Col (+ cursor count if multi-cursor)
         var pos_buf: [64]u8 = undefined;
@@ -303,7 +510,7 @@ pub fn frame(editor: *Editor) bool {
     }
 
     // --- Editor area (expand=.both, LAST child) ---
-    editorPane(editor);
+    renderLayout(editor, 0);
 
     // --- Handle window close / quit events ---
     for (dvui.events()) |*e| {
@@ -315,14 +522,52 @@ pub fn frame(editor: *Editor) bool {
     return true;
 }
 
+/// Recursively render the layout tree. Split nodes use dvui.paned() for
+/// draggable dividers; leaf nodes render an editor pane.
+fn renderLayout(editor: *Editor, node_idx: u8) void {
+    if (!build_options.has_gui) return;
+    if (node_idx >= editor.layout.nodes.items.len) return;
+
+    switch (editor.layout.nodes.items[node_idx]) {
+        .leaf => |pane_id| {
+            editorPane(editor, pane_id);
+        },
+        .split => |s| {
+            var paned = dvui.paned(@src(), .{
+                .direction = if (s.direction == .horizontal) .horizontal else .vertical,
+                .collapsed_size = 100,
+                .split_ratio = editor.layout.ratioPtr(node_idx),
+                .handle_size = 4,
+                .handle_dynamic = .{
+                    .handle_size_max = 8,
+                    .distance_max = 16,
+                },
+            }, .{
+                .expand = .both,
+                .id_extra = node_idx,
+            });
+            defer paned.deinit();
+
+            if (paned.showFirst()) {
+                renderLayout(editor, s.first);
+            }
+            if (paned.showSecond()) {
+                renderLayout(editor, s.second);
+            }
+        },
+    }
+}
+
 /// The main editor text editing pane — custom line-by-line rendering.
 /// No TextLayoutWidget or ScrollArea; we own rendering, scrolling, and input.
-fn editorPane(editor: *Editor) void {
+fn editorPane(editor: *Editor, pane_id: u8) void {
     if (!build_options.has_gui) return;
 
-    // NOTE: doc must be re-fetched after key events since close_tab can
-    // deinit the active document, invalidating any earlier pointer.
-    var doc = editor.activeDoc();
+    const is_active_pane = pane_id == editor.active_pane;
+
+    // Get the document for THIS pane (not necessarily the active doc).
+    var pane_doc_idx = editor.layout.panes.items[pane_id].doc_idx;
+    var doc = &editor.documents.items[pane_doc_idx];
 
     // --- Container box for the editor area ---
     var ebox = dvui.box(@src(), .{ .dir = .vertical }, .{
@@ -331,6 +576,7 @@ fn editorPane(editor: *Editor) void {
         .style = .window,
         .padding = .{ .x = 4, .y = 4, .w = 4, .h = 4 },
         .name = "editor_pane",
+        .id_extra = pane_id,
     });
     defer ebox.deinit();
 
@@ -366,29 +612,34 @@ fn editorPane(editor: *Editor) void {
     editor.text_width = if (text_area_w_logical > 0) @intFromFloat(text_area_w_logical) else 80;
     const do_wrap = editor.word_wrap;
 
-    // --- Handle keyboard events (before rendering) ---
-    _ = handleGuiKeyEvents(editor, wd);
+    // --- Handle keyboard events (before rendering) — only for the focused pane ---
+    if (is_active_pane) {
+        _ = handleGuiKeyEvents(editor, wd);
 
-    // Re-fetch doc after key events — close_tab may have changed/freed the active document
-    doc = editor.activeDoc();
+        // Re-fetch doc after key events — close_tab may have changed/freed the active document
+        pane_doc_idx = editor.layout.panes.items[pane_id].doc_idx;
+        doc = &editor.documents.items[pane_doc_idx];
+    }
 
     // --- Handle mouse events ---
     // Block mouse clicks/drags when a modal is active so they don't go to editor text.
-    // Allow focus events through so keyboard input keeps working.
+    // Only the active pane handles modal mouse events (settings click, etc.).
     if (editor.mode != .normal) {
-        for (dvui.events()) |*e| {
-            if (e.handled) continue;
-            if (e.evt != .mouse) continue;
-            switch (e.evt.mouse.action) {
-                .press => {
-                    e.handle(@src(), wd);
-                    // Handle clicks in settings panel
-                    if (editor.mode == .settings) {
-                        handleSettingsClick(editor, e.evt.mouse.p, area, font, lh, scale);
-                    }
-                },
-                .release, .motion => e.handle(@src(), wd),
-                else => {},
+        if (is_active_pane) {
+            for (dvui.events()) |*e| {
+                if (e.handled) continue;
+                if (e.evt != .mouse) continue;
+                switch (e.evt.mouse.action) {
+                    .press => {
+                        e.handle(@src(), wd);
+                        // Handle clicks in settings panel
+                        if (editor.mode == .settings) {
+                            handleSettingsClick(editor, e.evt.mouse.p, area, font, lh, scale);
+                        }
+                    },
+                    .release, .motion => e.handle(@src(), wd),
+                    else => {},
+                }
             }
         }
     } else {
@@ -402,7 +653,7 @@ fn editorPane(editor: *Editor) void {
                 .h = area.h,
             };
         }
-        handleMouseEvents(editor, wd, drag_area, font, line_height, scale);
+        handleMouseEvents(editor, pane_id, wd, drag_area, font, line_height, scale);
     }
 
     // --- Ensure cursor visible (unless user is scrolling with wheel or dragging) ---
@@ -414,13 +665,14 @@ fn editorPane(editor: *Editor) void {
         }
     }
 
-    // --- Request text input from SDL ---
-    // Always request when a modal needs text (menu clicks steal focus from editor widget).
+    // --- Request text input from SDL — only for the focused pane ---
     const focused = if (dvui.focusedWidgetId()) |fid| fid == wd.id else false;
-    const needs_text = focused or editor.mode != .normal;
-    if (needs_text) {
-        dvui.wantTextInput(area.toNatural());
-        if (!focused) dvui.focusWidget(wd.id, null, 0);
+    if (is_active_pane) {
+        const needs_text = focused or editor.mode != .normal;
+        if (needs_text) {
+            dvui.wantTextInput(area.toNatural());
+            if (!focused) dvui.focusWidget(wd.id, null, 0);
+        }
     }
 
     // Full editor area for rendering (includes gutter).
@@ -457,12 +709,12 @@ fn editorPane(editor: *Editor) void {
     // --- Render visible lines ---
     const sel_range = doc.cursors.primaryConst().selectionRange();
     const cursor_pos = doc.cursorPos();
-    const text_color = dvui.themeGet().color(.window, .text);
-    const sel_color = dvui.themeGet().focus;
-    const gutter_text_color = dvui.Color{ .r = 130, .g = 130, .b = 130, .a = 200 };
-    const gutter_active_color = dvui.themeGet().color(.window, .text);
-    const gutter_bg_color = dvui.Color{ .r = 40, .g = 40, .b = 40, .a = 60 };
-    const gutter_sep_color = dvui.Color{ .r = 80, .g = 80, .b = 80, .a = 100 };
+    const text_color = toDvui(editor.theme.text);
+    const sel_color = toDvui(editor.theme.selection);
+    const gutter_text_color = toDvui(editor.theme.gutter_text);
+    const gutter_active_color = toDvui(editor.theme.gutter_text_active);
+    const gutter_bg_color = toDvui(editor.theme.gutter_bg);
+    const gutter_sep_color = toDvui(editor.theme.gutter_separator);
 
     // Draw gutter background
     const gutter_bg_rect: dvui.Rect.Physical = .{
@@ -492,7 +744,7 @@ fn editorPane(editor: *Editor) void {
     const text_cols: usize = if (char_width > 0) @intFromFloat(@floor(text_area_w / char_width)) else 80;
 
     // Wrap continuation marker style
-    const wrap_marker_color = dvui.Color{ .r = 100, .g = 100, .b = 100, .a = 150 };
+    const wrap_marker_color = toDvui(editor.theme.wrap_marker);
 
     // --- Render lines (gutter + text in two clips) ---
     var line_idx: usize = doc.scroll_top;
@@ -503,7 +755,7 @@ fn editorPane(editor: *Editor) void {
         const line_start_offset = doc.buffer.line_starts.items[line_idx];
         var tab_exp_buf: [16384]u8 = undefined;
         const line_text = expandTabs(orig_line, editor.tab_width, &tab_exp_buf);
-        const needs_wrap = do_wrap and line_text.len > 0 and font.textSize(line_text).w * scale > text_area_w;
+        const needs_wrap = do_wrap and line_text.len > 0 and @as(f32, @floatFromInt(line_text.len)) * char_width > text_area_w;
 
         var wrap_row: usize = 0;
         var byte_pos: usize = 0;
@@ -521,7 +773,7 @@ fn editorPane(editor: *Editor) void {
                 if (wrap_row == 0) {
                     var num_buf: [16]u8 = undefined;
                     const num_str = std.fmt.bufPrint(&num_buf, "{d}", .{line_idx + 1}) catch "";
-                    const num_text_w = font.textSize(num_str).w * scale;
+                    const num_text_w = @as(f32, @floatFromInt(num_str.len)) * digit_width;
                     const num_x = render_area.x + gutter_width - gutter_padding - num_text_w;
                     const num_color = if (cursor_pos.line == line_idx) gutter_active_color else gutter_text_color;
                     dvui.renderText(.{
@@ -533,7 +785,7 @@ fn editorPane(editor: *Editor) void {
                     }) catch {};
                 } else {
                     // Wrap continuation marker "."
-                    const dot_w = font.textSize(".").w * scale;
+                    const dot_w = char_width;
                     const dot_x = render_area.x + gutter_width - gutter_padding - dot_w;
                     dvui.renderText(.{
                         .font = font,
@@ -574,16 +826,8 @@ fn editorPane(editor: *Editor) void {
                         const sel_byte_start = if (sel_start_exp > row_start) sel_start_exp - row_start else 0;
                         const sel_byte_end = if (sel_end_exp < row_end) sel_end_exp - row_start else segment.len;
 
-                        const sx_start = if (sel_byte_start > 0 and sel_byte_start <= segment.len)
-                            font.textSize(segment[0..sel_byte_start]).w * scale
-                        else
-                            0;
-                        const sx_end = if (sel_byte_end > 0 and sel_byte_end <= segment.len)
-                            font.textSize(segment[0..sel_byte_end]).w * scale
-                        else if (sel_byte_end == 0)
-                            0
-                        else
-                            font.textSize(segment).w * scale;
+                        const sx_start = @as(f32, @floatFromInt(sel_byte_start)) * char_width;
+                        const sx_end = @as(f32, @floatFromInt(@min(sel_byte_end, segment.len))) * char_width;
 
                         const sw = if (sel.end > line_start_offset + orig_line.len and row_end >= line_text.len)
                             text_area_w - sx_start
@@ -627,15 +871,21 @@ fn editorPane(editor: *Editor) void {
                         if (blink_on) {
                             const col_in_seg = cc - row_start;
                             const clamped = @min(col_in_seg, segment.len);
-                            const cx = if (clamped > 0)
-                                font.textSize(segment[0..clamped]).w * scale
-                            else
-                                0;
+                            const cx = @as(f32, @floatFromInt(clamped)) * char_width;
                             const cr: dvui.Rect.Physical = .{ .x = row_x + cx - 1, .y = y, .w = 3, .h = line_height };
                             cr.fill(.{}, .{ .color = sel_color, .fade = 1.0 });
                         }
-                        // Request redraw so blink animation continues
-                        dvui.refresh(null, @src(), null);
+                        // Schedule wakeup for next blink transition instead of continuous refresh
+                        const time_until_toggle: i128 = if (blink_on)
+                            blink_interval_ms - cycle
+                        else
+                            blink_interval_ms * 2 - cycle;
+                        const micros: i32 = @intCast(@max(time_until_toggle * 1000, 1000));
+                        const blink_id = dvui.Id.extendId(null, @src(), 0);
+                        dvui.animation(blink_id, "_blink", .{
+                            .start_time = micros,
+                            .end_time = micros + 1000,
+                        });
                     }
                 }
 
@@ -649,10 +899,7 @@ fn editorPane(editor: *Editor) void {
                         if (sc_col >= row_start and (sc_col < row_end or (sc_on_last and sc_col == row_end))) {
                             const sc_in_seg = sc_col - row_start;
                             const sc_clamped = @min(sc_in_seg, segment.len);
-                            const sc_cx = if (sc_clamped > 0)
-                                font.textSize(segment[0..sc_clamped]).w * scale
-                            else
-                                0;
+                            const sc_cx = @as(f32, @floatFromInt(sc_clamped)) * char_width;
                             const sc_r: dvui.Rect.Physical = .{ .x = row_x + sc_cx - 1, .y = y, .w = 3, .h = line_height };
                             sc_r.fill(.{}, .{ .color = sel_color, .fade = 0.7 });
                         }
@@ -674,7 +921,7 @@ fn editorPane(editor: *Editor) void {
     {
         const prev_clip = dvui.clip(text_clip_rect);
         defer dvui.clipSet(prev_clip);
-        const tilde_color = dvui.Color{ .r = 100, .g = 100, .b = 100, .a = 128 };
+        const tilde_color = toDvui(editor.theme.tilde);
         while (y < render_area.y + render_area.h) : (y += line_height) {
             dvui.renderText(.{
                 .font = font,
@@ -688,15 +935,31 @@ fn editorPane(editor: *Editor) void {
 
     _ = text_cols; // used for future scroll adjustment
 
+    // --- Focused pane indicator (subtle border highlight) ---
+    if (is_active_pane and editor.layout.paneCount() > 1) {
+        const focus_color = toDvui(editor.theme.selection);
+        const border_w: f32 = 2 * scale;
+        // Top
+        (dvui.Rect.Physical{ .x = render_area.x, .y = render_area.y, .w = render_area.w, .h = border_w }).fill(.{}, .{ .color = focus_color, .fade = 0.6 });
+        // Bottom
+        (dvui.Rect.Physical{ .x = render_area.x, .y = render_area.y + render_area.h - border_w, .w = render_area.w, .h = border_w }).fill(.{}, .{ .color = focus_color, .fade = 0.6 });
+        // Left
+        (dvui.Rect.Physical{ .x = render_area.x, .y = render_area.y, .w = border_w, .h = render_area.h }).fill(.{}, .{ .color = focus_color, .fade = 0.6 });
+        // Right
+        (dvui.Rect.Physical{ .x = render_area.x + render_area.w - border_w, .y = render_area.y, .w = border_w, .h = render_area.h }).fill(.{}, .{ .color = focus_color, .fade = 0.6 });
+    }
+
     // --- Modal overlays (find, find_replace, command_palette, goto_line, confirm_quit) ---
-    if (editor.mode != .normal) {
+    // Only render modals in the focused pane.
+    if (is_active_pane and editor.mode != .normal) {
         drawModalOverlay(editor, render_area, render_rs, scale);
     }
 }
 
 /// Handle mouse events for the custom editor pane.
-fn handleMouseEvents(editor: *Editor, wd: *dvui.WidgetData, area: dvui.Rect.Physical, font: dvui.Font, line_height: f32, scale: f32) void {
-    const doc = editor.activeDoc();
+fn handleMouseEvents(editor: *Editor, pane_id: u8, wd: *dvui.WidgetData, area: dvui.Rect.Physical, font: dvui.Font, line_height: f32, scale: f32) void {
+    const pane_doc_idx = editor.layout.panes.items[pane_id].doc_idx;
+    const doc = &editor.documents.items[pane_doc_idx];
     const tab_width = editor.tab_width;
     const double_click_threshold_ms: u64 = 400;
     const double_click_distance: f32 = 5; // pixels
@@ -723,6 +986,10 @@ fn handleMouseEvents(editor: *Editor, wd: *dvui.WidgetData, area: dvui.Rect.Phys
                 e.handle(@src(), wd);
                 dvui.focusWidget(wd.id, null, e.num);
                 scroll_pinned = false;
+
+                // Focus this pane on click
+                editor.focusPane(pane_id);
+
                 const offset = screenToOffset(doc, area, font, line_height, scale, me.p, tab_width);
 
                 // Alt+click: add a cursor at click position
@@ -944,7 +1211,7 @@ fn screenToOffset(doc: *const Document, area: dvui.Rect.Physical, font: dvui.Fon
         const orig_line = doc.buffer.lineContent(line_idx);
         var exp_buf: [16384]u8 = undefined;
         const line_text = expandTabs(orig_line, tab_width, &exp_buf);
-        const needs_wrap = line_text.len > 0 and font.textSize(line_text).w > text_area_w;
+        const needs_wrap = line_text.len > 0 and @as(f32, @floatFromInt(line_text.len)) * (char_width / scale) > text_area_w;
 
         var byte_pos: usize = 0;
         while (true) {
@@ -1190,6 +1457,7 @@ fn dvuiKeyToStr(key: dvui.Event.Key, buf: *[64]u8) []const u8 {
         .enter => "enter",
         .escape => "escape",
         .slash => "/",
+        .backslash => "backslash",
         .minus => "-",
         .equal => "=",
         .space => "space",
@@ -1242,6 +1510,7 @@ fn dvuiKeyToStrNoShift(key: dvui.Event.Key, buf: *[64]u8) []const u8 {
         .enter => "enter",
         .escape => "escape",
         .slash => "/",
+        .backslash => "backslash",
         .minus => "-",
         .equal => "=",
         .space => "space",
@@ -1504,7 +1773,8 @@ fn guiWrapColToVisual(line: []const u8, font: dvui.Font, max_width: f32, byte_co
         if (byte_col < pos or pos >= line.len) {
             const clamped = @min(byte_col, pos);
             const effective_start = @min(row_start, clamped);
-            const px = if (clamped > effective_start) font.textSize(line[effective_start..clamped]).w else 0;
+            const char_w = font.textSize("M").w;
+            const px: f32 = @as(f32, @floatFromInt(clamped - effective_start)) * char_w;
             return .{ .row = visual_row, .px = px };
         }
         visual_row += 1;
@@ -1531,12 +1801,12 @@ fn guiWrapVisualToCol(line: []const u8, font: dvui.Font, max_width: f32, target_
     const segment = line[row_start..row_end];
     if (segment.len == 0) return row_start;
 
-    var end_idx: usize = 0;
-    _ = font.textSizeEx(segment, .{
-        .max_width = @floatFromInt(preferred_px),
-        .end_idx = &end_idx,
-        .end_metric = .nearest,
-    });
+    // Monospace: convert pixel x to column via division
+    const char_w = font.textSize("M").w;
+    const end_idx: usize = if (char_w > 0)
+        @min(@as(usize, @intFromFloat(@round(@as(f32, @floatFromInt(preferred_px)) / char_w))), segment.len)
+    else
+        segment.len;
 
     const result = row_start + end_idx;
     // For non-final rows, ensure we don't return the start of the next row
@@ -1833,11 +2103,10 @@ fn handlePaletteKeyGui(editor: *Editor, key: dvui.Event.Key) void {
         },
         .enter => {
             const filter = editor.palette_buf[0..editor.palette_buf_len];
-            const names = editor.commands.allNames(editor.allocator) catch {
+            const names = editor.commands.allNames() catch {
                 editor.mode = .normal;
                 return;
             };
-            defer editor.allocator.free(names);
             // Find the Nth matching item (palette_selected)
             var idx: usize = 0;
             for (names) |name| {
@@ -1845,7 +2114,12 @@ fn handlePaletteKeyGui(editor: *Editor, key: dvui.Event.Key) void {
                 if (idx == editor.palette_selected) {
                     editor.mode = .normal;
                     editor.palette_selected = 0;
+                    const prev_theme = editor.theme_name;
                     _ = editor.execCommand(name, null);
+                    // If a theme command changed the preset, update DVUI chrome
+                    if (editor.theme_name.ptr != prev_theme.ptr) {
+                        dvui.themeSet(dvuiThemeForPreset(editor.theme_name));
+                    }
                     return;
                 }
                 idx += 1;
@@ -1887,8 +2161,9 @@ fn handleConfirmQuitKeyGui(editor: *Editor, key: dvui.Event.Key) void {
 const SettingDef = struct {
     key: []const u8,
     label: []const u8,
-    kind: enum { boolean, number },
+    kind: enum { boolean, number, enum_choice },
     desc: []const u8,
+    choices: []const []const u8 = &.{},
 };
 
 const settings_defs = [_]SettingDef{
@@ -1901,6 +2176,8 @@ const settings_defs = [_]SettingDef{
     .{ .key = "gutter_min_digits", .label = "Gutter Min Digits", .kind = .number, .desc = "Minimum width of line number gutter (1-10)" },
     .{ .key = "page_size", .label = "Page Size", .kind = .number, .desc = "Lines to scroll on Page Up/Down (5-200)" },
     .{ .key = "click_clears_cursors", .label = "Click Clears Cursors", .kind = .boolean, .desc = "Left-click clears secondary cursors" },
+    .{ .key = "max_undo_history", .label = "Undo History Limit", .kind = .number, .desc = "Max undo operations per document, 0 = unlimited (0-100000)" },
+    .{ .key = "theme", .label = "Theme", .kind = .enum_choice, .desc = "Editor color theme", .choices = &.{ "dark", "light", "high_contrast" } },
 };
 
 /// Handle mouse clicks in the settings panel overlay.
@@ -1912,7 +2189,7 @@ fn handleSettingsClick(editor: *Editor, p: dvui.Point.Physical, render_area: dvu
 
     // Recalculate panel geometry (must match drawModalOverlay .settings)
     const panel_h = pad + row_h + @as(f32, @floatFromInt(total)) * row_h + row_h + pad;
-    const panel_w = @min(render_area.w * 0.8, 600 * scale);
+    const panel_w = @min(render_area.w * 0.8, 800 * scale);
     const panel_x = render_area.x + (render_area.w - panel_w) / 2;
     const panel_y = render_area.y + (render_area.h - panel_h) / 3;
 
@@ -1948,16 +2225,22 @@ fn handleSettingsClick(editor: *Editor, p: dvui.Point.Physical, render_area: dvu
 
     // Toggle/edit the clicked setting (same logic as Enter/Space)
     const def = settings_defs[clicked_row];
-    if (def.kind == .boolean) {
-        const new_val = !getSettingBool(editor, def.key);
-        applySettingBool(editor, def.key, new_val);
-        const val_str: []const u8 = if (new_val) "true" else "false";
-        lua_settings.writeSettingToFile(def.key, val_str) catch {};
-    } else {
-        editor.settings_editing = clicked_row;
-        const cur_val = getSettingNumber(editor, def.key);
-        const written = std.fmt.bufPrint(&editor.settings_num_buf, "{d}", .{cur_val}) catch "";
-        editor.settings_num_len = written.len;
+    switch (def.kind) {
+        .boolean => {
+            const new_val = !getSettingBool(editor, def.key);
+            applySettingBool(editor, def.key, new_val);
+            const val_str: []const u8 = if (new_val) "true" else "false";
+            lua_settings.writeSettingToFile(def.key, val_str) catch {};
+        },
+        .number => {
+            editor.settings_editing = clicked_row;
+            const cur_val = getSettingNumber(editor, def.key);
+            const written = std.fmt.bufPrint(&editor.settings_num_buf, "{d}", .{cur_val}) catch "";
+            editor.settings_num_len = written.len;
+        },
+        .enum_choice => {
+            cycleEnumSetting(editor, def);
+        },
     }
 }
 
@@ -2004,19 +2287,22 @@ fn handleSettingsKeyGui(editor: *Editor, key: dvui.Event.Key) void {
         },
         .enter, .space => {
             const def = settings_defs[editor.settings_selected];
-            if (def.kind == .boolean) {
-                // Toggle boolean
-                const new_val = !getSettingBool(editor, def.key);
-                applySettingBool(editor, def.key, new_val);
-                const val_str: []const u8 = if (new_val) "true" else "false";
-                lua_settings.writeSettingToFile(def.key, val_str) catch {};
-            } else {
-                // Enter numeric edit mode
-                editor.settings_editing = editor.settings_selected;
-                // Pre-fill with current value
-                const cur_val = getSettingNumber(editor, def.key);
-                const written = std.fmt.bufPrint(&editor.settings_num_buf, "{d}", .{cur_val}) catch "";
-                editor.settings_num_len = written.len;
+            switch (def.kind) {
+                .boolean => {
+                    const new_val = !getSettingBool(editor, def.key);
+                    applySettingBool(editor, def.key, new_val);
+                    const val_str: []const u8 = if (new_val) "true" else "false";
+                    lua_settings.writeSettingToFile(def.key, val_str) catch {};
+                },
+                .number => {
+                    editor.settings_editing = editor.settings_selected;
+                    const cur_val = getSettingNumber(editor, def.key);
+                    const written = std.fmt.bufPrint(&editor.settings_num_buf, "{d}", .{cur_val}) catch "";
+                    editor.settings_num_len = written.len;
+                },
+                .enum_choice => {
+                    cycleEnumSetting(editor, def);
+                },
             }
         },
         else => {},
@@ -2045,6 +2331,7 @@ fn getSettingNumber(editor: *const Editor, key: []const u8) i64 {
     if (std.mem.eql(u8, key, "auto_save_interval_ms")) return @intCast(editor.auto_save_interval_ms);
     if (std.mem.eql(u8, key, "gutter_min_digits")) return @intCast(editor.gutter_min_digits);
     if (std.mem.eql(u8, key, "page_size")) return @intCast(editor.page_size);
+    if (std.mem.eql(u8, key, "max_undo_history")) return @intCast(editor.max_undo_history);
     return 0;
 }
 
@@ -2061,6 +2348,34 @@ fn applySettingNumber(editor: *Editor, key: []const u8, val: i64) void {
     if (std.mem.eql(u8, key, "page_size")) {
         if (val >= 5 and val <= 200) editor.page_size = @intCast(val);
     }
+    if (std.mem.eql(u8, key, "max_undo_history")) {
+        if (val >= 0 and val <= 100000) {
+            editor.max_undo_history = @intCast(val);
+            for (editor.documents.items) |*doc| {
+                doc.history.max_size = editor.max_undo_history;
+            }
+        }
+    }
+}
+
+fn cycleEnumSetting(editor: *Editor, def: SettingDef) void {
+    const current = getSettingEnum(editor, def.key);
+    var next_idx: usize = 0;
+    for (def.choices, 0..) |choice, i| {
+        if (std.mem.eql(u8, choice, current)) {
+            next_idx = (i + 1) % def.choices.len;
+            break;
+        }
+    }
+    const next = def.choices[next_idx];
+    if (std.mem.eql(u8, def.key, "theme")) {
+        switchTheme(editor, next);
+    }
+}
+
+fn getSettingEnum(editor: *const Editor, key: []const u8) []const u8 {
+    if (std.mem.eql(u8, key, "theme")) return editor.theme_name;
+    return "";
 }
 
 /// Open init.lua in the editor as a document.
@@ -2080,6 +2395,95 @@ fn openSettingsFile(editor: *Editor) void {
         } else |_| {}
     }
     _ = editor.openFile(config_path) catch {};
+}
+
+/// Switch the active GUI theme. Updates editor colors, DVUI chrome, and persists to init.lua.
+fn switchTheme(editor: *Editor, name: []const u8) void {
+    const lua_settings = @import("../core/lua_settings.zig");
+    if (std.mem.eql(u8, name, "dark")) {
+        editor.theme = theme_mod.gui_dark;
+        editor.theme_name = "dark";
+    } else if (std.mem.eql(u8, name, "light")) {
+        editor.theme = theme_mod.gui_light;
+        editor.theme_name = "light";
+    } else if (std.mem.eql(u8, name, "high_contrast")) {
+        editor.theme = theme_mod.gui_high_contrast;
+        editor.theme_name = "high_contrast";
+    } else return;
+
+    // Update DVUI chrome (menus, scrollbars, etc.) live
+    dvui.themeSet(dvuiThemeForPreset(editor.theme_name));
+
+    // Persist choice to init.lua
+    var val_buf: [32]u8 = undefined;
+    const quoted = std.fmt.bufPrint(&val_buf, "\"{s}\"", .{name}) catch return;
+    lua_settings.writeSettingToFile("theme", quoted) catch {};
+}
+
+/// Open the GUI theme override file in the editor. Creates a commented template if it doesn't exist.
+fn openThemeFile(editor: *Editor) void {
+    const lua_settings = @import("../core/lua_settings.zig");
+    const dir = lua_settings.getConfigDir() orelse return;
+    var path_buf: [512]u8 = undefined;
+    const path = std.fmt.bufPrint(&path_buf, "{s}/themes/gui-theme.lua", .{dir}) catch return;
+    if (path.len >= path_buf.len) return;
+    path_buf[path.len] = 0;
+    const z_path: [:0]const u8 = path_buf[0..path.len :0];
+
+    // Template is auto-created by loadThemeFiles on startup; just open it
+    _ = editor.openFile(z_path) catch {};
+}
+
+/// Open the ZIDE config folder in the OS file explorer.
+fn openThemeFolder() void {
+    const lua_settings = @import("../core/lua_settings.zig");
+    const config_dir = lua_settings.getConfigDir() orelse return;
+
+    // Build themes/ subdirectory path
+    var dir_buf: [512]u8 = undefined;
+    const dir_slice = std.fmt.bufPrint(&dir_buf, "{s}/themes", .{config_dir}) catch return;
+    if (dir_slice.len >= dir_buf.len) return;
+
+    // Ensure directory exists
+    std.fs.cwd().makePath(dir_slice) catch {};
+
+    const builtin = @import("builtin");
+    // Windows explorer needs backslashes — the config path mixes \ and /
+    if (builtin.os.tag == .windows) {
+        for (dir_buf[0..dir_slice.len]) |*c| {
+            if (c.* == '/') c.* = '\\';
+        }
+    }
+    dir_buf[dir_slice.len] = 0;
+    const dir_z: [:0]const u8 = dir_buf[0..dir_slice.len :0];
+
+    const opener: [:0]const u8 = if (builtin.os.tag == .windows) "explorer" else if (builtin.os.tag == .macos) "open" else "xdg-open";
+
+    const argv = [_][]const u8{ opener, dir_z };
+    var child = std.process.Child.init(&argv, std.heap.page_allocator);
+    _ = child.spawn() catch return;
+}
+
+/// Open Documentation.md in the editor.
+fn openDocumentation(editor: *Editor) void {
+    // Try to find Documentation.md relative to the executable
+    var exe_dir_buf: [512]u8 = undefined;
+    if (std.fs.selfExeDirPath(&exe_dir_buf)) |exe_dir| {
+        var doc_buf: [600]u8 = undefined;
+        const doc_path = std.fmt.bufPrint(&doc_buf, "{s}/Documentation.md", .{exe_dir}) catch return;
+        if (doc_path.len >= doc_buf.len) return;
+        doc_buf[doc_path.len] = 0;
+        const z_path: [:0]const u8 = doc_buf[0..doc_path.len :0];
+        if (std.fs.cwd().access(z_path, .{})) |_| {
+            _ = editor.openFile(z_path) catch {};
+            return;
+        } else |_| {}
+    } else |_| {}
+
+    // Fallback: try current working directory
+    if (std.fs.cwd().access("Documentation.md", .{})) |_| {
+        _ = editor.openFile("Documentation.md") catch {};
+    } else |_| {}
 }
 
 // ===========================================================================
@@ -2232,10 +2636,10 @@ fn drawModalOverlay(editor: *Editor, render_area: dvui.Rect.Physical, render_rs:
     const font = dvui.Font.theme(.mono);
     const lh = font.lineHeight() * scale;
     const pad: f32 = 8 * scale;
-    const fg = dvui.Color{ .r = 255, .g = 255, .b = 255, .a = 255 };
-    const bg = dvui.Color{ .r = 50, .g = 50, .b = 60, .a = 230 };
-    const dim = dvui.Color{ .r = 150, .g = 150, .b = 150, .a = 200 };
-    const warn_color = dvui.Color{ .r = 255, .g = 100, .b = 100, .a = 255 };
+    const fg = toDvui(editor.theme.overlay_fg);
+    const bg = toDvui(editor.theme.overlay_bg);
+    const dim = toDvui(editor.theme.overlay_dim);
+    const warn_color = toDvui(editor.theme.overlay_warn);
 
     switch (editor.mode) {
         .goto_line => {
@@ -2311,9 +2715,7 @@ fn drawModalOverlay(editor: *Editor, render_area: dvui.Rect.Physical, render_rs:
             const max_items: usize = 10;
             // Count matching items for height
             var match_count: usize = 0;
-            const names = editor.commands.allNames(editor.allocator) catch &[_][]const u8{};
-            const names_owned = names.len > 0;
-            defer if (names_owned) editor.allocator.free(names);
+            const names = editor.commands.allNames() catch &[_][]const u8{};
             for (names) |name| {
                 if (filter.len == 0 or guiFuzzyMatch(name, filter)) {
                     match_count += 1;
@@ -2333,7 +2735,7 @@ fn drawModalOverlay(editor: *Editor, render_area: dvui.Rect.Physical, render_rs:
             const input_txt = std.fmt.bufPrint(&input_buf, "> {s}_", .{filter}) catch "> ";
             renderOverlayText(font, input_txt, render_area.x + pad, render_area.y + pad, render_rs, fg);
             // Highlight color for selected item
-            const sel_highlight = dvui.Color{ .r = 80, .g = 80, .b = 120, .a = 200 };
+            const sel_highlight = toDvui(editor.theme.overlay_selection);
             // List items
             var item_y: f32 = render_area.y + pad + lh + pad;
             var shown: usize = 0;
@@ -2363,7 +2765,7 @@ fn drawModalOverlay(editor: *Editor, render_area: dvui.Rect.Physical, render_rs:
             // Title + settings rows + hint row
             const panel_h = pad + row_h + @as(f32, @floatFromInt(total)) * row_h + row_h + pad;
             // Center the panel
-            const panel_w = @min(render_area.w * 0.8, 600 * scale);
+            const panel_w = @min(render_area.w * 0.8, 800 * scale);
             const panel_x = render_area.x + (render_area.w - panel_w) / 2;
             const panel_y = render_area.y + (render_area.h - panel_h) / 3;
             const panel_rect: dvui.Rect.Physical = .{ .x = panel_x, .y = panel_y, .w = panel_w, .h = panel_h };
@@ -2374,7 +2776,7 @@ fn drawModalOverlay(editor: *Editor, render_area: dvui.Rect.Physical, render_rs:
             panel_rect.fill(.{}, .{ .color = bg, .fade = 1.0 });
 
             var y = panel_y + pad;
-            const sel_highlight = dvui.Color{ .r = 80, .g = 80, .b = 120, .a = 200 };
+            const sel_highlight = toDvui(editor.theme.overlay_selection);
 
             // Title
             renderOverlayText(font, "Settings", panel_x + pad, y, render_rs, fg);
@@ -2402,12 +2804,18 @@ fn drawModalOverlay(editor: *Editor, render_area: dvui.Rect.Physical, render_rs:
                         // Show editable numeric field
                         break :blk std.fmt.bufPrint(&val_buf, "[{s}_]", .{editor.settings_num_buf[0..editor.settings_num_len]}) catch "?";
                     }
-                    if (def.kind == .boolean) {
-                        const bval = getSettingBool(editor, def.key);
-                        break :blk if (bval) "ON" else "OFF";
-                    } else {
-                        const nval = getSettingNumber(editor, def.key);
-                        break :blk std.fmt.bufPrint(&val_buf, "{d}", .{nval}) catch "?";
+                    switch (def.kind) {
+                        .boolean => {
+                            const bval = getSettingBool(editor, def.key);
+                            break :blk if (bval) "ON" else "OFF";
+                        },
+                        .number => {
+                            const nval = getSettingNumber(editor, def.key);
+                            break :blk std.fmt.bufPrint(&val_buf, "{d}", .{nval}) catch "?";
+                        },
+                        .enum_choice => {
+                            break :blk getSettingEnum(editor, def.key);
+                        },
                     }
                 };
                 const val_w = font.textSize(val_str).w * scale;
@@ -2415,19 +2823,26 @@ fn drawModalOverlay(editor: *Editor, render_area: dvui.Rect.Physical, render_rs:
                     if (editor.settings_editing != null and editor.settings_editing.? == i) break :blk fg;
                     if (def.kind == .boolean) {
                         break :blk if (getSettingBool(editor, def.key))
-                            dvui.Color{ .r = 100, .g = 220, .b = 100, .a = 255 }
+                            toDvui(editor.theme.bool_true)
                         else
-                            dvui.Color{ .r = 180, .g = 80, .b = 80, .a = 255 };
+                            toDvui(editor.theme.bool_false);
                     }
                     break :blk label_color;
                 };
                 renderOverlayText(font, val_str, panel_x + panel_w - val_w - pad, y, render_rs, val_color);
 
-                // Description (between label and value, dimmer)
+                // Description (between label and value, dimmer — clipped to avoid overlap)
                 if (is_selected) {
-                    const desc_x = panel_x + pad + font.textSize(def.label).w * scale + pad * 2;
-                    const desc_color = dvui.Color{ .r = 120, .g = 120, .b = 140, .a = 200 };
-                    renderOverlayText(font, def.desc, desc_x, y, render_rs, desc_color);
+                    const cw = font.textSize("W").w * scale;
+                    const desc_x = panel_x + pad + @as(f32, @floatFromInt(def.label.len)) * cw + pad * 2;
+                    const desc_max_x = panel_x + panel_w - val_w - pad - pad;
+                    if (desc_x < desc_max_x) {
+                        const desc_clip: dvui.Rect.Physical = .{ .x = desc_x, .y = y, .w = desc_max_x - desc_x, .h = row_h };
+                        const prev_clip2 = dvui.clip(desc_clip);
+                        defer dvui.clipSet(prev_clip2);
+                        const desc_color = toDvui(editor.theme.overlay_hint);
+                        renderOverlayText(font, def.desc, desc_x, y, render_rs, desc_color);
+                    }
                 }
 
                 y += row_h;
@@ -2438,7 +2853,7 @@ fn drawModalOverlay(editor: *Editor, render_area: dvui.Rect.Physical, render_rs:
                 "Type value, Enter: apply, Esc: cancel"
             else
                 "Click/Up/Down: navigate | Enter/Space/Click: toggle/edit | Esc: close";
-            const hint_color = dvui.Color{ .r = 100, .g = 100, .b = 120, .a = 180 };
+            const hint_color = toDvui(editor.theme.overlay_hint);
             renderOverlayText(font, hint, panel_x + pad, y, render_rs, hint_color);
         },
         else => {},

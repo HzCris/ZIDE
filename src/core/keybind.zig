@@ -91,6 +91,10 @@ pub const KeybindMap = struct {
         try self.set("ctrl+alt+up", "add_cursor_above");
         try self.set("ctrl+alt+down", "add_cursor_below");
         try self.set("ctrl+d", "add_next_occurrence");
+        // Split pane shortcuts
+        try self.set("alt+backslash", "split_vertical");
+        try self.set("alt+shift+backslash", "split_horizontal");
+        try self.set("ctrl+shift+w", "close_pane");
     }
 };
 

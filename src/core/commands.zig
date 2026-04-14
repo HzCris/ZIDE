@@ -1,5 +1,7 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
+const theme_mod = @import("theme.zig");
+const lua_settings = @import("lua_settings.zig");
 
 /// Forward declaration — Editor will be defined in editor.zig.
 /// Commands receive a pointer to the editor state.
@@ -20,6 +22,8 @@ pub const Command = struct {
 pub const CommandRegistry = struct {
     commands: std.StringHashMapUnmanaged(Command),
     allocator: Allocator,
+    /// Cached sorted command names (invalidated on register).
+    cached_names: ?[][]const u8 = null,
 
     pub fn init(allocator: Allocator) CommandRegistry {
         return .{
@@ -29,6 +33,7 @@ pub const CommandRegistry = struct {
     }
 
     pub fn deinit(self: *CommandRegistry) void {
+        self.invalidateCache();
         self.commands.deinit(self.allocator);
     }
 
@@ -39,6 +44,7 @@ pub const CommandRegistry = struct {
             .description = description,
             .execute = func,
         });
+        self.invalidateCache();
     }
 
     /// Look up a command by name.
@@ -54,8 +60,10 @@ pub const CommandRegistry = struct {
     }
 
     /// Get a sorted list of all command names (for command palette).
-    pub fn allNames(self: *const CommandRegistry, allocator: Allocator) ![][]const u8 {
-        var names = try std.ArrayList([]const u8).initCapacity(allocator, self.commands.count());
+    /// Returns a cached slice — caller must NOT free it.
+    pub fn allNames(self: *CommandRegistry) ![][]const u8 {
+        if (self.cached_names) |names| return names;
+        var names = try std.ArrayList([]const u8).initCapacity(self.allocator, self.commands.count());
         var iter = self.commands.iterator();
         while (iter.next()) |entry| {
             names.appendAssumeCapacity(entry.key_ptr.*);
@@ -65,7 +73,16 @@ pub const CommandRegistry = struct {
                 return std.mem.order(u8, a, b) == .lt;
             }
         }.lessThan);
+        self.cached_names = names.items;
         return names.items;
+    }
+
+    fn invalidateCache(self: *CommandRegistry) void {
+        if (self.cached_names) |names| {
+            // Free the ArrayList's backing allocation
+            self.allocator.free(names);
+            self.cached_names = null;
+        }
     }
 
     /// Number of registered commands.
@@ -123,6 +140,25 @@ pub fn registerBuiltins(registry: *CommandRegistry) !void {
     try registry.register("add_cursor_above", "Add cursor above", cmdAddCursorAbove);
     try registry.register("add_next_occurrence", "Add cursor at next occurrence", cmdAddNextOccurrence);
     try registry.register("escape_multicursor", "Remove secondary cursors", cmdEscapeMulticursor);
+    // Split pane commands
+    try registry.register("split_vertical", "Split pane vertically (side by side)", cmdSplitVertical);
+    try registry.register("split_horizontal", "Split pane horizontally (top/bottom)", cmdSplitHorizontal);
+    try registry.register("close_pane", "Close current pane", cmdClosePane);
+    try registry.register("focus_next_pane", "Focus next pane", cmdFocusNextPane);
+    try registry.register("focus_prev_pane", "Focus previous pane", cmdFocusPrevPane);
+    // Theme commands (set both frontends)
+    try registry.register("theme_dark", "Switch to dark theme (both frontends)", cmdThemeDark);
+    try registry.register("theme_light", "Switch to light theme (both frontends)", cmdThemeLight);
+    try registry.register("theme_high_contrast", "Switch to high contrast theme (both frontends)", cmdThemeHighContrast);
+    try registry.register("theme_terminal", "Switch to terminal theme (TUI only, uses ANSI colors)", cmdThemeTerminal);
+    // GUI-only theme commands
+    try registry.register("gui_theme_dark", "Switch GUI to dark theme", cmdGuiThemeDark);
+    try registry.register("gui_theme_light", "Switch GUI to light theme", cmdGuiThemeLight);
+    try registry.register("gui_theme_high_contrast", "Switch GUI to high contrast theme", cmdGuiThemeHighContrast);
+    // TUI-only theme commands
+    try registry.register("tui_theme_dark", "Switch TUI to dark theme", cmdTuiThemeDark);
+    try registry.register("tui_theme_light", "Switch TUI to light theme", cmdTuiThemeLight);
+    try registry.register("tui_theme_high_contrast", "Switch TUI to high contrast theme", cmdTuiThemeHighContrast);
 }
 
 // --- Built-in command implementations ---
@@ -631,8 +667,87 @@ fn cmdEscapeMulticursor(editor: *Editor, _: ?[]const u8) void {
     editor.activeDoc().cursors.clearSecondary();
 }
 
+fn cmdSplitVertical(editor: *Editor, _: ?[]const u8) void {
+    _ = editor.execAction("split_vertical");
+}
+
+fn cmdSplitHorizontal(editor: *Editor, _: ?[]const u8) void {
+    _ = editor.execAction("split_horizontal");
+}
+
+fn cmdClosePane(editor: *Editor, _: ?[]const u8) void {
+    _ = editor.execAction("close_pane");
+}
+
+fn cmdFocusNextPane(editor: *Editor, _: ?[]const u8) void {
+    _ = editor.execAction("focus_next_pane");
+}
+
+fn cmdFocusPrevPane(editor: *Editor, _: ?[]const u8) void {
+    _ = editor.execAction("focus_prev_pane");
+}
+
 fn isWordCharByte(byte: u8) bool {
     return std.ascii.isAlphanumeric(byte) or byte == '_';
+}
+
+// ---- Theme commands ----
+
+fn setGuiTheme(editor: *Editor, name: []const u8, preset: theme_mod.EditorTheme) void {
+    editor.theme = preset;
+    editor.theme_name = name;
+    var val_buf: [32]u8 = undefined;
+    const quoted = std.fmt.bufPrint(&val_buf, "\"{s}\"", .{name}) catch return;
+    lua_settings.writeSettingToFile("theme", quoted) catch {};
+}
+
+fn setTuiTheme(editor: *Editor, name: []const u8, preset: theme_mod.TuiTheme) void {
+    editor.tui_theme = preset;
+    editor.tui_theme_name = name;
+    var val_buf: [32]u8 = undefined;
+    const quoted = std.fmt.bufPrint(&val_buf, "\"{s}\"", .{name}) catch return;
+    lua_settings.writeSettingToFile("tui_theme", quoted) catch {};
+}
+
+fn cmdThemeDark(editor: *Editor, _: ?[]const u8) void {
+    setGuiTheme(editor, "dark", theme_mod.gui_dark);
+    setTuiTheme(editor, "dark", theme_mod.tui_dark);
+}
+
+fn cmdThemeLight(editor: *Editor, _: ?[]const u8) void {
+    setGuiTheme(editor, "light", theme_mod.gui_light);
+    setTuiTheme(editor, "light", theme_mod.tui_light);
+}
+
+fn cmdThemeHighContrast(editor: *Editor, _: ?[]const u8) void {
+    setGuiTheme(editor, "high_contrast", theme_mod.gui_high_contrast);
+    setTuiTheme(editor, "high_contrast", theme_mod.tui_high_contrast);
+}
+
+fn cmdThemeTerminal(editor: *Editor, _: ?[]const u8) void {
+    setTuiTheme(editor, "terminal", theme_mod.tui_terminal);
+}
+
+// GUI-only theme commands (don't touch TUI theme)
+fn cmdGuiThemeDark(editor: *Editor, _: ?[]const u8) void {
+    setGuiTheme(editor, "dark", theme_mod.gui_dark);
+}
+fn cmdGuiThemeLight(editor: *Editor, _: ?[]const u8) void {
+    setGuiTheme(editor, "light", theme_mod.gui_light);
+}
+fn cmdGuiThemeHighContrast(editor: *Editor, _: ?[]const u8) void {
+    setGuiTheme(editor, "high_contrast", theme_mod.gui_high_contrast);
+}
+
+// TUI-only theme commands (don't touch GUI theme)
+fn cmdTuiThemeDark(editor: *Editor, _: ?[]const u8) void {
+    setTuiTheme(editor, "dark", theme_mod.tui_dark);
+}
+fn cmdTuiThemeLight(editor: *Editor, _: ?[]const u8) void {
+    setTuiTheme(editor, "light", theme_mod.tui_light);
+}
+fn cmdTuiThemeHighContrast(editor: *Editor, _: ?[]const u8) void {
+    setTuiTheme(editor, "high_contrast", theme_mod.tui_high_contrast);
 }
 
 // ---- Tests ----

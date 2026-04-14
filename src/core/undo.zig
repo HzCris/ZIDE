@@ -32,6 +32,8 @@ pub const UndoHistory = struct {
     next_group_id: u32 = 1,
     /// Whether we're currently replaying (undo/redo in progress).
     recording: bool = true,
+    /// Maximum number of undo operations to keep (0 = unlimited).
+    max_size: usize = 100,
 
     pub fn init(allocator: Allocator) UndoHistory {
         return .{
@@ -66,6 +68,7 @@ pub const UndoHistory = struct {
             .cursor_after = cursor_after,
             .group_id = group_id,
         });
+        self.trimOldest();
     }
 
     /// Record a delete operation.
@@ -82,6 +85,7 @@ pub const UndoHistory = struct {
             .cursor_after = cursor_after,
             .group_id = group_id,
         });
+        self.trimOldest();
     }
 
     /// Undo one group of operations. Returns the cursor position to restore, or null if nothing to undo.
@@ -176,6 +180,15 @@ pub const UndoHistory = struct {
     }
 
     // --- Internal ---
+
+    /// Evict oldest undo operations if the stack exceeds max_size.
+    fn trimOldest(self: *UndoHistory) void {
+        if (self.max_size == 0) return; // unlimited
+        while (self.undo_stack.items.len > self.max_size) {
+            const old = self.undo_stack.orderedRemove(0);
+            self.allocator.free(old.text);
+        }
+    }
 
     fn clearRedoStack(self: *UndoHistory) void {
         for (self.redo_stack.items) |op| {

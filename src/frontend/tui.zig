@@ -2,6 +2,7 @@ const std = @import("std");
 const vaxis = @import("vaxis");
 const Editor = @import("../core/editor.zig").Editor;
 const Document = @import("../core/document.zig").Document;
+const TuiColor = @import("../core/theme.zig").TuiColor;
 
 const Key = vaxis.Key;
 const Cell = vaxis.Cell;
@@ -9,6 +10,15 @@ const Style = vaxis.Style;
 const Color = vaxis.Color;
 const Window = vaxis.Window;
 const Segment = vaxis.Segment;
+
+/// Convert a TuiColor to a vaxis Color.
+fn toVaxis(c: TuiColor) Color {
+    return switch (c) {
+        .default => .default,
+        .ansi => |idx| .{ .index = idx },
+        .rgb => |rgb| .{ .rgb = .{ rgb.r, rgb.g, rgb.b } },
+    };
+}
 
 // ===========================================================================
 // Safe text rendering helpers
@@ -132,7 +142,10 @@ pub fn run(allocator: std.mem.Allocator, editor: *Editor) !void {
             switch (event) {
                 .key_press => |key| dispatchKey(editor, key),
                 .mouse => |mouse| handleMouse(editor, mouse),
-                .winsize => |ws| try vx.resize(allocator, tty.writer(), ws),
+                .winsize => |ws| {
+                    try vx.resize(allocator, tty.writer(), ws);
+                    vx.refresh = true;
+                },
                 else => {},
             }
         }
@@ -156,7 +169,6 @@ pub fn run(allocator: std.mem.Allocator, editor: *Editor) !void {
         }
 
         win.clear();
-        vx.refresh = true; // Force full redraw every frame on Windows
 
         if (height < 3 or width < 10) {
             try vx.render(tty.writer());
@@ -164,7 +176,10 @@ pub fn run(allocator: std.mem.Allocator, editor: *Editor) !void {
             switch (event) {
                 .key_press => |key| dispatchKey(editor, key),
                 .mouse => |mouse| handleMouse(editor, mouse),
-                .winsize => |ws| try vx.resize(allocator, tty.writer(), ws),
+                .winsize => |ws| {
+                    try vx.resize(allocator, tty.writer(), ws);
+                    vx.refresh = true;
+                },
                 else => {},
             }
             continue;
@@ -176,10 +191,10 @@ pub fn run(allocator: std.mem.Allocator, editor: *Editor) !void {
         // Draw overlay if in a special mode (replaces status bar)
         switch (editor.mode) {
             .find => {
-                drawOverlay(win, "Find: ", editor.find_buf[0..editor.find_buf_len], width, height);
+                drawOverlay(win, editor, "Find: ", editor.find_buf[0..editor.find_buf_len], width, height);
                 // Show search status message (e.g. "No matches found") right-aligned
                 if (editor.status_message.len > 0) {
-                    const msg_style: Style = .{ .bg = .{ .index = 0 }, .fg = .{ .index = 9 } };
+                    const msg_style: Style = .{ .bg = toVaxis(editor.tui_theme.overlay_bg), .fg = toVaxis(editor.tui_theme.overlay_warn) };
                     const overlay_y: u16 = height -| 1;
                     const msg_win = win.child(.{ .y_off = @intCast(overlay_y), .width = width, .height = 1 });
                     const msg_len: u16 = @intCast(@min(editor.status_message.len, width));
@@ -191,23 +206,23 @@ pub fn run(allocator: std.mem.Allocator, editor: *Editor) !void {
                 drawFindReplaceOverlay(win, editor, width, height);
             },
             .file_open => {
-                drawOverlay(win, "Open: ", editor.open_buf[0..editor.open_buf_len], width, height);
+                drawOverlay(win, editor, "Open: ", editor.open_buf[0..editor.open_buf_len], width, height);
             },
             .save_as => {
-                drawOverlay(win, "Save As: ", editor.open_buf[0..editor.open_buf_len], width, height);
+                drawOverlay(win, editor, "Save As: ", editor.open_buf[0..editor.open_buf_len], width, height);
             },
             .command_palette => {
                 drawCommandPalette(win, editor, width, height);
             },
             .goto_line => {
-                drawOverlay(win, "Go to line: ", editor.goto_buf[0..editor.goto_buf_len], width, height);
+                drawOverlay(win, editor, "Go to line: ", editor.goto_buf[0..editor.goto_buf_len], width, height);
             },
             .confirm_quit => {
-                drawOverlay(win, "Unsaved changes! [S]ave [D]iscard [C]ancel: ", "", width, height);
+                drawOverlay(win, editor, "Unsaved changes! [S]ave [D]iscard [C]ancel: ", "", width, height);
             },
             .settings => {
                 // Settings panel is GUI-only; in TUI just show a hint
-                drawOverlay(win, "Settings: edit ~/.config/zide/init.lua (Esc to close)", "", width, height);
+                drawOverlay(win, editor, "Settings: edit ~/.config/zide/init.lua (Esc to close)", "", width, height);
             },
             .normal => positionCursor(win, editor, width, height),
         }
@@ -219,7 +234,10 @@ pub fn run(allocator: std.mem.Allocator, editor: *Editor) !void {
         switch (event) {
             .key_press => |key| dispatchKey(editor, key),
             .mouse => |mouse| handleMouse(editor, mouse),
-            .winsize => |ws| try vx.resize(allocator, tty.writer(), ws),
+            .winsize => |ws| {
+                try vx.resize(allocator, tty.writer(), ws);
+                vx.refresh = true;
+            },
             else => {},
         }
     }
@@ -278,11 +296,11 @@ fn drawEditor(win: Window, editor: *Editor, width: u16, height: u16) void {
         .height = editor_height,
         .width = width,
     });
-    drawContent(content_win, doc, width, editor_height, editor.word_wrap);
+    drawContent(content_win, doc, editor, width, editor_height, editor.word_wrap);
 
     // Draw secondary cursors as reverse-video cells
     if (doc.cursors.count() > 1) {
-        drawSecondaryCursors(content_win, doc, width, editor_height, editor.word_wrap);
+        drawSecondaryCursors(content_win, doc, editor, width, editor_height, editor.word_wrap);
     }
 
     // Status bar
@@ -296,8 +314,8 @@ fn drawEditor(win: Window, editor: *Editor, width: u16, height: u16) void {
 
 /// Draw the tab bar.
 fn drawTabBar(win: Window, editor: *Editor, width: u16) void {
-    const bg_style: Style = .{ .bg = .{ .index = 8 }, .fg = .{ .index = 15 } }; // bright_black bg, white fg
-    const active_style: Style = .{ .bg = .{ .index = 4 }, .fg = .{ .index = 15 }, .bold = true }; // blue bg, bright_white fg
+    const bg_style: Style = .{ .bg = toVaxis(editor.tui_theme.tab_bg), .fg = toVaxis(editor.tui_theme.tab_fg) };
+    const active_style: Style = .{ .bg = toVaxis(editor.tui_theme.tab_active_bg), .fg = toVaxis(editor.tui_theme.tab_active_fg), .bold = true };
 
     // Fill background
     win.fill(.{ .style = bg_style });
@@ -607,7 +625,7 @@ fn ensureCursorVisibleWrapped(doc: *Document, editor_height: u16, width: u16) vo
 }
 
 /// Draw the editor content area with line numbers and optional word wrap.
-fn drawContent(win: Window, doc: *Document, width: u16, height: u16, wrap: bool) void {
+fn drawContent(win: Window, doc: *Document, editor: *Editor, width: u16, height: u16, wrap: bool) void {
     const total_lines = doc.lineCount();
     const gutter_width = lineNumberWidth(total_lines);
     const text_start_x = gutter_width + 1; // +1 for separator
@@ -615,13 +633,17 @@ fn drawContent(win: Window, doc: *Document, width: u16, height: u16, wrap: bool)
 
     const cursor_pos = doc.cursorPos();
 
-    const line_num_style: Style = .{ .fg = .{ .index = 8 } }; // bright_black
-    const line_num_active_style: Style = .{ .fg = .{ .index = 15 } }; // bright_white
-    const gutter_sep_style: Style = .{ .fg = .{ .index = 8 } }; // bright_black
-    const text_style: Style = .{ .fg = .{ .index = 15 } }; // white
-    const sel_style: Style = .{ .bg = .{ .index = 4 }, .fg = .{ .index = 15 } }; // blue bg for selection
-    const tilde_style: Style = .{ .fg = .{ .index = 8 } }; // bright_black
-    const wrap_marker_style: Style = .{ .fg = .{ .index = 8 } }; // dim for wrap continuation
+    const bg = toVaxis(editor.tui_theme.text_bg);
+    const line_num_style: Style = .{ .fg = toVaxis(editor.tui_theme.gutter_text), .bg = bg };
+    const line_num_active_style: Style = .{ .fg = toVaxis(editor.tui_theme.gutter_text_active), .bg = bg };
+    const gutter_sep_style: Style = .{ .fg = toVaxis(editor.tui_theme.gutter_separator), .bg = bg };
+    const text_style: Style = .{ .fg = toVaxis(editor.tui_theme.text_fg), .bg = bg };
+    const sel_style: Style = .{ .bg = toVaxis(editor.tui_theme.selection_bg), .fg = toVaxis(editor.tui_theme.selection_fg) };
+    const tilde_style: Style = .{ .fg = toVaxis(editor.tui_theme.tilde), .bg = bg };
+    const wrap_marker_style: Style = .{ .fg = toVaxis(editor.tui_theme.wrap_marker), .bg = bg };
+
+    // Fill entire content area with theme background
+    win.fill(.{ .style = .{ .bg = bg } });
 
     // Get selection range if any
     const sel = doc.cursors.primaryConst().selectionRange();
@@ -727,12 +749,12 @@ fn drawContent(win: Window, doc: *Document, width: u16, height: u16, wrap: bool)
 }
 
 /// Draw secondary cursors as reverse-video cells.
-fn drawSecondaryCursors(win: Window, doc: *Document, width: u16, height: u16, wrap: bool) void {
+fn drawSecondaryCursors(win: Window, doc: *Document, editor: *Editor, width: u16, height: u16, wrap: bool) void {
     const total_lines = doc.lineCount();
     const gutter_width = lineNumberWidth(total_lines);
     const text_start_x = gutter_width + 1;
     const text_width: u16 = if (width > text_start_x) width - text_start_x else 1;
-    const cursor_style: Style = .{ .bg = .{ .index = 15 }, .fg = .{ .index = 0 } }; // reverse video
+    const cursor_style: Style = .{ .bg = toVaxis(editor.tui_theme.cursor_bg), .fg = toVaxis(editor.tui_theme.cursor_fg) };
 
     // Skip primary cursor (index 0), render the rest
     for (doc.cursors.cursors.items[1..]) |c| {
@@ -780,7 +802,7 @@ fn drawSecondaryCursors(win: Window, doc: *Document, width: u16, height: u16, wr
 
 /// Draw the status bar.
 fn drawStatusBar(win: Window, editor: *Editor, width: u16) void {
-    const style: Style = .{ .bg = .{ .index = 4 }, .fg = .{ .index = 15 }, .bold = true }; // blue bg, bright white fg
+    const style: Style = .{ .bg = toVaxis(editor.tui_theme.status_bg), .fg = toVaxis(editor.tui_theme.status_fg), .bold = true };
 
     // Fill background
     win.fill(.{ .style = style });
@@ -1146,15 +1168,15 @@ fn handleKey(editor: *Editor, key: Key) void {
 // ===========================================================================
 
 /// Draw a single-line input overlay on the status bar line.
-fn drawOverlay(win: Window, label: []const u8, input: []const u8, width: u16, height: u16) void {
+fn drawOverlay(win: Window, editor: *Editor, label: []const u8, input: []const u8, width: u16, height: u16) void {
     const overlay_y: u16 = height -| 1;
     const overlay_win = win.child(.{
         .y_off = @intCast(overlay_y),
         .width = width,
         .height = 1,
     });
-    const style: Style = .{ .bg = .{ .index = 0 }, .fg = .{ .index = 14 }, .bold = true }; // cyan on black
-    const input_style: Style = .{ .bg = .{ .index = 0 }, .fg = .{ .index = 15 } }; // white on black
+    const style: Style = .{ .bg = toVaxis(editor.tui_theme.overlay_bg), .fg = toVaxis(editor.tui_theme.overlay_accent), .bold = true };
+    const input_style: Style = .{ .bg = toVaxis(editor.tui_theme.overlay_bg), .fg = toVaxis(editor.tui_theme.overlay_fg) };
     overlay_win.fill(.{ .style = style });
 
     _ = overlay_win.printSegment(.{ .text = label, .style = style }, .{ .wrap = .none });
@@ -1181,11 +1203,10 @@ fn drawCommandPalette(win: Window, editor: *Editor, width: u16, height: u16) voi
     const palette_width: u16 = @min(width -| 4, 60);
     const palette_x: u16 = (width -| palette_width) / 2;
 
-    const border_style: Style = .{ .bg = .{ .index = 0 }, .fg = .{ .index = 6 } }; // cyan border
-    const input_style: Style = .{ .bg = .{ .index = 0 }, .fg = .{ .index = 15 }, .bold = true };
-    const item_style: Style = .{ .bg = .{ .index = 0 }, .fg = .{ .index = 15 } };
-    const match_style: Style = .{ .bg = .{ .index = 4 }, .fg = .{ .index = 15 }, .bold = true };
-    _ = match_style;
+    const border_style: Style = .{ .bg = toVaxis(editor.tui_theme.overlay_bg), .fg = toVaxis(editor.tui_theme.overlay_border) };
+    const input_style: Style = .{ .bg = toVaxis(editor.tui_theme.overlay_bg), .fg = toVaxis(editor.tui_theme.overlay_fg), .bold = true };
+    const item_style: Style = .{ .bg = toVaxis(editor.tui_theme.overlay_bg), .fg = toVaxis(editor.tui_theme.overlay_fg) };
+    const selected_style: Style = .{ .bg = toVaxis(editor.tui_theme.overlay_selection_bg), .fg = toVaxis(editor.tui_theme.overlay_selection_fg), .bold = true, .reverse = true };
 
     // Header
     const header_win = win.child(.{ .x_off = @intCast(palette_x), .y_off = @intCast(input_y), .width = palette_width, .height = 1 });
@@ -1206,13 +1227,28 @@ fn drawCommandPalette(win: Window, editor: *Editor, width: u16, height: u16) voi
     var item_y: u16 = 1;
 
     // Get all command names and filter
-    const names = editor.commands.allNames(editor.allocator) catch return;
-    defer editor.allocator.free(names);
+    const names = editor.commands.allNames() catch return;
 
+    // Count matches to clamp selection
+    var match_count: usize = 0;
+    for (names) |name| {
+        if (filter.len > 0 and !fuzzyMatch(name, filter)) continue;
+        match_count += 1;
+    }
+    const visible_count = @min(match_count, max_items);
+    if (visible_count > 0) {
+        if (editor.palette_selected >= visible_count) editor.palette_selected = visible_count - 1;
+    } else {
+        editor.palette_selected = 0;
+    }
+
+    var shown: usize = 0;
     for (names) |name| {
         if (item_y > max_items) break;
-        // Fuzzy filter: all filter chars must appear in order in the name
         if (filter.len > 0 and !fuzzyMatch(name, filter)) continue;
+
+        const is_selected = shown == editor.palette_selected;
+        const style = if (is_selected) selected_style else item_style;
 
         const row_win = win.child(.{
             .x_off = @intCast(palette_x),
@@ -1220,11 +1256,12 @@ fn drawCommandPalette(win: Window, editor: *Editor, width: u16, height: u16) voi
             .width = palette_width,
             .height = 1,
         });
-        row_win.fill(.{ .style = item_style });
-        _ = row_win.printSegment(.{ .text = " ", .style = item_style }, .{ .wrap = .none });
+        row_win.fill(.{ .style = style });
+        _ = row_win.printSegment(.{ .text = " ", .style = style }, .{ .wrap = .none });
         const name_win = row_win.child(.{ .x_off = 1, .width = palette_width -| 1 });
-        _ = name_win.printSegment(.{ .text = name, .style = item_style }, .{ .wrap = .none });
+        _ = name_win.printSegment(.{ .text = name, .style = style }, .{ .wrap = .none });
         item_y += 1;
+        shown += 1;
     }
 }
 
@@ -1294,9 +1331,9 @@ fn handleFindKey(editor: *Editor, key: Key) void {
 
 /// Draw the Find & Replace two-line overlay.
 fn drawFindReplaceOverlay(win: Window, editor: *Editor, width: u16, height: u16) void {
-    const style: Style = .{ .bg = .{ .index = 0 }, .fg = .{ .index = 14 }, .bold = true };
-    const input_style: Style = .{ .bg = .{ .index = 0 }, .fg = .{ .index = 15 } };
-    const inactive_style: Style = .{ .bg = .{ .index = 0 }, .fg = .{ .index = 8 } };
+    const style: Style = .{ .bg = toVaxis(editor.tui_theme.overlay_bg), .fg = toVaxis(editor.tui_theme.overlay_accent), .bold = true };
+    const input_style: Style = .{ .bg = toVaxis(editor.tui_theme.overlay_bg), .fg = toVaxis(editor.tui_theme.overlay_fg) };
+    const inactive_style: Style = .{ .bg = toVaxis(editor.tui_theme.overlay_bg), .fg = toVaxis(editor.tui_theme.overlay_dim) };
 
     const find_label = "Find:    ";
     const repl_label = "Replace: ";
@@ -1327,11 +1364,11 @@ fn drawFindReplaceOverlay(win: Window, editor: *Editor, width: u16, height: u16)
     }
     // Show status message (e.g. "No matches found") on the find line, right-aligned
     if (editor.status_message.len > 0) {
-        const msg_style: Style = .{ .bg = .{ .index = 0 }, .fg = .{ .index = 9 } }; // red on black
+        const msg_style2: Style = .{ .bg = toVaxis(editor.tui_theme.overlay_bg), .fg = toVaxis(editor.tui_theme.overlay_warn) };
         const msg_len: u16 = @intCast(@min(editor.status_message.len, width));
         const msg_x: u16 = width -| msg_len -| 1;
         const msg_win = win.child(.{ .y_off = @intCast(find_y), .width = width, .height = 1 });
-        _ = writeStr(msg_win, msg_x, 0, editor.status_message, msg_style);
+        _ = writeStr(msg_win, msg_x, 0, editor.status_message, msg_style2);
     }
 
     // Cursor on active field
@@ -1602,32 +1639,48 @@ fn handlePaletteKey(editor: *Editor, key: Key) void {
 
     if (key.codepoint == Key.escape) {
         editor.mode = .normal;
+        editor.palette_selected = 0;
         return;
     }
     if (key.codepoint == Key.enter) {
-        // Execute first matching command
-        if (editor.palette_buf_len > 0) {
-            const filter = editor.palette_buf[0..editor.palette_buf_len];
-            const names = editor.commands.allNames(editor.allocator) catch {
+        // Execute the selected matching command
+        const filter = editor.palette_buf[0..editor.palette_buf_len];
+        const names = editor.commands.allNames() catch {
+            editor.mode = .normal;
+            editor.palette_selected = 0;
+            return;
+        };
+        var idx: usize = 0;
+        for (names) |name| {
+            if (filter.len > 0 and !fuzzyMatch(name, filter)) continue;
+            if (idx == editor.palette_selected) {
                 editor.mode = .normal;
+                editor.palette_selected = 0;
+                _ = editor.execCommand(name, null);
                 return;
-            };
-            defer editor.allocator.free(names);
-            for (names) |name| {
-                if (fuzzyMatch(name, filter)) {
-                    editor.mode = .normal;
-                    _ = editor.execCommand(name, null);
-                    return;
-                }
             }
+            idx += 1;
         }
         editor.mode = .normal;
+        editor.palette_selected = 0;
+        return;
+    }
+    if (key.codepoint == Key.tab or key.codepoint == Key.down) {
+        editor.palette_selected += 1;
+        return;
+    }
+    if (key.codepoint == Key.up) {
+        editor.palette_selected -|= 1;
         return;
     }
     if (key.codepoint == Key.backspace) {
-        if (editor.palette_buf_len > 0) editor.palette_buf_len -= 1;
+        if (editor.palette_buf_len > 0) {
+            editor.palette_buf_len -= 1;
+            editor.palette_selected = 0;
+        }
         return;
     }
+    editor.palette_selected = 0;
     appendToInputBuf(&editor.palette_buf, &editor.palette_buf_len, key);
 }
 

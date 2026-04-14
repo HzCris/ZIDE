@@ -110,15 +110,14 @@ pub const Document = struct {
         const c = self.cursors.primary();
         if (c.offset >= self.buffer.byteLen()) return;
         const cursor_before = c.offset;
-        const deleted_text = self.buffer.slice(c.offset, c.offset + count);
-        const saved_text = try self.allocator.dupe(u8, deleted_text);
-        defer self.allocator.free(saved_text);
-        const actual = self.buffer.delete(c.offset, count);
-        if (actual > 0) {
-            self.cursors.adjustAfterDelete(cursor_before, actual);
-            try self.history.recordDelete(cursor_before, saved_text[0..actual], cursor_before, c.offset);
-            self.dirty = true;
-        }
+        const actual_count = @min(count, self.buffer.byteLen() - c.offset);
+        if (actual_count == 0) return;
+        const deleted_text = self.buffer.slice(c.offset, c.offset + actual_count);
+        // Record before delete — recordDelete dupes the text internally
+        try self.history.recordDelete(cursor_before, deleted_text, cursor_before, cursor_before);
+        _ = self.buffer.delete(c.offset, actual_count);
+        self.cursors.adjustAfterDelete(cursor_before, actual_count);
+        self.dirty = true;
     }
 
     /// Delete `count` bytes backward from the primary cursor (like pressing Backspace).
@@ -129,14 +128,11 @@ pub const Document = struct {
         const del_count = @min(count, c.offset);
         const del_pos = c.offset - del_count;
         const deleted_text = self.buffer.slice(del_pos, del_pos + del_count);
-        const saved_text = try self.allocator.dupe(u8, deleted_text);
-        defer self.allocator.free(saved_text);
-        const actual = self.buffer.delete(del_pos, del_count);
-        if (actual > 0) {
-            self.cursors.adjustAfterDelete(del_pos, actual);
-            try self.history.recordDelete(del_pos, saved_text[0..actual], cursor_before, c.offset);
-            self.dirty = true;
-        }
+        // Record before delete — recordDelete dupes the text internally
+        try self.history.recordDelete(del_pos, deleted_text, cursor_before, del_pos);
+        _ = self.buffer.delete(del_pos, del_count);
+        self.cursors.adjustAfterDelete(del_pos, del_count);
+        self.dirty = true;
     }
 
     /// Delete the current selection (if any) for the primary cursor.
@@ -144,17 +140,15 @@ pub const Document = struct {
         const c = self.cursors.primary();
         const range = c.selectionRange() orelse return;
         const cursor_before = c.offset;
+        const del_len = range.end - range.start;
         const deleted_text = self.buffer.slice(range.start, range.end);
-        const saved_text = try self.allocator.dupe(u8, deleted_text);
-        defer self.allocator.free(saved_text);
-        const actual = self.buffer.delete(range.start, range.end - range.start);
-        if (actual > 0) {
-            self.cursors.adjustAfterDelete(range.start, actual);
-            c.offset = range.start;
-            c.clearSelection();
-            try self.history.recordDelete(range.start, saved_text[0..actual], cursor_before, c.offset);
-            self.dirty = true;
-        }
+        // Record before delete — recordDelete dupes the text internally
+        try self.history.recordDelete(range.start, deleted_text, cursor_before, range.start);
+        _ = self.buffer.delete(range.start, del_len);
+        self.cursors.adjustAfterDelete(range.start, del_len);
+        c.offset = range.start;
+        c.clearSelection();
+        self.dirty = true;
     }
 
     // ======================================================================
@@ -172,13 +166,11 @@ pub const Document = struct {
                 const range = c.selectionRange().?;
                 const del_len = range.end - range.start;
                 const deleted = self.buffer.slice(range.start, range.end);
-                const saved = try self.allocator.dupe(u8, deleted);
-                defer self.allocator.free(saved);
+                try self.history.recordDelete(range.start, deleted, range.end, range.start);
                 const actual = self.buffer.delete(range.start, del_len);
                 c.offset = range.start;
                 c.clearSelection();
                 self.cursors.adjustOthersAfterDelete(idx, range.start, actual);
-                try self.history.recordDelete(range.start, saved[0..actual], range.end, c.offset);
             }
             const pos = c.offset;
             const len = try self.buffer.insert(pos, text);
@@ -202,25 +194,21 @@ pub const Document = struct {
                 const range = c.selectionRange().?;
                 const del_len = range.end - range.start;
                 const deleted = self.buffer.slice(range.start, range.end);
-                const saved = try self.allocator.dupe(u8, deleted);
-                defer self.allocator.free(saved);
-                const actual = self.buffer.delete(range.start, del_len);
                 const before = c.offset;
+                try self.history.recordDelete(range.start, deleted, before, range.start);
+                const actual = self.buffer.delete(range.start, del_len);
                 c.offset = range.start;
                 c.clearSelection();
                 self.cursors.adjustOthersAfterDelete(idx, range.start, actual);
-                try self.history.recordDelete(range.start, saved[0..actual], before, c.offset);
             } else {
                 if (c.offset >= self.buffer.byteLen()) continue;
                 const pos = c.offset;
-                const deleted = self.buffer.slice(pos, pos + count_arg);
-                const saved = try self.allocator.dupe(u8, deleted);
-                defer self.allocator.free(saved);
-                const actual = self.buffer.delete(pos, count_arg);
-                if (actual > 0) {
-                    self.cursors.adjustOthersAfterDelete(idx, pos, actual);
-                    try self.history.recordDelete(pos, saved[0..actual], pos, c.offset);
-                }
+                const actual_count = @min(count_arg, self.buffer.byteLen() - pos);
+                if (actual_count == 0) continue;
+                const deleted = self.buffer.slice(pos, pos + actual_count);
+                try self.history.recordDelete(pos, deleted, pos, pos);
+                const actual = self.buffer.delete(pos, actual_count);
+                self.cursors.adjustOthersAfterDelete(idx, pos, actual);
             }
         }
         self.cursors.mergeCursors();
@@ -238,29 +226,23 @@ pub const Document = struct {
                 const range = c.selectionRange().?;
                 const del_len = range.end - range.start;
                 const deleted = self.buffer.slice(range.start, range.end);
-                const saved = try self.allocator.dupe(u8, deleted);
-                defer self.allocator.free(saved);
-                const actual = self.buffer.delete(range.start, del_len);
                 const before = c.offset;
+                try self.history.recordDelete(range.start, deleted, before, range.start);
+                const actual = self.buffer.delete(range.start, del_len);
                 c.offset = range.start;
                 c.clearSelection();
                 self.cursors.adjustOthersAfterDelete(idx, range.start, actual);
-                try self.history.recordDelete(range.start, saved[0..actual], before, c.offset);
             } else {
                 if (c.offset == 0) continue;
                 const del_count = @min(count_arg, c.offset);
                 const del_pos = c.offset - del_count;
                 const deleted = self.buffer.slice(del_pos, del_pos + del_count);
-                const saved = try self.allocator.dupe(u8, deleted);
-                defer self.allocator.free(saved);
                 const before = c.offset;
+                try self.history.recordDelete(del_pos, deleted, before, del_pos);
                 const actual = self.buffer.delete(del_pos, del_count);
-                if (actual > 0) {
-                    c.offset = del_pos;
-                    c.preferred_col = self.buffer.offsetToPos(c.offset).col;
-                    self.cursors.adjustOthersAfterDelete(idx, del_pos, actual);
-                    try self.history.recordDelete(del_pos, saved[0..actual], before, c.offset);
-                }
+                c.offset = del_pos;
+                c.preferred_col = self.buffer.offsetToPos(c.offset).col;
+                self.cursors.adjustOthersAfterDelete(idx, del_pos, actual);
             }
         }
         self.cursors.mergeCursors();
@@ -336,19 +318,16 @@ pub const Document = struct {
             self.buffer.byteLen();
         const len = line_end - line_start;
         if (len == 0) return;
+        const c = self.cursors.primary();
+        const cursor_before = c.offset;
         const deleted = self.buffer.slice(line_start, line_end);
-        const saved = try self.allocator.dupe(u8, deleted);
-        defer self.allocator.free(saved);
-        const actual = self.buffer.delete(line_start, len);
-        if (actual > 0) {
-            const c = self.cursors.primary();
-            const cursor_before = c.offset;
-            c.offset = @min(line_start, self.buffer.byteLen());
-            c.preferred_col = self.buffer.offsetToPos(c.offset).col;
-            c.clearSelection();
-            try self.history.recordDelete(line_start, saved[0..actual], cursor_before, c.offset);
-            self.dirty = true;
-        }
+        const new_cursor = @min(line_start, self.buffer.byteLen() - len);
+        try self.history.recordDelete(line_start, deleted, cursor_before, new_cursor);
+        _ = self.buffer.delete(line_start, len);
+        c.offset = @min(line_start, self.buffer.byteLen());
+        c.preferred_col = self.buffer.offsetToPos(c.offset).col;
+        c.clearSelection();
+        self.dirty = true;
     }
 
     /// Duplicate the current line below.
@@ -426,20 +405,16 @@ pub const Document = struct {
     pub fn deleteWordForward(self: *Document) !void {
         const c = self.cursors.primary();
         const start = c.offset;
-        // Use a temporary cursor to find word boundary
         var tmp = c.*;
         tmp.moveWordRight(&self.buffer);
         const end = tmp.offset;
         if (end > start) {
+            const del_len = end - start;
             const deleted = self.buffer.slice(start, end);
-            const saved = try self.allocator.dupe(u8, deleted);
-            defer self.allocator.free(saved);
-            const actual = self.buffer.delete(start, end - start);
-            if (actual > 0) {
-                self.cursors.adjustAfterDelete(start, actual);
-                try self.history.recordDelete(start, saved[0..actual], start, c.offset);
-                self.dirty = true;
-            }
+            try self.history.recordDelete(start, deleted, start, start);
+            _ = self.buffer.delete(start, del_len);
+            self.cursors.adjustAfterDelete(start, del_len);
+            self.dirty = true;
         }
     }
 
@@ -448,20 +423,16 @@ pub const Document = struct {
         const c = self.cursors.primary();
         const end = c.offset;
         if (end == 0) return;
-        // Use a temporary cursor to find word boundary
         var tmp = c.*;
         tmp.moveWordLeft(&self.buffer);
         const start = tmp.offset;
         if (end > start) {
+            const del_len = end - start;
             const deleted = self.buffer.slice(start, end);
-            const saved = try self.allocator.dupe(u8, deleted);
-            defer self.allocator.free(saved);
-            const actual = self.buffer.delete(start, end - start);
-            if (actual > 0) {
-                self.cursors.adjustAfterDelete(start, actual);
-                try self.history.recordDelete(start, saved[0..actual], end, c.offset);
-                self.dirty = true;
-            }
+            try self.history.recordDelete(start, deleted, end, start);
+            _ = self.buffer.delete(start, del_len);
+            self.cursors.adjustAfterDelete(start, del_len);
+            self.dirty = true;
         }
     }
 
@@ -470,7 +441,6 @@ pub const Document = struct {
         const pos = self.cursorPos();
         const line = self.lineContent(pos.line);
         const line_start = self.buffer.posToOffset(pos.line, 0);
-        // Count leading whitespace to remove
         var remove: usize = 0;
         if (line.len > 0 and line[0] == '\t') {
             remove = 1;
@@ -483,17 +453,14 @@ pub const Document = struct {
             }
         }
         if (remove == 0) return;
+        const c = self.cursors.primary();
+        const cursor_before = c.offset;
         const deleted = self.buffer.slice(line_start, line_start + remove);
-        const saved = try self.allocator.dupe(u8, deleted);
-        defer self.allocator.free(saved);
-        const actual = self.buffer.delete(line_start, remove);
-        if (actual > 0) {
-            const c = self.cursors.primary();
-            const cursor_before = c.offset;
-            self.cursors.adjustAfterDelete(line_start, actual);
-            try self.history.recordDelete(line_start, saved[0..actual], cursor_before, c.offset);
-            self.dirty = true;
-        }
+        const cursor_after = if (cursor_before >= line_start + remove) cursor_before - remove else if (cursor_before > line_start) line_start else cursor_before;
+        try self.history.recordDelete(line_start, deleted, cursor_before, cursor_after);
+        _ = self.buffer.delete(line_start, remove);
+        self.cursors.adjustAfterDelete(line_start, remove);
+        self.dirty = true;
     }
 
     /// Go to a specific line number (1-based), placing cursor at start.

@@ -5,6 +5,11 @@ const CommandRegistry = @import("commands.zig").CommandRegistry;
 const registerBuiltins = @import("commands.zig").registerBuiltins;
 const SystemClipboard = @import("clipboard.zig").SystemClipboard;
 const KeybindMap = @import("keybind.zig").KeybindMap;
+const Layout = @import("layout.zig").Layout;
+const SplitDirection = @import("layout.zig").SplitDirection;
+const theme_mod = @import("theme.zig");
+const EditorTheme = theme_mod.EditorTheme;
+const TuiTheme = theme_mod.TuiTheme;
 
 /// The central editor state. NOT a global singleton — passed explicitly.
 /// Owns open documents, the command registry, and global editor settings.
@@ -68,11 +73,27 @@ pub const Editor = struct {
     gutter_min_digits: usize = 3,
     /// Left-click clears secondary cursors (default true).
     click_clears_cursors: bool = true,
+    /// Maximum undo history size per document (0 = unlimited).
+    max_undo_history: usize = 100,
     /// Command palette selection index (for Tab cycling).
     palette_selected: usize = 0,
 
     /// Data-driven keybinding map (populated with CUA defaults, modifiable via Lua).
     keybinds: KeybindMap,
+
+    /// Layout tree for split panes (GUI).
+    layout: Layout = undefined,
+    /// Currently focused pane index.
+    active_pane: u8 = 0,
+
+    /// GUI editor theme (colors for editor area, overlays, gutter, etc.).
+    theme: EditorTheme = theme_mod.gui_dark,
+    /// TUI editor theme (ANSI or RGB colors for terminal rendering).
+    tui_theme: TuiTheme = theme_mod.tui_terminal,
+    /// Name of the active GUI theme preset ("dark", "light", "high_contrast", or "custom").
+    theme_name: []const u8 = "dark",
+    /// Name of the active TUI theme preset ("terminal", "dark", "light", "high_contrast", or "custom").
+    tui_theme_name: []const u8 = "terminal",
 
     /// Settings panel selection index.
     settings_selected: usize = 0,
@@ -100,9 +121,11 @@ pub const Editor = struct {
             .commands = CommandRegistry.init(allocator),
             .allocator = allocator,
             .keybinds = KeybindMap.init(allocator),
+            .layout = try Layout.init(allocator),
         };
         // Always have at least one empty document
         var doc = Document.init(allocator);
+        doc.history.max_size = editor.max_undo_history;
         try doc.loadText("");
         try editor.documents.append(allocator, doc);
         // Register built-in commands
@@ -119,35 +142,52 @@ pub const Editor = struct {
         self.documents.deinit(self.allocator);
         self.commands.deinit();
         self.keybinds.deinit();
+        self.layout.deinit();
         if (self.clipboard.len > 0) {
             self.allocator.free(self.clipboard);
         }
     }
 
-    /// Get the currently active document.
+    /// Get the currently active document (from the focused pane).
     pub fn activeDoc(self: *Editor) *Document {
-        return &self.documents.items[self.active_doc_idx];
+        const doc_idx = self.activeDocIdx();
+        return &self.documents.items[doc_idx];
     }
 
     pub fn activeDocConst(self: *const Editor) *const Document {
-        return &self.documents.items[self.active_doc_idx];
+        const doc_idx = self.activeDocIdx();
+        return &self.documents.items[doc_idx];
     }
 
-    /// Open a new empty document and make it active.
+    /// Get the document index for the currently focused pane.
+    fn activeDocIdx(self: *const Editor) usize {
+        if (self.active_pane < self.layout.panes.items.len) {
+            return self.layout.panes.items[self.active_pane].doc_idx;
+        }
+        return self.active_doc_idx;
+    }
+
+    /// Open a new empty document and make it active (in the focused pane).
     pub fn newDocument(self: *Editor) !*Document {
         var doc = Document.init(self.allocator);
+        doc.history.max_size = self.max_undo_history;
         try doc.loadText("");
         try self.documents.append(self.allocator, doc);
-        self.active_doc_idx = self.documents.items.len - 1;
+        const idx = self.documents.items.len - 1;
+        self.active_doc_idx = idx;
+        self.paneShowDoc(idx);
         return self.activeDoc();
     }
 
-    /// Open a file into a new document tab.
+    /// Open a file into a new document tab (in the focused pane).
     pub fn openFile(self: *Editor, path: []const u8) !*Document {
         var doc = Document.init(self.allocator);
+        doc.history.max_size = self.max_undo_history;
         try doc.open(path);
         try self.documents.append(self.allocator, doc);
-        self.active_doc_idx = self.documents.items.len - 1;
+        const idx = self.documents.items.len - 1;
+        self.active_doc_idx = idx;
+        self.paneShowDoc(idx);
         return self.activeDoc();
     }
 
@@ -160,23 +200,36 @@ pub const Editor = struct {
             self.documents.items[0] = Document.init(self.allocator);
             self.documents.items[0].loadText("") catch {};
             self.active_doc_idx = 0;
+            self.paneShowDoc(0);
             return false;
         }
-        self.documents.items[self.active_doc_idx].deinit();
-        _ = self.documents.orderedRemove(self.active_doc_idx);
+        const removed_idx = self.active_doc_idx;
+        self.documents.items[removed_idx].deinit();
+        _ = self.documents.orderedRemove(removed_idx);
         if (self.active_doc_idx >= self.documents.items.len) {
             self.active_doc_idx = self.documents.items.len - 1;
+        }
+        // Fix up all pane doc indices after document removal:
+        // - Panes pointing at the removed doc get reassigned to active_doc_idx
+        // - Panes pointing above the removed doc shift down by 1
+        for (self.layout.panes.items) |*pane| {
+            if (pane.doc_idx == removed_idx) {
+                pane.doc_idx = self.active_doc_idx;
+            } else if (pane.doc_idx > removed_idx) {
+                pane.doc_idx -= 1;
+            }
         }
         return true;
     }
 
-    /// Switch to the next document tab.
+    /// Switch to the next document tab (in the focused pane).
     pub fn nextDoc(self: *Editor) void {
         if (self.documents.items.len <= 1) return;
         self.active_doc_idx = (self.active_doc_idx + 1) % self.documents.items.len;
+        self.paneShowDoc(self.active_doc_idx);
     }
 
-    /// Switch to the previous document tab.
+    /// Switch to the previous document tab (in the focused pane).
     pub fn prevDoc(self: *Editor) void {
         if (self.documents.items.len <= 1) return;
         if (self.active_doc_idx == 0) {
@@ -184,12 +237,14 @@ pub const Editor = struct {
         } else {
             self.active_doc_idx -= 1;
         }
+        self.paneShowDoc(self.active_doc_idx);
     }
 
-    /// Switch to document at index.
+    /// Switch to document at index (in the currently focused pane).
     pub fn switchToDoc(self: *Editor, idx: usize) void {
         if (idx < self.documents.items.len) {
             self.active_doc_idx = idx;
+            self.paneShowDoc(idx);
         }
     }
 
@@ -248,6 +303,7 @@ pub const Editor = struct {
         if (std.mem.eql(u8, action, "command_palette")) {
             self.mode = .command_palette;
             self.palette_buf_len = 0;
+            self.palette_selected = 0;
             return true;
         }
         if (std.mem.eql(u8, action, "goto_line")) {
@@ -267,6 +323,27 @@ pub const Editor = struct {
         }
         if (std.mem.eql(u8, action, "close_tab")) {
             _ = self.closeActiveDoc();
+            return true;
+        }
+        // Split pane actions
+        if (std.mem.eql(u8, action, "split_vertical")) {
+            self.splitActive(.horizontal); // horizontal = side by side
+            return true;
+        }
+        if (std.mem.eql(u8, action, "split_horizontal")) {
+            self.splitActive(.vertical); // vertical = top/bottom
+            return true;
+        }
+        if (std.mem.eql(u8, action, "close_pane")) {
+            self.closePaneAction();
+            return true;
+        }
+        if (std.mem.eql(u8, action, "focus_next_pane")) {
+            self.focusNextPane();
+            return true;
+        }
+        if (std.mem.eql(u8, action, "focus_prev_pane")) {
+            self.focusPrevPane();
             return true;
         }
         // Fall back to command registry
@@ -338,6 +415,64 @@ pub const Editor = struct {
             if (doc.dirty) return true;
         }
         return false;
+    }
+
+    // ---- Split pane operations ----
+
+    /// Split the currently focused pane. The new pane shows the same document.
+    pub fn splitActive(self: *Editor, direction: SplitDirection) void {
+        const current_doc_idx = self.activeDocIdx();
+        const new_pane = self.layout.splitPane(self.active_pane, direction, current_doc_idx) catch return;
+        self.active_pane = new_pane;
+        // Keep active_doc_idx in sync for compatibility
+        self.active_doc_idx = current_doc_idx;
+    }
+
+    /// Close the currently focused pane. If it's the last pane, does nothing.
+    pub fn closePaneAction(self: *Editor) void {
+        if (self.layout.paneCount() <= 1) return;
+        const closed_pane = self.active_pane;
+        // Move focus to a sibling before closing
+        if (self.layout.nextPane(closed_pane)) |next| {
+            self.active_pane = next;
+        } else {
+            self.active_pane = 0;
+        }
+        _ = self.layout.closePane(closed_pane);
+        // Update active_doc_idx to match new focused pane
+        self.active_doc_idx = self.activeDocIdx();
+    }
+
+    /// Focus the next pane in traversal order.
+    pub fn focusNextPane(self: *Editor) void {
+        if (self.layout.nextPane(self.active_pane)) |next| {
+            self.active_pane = next;
+            self.active_doc_idx = self.activeDocIdx();
+        }
+    }
+
+    /// Focus the previous pane in traversal order.
+    pub fn focusPrevPane(self: *Editor) void {
+        if (self.layout.prevPane(self.active_pane)) |prev| {
+            self.active_pane = prev;
+            self.active_doc_idx = self.activeDocIdx();
+        }
+    }
+
+    /// Set the active pane by pane ID and update active_doc_idx.
+    pub fn focusPane(self: *Editor, pane_id: u8) void {
+        if (pane_id < self.layout.panes.items.len) {
+            self.active_pane = pane_id;
+            self.active_doc_idx = self.layout.panes.items[pane_id].doc_idx;
+        }
+    }
+
+    /// Switch the active pane to show a specific document.
+    pub fn paneShowDoc(self: *Editor, doc_idx: usize) void {
+        if (self.active_pane < self.layout.panes.items.len) {
+            self.layout.panes.items[self.active_pane].doc_idx = doc_idx;
+            self.active_doc_idx = doc_idx;
+        }
     }
 };
 
