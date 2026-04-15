@@ -6,7 +6,9 @@ const registerBuiltins = @import("commands.zig").registerBuiltins;
 const SystemClipboard = @import("clipboard.zig").SystemClipboard;
 const KeybindMap = @import("keybind.zig").KeybindMap;
 const Layout = @import("layout.zig").Layout;
+const PaneContent = @import("layout.zig").PaneContent;
 const SplitDirection = @import("layout.zig").SplitDirection;
+pub const terminal_mod = @import("terminal.zig");
 const theme_mod = @import("theme.zig");
 const EditorTheme = theme_mod.EditorTheme;
 const TuiTheme = theme_mod.TuiTheme;
@@ -120,6 +122,9 @@ pub const Editor = struct {
     /// Lua-registered LSP server configs (language → command).
     lsp_configs: std.ArrayList(LspConfig),
 
+    /// Open terminal emulators (null entries are closed/freed terminals).
+    terminals: std.ArrayList(?*terminal_mod.Terminal),
+
     /// Registered languages (Zig built-in + Lua-loaded extensions).
     languages: std.ArrayList(syntax.LanguageDef),
     /// GUI syntax highlight colors.
@@ -167,6 +172,7 @@ pub const Editor = struct {
             .layout = try Layout.init(allocator),
             .completion_items = .empty,
             .lsp_configs = .empty,
+            .terminals = .empty,
             .languages = .empty,
             .lang_syntax_overrides = .empty,
         };
@@ -203,6 +209,10 @@ pub const Editor = struct {
             self.allocator.free(cfg.command);
         }
         self.lsp_configs.deinit(self.allocator);
+        for (self.terminals.items) |maybe_term| {
+            if (maybe_term) |term| term.deinit();
+        }
+        self.terminals.deinit(self.allocator);
         self.languages.deinit(self.allocator);
         self.lang_syntax_overrides.deinit(self.allocator);
         if (self.clipboard.len > 0) {
@@ -224,9 +234,31 @@ pub const Editor = struct {
     /// Get the document index for the currently focused pane.
     fn activeDocIdx(self: *const Editor) usize {
         if (self.active_pane < self.layout.panes.items.len) {
-            return self.layout.panes.items[self.active_pane].doc_idx;
+            return switch (self.layout.panes.items[self.active_pane].content) {
+                .editor => |idx| idx,
+                .terminal => self.active_doc_idx,
+            };
         }
         return self.active_doc_idx;
+    }
+
+    /// Check if the currently focused pane is a terminal.
+    pub fn activePaneIsTerminal(self: *const Editor) bool {
+        if (self.active_pane < self.layout.panes.items.len) {
+            return self.layout.panes.items[self.active_pane].content == .terminal;
+        }
+        return false;
+    }
+
+    /// Get the terminal index of the active pane (if it's a terminal).
+    pub fn activePaneTerminalIdx(self: *const Editor) ?usize {
+        if (self.active_pane < self.layout.panes.items.len) {
+            return switch (self.layout.panes.items[self.active_pane].content) {
+                .terminal => |idx| idx,
+                .editor => null,
+            };
+        }
+        return null;
     }
 
     /// Open a new empty document and make it active (in the focused pane).
@@ -277,13 +309,18 @@ pub const Editor = struct {
             self.active_doc_idx = self.documents.items.len - 1;
         }
         // Fix up all pane doc indices after document removal:
-        // - Panes pointing at the removed doc get reassigned to active_doc_idx
-        // - Panes pointing above the removed doc shift down by 1
+        // - Editor panes pointing at the removed doc get reassigned to active_doc_idx
+        // - Editor panes pointing above the removed doc shift down by 1
         for (self.layout.panes.items) |*pane| {
-            if (pane.doc_idx == removed_idx) {
-                pane.doc_idx = self.active_doc_idx;
-            } else if (pane.doc_idx > removed_idx) {
-                pane.doc_idx -= 1;
+            switch (pane.content) {
+                .editor => |*idx| {
+                    if (idx.* == removed_idx) {
+                        idx.* = self.active_doc_idx;
+                    } else if (idx.* > removed_idx) {
+                        idx.* -= 1;
+                    }
+                },
+                .terminal => {},
             }
         }
         return true;
@@ -415,6 +452,19 @@ pub const Editor = struct {
             self.focusPrevPane();
             return true;
         }
+        // Terminal actions
+        if (std.mem.eql(u8, action, "toggle_terminal")) {
+            self.toggleTerminal();
+            return true;
+        }
+        if (std.mem.eql(u8, action, "close_terminal")) {
+            self.closeActiveTerminal();
+            return true;
+        }
+        if (std.mem.eql(u8, action, "open_terminal_right")) {
+            self.openTerminalRight();
+            return true;
+        }
         // LSP actions
         if (std.mem.eql(u8, action, "lsp_completion")) {
             self.triggerCompletion();
@@ -500,7 +550,7 @@ pub const Editor = struct {
     /// Split the currently focused pane. The new pane shows the same document.
     pub fn splitActive(self: *Editor, direction: SplitDirection) void {
         const current_doc_idx = self.activeDocIdx();
-        const new_pane = self.layout.splitPane(self.active_pane, direction, current_doc_idx) catch return;
+        const new_pane = self.layout.splitPane(self.active_pane, direction, .{ .editor = current_doc_idx }) catch return;
         self.active_pane = new_pane;
         // Keep active_doc_idx in sync for compatibility
         self.active_doc_idx = current_doc_idx;
@@ -510,6 +560,16 @@ pub const Editor = struct {
     pub fn closePaneAction(self: *Editor) void {
         if (self.layout.paneCount() <= 1) return;
         const closed_pane = self.active_pane;
+        // If closing a terminal pane, clean up the terminal
+        if (closed_pane < self.layout.panes.items.len) {
+            switch (self.layout.panes.items[closed_pane].content) {
+                .terminal => |idx| {
+                    self.closeTerminal(idx);
+                    return;
+                },
+                .editor => {},
+            }
+        }
         // Move focus to a sibling before closing
         if (self.layout.nextPane(closed_pane)) |next| {
             self.active_pane = next;
@@ -541,15 +601,131 @@ pub const Editor = struct {
     pub fn focusPane(self: *Editor, pane_id: u8) void {
         if (pane_id < self.layout.panes.items.len) {
             self.active_pane = pane_id;
-            self.active_doc_idx = self.layout.panes.items[pane_id].doc_idx;
+            switch (self.layout.panes.items[pane_id].content) {
+                .editor => |idx| self.active_doc_idx = idx,
+                .terminal => {},
+            }
         }
     }
 
     /// Switch the active pane to show a specific document.
     pub fn paneShowDoc(self: *Editor, doc_idx: usize) void {
         if (self.active_pane < self.layout.panes.items.len) {
-            self.layout.panes.items[self.active_pane].doc_idx = doc_idx;
+            self.layout.panes.items[self.active_pane].content = .{ .editor = doc_idx };
             self.active_doc_idx = doc_idx;
+        }
+    }
+
+    // ---- Terminal operations ----
+
+    /// Open a new terminal in a bottom split pane.
+    pub fn openTerminal(self: *Editor) void {
+        self.openTerminalSplit(.vertical);
+    }
+
+    pub fn openTerminalRight(self: *Editor) void {
+        self.openTerminalSplit(.horizontal);
+    }
+
+    fn openTerminalSplit(self: *Editor, direction: @import("layout.zig").SplitDirection) void {
+        const builtin = @import("builtin");
+        const command = if (builtin.os.tag == .windows) "powershell.exe" else "/bin/bash";
+        const term = terminal_mod.Terminal.init(self.allocator, 80, 24, command) catch |err| {
+            std.log.err("Failed to open terminal: {}", .{err});
+            return;
+        };
+        self.terminals.append(self.allocator, term) catch return;
+        const term_idx = self.terminals.items.len - 1;
+        const new_pane = self.layout.splitPane(self.active_pane, direction, .{ .terminal = term_idx }) catch return;
+        self.active_pane = new_pane;
+    }
+
+    /// Close a terminal by index: stop PTY, close its pane, focus a neighbor.
+    pub fn closeTerminal(self: *Editor, term_idx: usize) void {
+        if (term_idx >= self.terminals.items.len) return;
+        // Find and close the pane showing this terminal
+        for (self.layout.panes.items, 0..) |pane, i| {
+            if (pane.content == .terminal and pane.content.terminal == term_idx) {
+                if (self.active_pane == @as(u8, @intCast(i))) {
+                    // Move focus before closing
+                    if (self.layout.nextPane(self.active_pane)) |next| {
+                        self.active_pane = next;
+                    } else {
+                        self.active_pane = 0;
+                    }
+                }
+                _ = self.layout.closePane(@intCast(i));
+                break;
+            }
+        }
+        // Deinit the terminal and null out the entry
+        if (self.terminals.items[term_idx]) |t| {
+            t.deinit();
+            self.terminals.items[term_idx] = null;
+        }
+        // Ensure active_pane is a valid leaf in the live tree
+        self.ensureValidActivePane();
+        self.active_doc_idx = self.activeDocIdx();
+    }
+
+    /// Make sure active_pane points to a real leaf in the layout tree.
+    /// If it doesn't, find the first valid leaf (preferring editor panes).
+    fn ensureValidActivePane(self: *Editor) void {
+        // Check if active_pane is actually a leaf in the tree
+        if (self.layout.findLeafNode(self.active_pane) != null) return;
+        // Not found — find first editor leaf, fallback to any leaf
+        if (self.layout.firstLeafPane(0)) |pid| {
+            self.active_pane = pid;
+        } else {
+            self.active_pane = 0;
+        }
+    }
+
+    /// Toggle terminal: focus existing terminal, or open one. If already in terminal, go back.
+    pub fn toggleTerminal(self: *Editor) void {
+        // If currently in a terminal pane, focus the previous non-terminal pane
+        if (self.activePaneIsTerminal()) {
+            // Find a non-terminal pane to focus
+            var leaves: std.ArrayList(u8) = .empty;
+            defer leaves.deinit(self.allocator);
+            self.layout.collectLeaves(0, &leaves) catch return;
+            for (leaves.items) |pid| {
+                if (pid == self.active_pane) continue;
+                if (pid < self.layout.panes.items.len) {
+                    if (self.layout.panes.items[pid].content == .editor) {
+                        self.focusPane(pid);
+                        return;
+                    }
+                }
+            }
+            return;
+        }
+
+        // Not in a terminal — find an existing live terminal pane to focus
+        for (self.layout.panes.items, 0..) |pane, i| {
+            if (pane.content == .terminal) {
+                const tidx = pane.content.terminal;
+                // Check the terminal is still alive and the pane is in the layout tree
+                if (tidx < self.terminals.items.len and self.terminals.items[tidx] != null and
+                    self.layout.findLeafNode(@intCast(i)) != null)
+                {
+                    self.focusPane(@intCast(i));
+                    return;
+                }
+            }
+        }
+
+        // No terminal exists — open one
+        self.openTerminal();
+    }
+
+    /// Close the active pane's terminal (if it is one).
+    pub fn closeActiveTerminal(self: *Editor) void {
+        if (self.active_pane < self.layout.panes.items.len) {
+            switch (self.layout.panes.items[self.active_pane].content) {
+                .terminal => |idx| self.closeTerminal(idx),
+                .editor => {},
+            }
         }
     }
 

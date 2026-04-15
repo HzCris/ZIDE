@@ -25,7 +25,7 @@ Before fully implementing, be sure to make it as efficient as possible resource-
 - [] File tree / project browser (Including a Starting Directory option)
 - [] Git integration (gutter signs)
 - [x] LSP support
-- [] Embedded Terminal
+- [x] Embedded Terminal
 - [] LLM support using OpenAI API for various cloud providers and local LLMs (And claude if allowed)
 - [] Ctrl+/ to comment highlighted text (Requires a lot of language/file maintenance/upkeeping)
 - [] Debug Support

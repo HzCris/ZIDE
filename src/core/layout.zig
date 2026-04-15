@@ -1,9 +1,15 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 
-/// A pane is a leaf in the layout tree — it shows one document.
+/// Content type for a pane — either an editor document or a terminal.
+pub const PaneContent = union(enum) {
+    editor: usize, // doc_idx
+    terminal: usize, // terminal_idx
+};
+
+/// A pane is a leaf in the layout tree.
 pub const Pane = struct {
-    doc_idx: usize,
+    content: PaneContent,
 };
 
 /// Direction of a split.
@@ -38,7 +44,7 @@ pub const Layout = struct {
             .allocator = allocator,
         };
         // Start with a single pane (pane 0) showing document 0
-        try layout.panes.append(allocator, .{ .doc_idx = 0 });
+        try layout.panes.append(allocator, .{ .content = .{ .editor = 0 } });
         // Root node is a leaf pointing to pane 0
         try layout.nodes.append(allocator, .{ .leaf = 0 });
         return layout;
@@ -55,15 +61,15 @@ pub const Layout = struct {
     }
 
     /// Split a pane into two. The existing pane stays as the first child,
-    /// a new pane (showing `new_doc_idx`) becomes the second child.
+    /// a new pane becomes the second child.
     /// Returns the new pane's index.
-    pub fn splitPane(self: *Layout, pane_id: u8, direction: SplitDirection, new_doc_idx: usize) !u8 {
+    pub fn splitPane(self: *Layout, pane_id: u8, direction: SplitDirection, new_content: PaneContent) !u8 {
         // Find the leaf node for this pane
         const leaf_node_idx = self.findLeafNode(pane_id) orelse return error.PaneNotFound;
 
         // Create the new pane
         const new_pane_id: u8 = @intCast(self.panes.items.len);
-        try self.panes.append(self.allocator, .{ .doc_idx = new_doc_idx });
+        try self.panes.append(self.allocator, .{ .content = new_content });
 
         // Create two new leaf nodes
         const first_leaf_idx: u8 = @intCast(self.nodes.items.len);
@@ -102,16 +108,24 @@ pub const Layout = struct {
     }
 
     /// Find the node index of the leaf that contains the given pane_id.
+    /// Only searches the live tree reachable from the root node, ignoring
+    /// orphaned nodes left behind by closePane.
     pub fn findLeafNode(self: *const Layout, pane_id: u8) ?usize {
-        for (self.nodes.items, 0..) |node, i| {
-            switch (node) {
-                .leaf => |pid| {
-                    if (pid == pane_id) return i;
-                },
-                .split => {},
-            }
+        return self.findLeafNodeFrom(0, pane_id);
+    }
+
+    fn findLeafNodeFrom(self: *const Layout, node_idx: u8, pane_id: u8) ?usize {
+        if (node_idx >= self.nodes.items.len) return null;
+        switch (self.nodes.items[node_idx]) {
+            .leaf => |pid| {
+                if (pid == pane_id) return node_idx;
+                return null;
+            },
+            .split => |s| {
+                if (self.findLeafNodeFrom(s.first, pane_id)) |found| return found;
+                return self.findLeafNodeFrom(s.second, pane_id);
+            },
         }
-        return null;
     }
 
     /// Find the parent split node of a given node index.
@@ -207,7 +221,7 @@ test "layout split pane" {
     var layout = try Layout.init(allocator);
     defer layout.deinit();
 
-    const new_pane = try layout.splitPane(0, .horizontal, 1);
+    const new_pane = try layout.splitPane(0, .horizontal, .{ .editor = 1 });
     try std.testing.expectEqual(@as(u8, 1), new_pane);
     try std.testing.expectEqual(@as(usize, 2), layout.paneCount());
 
@@ -226,7 +240,7 @@ test "layout close pane" {
     var layout = try Layout.init(allocator);
     defer layout.deinit();
 
-    _ = try layout.splitPane(0, .horizontal, 1);
+    _ = try layout.splitPane(0, .horizontal, .{ .editor = 1 });
     try std.testing.expectEqual(@as(usize, 2), layout.paneCount());
 
     // Close pane 1 — root should become a leaf again
@@ -251,8 +265,8 @@ test "layout next/prev pane" {
     var layout = try Layout.init(allocator);
     defer layout.deinit();
 
-    _ = try layout.splitPane(0, .horizontal, 1);
-    _ = try layout.splitPane(1, .vertical, 2);
+    _ = try layout.splitPane(0, .horizontal, .{ .editor = 1 });
+    _ = try layout.splitPane(1, .vertical, .{ .editor = 2 });
 
     try std.testing.expectEqual(@as(?u8, 1), layout.nextPane(0));
     try std.testing.expectEqual(@as(?u8, 0), layout.prevPane(1));

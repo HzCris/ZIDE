@@ -8,6 +8,7 @@ const ThemeColor = @import("../core/theme.zig").ThemeColor;
 const theme_mod = @import("../core/theme.zig");
 const syntax = @import("../core/syntax.zig");
 const lsp = @import("../core/lsp.zig");
+const terminal_mod = @import("../core/terminal.zig");
 
 /// Convert a ThemeColor to a dvui.Color.
 fn toDvui(c: ThemeColor) dvui.Color {
@@ -238,6 +239,12 @@ pub fn frame(editor: *Editor) bool {
             if (key.mod.control() and key.code == .tab) {
                 e.handled = true;
                 if (key.mod.shift()) editor.prevDoc() else editor.nextDoc();
+                continue;
+            }
+
+            // When terminal pane is focused, only handle ctrl+backtick here;
+            // all other keys are routed to the terminal by handleTerminalKeyEvents.
+            if (editor.activePaneIsTerminal()) {
                 continue;
             }
 
@@ -615,7 +622,13 @@ fn renderLayout(editor: *Editor, node_idx: u8) void {
 
     switch (editor.layout.nodes.items[node_idx]) {
         .leaf => |pane_id| {
-            editorPane(editor, pane_id);
+            if (pane_id < editor.layout.panes.items.len) {
+                const pane = editor.layout.panes.items[pane_id];
+                switch (pane.content) {
+                    .editor => editorPane(editor, pane_id),
+                    .terminal => |term_idx| terminalPane(editor, pane_id, term_idx),
+                }
+            }
         },
         .split => |s| {
             var paned = dvui.paned(@src(), .{
@@ -651,7 +664,10 @@ fn editorPane(editor: *Editor, pane_id: u8) void {
     const is_active_pane = pane_id == editor.active_pane;
 
     // Get the document for THIS pane (not necessarily the active doc).
-    var pane_doc_idx = editor.layout.panes.items[pane_id].doc_idx;
+    var pane_doc_idx = switch (editor.layout.panes.items[pane_id].content) {
+        .editor => |idx| idx,
+        .terminal => return, // terminal panes handled by terminalPane()
+    };
     var doc = &editor.documents.items[pane_doc_idx];
 
     // --- Container box for the editor area ---
@@ -682,7 +698,7 @@ fn editorPane(editor: *Editor, pane_id: u8) void {
 
     // Estimate visible columns for horizontal scroll (approximate with 'M' width)
     const m_width = font.textSize("M").w * scale;
-    const visible_cols: usize = if (m_width > 0) @intFromFloat(@floor(area.w / m_width)) else 80;
+    const visible_cols: usize = if (m_width > 0 and area.w > 0) @intFromFloat(@floor(area.w / m_width)) else 80;
 
     // --- Line number gutter width (needed for mouse + rendering) ---
     const line_count_for_gutter = doc.buffer.lineCount();
@@ -693,7 +709,7 @@ fn editorPane(editor: *Editor, pane_id: u8) void {
 
     // Store logical text area width for visual-row movement calculations
     // (in unscaled font units, matching what guiWrapAdvanceRow uses)
-    const text_area_w_logical = (area.w - gutter_total_width) / scale;
+    const text_area_w_logical = @max(0.0, area.w - gutter_total_width) / scale;
     editor.text_width = if (text_area_w_logical > 0) @intFromFloat(text_area_w_logical) else 80;
     const do_wrap = editor.word_wrap;
 
@@ -702,7 +718,10 @@ fn editorPane(editor: *Editor, pane_id: u8) void {
         _ = handleGuiKeyEvents(editor, wd);
 
         // Re-fetch doc after key events — close_tab may have changed/freed the active document
-        pane_doc_idx = editor.layout.panes.items[pane_id].doc_idx;
+        pane_doc_idx = switch (editor.layout.panes.items[pane_id].content) {
+            .editor => |idx| idx,
+            .terminal => return,
+        };
         doc = &editor.documents.items[pane_doc_idx];
     }
 
@@ -824,9 +843,9 @@ fn editorPane(editor: *Editor, pane_id: u8) void {
     if (do_wrap) doc.scroll_left = 0;
 
     // Text area width in pixels (for wrap measurement)
-    const text_area_w = text_clip_rect.w;
+    const text_area_w = @max(0.0, text_clip_rect.w);
     // Text area width in approximate columns (for ensureCursorVisible fallback)
-    const text_cols: usize = if (char_width > 0) @intFromFloat(@floor(text_area_w / char_width)) else 80;
+    const text_cols: usize = if (char_width > 0 and text_area_w > 0) @intFromFloat(@floor(text_area_w / char_width)) else 80;
 
     // Wrap continuation marker style
     const wrap_marker_color = toDvui(editor.theme.wrap_marker);
@@ -1177,9 +1196,407 @@ fn editorPane(editor: *Editor, pane_id: u8) void {
     }
 }
 
+/// Render a terminal pane in the GUI using the cell grid.
+fn terminalPane(editor: *Editor, pane_id: u8, term_idx: usize) void {
+    if (!build_options.has_gui) return;
+    if (term_idx >= editor.terminals.items.len) return;
+
+    const term = editor.terminals.items[term_idx] orelse return;
+    const is_active_pane = pane_id == editor.active_pane;
+
+    // Container box
+    var ebox = dvui.box(@src(), .{ .dir = .vertical }, .{
+        .expand = .both,
+        .background = true,
+        .style = .window,
+        .padding = .{ .x = 2, .y = 2, .w = 2, .h = 2 },
+        .name = "terminal_pane",
+        .id_extra = pane_id,
+    });
+    defer ebox.deinit();
+
+    const wd = ebox.data();
+    const rs = wd.contentRectScale();
+    const scale = rs.s;
+    const area = rs.r;
+
+    // Get monospace font metrics (same as editorPane)
+    const font = dvui.Font.theme(.mono);
+    const lh = font.lineHeight();
+    const line_height: f32 = lh * scale;
+    if (line_height <= 0) return;
+    const cell_w = font.textSize("M").w * scale;
+    if (cell_w <= 0) return;
+
+    // Calculate visible cols/rows and resize terminal if needed
+    const visible_cols: u16 = @intFromFloat(@max(1.0, area.w / cell_w));
+    const visible_rows: u16 = @intFromFloat(@max(1.0, area.h / line_height));
+
+    if (visible_cols != term.cols or visible_rows != term.rows) {
+        term.resizeGrid(visible_cols, visible_rows);
+    }
+
+    // Handle mouse clicks — focus this pane when clicked
+    for (dvui.events()) |*e| {
+        if (e.handled) continue;
+        if (e.evt != .mouse) continue;
+        const me = e.evt.mouse;
+        if (me.p.x < area.x or me.p.x > area.x + area.w or
+            me.p.y < area.y or me.p.y > area.y + area.h) continue;
+        switch (me.action) {
+            .focus, .press => {
+                e.handle(@src(), wd);
+                dvui.focusWidget(wd.id, null, e.num);
+                editor.focusPane(pane_id);
+            },
+            else => {},
+        }
+    }
+
+    // Handle keyboard input for terminal
+    if (is_active_pane) {
+        if (handleTerminalKeyEvents(editor, term, wd)) return; // terminal was freed
+    }
+
+    // Clip to terminal area
+    const old_clip = dvui.clip(area);
+    defer dvui.clipSet(old_clip);
+    const render_rs: dvui.RectScale = .{ .r = area, .s = scale };
+
+    // Lock terminal mutex and render cell grid
+    term.mutex.lock();
+    defer term.mutex.unlock();
+
+    const t_cols = term.cols;
+    const t_rows = term.rows;
+    const t_cursor_row = term.cursor_row;
+    const t_cursor_col = term.cursor_col;
+    const t_cursor_visible = term.cursor_visible;
+    const t_exited = term.exited;
+
+    // Render rows using span-based text rendering (same approach as editorPane).
+    // Rendering individual characters at grid positions causes spacing issues because
+    // renderText handles character advance internally; we must render strings.
+    for (0..t_rows) |r| {
+        const y = area.y + @as(f32, @floatFromInt(r)) * line_height;
+
+        // --- Background pass: draw non-default cell backgrounds ---
+        for (0..t_cols) |c| {
+            const cell = term.cellAtUnsafe(@intCast(r), @intCast(c));
+            const bg_color = if (cell.reverse) cell.fg else cell.bg;
+            if (bg_color.r != 0x1E or bg_color.g != 0x1E or bg_color.b != 0x24) {
+                const x = area.x + @as(f32, @floatFromInt(c)) * cell_w;
+                (dvui.Rect.Physical{ .x = x, .y = y, .w = cell_w, .h = line_height }).fill(.{}, .{
+                    .color = .{ .r = bg_color.r, .g = bg_color.g, .b = bg_color.b, .a = 0xFF },
+                    .fade = 1.0,
+                });
+            }
+        }
+
+        // --- Text pass: render spans of same-color text as strings ---
+        // Build row text and split into spans when fg color changes.
+        var row_buf: [1024]u8 = undefined;
+        var buf_len: usize = 0;
+        var span_start_col: usize = 0;
+
+        const first_cell = term.cellAtUnsafe(@intCast(r), 0);
+        var span_fg: terminal_mod.Color = if (first_cell.reverse) first_cell.bg else first_cell.fg;
+        var draw_x: f32 = area.x;
+
+        for (0..t_cols) |c| {
+            const cell = term.cellAtUnsafe(@intCast(r), @intCast(c));
+            const fg = if (cell.reverse) cell.bg else cell.fg;
+
+            // Flush span if fg color changed
+            if (fg.r != span_fg.r or fg.g != span_fg.g or fg.b != span_fg.b) {
+                if (buf_len > 0) {
+                    dvui.renderText(.{
+                        .font = font,
+                        .text = row_buf[0..buf_len],
+                        .rs = render_rs,
+                        .p = .{ .x = draw_x, .y = y },
+                        .color = .{ .r = span_fg.r, .g = span_fg.g, .b = span_fg.b, .a = 0xFF },
+                    }) catch {};
+                    draw_x += font.textSize(row_buf[0..buf_len]).w * scale;
+                } else {
+                    // Empty span (spaces) — advance by cell count
+                    draw_x += @as(f32, @floatFromInt(c - span_start_col)) * cell_w;
+                }
+                buf_len = 0;
+                span_start_col = c;
+                span_fg = fg;
+            }
+
+            // Encode cell codepoint into the row buffer
+            if (cell.codepoint >= 32 and cell.codepoint != 0) {
+                if (buf_len + 4 <= row_buf.len) {
+                    const len = std.unicode.utf8Encode(cell.codepoint, row_buf[buf_len..][0..4]) catch {
+                        row_buf[buf_len] = ' ';
+                        buf_len += 1;
+                        continue;
+                    };
+                    buf_len += len;
+                }
+            } else {
+                if (buf_len < row_buf.len) {
+                    row_buf[buf_len] = ' ';
+                    buf_len += 1;
+                }
+            }
+        }
+
+        // Flush final span
+        if (buf_len > 0) {
+            dvui.renderText(.{
+                .font = font,
+                .text = row_buf[0..buf_len],
+                .rs = render_rs,
+                .p = .{ .x = draw_x, .y = y },
+                .color = .{ .r = span_fg.r, .g = span_fg.g, .b = span_fg.b, .a = 0xFF },
+            }) catch {};
+        }
+
+        // --- Underline pass ---
+        for (0..t_cols) |c| {
+            const cell = term.cellAtUnsafe(@intCast(r), @intCast(c));
+            if (cell.underline) {
+                const fg_color = if (cell.reverse) cell.bg else cell.fg;
+                const x = area.x + @as(f32, @floatFromInt(c)) * cell_w;
+                const ul_y = y + line_height - 2 * scale;
+                (dvui.Rect.Physical{ .x = x, .y = ul_y, .w = cell_w, .h = 1 * scale }).fill(.{}, .{
+                    .color = .{ .r = fg_color.r, .g = fg_color.g, .b = fg_color.b, .a = 0xFF },
+                    .fade = 1.0,
+                });
+            }
+        }
+    }
+
+    // Draw cursor — measure text prefix up to cursor column for accurate positioning
+    if (is_active_pane and t_cursor_visible and !t_exited) {
+        var prefix_buf: [512]u8 = undefined;
+        var prefix_len: usize = 0;
+        for (0..@as(usize, t_cursor_col)) |c| {
+            const cell = term.cellAtUnsafe(t_cursor_row, @intCast(c));
+            if (cell.codepoint >= 32 and cell.codepoint != 0) {
+                if (prefix_len + 4 <= prefix_buf.len) {
+                    const len = std.unicode.utf8Encode(cell.codepoint, prefix_buf[prefix_len..][0..4]) catch {
+                        prefix_buf[prefix_len] = ' ';
+                        prefix_len += 1;
+                        continue;
+                    };
+                    prefix_len += len;
+                }
+            } else {
+                if (prefix_len < prefix_buf.len) {
+                    prefix_buf[prefix_len] = ' ';
+                    prefix_len += 1;
+                }
+            }
+        }
+        const cx = area.x + font.textSize(prefix_buf[0..prefix_len]).w * scale;
+        const cy = area.y + @as(f32, @floatFromInt(t_cursor_row)) * line_height;
+        const cursor_rect = dvui.Rect.Physical{ .x = cx, .y = cy, .w = 2 * scale, .h = line_height };
+        cursor_rect.fill(.{}, .{
+            .color = .{ .r = 0xCC, .g = 0xCC, .b = 0xCC, .a = 0xCC },
+            .fade = 1.0,
+        });
+    }
+
+    // Show exit message
+    if (t_exited) {
+        const msg = "[Process exited]";
+        const msg_y = area.y + @as(f32, @floatFromInt(t_rows / 2)) * line_height;
+        const msg_x = area.x + 8 * scale;
+        dvui.renderText(.{
+            .font = font,
+            .text = msg,
+            .rs = render_rs,
+            .p = .{ .x = msg_x, .y = msg_y },
+            .color = .{ .r = 0x88, .g = 0x88, .b = 0x88, .a = 0xFF },
+        }) catch {};
+    }
+
+    // Active pane indicator (same as editor)
+    if (is_active_pane and editor.layout.paneCount() > 1) {
+        const focus_color: dvui.Color = .{ .r = 0x35, .g = 0x84, .b = 0xe4, .a = 0xFF };
+        const border_w: f32 = 2 * scale;
+        (dvui.Rect.Physical{ .x = area.x, .y = area.y, .w = border_w, .h = area.h }).fill(.{}, .{ .color = focus_color, .fade = 0.6 });
+    }
+}
+
+/// Handle keyboard events when a terminal pane is focused.
+/// Returns true if the terminal was closed and caller should stop using `term`.
+fn handleTerminalKeyEvents(editor: *Editor, term: *terminal_mod.Terminal, wd: *dvui.WidgetData) bool {
+    if (!build_options.has_gui) return false;
+
+    for (dvui.events()) |*e| {
+        if (e.handled) continue;
+
+        switch (e.evt) {
+            .key => |key| {
+                if (key.action != .down and key.action != .repeat) continue;
+
+                // Skip modifier-only keys
+                if (key.code == .left_shift or key.code == .right_shift or
+                    key.code == .left_control or key.code == .right_control or
+                    key.code == .left_alt or key.code == .right_alt or
+                    key.code == .left_command or key.code == .right_command) continue;
+
+                // ctrl+shift+w → close terminal pane
+                if (key.mod.control() and key.mod.shift() and key.code == .w) {
+                    e.handle(@src(), wd);
+                    editor.closeActiveTerminal();
+                    return true; // terminal is freed, caller must stop
+                }
+
+                // ctrl+backtick → toggle terminal
+                if (key.mod.control() and key.code == .grave) {
+                    e.handle(@src(), wd);
+                    editor.toggleTerminal();
+                    continue;
+                }
+
+                // Special keys (arrows, enter, backspace, etc.)
+                const special_cp: u21 = mapDvuiKey(key.code);
+                if (special_cp != 0) {
+                    e.handle(@src(), wd);
+                    var out: [16]u8 = undefined;
+                    const n = terminal_mod.Terminal.encodeKey(
+                        special_cp,
+                        key.mod.control(),
+                        key.mod.alt(),
+                        key.mod.shift(),
+                        &out,
+                    );
+                    if (n > 0) {
+                        term.writeInput(out[0..n]);
+                    }
+                    continue;
+                }
+
+                // Printable character keys (letters, digits, punctuation)
+                if (dvuiKeyToChar(key.code, key.mod.shift())) |cp| {
+                    e.handle(@src(), wd);
+                    var out: [16]u8 = undefined;
+                    // For ctrl+letter, use the base (lowercase) char
+                    const base_cp: u21 = if (key.mod.control())
+                        (dvuiKeyToChar(key.code, false) orelse cp)
+                    else
+                        cp;
+                    const n = terminal_mod.Terminal.encodeKey(
+                        base_cp,
+                        key.mod.control(),
+                        key.mod.alt(),
+                        false,
+                        &out,
+                    );
+                    if (n > 0) {
+                        term.writeInput(out[0..n]);
+                    }
+                    continue;
+                }
+            },
+            .text => |te| {
+                // Fallback for characters not covered by dvuiKeyToChar
+                // (e.g. international input methods)
+                switch (te.action) {
+                    .value => |val| {
+                        if (val.txt.len > 0) {
+                            e.handle(@src(), wd);
+                            term.writeInput(val.txt);
+                        }
+                    },
+                    else => {},
+                }
+            },
+            else => {},
+        }
+    }
+    return false;
+}
+
+/// Map DVUI key enum to a codepoint for terminal key encoding.
+fn mapDvuiKey(key: dvui.enums.Key) u21 {
+    return switch (key) {
+        .up => 0xF700,
+        .down => 0xF701,
+        .left => 0xF702,
+        .right => 0xF703,
+        .home => 0xF704,
+        .end => 0xF705,
+        .page_up => 0xF706,
+        .page_down => 0xF707,
+        .insert => 0xF708,
+        .delete => 0xF709,
+        .enter => 0x0D,
+        .tab => 0x09,
+        .backspace => 0x08,
+        .escape => 0x1B,
+        .space => ' ',
+        else => 0,
+    };
+}
+
+/// Map DVUI key code to a printable character, handling shift for US keyboard layout.
+fn dvuiKeyToChar(key: dvui.enums.Key, shift: bool) ?u21 {
+    return switch (key) {
+        .a => if (shift) @as(u21, 'A') else 'a',
+        .b => if (shift) @as(u21, 'B') else 'b',
+        .c => if (shift) @as(u21, 'C') else 'c',
+        .d => if (shift) @as(u21, 'D') else 'd',
+        .e => if (shift) @as(u21, 'E') else 'e',
+        .f => if (shift) @as(u21, 'F') else 'f',
+        .g => if (shift) @as(u21, 'G') else 'g',
+        .h => if (shift) @as(u21, 'H') else 'h',
+        .i => if (shift) @as(u21, 'I') else 'i',
+        .j => if (shift) @as(u21, 'J') else 'j',
+        .k => if (shift) @as(u21, 'K') else 'k',
+        .l => if (shift) @as(u21, 'L') else 'l',
+        .m => if (shift) @as(u21, 'M') else 'm',
+        .n => if (shift) @as(u21, 'N') else 'n',
+        .o => if (shift) @as(u21, 'O') else 'o',
+        .p => if (shift) @as(u21, 'P') else 'p',
+        .q => if (shift) @as(u21, 'Q') else 'q',
+        .r => if (shift) @as(u21, 'R') else 'r',
+        .s => if (shift) @as(u21, 'S') else 's',
+        .t => if (shift) @as(u21, 'T') else 't',
+        .u => if (shift) @as(u21, 'U') else 'u',
+        .v => if (shift) @as(u21, 'V') else 'v',
+        .w => if (shift) @as(u21, 'W') else 'w',
+        .x => if (shift) @as(u21, 'X') else 'x',
+        .y => if (shift) @as(u21, 'Y') else 'y',
+        .z => if (shift) @as(u21, 'Z') else 'z',
+        .zero => if (shift) @as(u21, ')') else '0',
+        .one => if (shift) @as(u21, '!') else '1',
+        .two => if (shift) @as(u21, '@') else '2',
+        .three => if (shift) @as(u21, '#') else '3',
+        .four => if (shift) @as(u21, '$') else '4',
+        .five => if (shift) @as(u21, '%') else '5',
+        .six => if (shift) @as(u21, '^') else '6',
+        .seven => if (shift) @as(u21, '&') else '7',
+        .eight => if (shift) @as(u21, '*') else '8',
+        .nine => if (shift) @as(u21, '(') else '9',
+        .minus => if (shift) @as(u21, '_') else '-',
+        .equal => if (shift) @as(u21, '+') else '=',
+        .left_bracket => if (shift) @as(u21, '{') else '[',
+        .right_bracket => if (shift) @as(u21, '}') else ']',
+        .backslash => if (shift) @as(u21, '|') else '\\',
+        .semicolon => if (shift) @as(u21, ':') else ';',
+        .apostrophe => if (shift) @as(u21, '"') else '\'',
+        .comma => if (shift) @as(u21, '<') else ',',
+        .period => if (shift) @as(u21, '>') else '.',
+        .slash => if (shift) @as(u21, '?') else '/',
+        .grave => if (shift) @as(u21, '~') else '`',
+        else => null,
+    };
+}
+
 /// Handle mouse events for the custom editor pane.
 fn handleMouseEvents(editor: *Editor, pane_id: u8, wd: *dvui.WidgetData, area: dvui.Rect.Physical, font: dvui.Font, line_height: f32, scale: f32) void {
-    const pane_doc_idx = editor.layout.panes.items[pane_id].doc_idx;
+    const pane_doc_idx = switch (editor.layout.panes.items[pane_id].content) {
+        .editor => |idx| idx,
+        .terminal => return,
+    };
     const doc = &editor.documents.items[pane_doc_idx];
     const tab_width = editor.tab_width;
     const double_click_threshold_ms: u64 = 400;
@@ -1728,6 +2145,7 @@ fn dvuiKeyToStr(key: dvui.Event.Key, buf: *[64]u8) []const u8 {
         .equal => "=",
         .space => "space",
         .comma => ",",
+        .grave => "`",
         .a => "a", .b => "b", .c => "c", .d => "d", .e => "e", .f => "f",
         .g => "g", .h => "h", .i => "i", .j => "j", .k => "k", .l => "l",
         .m => "m", .n => "n", .o => "o", .p => "p", .q => "q", .r => "r",
@@ -1781,6 +2199,7 @@ fn dvuiKeyToStrNoShift(key: dvui.Event.Key, buf: *[64]u8) []const u8 {
         .equal => "=",
         .space => "space",
         .comma => ",",
+        .grave => "`",
         .a => "a", .b => "b", .c => "c", .d => "d", .e => "e", .f => "f",
         .g => "g", .h => "h", .i => "i", .j => "j", .k => "k", .l => "l",
         .m => "m", .n => "n", .o => "o", .p => "p", .q => "q", .r => "r",

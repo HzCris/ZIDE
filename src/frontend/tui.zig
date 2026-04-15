@@ -5,6 +5,7 @@ const Document = @import("../core/document.zig").Document;
 const TuiColor = @import("../core/theme.zig").TuiColor;
 const syntax = @import("../core/syntax.zig");
 const lsp = @import("../core/lsp.zig");
+const terminal_mod = @import("../core/terminal.zig");
 
 const Key = vaxis.Key;
 const Cell = vaxis.Cell;
@@ -273,6 +274,11 @@ pub fn run(allocator: std.mem.Allocator, editor: *Editor) !void {
 
 /// Dispatch key based on current editor mode.
 fn dispatchKey(editor: *Editor, key: Key) void {
+    // Terminal pane: route keys to PTY (except ctrl+backtick for toggle)
+    if (editor.activePaneIsTerminal()) {
+        handleTerminalKey(editor, key);
+        return;
+    }
     // Completion popup intercepts keys when active (regardless of mode)
     if (editor.completion_active) {
         handleCompletionKey(editor, key);
@@ -294,8 +300,77 @@ fn dispatchKey(editor: *Editor, key: Key) void {
     }
 }
 
+/// Handle key events when focused on a terminal pane.
+fn handleTerminalKey(editor: *Editor, key: Key) void {
+    // ctrl+backtick (`) toggles back to editor
+    if (key.codepoint == '`' and key.mods.ctrl) {
+        editor.toggleTerminal();
+        return;
+    }
+
+    // Get the active terminal
+    const term_idx = editor.activePaneTerminalIdx() orelse return;
+    if (term_idx >= editor.terminals.items.len) return;
+    const term = editor.terminals.items[term_idx] orelse return;
+
+    // Map vaxis key to terminal key encoding
+    var out: [16]u8 = undefined;
+    const cp: u21 = mapVaxisKey(key);
+    if (cp == 0) return;
+
+    const n = terminal_mod.Terminal.encodeKey(
+        cp,
+        key.mods.ctrl,
+        key.mods.alt,
+        key.mods.shift,
+        &out,
+    );
+    if (n > 0) {
+        term.writeInput(out[0..n]);
+    }
+}
+
+/// Map a vaxis Key to a codepoint for terminal key encoding.
+fn mapVaxisKey(key: Key) u21 {
+    // If there's a codepoint, use it directly
+    if (key.codepoint > 0 and key.codepoint < 0xF700) {
+        return key.codepoint;
+    }
+
+    // Special keys
+    return switch (key.codepoint) {
+        Key.enter => 0x0D,
+        Key.tab => 0x09,
+        Key.backspace => 0x08,
+        Key.escape => 0x1B,
+        Key.up => 0xF700,
+        Key.down => 0xF701,
+        Key.left => 0xF702,
+        Key.right => 0xF703,
+        Key.home => 0xF704,
+        Key.end => 0xF705,
+        Key.page_up => 0xF706,
+        Key.page_down => 0xF707,
+        Key.insert => 0xF708,
+        Key.delete => 0xF709,
+        else => 0,
+    };
+}
+
 /// Draw the full editor screen.
 fn drawEditor(win: Window, editor: *Editor, width: u16, height: u16) void {
+    // Check if active pane is a terminal
+    if (editor.activePaneIsTerminal()) {
+        if (editor.activePaneTerminalIdx()) |term_idx| {
+            if (term_idx < editor.terminals.items.len) {
+                if (editor.terminals.items[term_idx]) |t| {
+                    drawTerminal(win, editor, t, width, height);
+                    return;
+                }
+            }
+        }
+    }
+
     const doc = editor.activeDoc();
     const tab_bar_height: u16 = if (editor.docCount() > 1) 1 else 0;
     const status_height: u16 = 1;
@@ -343,6 +418,78 @@ fn drawEditor(win: Window, editor: *Editor, width: u16, height: u16) void {
         .width = width,
     });
     drawStatusBar(status_win, editor, width);
+}
+
+/// Draw a terminal pane in the TUI.
+fn drawTerminal(win: Window, editor: *Editor, term: *terminal_mod.Terminal, width: u16, height: u16) void {
+    const status_height: u16 = 1;
+    const term_height = height -| status_height;
+
+    // Resize terminal grid if needed
+    if (width != term.cols or term_height != term.rows) {
+        term.resizeGrid(width, term_height);
+    }
+
+    term.mutex.lock();
+    defer term.mutex.unlock();
+
+    const t_cols = term.cols;
+    const t_rows = term.rows;
+
+    // Render cells
+    for (0..@min(t_rows, term_height)) |r| {
+        for (0..@min(t_cols, width)) |c| {
+            const cell = term.cellAtUnsafe(@intCast(r), @intCast(c));
+
+            const fg_tc = if (cell.reverse) cell.bg else cell.fg;
+            const bg_tc = if (cell.reverse) cell.fg else cell.bg;
+
+            const fg: Color = .{ .rgb = .{ fg_tc.r, fg_tc.g, fg_tc.b } };
+            const bg: Color = .{ .rgb = .{ bg_tc.r, bg_tc.g, bg_tc.b } };
+
+            var glyph_buf: [4]u8 = undefined;
+            const glyph_len = std.unicode.utf8Encode(cell.codepoint, &glyph_buf) catch 0;
+
+            const style: Style = .{
+                .fg = fg,
+                .bg = bg,
+                .bold = cell.bold,
+                .ul_style = if (cell.underline) .single else .off,
+            };
+
+            win.writeCell(@intCast(c), @intCast(r), .{
+                .char = if (glyph_len > 0) .{ .grapheme = glyph_buf[0..glyph_len], .width = 1 } else .{ .grapheme = " ", .width = 1 },
+                .style = style,
+            });
+        }
+    }
+
+    // Status bar
+    const status_win = win.child(.{
+        .y_off = @intCast(height - 1),
+        .height = 1,
+        .width = width,
+    });
+    const status_bg: Style = .{
+        .bg = toVaxis(editor.tui_theme.status_bg),
+        .fg = toVaxis(editor.tui_theme.status_fg),
+    };
+    // Fill status bar
+    for (0..width) |x| {
+        status_win.writeCell(@intCast(x), 0, .{
+            .char = .{ .grapheme = " ", .width = 1 },
+            .style = status_bg,
+        });
+    }
+
+    const label = if (term.exited) "[TERMINAL - exited]" else "[TERMINAL]";
+    for (label, 0..) |ch, i| {
+        if (i >= width) break;
+        status_win.writeCell(@intCast(i), 0, .{
+            .char = .{ .grapheme = &.{ch}, .width = 1 },
+            .style = status_bg,
+        });
+    }
 }
 
 /// Draw the tab bar.

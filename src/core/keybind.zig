@@ -98,6 +98,9 @@ pub const KeybindMap = struct {
         // LSP shortcuts
         try self.set("ctrl+space", "lsp_completion");
         try self.set("f12", "lsp_goto_definition");
+        // Terminal
+        try self.set("ctrl+`", "toggle_terminal");
+        try self.set("ctrl+shift+`", "open_terminal_right");
     }
 };
 

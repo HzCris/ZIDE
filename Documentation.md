@@ -26,6 +26,8 @@
 | Alt+Shift+Up/Down | Add cursor above/below (TUI fallback) |
 | Ctrl+Space | LSP completion |
 | F12 | LSP go-to-definition |
+| Ctrl+` | Toggle terminal (bottom split) |
+| Ctrl+Shift+` | Open terminal (side-by-side split) |
 | Alt+Click | Add cursor at click position |
 | Ctrl+K | Delete line |
 | Escape / Left-click | Remove secondary cursors |
@@ -457,6 +459,34 @@ All editing actions go through named commands in `CommandRegistry`. Commands can
 - Lua scripting: `zide.bind("ctrl+d", "delete_line")`
 
 50+ registered commands covering cursor movement, editing, selection, clipboard, line operations, and theme switching. Theme commands: `theme_dark`, `theme_light`, `theme_high_contrast`, `theme_terminal` (set both frontends); `gui_theme_dark/light/high_contrast` (GUI only); `tui_theme_dark/light/high_contrast` (TUI only). Additional "actions" (quit, save, find, find_replace, file_open, save_as, command_palette, goto_line, new_document, close_tab) are handled by the frontend but bindable via the keybind map.
+
+## Embedded Terminal
+
+ZIDE includes a built-in terminal emulator that integrates with the split pane system.
+
+### Opening a Terminal
+- **Ctrl+`** (backtick): Toggle terminal — opens a terminal in a bottom split if none exists, focuses an existing terminal, or returns to the editor pane
+- Shell: PowerShell on Windows, `$SHELL` (or `/bin/bash`) on Linux
+
+### Terminal Features
+- Full ANSI/VT escape sequence support (colors, cursor movement, erase, scroll regions, alternate screen buffer)
+- 16-color, 256-color, and 24-bit RGB color support
+- Bold, underline, and reverse video attributes
+- Automatic resize when the pane dimensions change
+- Process exit detection with `[Process exited]` message
+
+### Terminal Commands
+| Command | Keybind | Description |
+|---------|---------|-------------|
+| `toggle_terminal` | `Ctrl+\`` | Open/focus/unfocus terminal |
+| `close_terminal` | — | Close the active terminal pane |
+
+### Architecture
+- **`src/core/pty.zig`** — Cross-platform PTY abstraction (ConPTY on Windows, posix on Linux)
+- **`src/core/ansi.zig`** — VT/ANSI escape sequence state machine parser
+- **`src/core/terminal.zig`** — Terminal emulator (cell grid, reader thread, key encoding)
+- Terminal panes use the same split pane layout system as editor panes — they can be placed anywhere (horizontal or vertical splits)
+- Background reader thread reads PTY output and updates a mutex-protected cell grid; the main thread reads the grid each frame for rendering
 
 ### Performance
 - **Gap buffer** text storage — inserts/deletes at cursor are O(1) amortized instead of O(n) memmove
