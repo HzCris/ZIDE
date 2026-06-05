@@ -357,59 +357,61 @@ fn mapVaxisKey(key: Key) u21 {
     };
 }
 
+/// Rectangle in screen space. Used to route mouse clicks to panes.
+const PaneRect = struct {
+    pane_id: u8,
+    x: u16,
+    y: u16,
+    w: u16,
+    h: u16,
+};
+
+/// Cached pane rectangles after last draw. Used by screenToOffset/resolvePaneAt.
+var pane_rects: [64]PaneRect = undefined;
+var pane_rect_count: usize = 0;
+
+fn pushPaneRect(pane_id: u8, x: u16, y: u16, w: u16, h: u16) void {
+    if (pane_rect_count >= pane_rects.len) return;
+    pane_rects[pane_rect_count] = .{ .pane_id = pane_id, .x = x, .y = y, .w = w, .h = h };
+    pane_rect_count += 1;
+}
+
+/// Find which pane contains screen coordinates (col, row). Returns pane_id and
+/// the local (pane-relative) coordinates.
+fn resolvePaneAt(editor: *Editor, col: i16, row: i16) ?struct { pane_id: u8, local_x: u16, local_y: u16 } {
+    _ = editor;
+    if (col < 0 or row < 0) return null;
+    const cx: u16 = @intCast(col);
+    const ry: u16 = @intCast(row);
+    for (pane_rects[0..pane_rect_count]) |pr| {
+        if (cx >= pr.x and cx < pr.x + pr.w and ry >= pr.y and ry < pr.y + pr.h) {
+            return .{ .pane_id = pr.pane_id, .local_x = cx - pr.x, .local_y = ry - pr.y };
+        }
+    }
+    return null;
+}
+
 /// Draw the full editor screen.
 fn drawEditor(win: Window, editor: *Editor, width: u16, height: u16) void {
-    // Check if active pane is a terminal
-    if (editor.activePaneIsTerminal()) {
-        if (editor.activePaneTerminalIdx()) |term_idx| {
-            if (term_idx < editor.terminals.items.len) {
-                if (editor.terminals.items[term_idx]) |t| {
-                    drawTerminal(win, editor, t, width, height);
-                    return;
-                }
-            }
-        }
-    }
+    pane_rect_count = 0;
 
-    const doc = editor.activeDoc();
     const tab_bar_height: u16 = if (editor.docCount() > 1) 1 else 0;
     const status_height: u16 = 1;
-    const editor_height = height -| tab_bar_height -| status_height;
+    const content_height = height -| tab_bar_height -| status_height;
 
-    // Update text_width for visual-row movement
-    const total_lines = doc.lineCount();
-    const gutter_w = lineNumberWidth(total_lines);
-    const tw: u16 = if (width > gutter_w + 1) width - gutter_w - 1 else 1;
-    editor.text_width = tw;
-
-    // Ensure cursor is visible (unless user is scrolling with wheel)
-    if (!scroll_pinned) {
-        if (editor.word_wrap) {
-            doc.scroll_left = 0;
-            ensureCursorVisibleWrapped(doc, editor_height, width);
-        } else {
-            doc.ensureCursorVisible(editor_height, width -| 5);
-        }
-    }
-
-    // Tab bar
+    // Tab bar (global, spans full width)
     if (tab_bar_height > 0) {
         const tab_win = win.child(.{ .y_off = 0, .height = 1, .width = width });
         drawTabBar(tab_win, editor, width);
     }
 
-    // Editor content
+    // Render pane tree into the content area
     const content_win = win.child(.{
         .y_off = @intCast(tab_bar_height),
-        .height = editor_height,
+        .height = content_height,
         .width = width,
     });
-    drawContent(content_win, doc, editor, width, editor_height, editor.word_wrap);
-
-    // Draw secondary cursors as reverse-video cells
-    if (doc.cursors.count() > 1) {
-        drawSecondaryCursors(content_win, doc, editor, width, editor_height, editor.word_wrap);
-    }
+    renderPaneLayout(content_win, editor, 0, tab_bar_height, 0, width, content_height);
 
     // Status bar
     const status_win = win.child(.{
@@ -420,14 +422,147 @@ fn drawEditor(win: Window, editor: *Editor, width: u16, height: u16) void {
     drawStatusBar(status_win, editor, width);
 }
 
-/// Draw a terminal pane in the TUI.
-fn drawTerminal(win: Window, editor: *Editor, term: *terminal_mod.Terminal, width: u16, height: u16) void {
-    const status_height: u16 = 1;
-    const term_height = height -| status_height;
+/// Recursively render the layout tree into the given window.
+/// screen_x / screen_y give the window's absolute top-left on the terminal,
+/// used to record pane rects for mouse hit-testing.
+fn renderPaneLayout(
+    win: Window,
+    editor: *Editor,
+    node_idx: u8,
+    screen_x: u16,
+    screen_y: u16,
+    width: u16,
+    height: u16,
+) void {
+    if (node_idx >= editor.layout.nodes.items.len) return;
+    if (width == 0 or height == 0) return;
 
+    switch (editor.layout.nodes.items[node_idx]) {
+        .leaf => |pane_id| {
+            pushPaneRect(pane_id, screen_x, screen_y, width, height);
+            drawPane(win, editor, pane_id, width, height);
+        },
+        .split => |s| {
+            const sep_style: Style = .{
+                .fg = toVaxis(editor.tui_theme.gutter_separator),
+                .bg = toVaxis(editor.tui_theme.text_bg),
+            };
+            switch (s.direction) {
+                .horizontal => {
+                    // side-by-side with 1-col separator
+                    if (width < 3) {
+                        // Too narrow to split — just render the first child
+                        renderPaneLayout(win, editor, s.first, screen_x, screen_y, width, height);
+                        return;
+                    }
+                    const avail: u16 = width - 1;
+                    var first_w: u16 = @intFromFloat(@round(@as(f32, @floatFromInt(avail)) * s.ratio));
+                    if (first_w == 0) first_w = 1;
+                    if (first_w >= avail) first_w = avail - 1;
+                    const second_w: u16 = avail - first_w;
+
+                    const first_win = win.child(.{ .x_off = 0, .y_off = 0, .width = first_w, .height = height });
+                    renderPaneLayout(first_win, editor, s.first, screen_x, screen_y, first_w, height);
+
+                    // Vertical separator at column first_w
+                    for (0..height) |r| {
+                        win.writeCell(@intCast(first_w), @intCast(r), .{
+                            .char = .{ .grapheme = "\u{2502}", .width = 1 }, // │
+                            .style = sep_style,
+                        });
+                    }
+
+                    const second_win = win.child(.{
+                        .x_off = @intCast(first_w + 1),
+                        .y_off = 0,
+                        .width = second_w,
+                        .height = height,
+                    });
+                    renderPaneLayout(second_win, editor, s.second, screen_x + first_w + 1, screen_y, second_w, height);
+                },
+                .vertical => {
+                    // top/bottom with 1-row separator
+                    if (height < 3) {
+                        renderPaneLayout(win, editor, s.first, screen_x, screen_y, width, height);
+                        return;
+                    }
+                    const avail: u16 = height - 1;
+                    var first_h: u16 = @intFromFloat(@round(@as(f32, @floatFromInt(avail)) * s.ratio));
+                    if (first_h == 0) first_h = 1;
+                    if (first_h >= avail) first_h = avail - 1;
+                    const second_h: u16 = avail - first_h;
+
+                    const first_win = win.child(.{ .x_off = 0, .y_off = 0, .width = width, .height = first_h });
+                    renderPaneLayout(first_win, editor, s.first, screen_x, screen_y, width, first_h);
+
+                    // Horizontal separator at row first_h
+                    for (0..width) |c| {
+                        win.writeCell(@intCast(c), @intCast(first_h), .{
+                            .char = .{ .grapheme = "\u{2500}", .width = 1 }, // ─
+                            .style = sep_style,
+                        });
+                    }
+
+                    const second_win = win.child(.{
+                        .x_off = 0,
+                        .y_off = @intCast(first_h + 1),
+                        .width = width,
+                        .height = second_h,
+                    });
+                    renderPaneLayout(second_win, editor, s.second, screen_x, screen_y + first_h + 1, width, second_h);
+                },
+            }
+        },
+    }
+}
+
+/// Draw a single pane (editor or terminal) into the given window.
+fn drawPane(win: Window, editor: *Editor, pane_id: u8, width: u16, height: u16) void {
+    const pane = editor.layout.panes.items[pane_id];
+    switch (pane.content) {
+        .editor => |doc_idx| {
+            if (doc_idx >= editor.documents.items.len) return;
+            const doc = &editor.documents.items[doc_idx];
+            const is_active = pane_id == editor.active_pane;
+
+            // Only the active pane's doc drives editor.text_width and cursor-visible logic
+            if (is_active) {
+                const total_lines = doc.lineCount();
+                const gutter_w = lineNumberWidth(total_lines);
+                const tw: u16 = if (width > gutter_w + 1) width - gutter_w - 1 else 1;
+                editor.text_width = tw;
+
+                if (!scroll_pinned) {
+                    if (editor.word_wrap) {
+                        doc.scroll_left = 0;
+                        ensureCursorVisibleWrapped(doc, height, width);
+                    } else {
+                        doc.ensureCursorVisible(height, width -| 5);
+                    }
+                }
+            }
+
+            drawContent(win, doc, editor, width, height, editor.word_wrap);
+            if (is_active and doc.cursors.count() > 1) {
+                drawSecondaryCursors(win, doc, editor, width, height, editor.word_wrap);
+            }
+        },
+        .terminal => |term_idx| {
+            if (term_idx < editor.terminals.items.len) {
+                if (editor.terminals.items[term_idx]) |t| {
+                    drawTerminalInPane(win, editor, t, width, height);
+                }
+            }
+        },
+    }
+}
+
+/// Draw a terminal into a pane-sized window (no status bar, caller owns layout).
+fn drawTerminalInPane(win: Window, editor: *Editor, term: *terminal_mod.Terminal, width: u16, height: u16) void {
+    _ = editor;
     // Resize terminal grid if needed
-    if (width != term.cols or term_height != term.rows) {
-        term.resizeGrid(width, term_height);
+    if (width != term.cols or height != term.rows) {
+        term.resizeGrid(width, height);
     }
 
     term.mutex.lock();
@@ -436,60 +571,47 @@ fn drawTerminal(win: Window, editor: *Editor, term: *terminal_mod.Terminal, widt
     const t_cols = term.cols;
     const t_rows = term.rows;
 
-    // Render cells
-    for (0..@min(t_rows, term_height)) |r| {
+    for (0..@min(t_rows, height)) |r| {
         for (0..@min(t_cols, width)) |c| {
             const cell = term.cellAtUnsafe(@intCast(r), @intCast(c));
-
             const fg_tc = if (cell.reverse) cell.bg else cell.fg;
             const bg_tc = if (cell.reverse) cell.fg else cell.bg;
-
             const fg: Color = .{ .rgb = .{ fg_tc.r, fg_tc.g, fg_tc.b } };
             const bg: Color = .{ .rgb = .{ bg_tc.r, bg_tc.g, bg_tc.b } };
 
             var glyph_buf: [4]u8 = undefined;
             const glyph_len = std.unicode.utf8Encode(cell.codepoint, &glyph_buf) catch 0;
-
             const style: Style = .{
                 .fg = fg,
                 .bg = bg,
                 .bold = cell.bold,
                 .ul_style = if (cell.underline) .single else .off,
             };
-
             win.writeCell(@intCast(c), @intCast(r), .{
                 .char = if (glyph_len > 0) .{ .grapheme = glyph_buf[0..glyph_len], .width = 1 } else .{ .grapheme = " ", .width = 1 },
                 .style = style,
             });
         }
     }
+}
 
-    // Status bar
-    const status_win = win.child(.{
-        .y_off = @intCast(height - 1),
-        .height = 1,
-        .width = width,
-    });
-    const status_bg: Style = .{
-        .bg = toVaxis(editor.tui_theme.status_bg),
-        .fg = toVaxis(editor.tui_theme.status_fg),
-    };
-    // Fill status bar
-    for (0..width) |x| {
-        status_win.writeCell(@intCast(x), 0, .{
-            .char = .{ .grapheme = " ", .width = 1 },
-            .style = status_bg,
-        });
-    }
+/// Compute the width of tab `i` in the tab bar. Matches the format in drawTabBar:
+/// " " + display_name + (dirty ? "*" : "") + " " + "|".
+fn tabWidth(doc: *const Document) u16 {
+    const dirty_w: u16 = if (doc.dirty) 1 else 0;
+    return @intCast(3 + doc.display_name.len + dirty_w);
+}
 
-    const label = if (term.exited) "[TERMINAL - exited]" else "[TERMINAL]";
-    for (label, 0..) |ch, i| {
-        if (i >= width) break;
-        status_win.writeCell(@intCast(i), 0, .{
-            .char = .{ .grapheme = &.{ch}, .width = 1 },
-            .style = status_bg,
-        });
+/// Given a click x on the tab bar, return the doc index of the clicked tab,
+/// or null if the click is past the last tab.
+fn tabAtX(editor: *Editor, click_x: u16) ?usize {
+    var x: u16 = 0;
+    for (editor.documents.items, 0..) |*doc, i| {
+        const w = tabWidth(doc);
+        if (click_x >= x and click_x < x + w) return i;
+        x += w;
     }
+    return null;
 }
 
 /// Draw the tab bar.
@@ -1095,6 +1217,22 @@ fn drawStatusBar(win: Window, editor: *Editor, width: u16) void {
     // Fill background
     win.fill(.{ .style = style });
 
+    // Terminal pane: show simple label instead of doc info
+    if (editor.activePaneIsTerminal()) {
+        const label = blk: {
+            if (editor.activePaneTerminalIdx()) |ti| {
+                if (ti < editor.terminals.items.len) {
+                    if (editor.terminals.items[ti]) |t| {
+                        if (t.exited) break :blk " [TERMINAL - exited]";
+                    }
+                }
+            }
+            break :blk " [TERMINAL]";
+        };
+        _ = writeStr(win, 0, 0, label, style);
+        return;
+    }
+
     const doc = editor.activeDoc();
     const pos = doc.cursorPos();
 
@@ -1150,15 +1288,32 @@ fn lineNumberWidth(total_lines: usize) u16 {
 
 /// Position the real terminal cursor at the editor cursor location.
 fn positionCursor(win: Window, editor: *Editor, width: u16, height: u16) void {
+    _ = width;
+    _ = height;
+    // Find the active pane's rect; bail if it isn't an editor pane
+    if (editor.activePaneIsTerminal()) {
+        win.hideCursor();
+        return;
+    }
+    var active_rect: ?PaneRect = null;
+    for (pane_rects[0..pane_rect_count]) |pr| {
+        if (pr.pane_id == editor.active_pane) {
+            active_rect = pr;
+            break;
+        }
+    }
+    const rect = active_rect orelse {
+        win.hideCursor();
+        return;
+    };
+
     const doc = editor.activeDoc();
     const pos = doc.cursorPos();
 
-    const tab_bar_height: u16 = if (editor.docCount() > 1) 1 else 0;
-    const status_height: u16 = 1;
     const total_lines = doc.lineCount();
     const gutter_width = lineNumberWidth(total_lines);
     const text_start_x = gutter_width + 1;
-    const text_width: u16 = if (width > text_start_x) width - text_start_x else 1;
+    const text_width: u16 = if (rect.w > text_start_x) rect.w - text_start_x else 1;
 
     if (editor.word_wrap) {
         // With wrapping: compute visual row by summing wrapped heights of preceding lines
@@ -1167,15 +1322,14 @@ fn positionCursor(win: Window, editor: *Editor, width: u16, height: u16) void {
         while (line_idx < pos.line and line_idx < total_lines) : (line_idx += 1) {
             visual_row += wrapLineRows(doc.lineContent(line_idx), text_width);
         }
-        // Add the cursor's position within its wrapped line
         const cur_line = doc.lineContent(pos.line);
         const wrap_pos = wrapColToVisual(cur_line, text_width, pos.col);
         visual_row += wrap_pos.row;
 
-        const screen_y = tab_bar_height +| visual_row;
-        const screen_x = text_start_x +| wrap_pos.col;
+        const screen_y = rect.y +| visual_row;
+        const screen_x = rect.x +| text_start_x +| wrap_pos.col;
 
-        if (screen_y < height -| status_height and screen_x < width) {
+        if (visual_row < rect.h and (text_start_x + wrap_pos.col) < rect.w) {
             win.showCursor(screen_x, screen_y);
             win.setCursorShape(.beam_blink);
         } else {
@@ -1185,10 +1339,10 @@ fn positionCursor(win: Window, editor: *Editor, width: u16, height: u16) void {
         const visible_line = pos.line -| doc.scroll_top;
         const visible_col = pos.col -| doc.scroll_left;
 
-        const screen_y: u16 = @intCast(@min(visible_line + tab_bar_height, height -| status_height -| 1));
-        const screen_x: u16 = text_start_x +| @as(u16, @intCast(@min(visible_col, width -| text_start_x)));
+        const screen_y: u16 = rect.y +| @as(u16, @intCast(@min(visible_line, rect.h -| 1)));
+        const screen_x: u16 = rect.x +| text_start_x +| @as(u16, @intCast(@min(visible_col, rect.w -| text_start_x)));
 
-        if (screen_y < height -| status_height and screen_x < width) {
+        if (visible_line < rect.h and (text_start_x + visible_col) < rect.w) {
             win.showCursor(screen_x, screen_y);
             win.setCursorShape(.beam_blink);
         } else {
@@ -1200,16 +1354,23 @@ fn positionCursor(win: Window, editor: *Editor, width: u16, height: u16) void {
 /// Convert a screen position (x, y) in the editor area to a buffer offset.
 /// Returns null if the position is outside the editor content area.
 fn screenToOffset(editor: *Editor, screen_x: i16, screen_y: i16) ?usize {
-    const doc = editor.activeDoc();
-    const total_lines = doc.lineCount();
-    const tab_bar_height: i16 = if (editor.docCount() > 1) 1 else 0;
-    const gutter_width = lineNumberWidth(total_lines);
-    const text_start_x: i16 = @intCast(gutter_width + 1);
+    const hit = resolvePaneAt(editor, screen_x, screen_y) orelse return null;
+    const pane = editor.layout.panes.items[hit.pane_id];
+    const doc_idx = switch (pane.content) {
+        .editor => |idx| idx,
+        .terminal => return null,
+    };
+    if (doc_idx >= editor.documents.items.len) return null;
+    const doc = &editor.documents.items[doc_idx];
 
-    // Must be in the text area
-    if (screen_x < text_start_x or screen_y < tab_bar_height) return null;
-    const text_col: usize = @intCast(screen_x - text_start_x);
-    const content_row: usize = @intCast(screen_y - tab_bar_height);
+    const total_lines = doc.lineCount();
+    const gutter_width = lineNumberWidth(total_lines);
+    const text_start_x: u16 = gutter_width + 1;
+
+    // Must be in the text area of the pane
+    if (hit.local_x < text_start_x) return null;
+    const text_col: usize = hit.local_x - text_start_x;
+    const content_row: usize = hit.local_y;
 
     if (editor.word_wrap) {
         const text_width = editor.text_width;
@@ -1247,6 +1408,25 @@ fn handleMouse(editor: *Editor, mouse: vaxis.Mouse) void {
             if (mouse.type == .press) {
                 // Click: position cursor — also un-pin scroll
                 scroll_pinned = false;
+
+                // Tab bar click: switch document in active pane
+                const tab_bar_height: i16 = if (editor.docCount() > 1) 1 else 0;
+                if (tab_bar_height > 0 and mouse.row == 0) {
+                    if (tabAtX(editor, @intCast(mouse.col))) |doc_idx| {
+                        editor.switchToDoc(doc_idx);
+                    }
+                    return;
+                }
+
+                // Route click to the pane it landed in
+                if (resolvePaneAt(editor, mouse.col, mouse.row)) |hit| {
+                    editor.active_pane = hit.pane_id;
+                    const pane = editor.layout.panes.items[hit.pane_id];
+                    if (pane.content == .editor) {
+                        editor.active_doc_idx = pane.content.editor;
+                    }
+                }
+
                 if (screenToOffset(editor, mouse.col, mouse.row)) |offset| {
                     const doc = editor.activeDoc();
                     if (mouse.mods.alt) {

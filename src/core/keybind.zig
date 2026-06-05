@@ -94,7 +94,13 @@ pub const KeybindMap = struct {
         // Split pane shortcuts
         try self.set("alt+backslash", "split_vertical");
         try self.set("alt+shift+backslash", "split_horizontal");
-        try self.set("ctrl+shift+w", "close_pane");
+        try self.set("ctrl+alt+q", "close_pane");
+        try self.set("ctrl+page_down", "next_doc");
+        try self.set("ctrl+page_up", "prev_doc");
+        try self.set("ctrl+tab", "next_doc");
+        try self.set("ctrl+shift+tab", "prev_doc");
+        try self.set("alt+right", "focus_next_pane");
+        try self.set("alt+left", "focus_prev_pane");
         // LSP shortcuts
         try self.set("ctrl+space", "lsp_completion");
         try self.set("f12", "lsp_goto_definition");

@@ -47,11 +47,29 @@ fn worstDiagnosticOnLine(doc: *Document, line: usize) ?*const lsp.Diagnostic {
 // These use the same Vera Sans fonts as DVUI's built-in Adwaita themes.
 // ---------------------------------------------------------------------------
 
+/// Name under which the bundled (or user-overridden) mono font is registered with DVUI.
+pub const custom_mono_family = "zide-mono";
+
+/// Bundled default mono font (Fira Code Nerd Font Mono — covers box-drawing,
+/// powerline glyphs, devicons, etc.). Used unless the user sets `mono_font_path`.
+pub const bundled_mono_ttf = @embedFile("bundled_mono_font");
+
 /// Return the DVUI theme matching the current editor theme preset.
-pub fn dvuiThemeForPreset(preset_name: []const u8) dvui.Theme {
-    if (std.mem.eql(u8, preset_name, "light")) return dvui_light;
-    if (std.mem.eql(u8, preset_name, "high_contrast")) return dvui_high_contrast;
-    return dvui_dark;
+/// If `use_custom_mono` is true, the mono font is switched to `custom_mono_family`
+/// (which must be registered beforehand via `dvui.Window.addFont`).
+/// If `mono_size` > 0, it overrides the default mono size.
+pub fn dvuiThemeForPreset(preset_name: []const u8, use_custom_mono: bool, mono_size: f32) dvui.Theme {
+    var theme: dvui.Theme = if (std.mem.eql(u8, preset_name, "light"))
+        dvui_light
+    else if (std.mem.eql(u8, preset_name, "high_contrast"))
+        dvui_high_contrast
+    else
+        dvui_dark;
+
+    const family: []const u8 = if (use_custom_mono) custom_mono_family else "Vera Sans Mono";
+    const size: f32 = if (mono_size > 0) mono_size else dvui.Font.DefaultSize;
+    theme.font_mono = .find(.{ .family = family, .size = size });
+    return theme;
 }
 
 const dvui_dark: dvui.Theme = blk: {
@@ -407,7 +425,7 @@ pub fn frame(editor: *Editor) bool {
                 _ = editor.execAction("split_horizontal");
                 m.close();
             }
-            if (dvui.menuItemLabel(@src(), "Close Pane       Ctrl+Shift+W", .{}, .{ .expand = .horizontal }) != null) {
+            if (dvui.menuItemLabel(@src(), "Close Pane       Ctrl+Alt+Q", .{}, .{ .expand = .horizontal }) != null) {
                 _ = editor.execAction("close_pane");
                 m.close();
             }
@@ -1442,8 +1460,8 @@ fn handleTerminalKeyEvents(editor: *Editor, term: *terminal_mod.Terminal, wd: *d
                     key.code == .left_alt or key.code == .right_alt or
                     key.code == .left_command or key.code == .right_command) continue;
 
-                // ctrl+shift+w → close terminal pane
-                if (key.mod.control() and key.mod.shift() and key.code == .w) {
+                // ctrl+alt+q → close terminal pane
+                if (key.mod.control() and key.mod.alt() and key.code == .q) {
                     e.handle(@src(), wd);
                     editor.closeActiveTerminal();
                     return true; // terminal is freed, caller must stop
@@ -2804,7 +2822,7 @@ fn handlePaletteKeyGui(editor: *Editor, key: dvui.Event.Key) void {
                     _ = editor.execCommand(name, null);
                     // If a theme command changed the preset, update DVUI chrome
                     if (editor.theme_name.ptr != prev_theme.ptr) {
-                        dvui.themeSet(dvuiThemeForPreset(editor.theme_name));
+                        dvui.themeSet(dvuiThemeForPreset(editor.theme_name, true, editor.mono_font_size));
                     }
                     return;
                 }
@@ -3098,7 +3116,7 @@ fn switchTheme(editor: *Editor, name: []const u8) void {
     } else return;
 
     // Update DVUI chrome (menus, scrollbars, etc.) live
-    dvui.themeSet(dvuiThemeForPreset(editor.theme_name));
+    dvui.themeSet(dvuiThemeForPreset(editor.theme_name, true, editor.mono_font_size));
 
     // Persist choice to init.lua
     var val_buf: [32]u8 = undefined;

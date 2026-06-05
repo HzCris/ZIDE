@@ -38,7 +38,10 @@
 | Ctrl+Home/End | Jump to file start/end |
 | Ctrl+Shift+Home/End | Select to file start/end |
 | Ctrl+W | Close tab |
-| Ctrl+Shift+W | Close pane |
+| Ctrl+Alt+Q | Close pane (also closes the focused terminal pane) |
+| Ctrl+Tab / Ctrl+Shift+Tab | Next / previous document tab |
+| Ctrl+PageDown / Ctrl+PageUp | Next / previous document tab |
+| Alt+Right / Alt+Left | Focus next / previous split pane |
 | Ctrl+Shift+S | Save As |
 | Alt+\ | Split pane vertically (side by side) |
 | Alt+Shift+\ | Split pane horizontally (top/bottom) |
@@ -96,9 +99,18 @@ All Ctrl/Alt shortcuts are remappable via `~/.config/zide/init.lua`.
 - Alt+click to add cursor at position
 - Left drag to select text
 - Scroll wheel to scroll viewport (independent of cursor position)
+- Click a tab in the tab bar to switch to it
+- Click in a split pane to focus it
+
+**Split Panes:**
+- Vertical split (Alt+\\) and horizontal split (Alt+Shift+\\)
+- Nested splits supported (binary layout tree)
+- Pane separators rendered with box-drawing characters
+- Close pane (Ctrl+Alt+Q), focus next/prev (Alt+Right/Alt+Left)
 
 **Documents / File I/O:**
 - Multi-document tabs (Ctrl+N new, Ctrl+W close, open by path)
+- Tab switching: Ctrl+Tab / Ctrl+Shift+Tab, Ctrl+PageDown / Ctrl+PageUp
 - Open file by path (Ctrl+O)
 - Save (Ctrl+S), Save As (Ctrl+Shift+S)
 - Line ending detection (LF / CRLF)
@@ -109,6 +121,8 @@ All Ctrl/Alt shortcuts are remappable via `~/.config/zide/init.lua`.
 - Config folder hierarchy: `~/.config/zide/` with `themes/` and `extensions/` subfolders
 - Lua settings file (`~/.config/zide/init.lua`)
   - `zide.set(key, value)` — tab_width, use_tabs, word_wrap, auto_close_brackets, page_size, auto_save, auto_save_interval_ms, click_clears_cursors, max_undo_history
+  - `zide.set("mono_font_path", "/path/to/font.ttf")` — use a custom monospace font (e.g. a Nerd Font for box-drawing and powerline glyphs in the embedded terminal)
+  - `zide.set("mono_font_size", 14)` — override the default monospace font size
   - `zide.set("tui_theme", name)` — switch TUI theme ("terminal", "dark", "light", "high_contrast")
   - `zide.set("tui_color_*", "#hex")` — override individual TUI color (e.g. `tui_color_text_fg`)
   - `zide.set("syn_*", "#hex")` — override syntax highlight color (e.g. `syn_keyword`, `syn_comment`)
@@ -169,7 +183,7 @@ All Ctrl/Alt shortcuts are remappable via `~/.config/zide/init.lua`.
 - Split panes: vertical (Alt+\) and horizontal (Alt+Shift+\) splits with draggable dividers
   - Binary layout tree — nested splits supported (split a split)
   - Click to focus pane, focused pane highlighted with border
-  - Close pane (Ctrl+Shift+W), navigate via command palette (`focus_next_pane`, `focus_prev_pane`)
+  - Close pane (Ctrl+Alt+Q), navigate via command palette (`focus_next_pane`, `focus_prev_pane`)
   - Each pane shows its own document independently, keyboard input goes to focused pane only
   - Modal overlays (find/replace, palette, etc.) render in focused pane
   - Split/close/focus commands available in View menu and command palette
@@ -497,3 +511,37 @@ ZIDE includes a built-in terminal emulator that integrates with the split pane s
 - GUI: cursor blink uses animation timer instead of continuous refresh
 - GUI: tab expansion columns pre-computed once per line, not per wrap row
 - TUI: vaxis cell-level diffing (only changed cells sent to terminal)
+
+# Extensions that every IDE has over a text editor.
+
+## TUI
+- [x] Syntax highlighting
+- [x] LSP support
+- [] File tree / project browser (Including a Starting Directory option)
+- [] LLM support using OpenAI API for various cloud providers and local LLMs (And claude if allowed)
+- [] Git integration (gutter signs)
+- [] Terminal Splitting
+- [] Block/column selection
+- [] Ctrl+/ to comment highlighted text (Requires a lot of language/file maintenance/upkeeping)
+- [] Debug Support
+- [] Nerdfont/Custom Icon integration
+- [] Session Persistance Option
+- [] TODO comment integration
+- [] Linting
+- [] Extension fetching (Think like how neovim pulls from github/codeberg)
+
+## GUI
+- [x] LSP support
+- [x] Embedded Terminal
+- [x] Syntax highlighting
+- [x] Block/column selection
+- [] File tree / project browser (Including a Starting Directory option)
+- [] LLM support using OpenAI API for various cloud providers and local LLMs (And claude if allowed)
+- [] Git integration (gutter signs)
+- [] Ctrl+/ to comment highlighted text (Requires a lot of language/file maintenance/upkeeping)
+- [] Debug Support
+- [] Nerdfont/Custom Icon integration
+- [] Session Persistance Option
+- [] TODO comment integration
+- [] Linting
+- [] Extension fetching (Think like how neovim pulls from github/codeberg)

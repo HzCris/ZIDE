@@ -437,6 +437,19 @@ fn luaSet(state: ?*zlua.LuaState) callconv(.c) c_int {
         } else {
             std.log.warn("zide.set: unknown tui_theme '{s}'", .{val_str});
         }
+    } else if (std.mem.eql(u8, key_str, "mono_font_path")) {
+        // zide.set("mono_font_path", "C:/path/to/font.ttf")
+        const val = lua.toString(2) catch return 0;
+        const val_str: []const u8 = val;
+        if (editor.mono_font_path.len > 0) editor.allocator.free(editor.mono_font_path);
+        editor.mono_font_path = editor.allocator.dupe(u8, val_str) catch {
+            editor.mono_font_path = "";
+            return 0;
+        };
+    } else if (std.mem.eql(u8, key_str, "mono_font_size")) {
+        // zide.set("mono_font_size", 14)
+        const val = lua.toNumber(2) catch return 0;
+        editor.mono_font_size = @floatCast(val);
     } else if (std.mem.startsWith(u8, key_str, "color_")) {
         // zide.set("color_text", "#ff8040") — override individual GUI theme color
         const val = lua.toString(2) catch return 0;

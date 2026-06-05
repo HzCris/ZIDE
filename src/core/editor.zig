@@ -101,6 +101,16 @@ pub const Editor = struct {
     /// Name of the active TUI theme preset ("terminal", "dark", "light", "high_contrast", or "custom").
     tui_theme_name: []const u8 = "terminal",
 
+    /// Path to a custom monospace TTF font. Empty = use DVUI default ("Vera Sans Mono").
+    /// Owned by the editor allocator when non-empty.
+    mono_font_path: []const u8 = "",
+    /// Base size for the monospace font. 0 = DVUI default.
+    mono_font_size: f32 = 0,
+
+    /// True when running under the GUI frontend. Set by the GUI on startup.
+    /// Terminal panes only render in the GUI, so the TUI gates these actions off.
+    gui_available: bool = false,
+
     /// Settings panel selection index.
     settings_selected: usize = 0,
     /// Settings panel: which numeric field is being edited (null = none).
@@ -217,6 +227,9 @@ pub const Editor = struct {
         self.lang_syntax_overrides.deinit(self.allocator);
         if (self.clipboard.len > 0) {
             self.allocator.free(self.clipboard);
+        }
+        if (self.mono_font_path.len > 0) {
+            self.allocator.free(self.mono_font_path);
         }
     }
 
@@ -431,6 +444,14 @@ pub const Editor = struct {
             _ = self.closeActiveDoc();
             return true;
         }
+        if (std.mem.eql(u8, action, "next_doc")) {
+            self.nextDoc();
+            return true;
+        }
+        if (std.mem.eql(u8, action, "prev_doc")) {
+            self.prevDoc();
+            return true;
+        }
         // Split pane actions
         if (std.mem.eql(u8, action, "split_vertical")) {
             self.splitActive(.horizontal); // horizontal = side by side
@@ -452,17 +473,17 @@ pub const Editor = struct {
             self.focusPrevPane();
             return true;
         }
-        // Terminal actions
+        // Terminal actions — only available in the GUI frontend (TUI can't host PTYs)
         if (std.mem.eql(u8, action, "toggle_terminal")) {
-            self.toggleTerminal();
+            if (self.gui_available) self.toggleTerminal();
             return true;
         }
         if (std.mem.eql(u8, action, "close_terminal")) {
-            self.closeActiveTerminal();
+            if (self.gui_available) self.closeActiveTerminal();
             return true;
         }
         if (std.mem.eql(u8, action, "open_terminal_right")) {
-            self.openTerminalRight();
+            if (self.gui_available) self.openTerminalRight();
             return true;
         }
         // LSP actions
@@ -641,20 +662,26 @@ pub const Editor = struct {
     }
 
     /// Close a terminal by index: stop PTY, close its pane, focus a neighbor.
+    /// If it's the last live pane, convert it to an editor instead of closing.
     pub fn closeTerminal(self: *Editor, term_idx: usize) void {
         if (term_idx >= self.terminals.items.len) return;
-        // Find and close the pane showing this terminal
+        // Find the pane showing this terminal
         for (self.layout.panes.items, 0..) |pane, i| {
             if (pane.content == .terminal and pane.content.terminal == term_idx) {
-                if (self.active_pane == @as(u8, @intCast(i))) {
-                    // Move focus before closing
+                const pane_u8: u8 = @intCast(i);
+                if (self.active_pane == pane_u8) {
                     if (self.layout.nextPane(self.active_pane)) |next| {
                         self.active_pane = next;
                     } else {
                         self.active_pane = 0;
                     }
                 }
-                _ = self.layout.closePane(@intCast(i));
+                const closed = self.layout.closePane(pane_u8);
+                if (!closed) {
+                    // It's the last live pane — convert to editor so the user isn't stuck on a blank pane.
+                    self.layout.panes.items[i].content = .{ .editor = self.active_doc_idx };
+                    self.active_pane = pane_u8;
+                }
                 break;
             }
         }
@@ -683,9 +710,8 @@ pub const Editor = struct {
 
     /// Toggle terminal: focus existing terminal, or open one. If already in terminal, go back.
     pub fn toggleTerminal(self: *Editor) void {
-        // If currently in a terminal pane, focus the previous non-terminal pane
+        // If currently in a terminal pane, focus the nearest non-terminal pane
         if (self.activePaneIsTerminal()) {
-            // Find a non-terminal pane to focus
             var leaves: std.ArrayList(u8) = .empty;
             defer leaves.deinit(self.allocator);
             self.layout.collectLeaves(0, &leaves) catch return;
@@ -701,21 +727,7 @@ pub const Editor = struct {
             return;
         }
 
-        // Not in a terminal — find an existing live terminal pane to focus
-        for (self.layout.panes.items, 0..) |pane, i| {
-            if (pane.content == .terminal) {
-                const tidx = pane.content.terminal;
-                // Check the terminal is still alive and the pane is in the layout tree
-                if (tidx < self.terminals.items.len and self.terminals.items[tidx] != null and
-                    self.layout.findLeafNode(@intCast(i)) != null)
-                {
-                    self.focusPane(@intCast(i));
-                    return;
-                }
-            }
-        }
-
-        // No terminal exists — open one
+        // From an editor pane — always open a new bottom terminal.
         self.openTerminal();
     }
 

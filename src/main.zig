@@ -123,6 +123,7 @@ fn runGui(allocator: std.mem.Allocator, lua: *zlua.Lua, cli_files: []const []con
     // Init editor state
     var editor = try Editor.init(allocator);
     defer editor.deinit();
+    editor.gui_available = true;
 
     // Start LSP client (ZLS)
     var lsp_client = LspClient.init(allocator);
@@ -187,9 +188,39 @@ fn runGui(allocator: std.mem.Allocator, lua: *zlua.Lua, cli_files: []const []con
 
     // Init DVUI window with custom theme matching editor theme preset
     var win = try dvui.Window.init(@src(), allocator, backend.backend(), .{
-        .theme = gui.dvuiThemeForPreset(editor.theme_name),
+        .theme = gui.dvuiThemeForPreset(editor.theme_name, false, editor.mono_font_size),
     });
     defer win.deinit();
+
+    // Register the mono font under `custom_mono_family`. Prefer the user's path
+    // if set; otherwise fall back to the bundled Fira Code Nerd Font.
+    var mono_loaded = false;
+    if (editor.mono_font_path.len > 0) blk: {
+        const f = std.fs.cwd().openFile(editor.mono_font_path, .{}) catch |err| {
+            std.log.warn("Failed to open mono font {s}: {} — falling back to bundled font", .{ editor.mono_font_path, err });
+            break :blk;
+        };
+        defer f.close();
+        const bytes = f.readToEndAlloc(allocator, 64 * 1024 * 1024) catch |err| {
+            std.log.warn("Failed to read mono font {s}: {} — falling back to bundled font", .{ editor.mono_font_path, err });
+            break :blk;
+        };
+        win.addFont(gui.custom_mono_family, bytes, allocator) catch |err| {
+            std.log.warn("Failed to register mono font: {} — falling back to bundled font", .{err});
+            allocator.free(bytes);
+            break :blk;
+        };
+        mono_loaded = true;
+    }
+    if (!mono_loaded) {
+        // Bundled font bytes are static (embedded in the executable) — pass null
+        // allocator so DVUI doesn't try to free them.
+        win.addFont(gui.custom_mono_family, gui.bundled_mono_ttf, null) catch |err| {
+            std.log.warn("Failed to register bundled mono font: {}", .{err});
+        };
+    }
+    // Reapply theme so font_mono resolves to the registered family.
+    win.theme = gui.dvuiThemeForPreset(editor.theme_name, true, editor.mono_font_size);
 
     // Use SDL3/DVUI native clipboard (works on Wayland where wl-paste subprocess may not).
     editor.clipboard_get_fn = &dvui.clipboardText;

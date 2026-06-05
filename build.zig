@@ -64,6 +64,12 @@ pub fn build(b: *std.Build) void {
         gui_mod.addImport("zit", zit_dep.module("zit"));
         gui_mod.addImport("vaxis", vaxis_dep.module("vaxis"));
 
+        // Bundled mono font (Fira Code Nerd Font Mono) — embedded into the binary
+        // so the GUI always has glyphs for box-drawing, powerline, etc.
+        gui_mod.addAnonymousImport("bundled_mono_font", .{
+            .root_source_file = b.path("libs/FiraCodeNerdFontMono-Medium.ttf"),
+        });
+
         // Windows application icon
         gui_mod.addWin32ResourceFile(.{ .file = b.path("src/icons/zide.rc") });
 
