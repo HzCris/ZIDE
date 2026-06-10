@@ -805,6 +805,18 @@ pub const Editor = struct {
 
     // ---- Language / syntax theme operations ----
 
+    /// Resolve the command used to start the LSP server for `lsp_language`.
+    /// A `zide.register_lsp{ language, command }` entry from init.lua whose
+    /// language matches (case-insensitive) overrides the default "zls" —
+    /// e.g. a full path to the zls binary matching the active toolchain.
+    /// First matching entry wins. Must be called after the Lua config loaded.
+    pub fn lspServerCommand(self: *const Editor) []const u8 {
+        for (self.lsp_configs.items) |cfg| {
+            if (std.ascii.eqlIgnoreCase(cfg.language, self.lsp_language)) return cfg.command;
+        }
+        return "zls";
+    }
+
     /// Find a registered language by file extension.
     /// The returned pointer stays valid for the editor's lifetime
     /// (each LanguageDef is its own heap allocation — appends never relocate).
@@ -1097,6 +1109,29 @@ test "per-language syntax theme override resolution" {
     // Unknown language falls back to the global theme
     const fallback = editor.syntaxThemeFor("ruby");
     try std.testing.expectEqual(editor.syntax_theme.keyword.r, fallback.keyword.r);
+}
+
+test "lsp server command resolution" {
+    const allocator = std.testing.allocator;
+    var editor = try Editor.init(allocator, std.testing.io);
+    defer editor.deinit();
+
+    // No config registered: default
+    try std.testing.expectEqualStrings("zls", editor.lspServerCommand());
+
+    // Config for another language doesn't affect the zig server
+    try editor.lsp_configs.append(allocator, .{
+        .language = try allocator.dupe(u8, "Python"),
+        .command = try allocator.dupe(u8, "pyright-langserver"),
+    });
+    try std.testing.expectEqualStrings("zls", editor.lspServerCommand());
+
+    // Case-insensitive match on lsp_language overrides the command
+    try editor.lsp_configs.append(allocator, .{
+        .language = try allocator.dupe(u8, "Zig"),
+        .command = try allocator.dupe(u8, "C:/tools/zls-0.16/zls.exe"),
+    });
+    try std.testing.expectEqualStrings("C:/tools/zls-0.16/zls.exe", editor.lspServerCommand());
 }
 
 test "editor undo via command" {

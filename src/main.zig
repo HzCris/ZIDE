@@ -254,20 +254,9 @@ fn runGui(allocator: std.mem.Allocator, io: std.Io, lua: *zlua.Lua, cli_files: [
     var editor = try Editor.init(allocator, io);
     defer editor.deinit();
 
-    // Start LSP client (ZLS)
-    var lsp_client = LspClient.init(allocator, io);
-    defer lsp_client.deinit();
-    lsp_client.start("zls") catch |err| {
-        std.log.warn("Failed to start ZLS: {}", .{err});
-        // Surface it in the status bar — the log file is easy to miss.
-        editor.status_message = if (err == error.FileNotFound)
-            "zls not found in PATH — completions disabled"
-        else
-            "zls failed to start — completions disabled (see zide.log)";
-    };
-    editor.lsp = &lsp_client;
-
-    // Register Lua API and load user config
+    // Register Lua API and load user config BEFORE starting the LSP —
+    // init.lua may override the server command via zide.register_lsp
+    // (e.g. a full path to a toolchain-matched zls).
     lua_settings.registerApi(lua, &editor);
     if (lua_settings.loadConfig(lua)) {
         std.log.info("Loaded user config (init.lua)", .{});
@@ -276,6 +265,20 @@ fn runGui(allocator: std.mem.Allocator, io: std.Io, lua: *zlua.Lua, cli_files: [
     lua_settings.loadSyntaxTheme(lua);
     lua_settings.loadExtensions(lua);
     lua_settings.loadLangSyntaxThemes(lua);
+
+    // Start LSP client (zls from PATH unless init.lua registered a command)
+    var lsp_client = LspClient.init(allocator, io);
+    defer lsp_client.deinit();
+    const lsp_cmd = editor.lspServerCommand();
+    lsp_client.start(lsp_cmd) catch |err| {
+        std.log.warn("Failed to start LSP server '{s}': {}", .{ lsp_cmd, err });
+        // Surface it in the status bar — the log file is easy to miss.
+        editor.status_message = if (err == error.FileNotFound)
+            "LSP server not found — completions disabled (see zide.log)"
+        else
+            "LSP server failed to start — completions disabled (see zide.log)";
+    };
+    editor.lsp = &lsp_client;
 
     // Open CLI files, or show welcome text
     if (cli_files.len > 0) {
@@ -370,20 +373,8 @@ fn runTui(allocator: std.mem.Allocator, io: std.Io, lua: *zlua.Lua, cli_files: [
     var editor = try Editor.init(allocator, io);
     defer editor.deinit();
 
-    // Start LSP client (ZLS)
-    var lsp_client = LspClient.init(allocator, io);
-    defer lsp_client.deinit();
-    lsp_client.start("zls") catch |err| {
-        std.log.warn("Failed to start ZLS: {}", .{err});
-        // Surface it in the status bar — the log file is easy to miss.
-        editor.status_message = if (err == error.FileNotFound)
-            "zls not found in PATH — completions disabled"
-        else
-            "zls failed to start — completions disabled (see zide.log)";
-    };
-    editor.lsp = &lsp_client;
-
-    // Register Lua API and load user config
+    // Register Lua API and load user config BEFORE starting the LSP —
+    // init.lua may override the server command via zide.register_lsp.
     lua_settings.registerApi(lua, &editor);
     if (lua_settings.loadConfig(lua)) {
         std.log.info("Loaded user config (init.lua)", .{});
@@ -392,6 +383,20 @@ fn runTui(allocator: std.mem.Allocator, io: std.Io, lua: *zlua.Lua, cli_files: [
     lua_settings.loadSyntaxTheme(lua);
     lua_settings.loadExtensions(lua);
     lua_settings.loadLangSyntaxThemes(lua);
+
+    // Start LSP client (zls from PATH unless init.lua registered a command)
+    var lsp_client = LspClient.init(allocator, io);
+    defer lsp_client.deinit();
+    const lsp_cmd = editor.lspServerCommand();
+    lsp_client.start(lsp_cmd) catch |err| {
+        std.log.warn("Failed to start LSP server '{s}': {}", .{ lsp_cmd, err });
+        // Surface it in the status bar — the log file is easy to miss.
+        editor.status_message = if (err == error.FileNotFound)
+            "LSP server not found — completions disabled (see zide.log)"
+        else
+            "LSP server failed to start — completions disabled (see zide.log)";
+    };
+    editor.lsp = &lsp_client;
 
     // Open CLI files, or show welcome text
     if (cli_files.len > 0) {

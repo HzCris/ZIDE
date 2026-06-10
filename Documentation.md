@@ -381,9 +381,9 @@ zide.register_language({
 
 ### Overview
 
-ZIDE includes a built-in LSP (Language Server Protocol) client that communicates with language servers over stdio JSON-RPC. ZLS (Zig Language Server) is started automatically when ZIDE launches, if `zls` is found in PATH.
+ZIDE includes a built-in LSP (Language Server Protocol) client that communicates with language servers over stdio JSON-RPC. ZLS (Zig Language Server) is started automatically when ZIDE launches — by default `zls` from PATH, overridable from `init.lua` (see *Lua LSP API* below). The user config is loaded **before** the server starts so the override can take effect.
 
-Startup feedback appears in the status bar: "LSP ready" once the handshake completes, or "zls not found in PATH — completions disabled" if the server couldn't be started. Details land in the log file (see Logging under Shared / Core). The server's own stderr is discarded, and on Windows the server is spawned with `CREATE_NO_WINDOW` so no console window appears.
+Startup feedback appears in the status bar: "LSP ready" once the handshake completes, or "LSP server not found — completions disabled" if it couldn't be started. Details (including the exact command tried) land in the log file (see Logging under Shared / Core). The server's own stderr is discarded, and on Windows the server is spawned with `CREATE_NO_WINDOW` so no console window appears.
 
 Documents are only synced to the server when their detected language matches the server's language (`zig` for the built-in zls client) — a `.txt` or `.md` buffer never reaches zls, so it can't get bogus Zig diagnostics. The status bar shows each document's detected language (e.g. `Ln 1, Col 1 | zig`, or `plain text` when nothing matched), so it's always visible what syntax/LSP applies.
 
@@ -426,19 +426,26 @@ Press **F12** to jump to the definition of the symbol under the cursor. If the d
 
 ### Lua LSP API (Sprint 3 — Implemented)
 
-Register additional language servers via `~/.config/zide/init.lua`:
+Configure the language server via `~/.config/zide/init.lua`:
 
 ```lua
+-- Point the built-in Zig server at a specific zls binary
+-- (e.g. the one matching your 0.16 toolchain instead of the PATH zls):
 zide.register_lsp({
-    language = "Python",
-    command = "pyright-langserver",
+    language = "zig",
+    command = "C:/Users/you/tools/zig-0.16.0/ZLS/zls.exe",
 })
 ```
 
 | Field | Type | Required | Description |
 |-------|------|----------|-------------|
-| `language` | string | yes | Language name (must match a registered language's name) |
-| `command` | string | yes | LSP server executable (must be in PATH) |
+| `language` | string | yes | Language name, case-insensitive (must match a registered language's name) |
+| `command` | string | yes | LSP server executable — a name resolved via PATH or a full path |
+
+At startup ZIDE starts **one** server: the one registered for the active LSP
+language (`zig` by default; first matching entry wins), falling back to plain
+`zls` from PATH when nothing matches. Entries for other languages are stored
+but not yet started — multi-server support is future work.
 
 ### Document Lifecycle
 
