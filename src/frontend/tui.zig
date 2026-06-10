@@ -132,15 +132,27 @@ const Event = union(enum) {
     focus_in,
     focus_out,
     lsp_data,
+    terminal_data,
 };
 
-/// Module-level loop pointer for LSP wake callback.
+/// Module-level loop pointer for reader-thread wake callbacks (LSP +
+/// terminal). Nulled before the loop dies so a late wake can't post to a
+/// dangling pointer (a reader preempted mid-call is a theoretical residual
+/// race; both threads are joined moments later in the deinit path).
 var global_loop: ?*vaxis.Loop(Event) = null;
 
 /// Wake function called from LSP reader thread to unblock nextEvent.
 fn lspWakeFn() void {
     if (global_loop) |loop_ptr| {
         loop_ptr.postEvent(.lsp_data);
+    }
+}
+
+/// Wake function called from terminal reader threads when new PTY output
+/// landed in a grid — unblocks nextEvent so the pane repaints.
+fn terminalWakeFn() void {
+    if (global_loop) |loop_ptr| {
+        loop_ptr.postEvent(.terminal_data);
     }
 }
 
@@ -165,11 +177,13 @@ pub fn run(allocator: std.mem.Allocator, editor: *Editor) !void {
     try loop.start();
     defer loop.stop();
 
-    // Set up LSP TUI wake
+    // Set up reader-thread wakes (LSP + terminal panes)
     global_loop = &loop;
+    defer global_loop = null; // runs before loop.stop()'s defer — no dangling wakes
     if (editor.lsp) |lsp_client| {
         lsp_client.tui_wake_fn = &lspWakeFn;
     }
+    editor.terminal_wake_fn = &terminalWakeFn;
 
     // Enter alternate screen
     try vx.enterAltScreen(tty.writer());
@@ -1362,11 +1376,6 @@ fn lineNumberWidth(total_lines: usize, min_digits: usize) u16 {
 fn positionCursor(win: Window, editor: *Editor, width: u16, height: u16) void {
     _ = width;
     _ = height;
-    // Find the active pane's rect; bail if it isn't an editor pane
-    if (editor.activePaneIsTerminal()) {
-        win.hideCursor();
-        return;
-    }
     var active_rect: ?PaneRect = null;
     for (pane_rects[0..pane_rect_count]) |pr| {
         if (pr.pane_id == editor.active_pane) {
@@ -1378,6 +1387,31 @@ fn positionCursor(win: Window, editor: *Editor, width: u16, height: u16) void {
         win.hideCursor();
         return;
     };
+
+    // Terminal pane: mirror the embedded terminal's own cursor.
+    if (editor.activePaneIsTerminal()) {
+        const term: ?*terminal_mod.Terminal = blk: {
+            const idx = editor.activePaneTerminalIdx() orelse break :blk null;
+            if (idx >= editor.terminals.items.len) break :blk null;
+            break :blk editor.terminals.items[idx];
+        };
+        const t = term orelse {
+            win.hideCursor();
+            return;
+        };
+        t.mutex.lock();
+        const trow = t.cursor_row;
+        const tcol = t.cursor_col;
+        const visible = t.cursor_visible and !t.exited;
+        t.mutex.unlock();
+        if (visible and trow < rect.h and tcol < rect.w) {
+            win.showCursor(rect.x +| tcol, rect.y +| trow);
+            win.setCursorShape(.block);
+        } else {
+            win.hideCursor();
+        }
+        return;
+    }
 
     const doc = editor.activeDoc();
     const pos = doc.cursorPos();

@@ -30,8 +30,8 @@
 | Ctrl+Shift+PgUp/PgDn | Move line up/down (Alt-free alternates) |
 | Ctrl+Space | LSP completion |
 | F12 | LSP go-to-definition |
-| Ctrl+` | Toggle terminal (bottom split) — GUI only |
-| Ctrl+Shift+` | Open terminal (side-by-side split) — GUI only |
+| Ctrl+` | Toggle terminal (bottom split) |
+| Ctrl+Shift+` | Open terminal (side-by-side split) |
 | Alt+Click | Add cursor at click position |
 | Ctrl+K | Delete line |
 | Escape / Left-click | Remove secondary cursors |
@@ -532,7 +532,7 @@ All editing actions go through named commands in `CommandRegistry`. Commands can
 
 ## Embedded Terminal
 
-ZIDE includes a built-in terminal emulator that integrates with the split pane system. **GUI frontend only** — in the TUI the terminal actions show a status-bar notice instead (you already have a terminal there).
+ZIDE includes a built-in terminal emulator that integrates with the split pane system — in both frontends (in the TUI, the shell's grid renders as cells and the reader thread wakes the event loop via `terminal_wake_fn`, the same pattern the LSP uses).
 
 ### Opening a Terminal
 - **Ctrl+`** (backtick): Toggle terminal — opens a terminal in a bottom split if none exists, focuses an existing terminal, or returns to the editor pane

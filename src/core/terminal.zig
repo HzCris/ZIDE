@@ -80,6 +80,12 @@ pub const Terminal = struct {
     // Whether the shell process has exited
     exited: bool = false,
 
+    /// Optional wake callback, fired from the reader thread after new output
+    /// lands in the grid. The TUI uses it to unblock its blocking event loop
+    /// (same pattern as LspClient.tui_wake_fn); the GUI repaints on its own
+    /// cadence and leaves it null.
+    wake_fn: ?*const fn () void = null,
+
     pub fn init(allocator: Allocator, cols: u16, rows: u16, command: []const u8) !*Terminal {
         const total = @as(usize, cols) * @as(usize, rows);
         const cells = try allocator.alloc(Cell, total);
@@ -673,11 +679,13 @@ pub const Terminal = struct {
             self.mutex.lock();
             self.processOutput(buf[0..n]);
             self.mutex.unlock();
+            if (self.wake_fn) |f| f();
         }
         // Mark as exited
         self.mutex.lock();
         self.exited = true;
         self.mutex.unlock();
+        if (self.wake_fn) |f| f();
     }
 
     // =========================================================================

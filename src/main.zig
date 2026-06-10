@@ -117,7 +117,7 @@ const welcome_text =
     \\//   Ctrl+Shift+PgUp/PgDn                 move line
     \\//
     \\// Terminal & code intelligence
-    \\//   Ctrl+`            toggle terminal    Ctrl+Shift+`     terminal in split   (GUI)
+    \\//   Ctrl+`            toggle terminal    Ctrl+Shift+`     terminal in split
     \\//   Ctrl+Space        completion (LSP)   F12              go to definition
     \\
 ;
@@ -245,7 +245,6 @@ fn runGui(allocator: std.mem.Allocator, lua: *zlua.Lua, cli_files: []const []con
     // Init editor state
     var editor = try Editor.init(allocator);
     defer editor.deinit();
-    editor.gui_available = true;
 
     // Start LSP client (ZLS)
     var lsp_client = LspClient.init(allocator);

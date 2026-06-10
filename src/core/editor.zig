@@ -107,9 +107,10 @@ pub const Editor = struct {
     /// Base size for the monospace font. 0 = DVUI default.
     mono_font_size: f32 = 0,
 
-    /// True when running under the GUI frontend. Set by the GUI on startup.
-    /// Terminal panes only render in the GUI, so the TUI gates these actions off.
-    gui_available: bool = false,
+    /// Optional wake callback copied onto every spawned Terminal so its
+    /// reader thread can unblock a blocking frontend event loop (the TUI
+    /// sets this; the GUI repaints on its own cadence and leaves it null).
+    terminal_wake_fn: ?*const fn () void = null,
 
     /// Settings panel selection index.
     settings_selected: usize = 0,
@@ -512,17 +513,20 @@ pub const Editor = struct {
             self.focusPrevPane();
             return true;
         }
-        // Terminal actions — only available in the GUI frontend (TUI can't host PTYs)
+        // Terminal actions — work in both frontends. (An old gate claimed the
+        // TUI "can't host PTYs"; it can — terminal-in-terminal is how vim's
+        // :terminal works, the TUI renders the grid as cells, and the reader
+        // thread wakes the event loop via terminal_wake_fn.)
         if (std.mem.eql(u8, action, "toggle_terminal")) {
-            if (self.gui_available) self.toggleTerminal() else self.status_message = "Embedded terminal is GUI-only";
+            self.toggleTerminal();
             return true;
         }
         if (std.mem.eql(u8, action, "close_terminal")) {
-            if (self.gui_available) self.closeActiveTerminal() else self.status_message = "Embedded terminal is GUI-only";
+            self.closeActiveTerminal();
             return true;
         }
         if (std.mem.eql(u8, action, "open_terminal_right")) {
-            if (self.gui_available) self.openTerminalRight() else self.status_message = "Embedded terminal is GUI-only";
+            self.openTerminalRight();
             return true;
         }
         // LSP actions
@@ -700,8 +704,10 @@ pub const Editor = struct {
         const command = if (builtin.os.tag == .windows) "powershell.exe" else "/bin/bash";
         const term = terminal_mod.Terminal.init(self.allocator, 80, 24, command) catch |err| {
             std.log.err("Failed to open terminal: {}", .{err});
+            self.status_message = "Failed to open terminal (see zide.log)";
             return;
         };
+        term.wake_fn = self.terminal_wake_fn;
         self.terminals.append(self.allocator, term) catch return;
         const term_idx = self.terminals.items.len - 1;
         const new_pane = self.layout.splitPane(self.active_pane, direction, .{ .terminal = term_idx }) catch return;
