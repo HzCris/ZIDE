@@ -17,6 +17,9 @@ pub const Buffer = struct {
     allocator: Allocator,
     /// Scratch buffer for lineContent/slice when the requested range spans the gap.
     scratch: std.ArrayList(u8),
+    /// Edit generation — bumped on every content change. Lets caches (e.g.
+    /// the find match count) detect staleness without rescanning.
+    version: u64 = 0,
 
     // -- Gap helpers --
 
@@ -66,6 +69,7 @@ pub const Buffer = struct {
         @memcpy(self.data[0..text.len], text);
         self.content_len = text.len;
         self.gap_start = text.len;
+        self.version +%= 1;
         try self.rebuildLineIndex();
     }
 
@@ -85,6 +89,7 @@ pub const Buffer = struct {
         const bytes = try file.readAll(self.data[0..size]);
         self.content_len = bytes;
         self.gap_start = bytes;
+        self.version +%= 1;
         try self.rebuildLineIndex();
     }
 
@@ -172,6 +177,7 @@ pub const Buffer = struct {
         @memcpy(self.data[self.gap_start .. self.gap_start + text.len], text);
         self.gap_start += text.len;
         self.content_len += text.len;
+        self.version +%= 1;
         try self.updateLineIndexAfterInsert(pos, text);
         return text.len;
     }
@@ -190,6 +196,7 @@ pub const Buffer = struct {
         self.updateLineIndexAfterDelete(pos, deleted);
         // Expand gap to absorb deleted text (no data movement)
         self.content_len -= actual;
+        self.version +%= 1;
         return actual;
     }
 

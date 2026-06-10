@@ -3337,9 +3337,27 @@ fn guiReplaceAll(editor: *Editor) void {
     }
 }
 
+/// Memoized find match count. The overlay queries this every frame while
+/// Find is open — without the cache that was a full O(buffer) scan (plus a
+/// full scratch copy when the gap was interior) per rendered frame.
+var match_cache_count: usize = 0;
+var match_cache_version: u64 = 0;
+var match_cache_doc: usize = 0;
+var match_cache_needle: [256]u8 = undefined;
+var match_cache_needle_len: usize = 0;
+
 /// Count total occurrences of needle in the document buffer.
 fn guiCountMatches(editor: *Editor, needle: []const u8) usize {
     const doc = editor.activeDoc();
+    const doc_key = @intFromPtr(doc);
+    if (doc_key == match_cache_doc and
+        doc.buffer.version == match_cache_version and
+        needle.len == match_cache_needle_len and
+        std.mem.eql(u8, match_cache_needle[0..match_cache_needle_len], needle))
+    {
+        return match_cache_count;
+    }
+
     const buf_len = doc.buffer.byteLen();
     const content = doc.buffer.slice(0, buf_len);
     var count: usize = 0;
@@ -3349,6 +3367,14 @@ fn guiCountMatches(editor: *Editor, needle: []const u8) usize {
             count += 1;
             pos = pos + idx + needle.len;
         } else break;
+    }
+
+    if (needle.len <= match_cache_needle.len) {
+        match_cache_doc = doc_key;
+        match_cache_version = doc.buffer.version;
+        match_cache_needle_len = needle.len;
+        @memcpy(match_cache_needle[0..needle.len], needle);
+        match_cache_count = count;
     }
     return count;
 }

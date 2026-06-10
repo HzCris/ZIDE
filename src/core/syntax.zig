@@ -178,28 +178,11 @@ pub fn tokenizeLine(
         }
     }
 
-    // --- Continuation: multi-line string ---
-    if (state == .in_string) {
-        const delim: u8 = if (lang.string_delimiters.len > 0) lang.string_delimiters[0] else '"';
-        var found_end = false;
-        while (i < line.len) : (i += 1) {
-            if (line[i] == '\\' and i + 1 < line.len) {
-                i += 1;
-                continue;
-            }
-            if (line[i] == delim) {
-                i += 1;
-                addSpan(&count, spans_buf, 0, i, .string);
-                state = .normal;
-                found_end = true;
-                break;
-            }
-        }
-        if (!found_end) {
-            addSpan(&count, spans_buf, 0, line.len, .string);
-            return .{ .count = count, .state = .in_string };
-        }
-    }
+    // NOTE: .in_string is currently unreachable — no tokenizer path emits it
+    // (Zig's \\ strings are line-scoped; multi-line string languages would
+    // need a continuation rule here). Normalize defensively if a stale cache
+    // ever hands one in.
+    if (state == .in_string) state = .normal;
 
     // --- Main tokenization loop ---
     while (i < line.len and count < spans_buf.len) {

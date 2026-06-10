@@ -99,27 +99,32 @@ pub const Cursor = struct {
         }
     }
 
-    /// Move right by one word.
-    pub fn moveWordRight(self: *Cursor, buf: *Buffer) void {
-        const content = buf.slice(0, buf.byteLen());
+    /// Move right by one word. Walks bytes via byteAt — a full-buffer slice()
+    /// here copied the whole document into scratch whenever the gap was
+    /// interior (i.e. after any edit), on every Ctrl+Arrow.
+    pub fn moveWordRight(self: *Cursor, buf: *const Buffer) void {
+        const len = buf.byteLen();
         var off = self.offset;
         // Skip current word chars
-        while (off < content.len and isWordChar(content[off])) off += 1;
+        while (off < len and isWordChar(buf.byteAt(off).?)) off += 1;
         // Skip non-word, non-newline chars (whitespace, punctuation)
-        while (off < content.len and !isWordChar(content[off]) and content[off] != '\n') off += 1;
+        while (off < len) {
+            const b = buf.byteAt(off).?;
+            if (isWordChar(b) or b == '\n') break;
+            off += 1;
+        }
         self.offset = off;
         self.preferred_col = buf.offsetToPos(off).col;
     }
 
     /// Move left by one word.
-    pub fn moveWordLeft(self: *Cursor, buf: *Buffer) void {
-        const content = buf.slice(0, buf.byteLen());
+    pub fn moveWordLeft(self: *Cursor, buf: *const Buffer) void {
         if (self.offset == 0) return;
         var off = self.offset - 1;
         // Skip non-word chars backwards
-        while (off > 0 and !isWordChar(content[off])) off -= 1;
+        while (off > 0 and !isWordChar(buf.byteAt(off) orelse 0)) off -= 1;
         // Skip word chars backwards to start of word
-        while (off > 0 and isWordChar(content[off - 1])) off -= 1;
+        while (off > 0 and isWordChar(buf.byteAt(off - 1) orelse 0)) off -= 1;
         self.offset = off;
         self.preferred_col = buf.offsetToPos(off).col;
     }

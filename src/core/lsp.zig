@@ -35,25 +35,6 @@ const LspPosition = struct {
     character: u32,
 };
 
-/// Initialize response — server capabilities we care about.
-const InitializeResult = struct {
-    capabilities: ServerCaps = .{},
-};
-
-const ServerCaps = struct {
-    completionProvider: ?struct {} = null,
-    definitionProvider: ?bool = null,
-};
-
-/// Completion response (simplified).
-const CompletionResponse = struct {
-    result: ?CompletionResult = null,
-};
-
-const CompletionResult = union {
-    items: []const CompletionItem,
-};
-
 const CompletionItem = struct {
     label: []const u8,
     detail: ?[]const u8 = null,
@@ -142,8 +123,6 @@ pub const LspClient = struct {
     incoming: MessageQueue = .{},
     next_id: i64 = 1,
     initialized: bool = false,
-    server_has_completion: bool = false,
-    server_has_definition: bool = false,
 
     // Optional TUI loop wake function
     tui_wake_fn: ?*const fn () void = null,

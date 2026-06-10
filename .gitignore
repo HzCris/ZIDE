@@ -3,4 +3,7 @@
 zig-out/
 references/
 
+# Build artifacts / scratch output
+*.o
+build_*.txt
 

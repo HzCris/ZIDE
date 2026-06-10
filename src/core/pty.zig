@@ -247,13 +247,20 @@ pub const Pty = struct {
             std.posix.dup2(slave, 2) catch std.posix.exit(1);
             if (slave > 2) std.posix.close(slave);
 
-            // Determine shell
+            // Run the requested command; fall back to $SHELL (previously the
+            // command argument was silently ignored on Linux)
             const shell = std.posix.getenv("SHELL") orelse "/bin/bash";
-
-            // Use the command or fall back to shell
-            _ = command;
-            const argv = [_:null]?[*:0]const u8{ @ptrCast(shell.ptr), null };
-            _ = std.c.execvp(@ptrCast(shell.ptr), &argv);
+            var cmd_buf: [256]u8 = undefined;
+            const prog: [*:0]const u8 = blk: {
+                if (command.len > 0 and command.len < cmd_buf.len) {
+                    @memcpy(cmd_buf[0..command.len], command);
+                    cmd_buf[command.len] = 0;
+                    break :blk cmd_buf[0..command.len :0].ptr;
+                }
+                break :blk shell.ptr;
+            };
+            const argv = [_:null]?[*:0]const u8{ prog, null };
+            _ = std.c.execvp(prog, &argv);
             std.posix.exit(1);
         }
 
