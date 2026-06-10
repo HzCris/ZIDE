@@ -787,6 +787,11 @@ fn editorPane(editor: *Editor, pane_id: u8) void {
             };
         }
         handleMouseEvents(editor, pane_id, wd, drag_area, font, line_height, scale);
+
+        // Right-click context menu — watches the whole pane content area;
+        // handleMouseEvents leaves right presses unhandled (after placing
+        // the cursor) so the ContextWidget can consume them here.
+        paneContextMenu(editor, pane_id, area);
     }
 
     // --- Ensure cursor visible (unless user is scrolling with wheel or dragging) ---
@@ -1620,6 +1625,40 @@ fn dvuiKeyToChar(key: dvui.enums.Key, shift: bool) ?u21 {
     };
 }
 
+/// Right-click context menu for an editor pane. The ContextWidget consumes
+/// right presses inside `area`; handleMouseEvents has already focused the
+/// pane and placed the cursor at the click point.
+fn paneContextMenu(editor: *Editor, pane_id: u8, area: dvui.Rect.Physical) void {
+    const ctext = dvui.context(@src(), .{ .rect = area }, .{ .id_extra = pane_id });
+    defer ctext.deinit();
+
+    if (ctext.activePoint()) |cp| {
+        var fw = dvui.floatingMenu(@src(), .{ .from = dvui.Rect.Natural.fromPoint(cp) }, .{});
+        defer fw.deinit();
+
+        if (dvui.menuItemLabel(@src(), "Cut              Ctrl+X", .{}, .{ .expand = .horizontal }) != null) {
+            _ = editor.execCommand("cut", null);
+            fw.close();
+        }
+        if (dvui.menuItemLabel(@src(), "Copy             Ctrl+C", .{}, .{ .expand = .horizontal }) != null) {
+            _ = editor.execCommand("copy", null);
+            fw.close();
+        }
+        if (dvui.menuItemLabel(@src(), "Paste            Ctrl+V", .{}, .{ .expand = .horizontal }) != null) {
+            _ = editor.execCommand("paste", null);
+            fw.close();
+        }
+        if (dvui.menuItemLabel(@src(), "Select All       Ctrl+A", .{}, .{ .expand = .horizontal }) != null) {
+            _ = editor.execCommand("select_all", null);
+            fw.close();
+        }
+        if (dvui.menuItemLabel(@src(), "Go to Definition F12", .{}, .{ .expand = .horizontal }) != null) {
+            _ = editor.execAction("lsp_goto_definition");
+            fw.close();
+        }
+    }
+}
+
 /// Handle mouse events for the custom editor pane.
 fn handleMouseEvents(editor: *Editor, pane_id: u8, wd: *dvui.WidgetData, area: dvui.Rect.Physical, font: dvui.Font, line_height: f32, scale: f32) void {
     const pane_doc_idx = switch (editor.layout.panes.items[pane_id].content) {
@@ -1651,6 +1690,29 @@ fn handleMouseEvents(editor: *Editor, pane_id: u8, wd: *dvui.WidgetData, area: d
                 dvui.focusWidget(wd.id, null, e.num);
             },
             .press => {
+                if (me.button == .right) {
+                    // Right-click: focus the pane and move the cursor to the
+                    // click point — unless it lands inside the current
+                    // selection (standard context-menu behavior, so Cut/Copy
+                    // act on the selection). Deliberately left unhandled: the
+                    // pane's ContextWidget (created after this) consumes the
+                    // press and opens the context menu.
+                    editor.focusPane(pane_id);
+                    const offset = screenToOffset(doc, area, font, line_height, scale, me.p, tab_width, do_wrap);
+                    const c = doc.cursors.primary();
+                    const inside_selection = if (c.selectionRange()) |r|
+                        offset >= r.start and offset <= r.end
+                    else
+                        false;
+                    if (!inside_selection) {
+                        if (doc.cursors.count() > 1) doc.cursors.clearSecondary();
+                        c.clearSelection();
+                        c.offset = offset;
+                        c.preferred_col = doc.buffer.offsetToPos(offset).col;
+                    }
+                    continue;
+                }
+
                 e.handle(@src(), wd);
                 dvui.focusWidget(wd.id, null, e.num);
                 scroll_pinned = false;

@@ -158,7 +158,13 @@ pub const LspClient = struct {
         var child = std.process.Child.init(argv, self.allocator);
         child.stdin_behavior = .Pipe;
         child.stdout_behavior = .Pipe;
-        child.stderr_behavior = .Pipe;
+        // Nobody drains stderr — a .Pipe would fill up (~4KB) and block the
+        // server mid-write, freezing the whole LSP session. Discard it.
+        child.stderr_behavior = .Ignore;
+        // Windows: the GUI runs without a console (FreeConsole on desktop
+        // launch), so a console-subsystem server like zls.exe would otherwise
+        // get a brand-new visible console window.
+        child.create_no_window = true;
 
         try child.spawn();
         self.process = child;
@@ -425,6 +431,7 @@ pub const LspClient = struct {
                 // Send initialized notification
                 self.sendNotification("initialized", "{}") catch {};
                 std.log.info("LSP initialized (handshake complete)", .{});
+                editor.status_message = "LSP ready";
             },
             .completion => {
                 self.handleCompletionResponse(json_bytes, editor);

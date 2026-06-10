@@ -51,6 +51,7 @@ pub const KeybindMap = struct {
     }
 
     /// Populate with CUA defaults.
+    /// Keep main.zig's `welcome_text` hotkey reference in sync with this list.
     pub fn loadDefaults(self: *KeybindMap) !void {
         // Ctrl+letter shortcuts
         try self.set("ctrl+q", "quit");

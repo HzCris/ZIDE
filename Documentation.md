@@ -23,7 +23,7 @@
 | Ctrl+D | Add next occurrence (multi-cursor); selects word first if no selection |
 | Ctrl+Shift+D | Duplicate line |
 | Ctrl+Shift+Up/Down | Add cursor above/below |
-| Alt+Shift+Up/Down | Add cursor above/below (TUI fallback) |
+| Ctrl+Alt+Up/Down | Add cursor above/below (fallback for terminals that eat Ctrl+Shift) |
 | Ctrl+Space | LSP completion |
 | F12 | LSP go-to-definition |
 | Ctrl+` | Toggle terminal (bottom split) |
@@ -135,7 +135,7 @@ All Ctrl/Alt shortcuts are remappable via `~/.config/zide/init.lua`.
 - Data-driven keybinding map (all Ctrl/Alt shortcuts remappable)
 - Auto-save (saves dirty documents with file paths after configurable interval, default 5s)
 - Application icon embedded in exe
-- Multiple cursor editing (Ctrl+Shift or Alt+Shift+Up/Down, Ctrl+D, Alt+click, Escape/click to clear)
+- Multiple cursor editing (Ctrl+Shift or Ctrl+Alt+Up/Down, Ctrl+D, Alt+click, Escape/click to clear)
 - Theme system: 3 built-in themes (dark, light, high-contrast)
   - "terminal" mode (default): uses ANSI indices, respects terminal color scheme
   - Named themes use direct RGB colors for a consistent look
@@ -179,7 +179,7 @@ All Ctrl/Alt shortcuts are remappable via `~/.config/zide/init.lua`.
 - Open Settings File (Preferences menu — opens init.lua directly in the editor for power users)
 - Tab character display (expands `\t` to spaces for rendering, cursor, selection, and wrapping)
 - Blinking caret (530ms cycle, resets on cursor movement)
-- Multiple cursor editing (Ctrl+Shift or Alt+Shift+Up/Down, Ctrl+D, Alt+click, Escape/click to clear)
+- Multiple cursor editing (Ctrl+Shift or Ctrl+Alt+Up/Down, Ctrl+D, Alt+click, Escape/click to clear)
 - Split panes: vertical (Alt+\) and horizontal (Alt+Shift+\) splits with draggable dividers
   - Binary layout tree — nested splits supported (split a split)
   - Click to focus pane, focused pane highlighted with border
@@ -204,6 +204,8 @@ All Ctrl/Alt shortcuts are remappable via `~/.config/zide/init.lua`.
 - Open Theme Folder: opens `~/.config/zide/themes/` in OS file explorer
 - Help > Documentation: opens Documentation.md in the editor
 - Tab bar styling: inactive tabs have visible borders and control-style background
+- Right-click context menu in editor panes: Cut, Copy, Paste, Select All, Go to Definition
+  - Right-click outside the selection moves the cursor to the click point first; inside the selection it keeps the selection (so Cut/Copy act on it)
 
 ### GUI — Not Yet Implemented
 - (none currently)
@@ -375,6 +377,8 @@ zide.register_language({
 
 ZIDE includes a built-in LSP (Language Server Protocol) client that communicates with language servers over stdio JSON-RPC. ZLS (Zig Language Server) is started automatically when ZIDE launches, if `zls` is found in PATH.
 
+Startup feedback appears in the status bar: "LSP ready" once the handshake completes, or "zls not found in PATH — completions disabled" if the server couldn't be started. Details land in the log file (see Logging under Shared / Core). The server's own stderr is discarded, and on Windows the server is spawned with `CREATE_NO_WINDOW` so no console window appears.
+
 ### Architecture
 
 - **Background reader thread** reads JSON-RPC messages from the language server's stdout and pushes them onto a thread-safe ring buffer queue
@@ -490,6 +494,24 @@ both stdin and stdout must be a TTY.
 - `Ctrl+S` on a buffer **with** a file path saves it; failures show in the status bar
 - `Ctrl+S` on an **untitled** buffer opens Save As (native dialog in the GUI, path prompt in the TUI)
 - Quit-with-unsaved-changes (`[S]ave`) only quits if **every** dirty document saved; otherwise it cancels and reports how many failed
+
+### Welcome Screen
+
+Starting ZIDE without file arguments opens a scratch buffer containing the full
+default hotkey reference (file, edit, find, multi-cursor, panes, terminal, LSP),
+plus a pointer to `init.lua` rebinding and the Ctrl+P command palette. Defined
+once as `welcome_text` in `main.zig` and shared by both frontends; keep it in
+sync with `keybind.zig`'s `loadDefaults()`.
+
+### Logging
+
+`std.log` output is written to **`~/.config/zide/zide.log`** (truncated on each
+run) — never to stderr. Reasons: in TUI mode vaxis owns the terminal, and a
+stray log line would be painted over the editor and stick there (vaxis diffs
+cells and never repaints what it didn't draw); in GUI desktop launches the
+console has been released. Check this file when diagnosing LSP/startup issues.
+CLI usage errors (bad flags, `--gui` on a TUI-only build) still print to the
+terminal directly.
 
 ### Command System
 

@@ -3,12 +3,59 @@ const builtin = @import("builtin");
 const build_options = @import("build_options");
 const zlua = @import("zlua");
 
-/// Suppress DVUI debug-level log spam (layout warnings etc.)
 pub const std_options: std.Options = .{
+    // Suppress DVUI debug-level log spam (layout warnings etc.)
     .log_scope_levels = &.{
         .{ .scope = .dvui, .level = .warn },
     },
+    .logFn = logToFile,
 };
+
+// ---------------------------------------------------------------------------
+// Logging
+//
+// std.log must never touch stderr here: in TUI mode vaxis owns the terminal,
+// and a stray log line (e.g. "LSP initialized" arriving seconds after startup)
+// gets painted over the alt screen and *sticks*, because vaxis diffs cells and
+// never repaints what it didn't draw. In GUI mode the console is freed or
+// hidden anyway. So everything goes to ~/.config/zide/zide.log instead
+// (truncated each run).
+// ---------------------------------------------------------------------------
+
+var log_mutex: std.Thread.Mutex = .{};
+var log_file: ?std.fs.File = null;
+var log_open_failed = false;
+
+fn logToFile(
+    comptime level: std.log.Level,
+    comptime scope: @Type(.enum_literal),
+    comptime format: []const u8,
+    args: anytype,
+) void {
+    // Mutex: the LSP reader thread and the main thread both log.
+    log_mutex.lock();
+    defer log_mutex.unlock();
+
+    const file = openLogFile() orelse return;
+    const prefix = comptime level.asText() ++ (if (scope == .default) ": " else "(" ++ @tagName(scope) ++ "): ");
+    var line_buf: [2048]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&line_buf);
+    w.print(prefix ++ format ++ "\n", args) catch {}; // overflow: keep what fit
+    file.writeAll(w.buffered()) catch {};
+}
+
+fn openLogFile() ?std.fs.File {
+    if (log_file) |f| return f;
+    if (log_open_failed) return null;
+    log_open_failed = true; // assume the worst; cleared on success
+    const dir = lua_settings.getConfigDir() orelse return null;
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const path = std.fmt.bufPrint(&path_buf, "{s}/zide.log", .{dir}) catch return null;
+    std.fs.cwd().makePath(dir) catch {};
+    log_file = std.fs.cwd().createFile(path, .{ .truncate = true }) catch return null;
+    log_open_failed = false;
+    return log_file;
+}
 
 // DVUI + SDL backend only available in the GUI build
 const dvui = if (build_options.has_gui) @import("dvui") else struct {};
@@ -24,6 +71,51 @@ const FrontendMode = enum {
     gui,
     tui,
 };
+
+/// Scratch-buffer contents shown when ZIDE starts without files — doubles as
+/// the hotkey reference. Keep in sync with keybind.zig loadDefaults().
+const welcome_text =
+    \\// Welcome to ZIDE!
+    \\//
+    \\// This is a scratch buffer — start typing, open a file with Ctrl+O,
+    \\// or press Ctrl+P to browse every command by name.
+    \\// Shortcuts below are the defaults; rebind any of them in
+    \\// ~/.config/zide/init.lua with  zide.bind("ctrl+s", "save")
+    \\//
+    \\// File
+    \\//   Ctrl+N            new file           Ctrl+O           open file
+    \\//   Ctrl+S            save               Ctrl+Shift+S     save as
+    \\//   Ctrl+W            close tab          Ctrl+Q           quit
+    \\//
+    \\// Edit
+    \\//   Ctrl+Z / Ctrl+Y   undo / redo
+    \\//   Ctrl+X / C / V    cut / copy / paste
+    \\//   Ctrl+A            select all
+    \\//   Ctrl+Shift+D      duplicate line     Ctrl+K           delete line
+    \\//   Alt+Up / Down     move line          Ctrl+Bksp / Del  delete word
+    \\//
+    \\// Find & go
+    \\//   Ctrl+F            find               Ctrl+H           find & replace
+    \\//   Ctrl+G            go to line         Ctrl+P           command palette
+    \\//   Ctrl+Left/Right   jump by word       Ctrl+Home/End    file start / end
+    \\//   (add Shift to the two above to select while moving)
+    \\//
+    \\// Multi-cursor
+    \\//   Ctrl+D            select next occurrence of selection
+    \\//   Ctrl+Shift+Up/Dn  add cursor above / below  (also Ctrl+Alt+Up/Dn)
+    \\//   Alt+Click         add cursor at mouse       (GUI)
+    \\//
+    \\// Tabs & panes
+    \\//   Ctrl+Tab          next tab           Ctrl+Shift+Tab   previous tab
+    \\//   (also Ctrl+PgDn / Ctrl+PgUp)
+    \\//   Alt+\             split vertical     Alt+Shift+\      split horizontal
+    \\//   Alt+Left/Right    focus pane         Ctrl+Alt+Q       close pane
+    \\//
+    \\// Terminal & code intelligence
+    \\//   Ctrl+`            toggle terminal    Ctrl+Shift+`     terminal in split
+    \\//   Ctrl+Space        completion (LSP)   F12              go to definition
+    \\
+;
 
 pub fn main() !void {
     var gpa_instance: std.heap.DebugAllocator(.{}) = .init;
@@ -99,7 +191,9 @@ pub fn main() !void {
             if (build_options.has_gui) {
                 try runGui(allocator, lua, files.items);
             } else {
-                std.log.err("GUI not available in this build. Use zide (not zide-tui) for GUI mode.", .{});
+                // CLI usage error — must reach the terminal (logs go to a file).
+                try stderr.print("GUI not available in this build. Use zide (not zide-tui) for GUI mode.\n", .{});
+                try stderr.flush();
             }
         },
         .tui => try runTui(allocator, lua, files.items),
@@ -153,6 +247,11 @@ fn runGui(allocator: std.mem.Allocator, lua: *zlua.Lua, cli_files: []const []con
     defer lsp_client.deinit();
     lsp_client.start("zls") catch |err| {
         std.log.warn("Failed to start ZLS: {}", .{err});
+        // Surface it in the status bar — the log file is easy to miss.
+        editor.status_message = if (err == error.FileNotFound)
+            "zls not found in PATH — completions disabled"
+        else
+            "zls failed to start — completions disabled (see zide.log)";
     };
     editor.lsp = &lsp_client;
 
@@ -183,20 +282,7 @@ fn runGui(allocator: std.mem.Allocator, lua: *zlua.Lua, cli_files: []const []con
             };
         }
     } else {
-        try editor.activeDoc().loadText(
-            \\// Welcome to ZIDE!
-            \\// Start typing to edit, or open a file from the command line.
-            \\//
-            \\// Keyboard shortcuts:
-            \\//   Ctrl+Z  Undo
-            \\//   Ctrl+Y  Redo
-            \\//   Ctrl+S  Save
-            \\
-            \\fn main() void {
-            \\    // Your code here
-            \\}
-            \\
-        );
+        try editor.activeDoc().loadText(welcome_text);
     }
 
     // Init SDL backend (creates OS window)
@@ -288,6 +374,11 @@ fn runTui(allocator: std.mem.Allocator, lua: *zlua.Lua, cli_files: []const []con
     defer lsp_client.deinit();
     lsp_client.start("zls") catch |err| {
         std.log.warn("Failed to start ZLS: {}", .{err});
+        // Surface it in the status bar — the log file is easy to miss.
+        editor.status_message = if (err == error.FileNotFound)
+            "zls not found in PATH — completions disabled"
+        else
+            "zls failed to start — completions disabled (see zide.log)";
     };
     editor.lsp = &lsp_client;
 
@@ -316,22 +407,7 @@ fn runTui(allocator: std.mem.Allocator, lua: *zlua.Lua, cli_files: []const []con
             };
         }
     } else {
-        try editor.activeDoc().loadText(
-            \\// Welcome to ZIDE (TUI mode)
-            \\// Start typing to edit.
-            \\//
-            \\// Shortcuts:
-            \\//   Ctrl+Q  Quit
-            \\//   Ctrl+S  Save
-            \\//   Ctrl+Z  Undo
-            \\//   Ctrl+Y  Redo
-            \\//   Ctrl+N  New buffer
-            \\
-            \\fn main() void {
-            \\    // Your code here
-            \\}
-            \\
-        );
+        try editor.activeDoc().loadText(welcome_text);
     }
 
     try tui.run(allocator, &editor);
