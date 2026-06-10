@@ -912,6 +912,11 @@ pub const Editor = struct {
 
         const doc = self.activeDoc();
         const cursor = doc.cursors.primary();
+        // Prefix replacement must not be diverted into deleting a selection,
+        // and the delete+insert pair should undo as one step.
+        cursor.clearSelection();
+        doc.history.beginGroup();
+        defer doc.history.endGroup();
 
         // Find the start of the word prefix (scan back from cursor)
         var prefix_start = cursor.offset;

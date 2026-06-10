@@ -623,8 +623,12 @@ fn cmdAddNextOccurrence(editor: *Editor, _: ?[]const u8) void {
     }
 
     const range = c.selectionRange() orelse return;
-    const needle = doc.buffer.slice(range.start, range.end);
-    if (needle.len == 0) return;
+    // Dupe the needle: slice() may return the buffer's shared scratch, which
+    // the full-content slice() below would overwrite/invalidate.
+    const needle_ref = doc.buffer.slice(range.start, range.end);
+    if (needle_ref.len == 0) return;
+    const needle = editor.allocator.dupe(u8, needle_ref) catch return;
+    defer editor.allocator.free(needle);
 
     // Find the furthest selection end among all cursors to search from there
     var search_start: usize = range.end;
@@ -751,6 +755,32 @@ fn cmdTuiThemeHighContrast(editor: *Editor, _: ?[]const u8) void {
 }
 
 // ---- Tests ----
+
+test "add_next_occurrence with selection spanning the gap" {
+    const allocator = std.testing.allocator;
+    var editor = try Editor.init(allocator);
+    defer editor.deinit();
+    const doc = editor.activeDoc();
+    try doc.loadText("xx ab ab ab");
+
+    // Park the gap at offset 5 (inside the upcoming selection) by editing there
+    doc.cursors.primary().offset = 5;
+    try doc.insertAtCursor("X");
+    _ = try doc.undoAction();
+    try std.testing.expectEqualStrings("xx ab ab ab", doc.buffer.slice(0, doc.buffer.byteLen()));
+
+    // Select "b a" (4..7) — spans the gap, so slice() returns the scratch buffer
+    const c = doc.cursors.primary();
+    c.offset = 4;
+    c.startSelection();
+    c.offset = 7;
+
+    cmdAddNextOccurrence(&editor, null);
+    try std.testing.expectEqual(@as(usize, 2), editor.activeDoc().cursors.count());
+    const new_c = editor.activeDoc().cursors.cursors.items[1];
+    try std.testing.expectEqual(@as(usize, 10), new_c.offset);
+    try std.testing.expectEqual(@as(usize, 7), new_c.anchor.?);
+}
 
 test "add_next_occurrence selects word then finds next" {
     const allocator = std.testing.allocator;

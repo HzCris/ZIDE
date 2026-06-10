@@ -34,6 +34,11 @@ pub const UndoHistory = struct {
     recording: bool = true,
     /// Maximum number of undo operations to keep (0 = unlimited).
     max_size: usize = 100,
+    /// Explicit group nesting depth (beginGroup/endGroup). While > 0, all
+    /// recorded ops share `active_group` so one undo reverts them together.
+    group_depth: u32 = 0,
+    /// Forced group id while group_depth > 0.
+    active_group: u32 = 0,
 
     pub fn init(allocator: Allocator) UndoHistory {
         return .{
@@ -52,6 +57,25 @@ pub const UndoHistory = struct {
             self.allocator.free(op.text);
         }
         self.redo_stack.deinit(self.allocator);
+    }
+
+    /// Begin an explicit undo group: every operation recorded until the
+    /// matching endGroup shares one group id (single undo step).
+    /// Re-entrant — nested begin/end pairs join the outermost group.
+    pub fn beginGroup(self: *UndoHistory) void {
+        if (self.group_depth == 0) {
+            self.active_group = self.next_group_id;
+            self.next_group_id += 1;
+        }
+        self.group_depth += 1;
+    }
+
+    /// End an explicit undo group started with beginGroup.
+    pub fn endGroup(self: *UndoHistory) void {
+        if (self.group_depth > 0) self.group_depth -= 1;
+        // Oversized groups are exempt from trimming while open; enforce the
+        // cap once the group is complete (may evict the whole group).
+        if (self.group_depth == 0) self.trimOldest();
     }
 
     /// Record an insert operation.
@@ -177,16 +201,31 @@ pub const UndoHistory = struct {
         self.undo_stack.items.len = 0;
         self.clearRedoStack();
         self.next_group_id = 1;
+        self.group_depth = 0;
     }
 
     // --- Internal ---
 
     /// Evict oldest undo operations if the stack exceeds max_size.
+    /// Always evicts whole groups — a partially trimmed group would apply a
+    /// partial undo and corrupt the buffer. The currently open group (if any)
+    /// is exempt until endGroup, so the stack may transiently exceed max_size.
     fn trimOldest(self: *UndoHistory) void {
         if (self.max_size == 0) return; // unlimited
-        while (self.undo_stack.items.len > self.max_size) {
-            const old = self.undo_stack.orderedRemove(0);
-            self.allocator.free(old.text);
+        if (self.undo_stack.items.len <= self.max_size) return;
+        var evict_to: usize = 0;
+        while (self.undo_stack.items.len - evict_to > self.max_size) {
+            const gid = self.undo_stack.items[evict_to].group_id;
+            if (self.group_depth > 0 and gid == self.active_group) break;
+            while (evict_to < self.undo_stack.items.len and self.undo_stack.items[evict_to].group_id == gid) {
+                self.allocator.free(self.undo_stack.items[evict_to].text);
+                evict_to += 1;
+            }
+        }
+        if (evict_to > 0) {
+            const remaining = self.undo_stack.items.len - evict_to;
+            std.mem.copyForwards(UndoOp, self.undo_stack.items[0..remaining], self.undo_stack.items[evict_to..]);
+            self.undo_stack.items.len = remaining;
         }
     }
 
@@ -200,6 +239,9 @@ pub const UndoHistory = struct {
     /// Determine group ID based on adjacency with previous operation.
     /// Adjacent same-type single-char operations on the same logical action get merged.
     fn resolveGroupId(self: *UndoHistory, op_type: OpType, offset: usize, text: []const u8) u32 {
+        // Explicit group open — everything joins it.
+        if (self.group_depth > 0) return self.active_group;
+
         if (self.undo_stack.items.len == 0) {
             defer self.next_group_id += 1;
             return self.next_group_id;
@@ -367,6 +409,113 @@ test "newline breaks group" {
     // Undo should remove "ab" (group 1)
     _ = try hist.undo(&buf);
     try std.testing.expectEqualStrings("", buf.slice(0, buf.byteLen()));
+}
+
+test "explicit group undone as one step" {
+    const allocator = std.testing.allocator;
+    var buf = @import("buffer.zig").Buffer.init(allocator);
+    defer buf.deinit();
+    try buf.loadText("hello");
+
+    var hist = UndoHistory.init(allocator);
+    defer hist.deinit();
+
+    // Multi-char + positionally distant ops would normally be separate groups
+    hist.beginGroup();
+    _ = buf.delete(0, 2); // "llo"
+    try hist.recordDelete(0, "he", 2, 0);
+    _ = try buf.insert(3, "!!");
+    try hist.recordInsert(3, "!!", 3, 5);
+    hist.endGroup();
+    try std.testing.expectEqualStrings("llo!!", buf.slice(0, buf.byteLen()));
+
+    // One undo reverts both
+    _ = try hist.undo(&buf);
+    try std.testing.expectEqualStrings("hello", buf.slice(0, buf.byteLen()));
+    try std.testing.expect(!hist.canUndo());
+
+    // One redo re-applies both
+    _ = try hist.redo(&buf);
+    try std.testing.expectEqualStrings("llo!!", buf.slice(0, buf.byteLen()));
+}
+
+test "nested groups join the outermost group" {
+    const allocator = std.testing.allocator;
+    var buf = @import("buffer.zig").Buffer.init(allocator);
+    defer buf.deinit();
+    try buf.loadText("");
+
+    var hist = UndoHistory.init(allocator);
+    defer hist.deinit();
+
+    hist.beginGroup();
+    _ = try buf.insert(0, "aa");
+    try hist.recordInsert(0, "aa", 0, 2);
+    hist.beginGroup(); // nested — same group
+    _ = try buf.insert(2, "bb");
+    try hist.recordInsert(2, "bb", 2, 4);
+    hist.endGroup();
+    _ = try buf.insert(4, "cc");
+    try hist.recordInsert(4, "cc", 4, 6);
+    hist.endGroup();
+
+    _ = try hist.undo(&buf);
+    try std.testing.expectEqualStrings("", buf.slice(0, buf.byteLen()));
+}
+
+test "trim evicts whole groups only" {
+    const allocator = std.testing.allocator;
+    var buf = @import("buffer.zig").Buffer.init(allocator);
+    defer buf.deinit();
+    try buf.loadText("");
+
+    var hist = UndoHistory.init(allocator);
+    defer hist.deinit();
+    hist.max_size = 3;
+
+    // Group of 2 ops, then 2 multi-char singles (each its own group)
+    hist.beginGroup();
+    _ = try buf.insert(0, "aa");
+    try hist.recordInsert(0, "aa", 0, 2);
+    _ = try buf.insert(2, "bb");
+    try hist.recordInsert(2, "bb", 2, 4);
+    hist.endGroup();
+    _ = try buf.insert(4, "cc");
+    try hist.recordInsert(4, "cc", 4, 6);
+    // Stack: [aa, bb, cc] (3 ≤ max). Next op exceeds → the FIRST WHOLE GROUP
+    // (aa+bb) must go, never just "aa".
+    _ = try buf.insert(6, "dd");
+    try hist.recordInsert(6, "dd", 6, 8);
+    try std.testing.expectEqual(@as(usize, 2), hist.undo_stack.items.len);
+
+    // Undo both remaining groups — must restore exactly to post-group state
+    _ = try hist.undo(&buf); // removes "dd"
+    _ = try hist.undo(&buf); // removes "cc"
+    try std.testing.expectEqualStrings("aabb", buf.slice(0, buf.byteLen()));
+    try std.testing.expect(!hist.canUndo());
+}
+
+test "open group exempt from trim until endGroup" {
+    const allocator = std.testing.allocator;
+    var buf = @import("buffer.zig").Buffer.init(allocator);
+    defer buf.deinit();
+    try buf.loadText("");
+
+    var hist = UndoHistory.init(allocator);
+    defer hist.deinit();
+    hist.max_size = 2;
+
+    hist.beginGroup();
+    var i: usize = 0;
+    while (i < 5) : (i += 1) {
+        _ = try buf.insert(i, "x");
+        try hist.recordInsert(i, "x", i, i + 1);
+    }
+    // Open group may exceed the cap without being split
+    try std.testing.expectEqual(@as(usize, 5), hist.undo_stack.items.len);
+    hist.endGroup();
+    // Whole oversized group evicted at endGroup — empty, but never partial
+    try std.testing.expectEqual(@as(usize, 0), hist.undo_stack.items.len);
 }
 
 test "new edit clears redo" {

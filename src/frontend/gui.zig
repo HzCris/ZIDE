@@ -3261,7 +3261,7 @@ fn guiReplaceOne(editor: *Editor) void {
     if (needle.len == 0) return;
     if (doc.selectedText()) |sel| {
         if (std.mem.eql(u8, sel, needle)) {
-            doc.deleteSelection() catch {};
+            // insertAtCursor replaces the active selection as one undo step
             doc.insertAtCursor(replacement) catch {};
         }
     }
@@ -3275,6 +3275,10 @@ fn guiReplaceAll(editor: *Editor) void {
     if (needle.len == 0) return;
     doc.cursors.primary().offset = 0;
     doc.cursors.primary().clearSelection();
+
+    // The whole replace-all is one undo step.
+    doc.history.beginGroup();
+    defer doc.history.endGroup();
 
     var count: usize = 0;
     while (count < 100_000) {

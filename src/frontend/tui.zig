@@ -2015,7 +2015,7 @@ fn replaceOne(editor: *Editor) void {
     // Check if current selection matches the needle
     if (doc.selectedText()) |sel| {
         if (std.mem.eql(u8, sel, needle)) {
-            doc.deleteSelection() catch {};
+            // insertAtCursor replaces the active selection as one undo step
             doc.insertAtCursor(replacement) catch {};
         }
     }
@@ -2032,6 +2032,10 @@ fn replaceAll(editor: *Editor) void {
     // Start from beginning
     doc.cursors.primary().offset = 0;
     doc.cursors.primary().clearSelection();
+
+    // The whole replace-all is one undo step.
+    doc.history.beginGroup();
+    defer doc.history.endGroup();
 
     var count: usize = 0;
     while (count < 100_000) { // safety limit
