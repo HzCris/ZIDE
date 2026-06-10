@@ -105,14 +105,14 @@ const welcome_text =
     \\//   Ctrl+Shift+Up/Dn  add cursor above / below  (also Ctrl+Alt+Up/Dn)
     \\//   Alt+Click         add cursor at mouse       (GUI)
     \\//
-    \\// Tabs & panes
+    \\// Tabs & panes (a pane is a split, a tab is a document)
     \\//   Ctrl+Tab          next tab           Ctrl+Shift+Tab   previous tab
     \\//   (also Ctrl+PgDn / Ctrl+PgUp)
     \\//   Alt+\             split vertical     Alt+Shift+\      split horizontal
-    \\//   Alt+Left/Right    focus pane         Ctrl+Alt+Q       close pane
+    \\//   Alt+Left/Right    focus pane         Ctrl+Alt+Q       close split pane
     \\//
     \\// Terminal & code intelligence
-    \\//   Ctrl+`            toggle terminal    Ctrl+Shift+`     terminal in split
+    \\//   Ctrl+`            toggle terminal    Ctrl+Shift+`     terminal in split   (GUI)
     \\//   Ctrl+Space        completion (LSP)   F12              go to definition
     \\
 ;

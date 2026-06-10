@@ -26,8 +26,8 @@
 | Ctrl+Alt+Up/Down | Add cursor above/below (fallback for terminals that eat Ctrl+Shift) |
 | Ctrl+Space | LSP completion |
 | F12 | LSP go-to-definition |
-| Ctrl+` | Toggle terminal (bottom split) |
-| Ctrl+Shift+` | Open terminal (side-by-side split) |
+| Ctrl+` | Toggle terminal (bottom split) — GUI only |
+| Ctrl+Shift+` | Open terminal (side-by-side split) — GUI only |
 | Alt+Click | Add cursor at click position |
 | Ctrl+K | Delete line |
 | Escape / Left-click | Remove secondary cursors |
@@ -160,7 +160,7 @@ All Ctrl/Alt shortcuts are remappable via `~/.config/zide/init.lua`.
 - Multi-document tabs (tab bar with close buttons)
 - New document (Ctrl+N)
 - Tab switching (Ctrl+Tab / Ctrl+Shift+Tab via menu)
-- Status bar (filename, dirty marker, Ln/Col)
+- Status bar (filename, dirty marker, Ln/Col, detected language)
 - Line numbers with active line highlight in gutter
 - Go to line (Ctrl+G, overlay input)
 - Find with incremental search, wrap-around, and status feedback (Ctrl+F)
@@ -379,6 +379,8 @@ ZIDE includes a built-in LSP (Language Server Protocol) client that communicates
 
 Startup feedback appears in the status bar: "LSP ready" once the handshake completes, or "zls not found in PATH — completions disabled" if the server couldn't be started. Details land in the log file (see Logging under Shared / Core). The server's own stderr is discarded, and on Windows the server is spawned with `CREATE_NO_WINDOW` so no console window appears.
 
+Documents are only synced to the server when their detected language matches the server's language (`zig` for the built-in zls client) — a `.txt` or `.md` buffer never reaches zls, so it can't get bogus Zig diagnostics. The status bar shows each document's detected language (e.g. `Ln 1, Col 1 | zig`, or `plain text` when nothing matched), so it's always visible what syntax/LSP applies.
+
 ### Architecture
 
 - **Background reader thread** reads JSON-RPC messages from the language server's stdout and pushes them onto a thread-safe ring buffer queue
@@ -524,7 +526,7 @@ All editing actions go through named commands in `CommandRegistry`. Commands can
 
 ## Embedded Terminal
 
-ZIDE includes a built-in terminal emulator that integrates with the split pane system.
+ZIDE includes a built-in terminal emulator that integrates with the split pane system. **GUI frontend only** — in the TUI the terminal actions show a status-bar notice instead (you already have a terminal there).
 
 ### Opening a Terminal
 - **Ctrl+`** (backtick): Toggle terminal — opens a terminal in a bottom split if none exists, focuses an existing terminal, or returns to the editor pane
@@ -545,6 +547,7 @@ ZIDE includes a built-in terminal emulator that integrates with the split pane s
 
 ### Architecture
 - **`src/core/pty.zig`** — Cross-platform PTY abstraction (ConPTY on Windows, posix on Linux)
+  - Windows gotcha: the shell must be spawned with `STARTF_USESTDHANDLES` + NULL std handles, or CreateProcess's std-handle duplication overrides the pseudoconsole attachment and the terminal stays blank (bit us when the GUI started releasing its console)
 - **`src/core/ansi.zig`** — VT/ANSI escape sequence state machine parser
 - **`src/core/terminal.zig`** — Terminal emulator (cell grid, reader thread, key encoding)
 - Terminal panes use the same split pane layout system as editor panes — they can be placed anywhere (horizontal or vertical splits)

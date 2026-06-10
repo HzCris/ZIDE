@@ -132,6 +132,14 @@ pub const Pty = struct {
         var si: STARTUPINFOEXW = std.mem.zeroes(STARTUPINFOEXW);
         si.StartupInfo.cb = @sizeOf(STARTUPINFOEXW);
         si.lpAttributeList = attr_list;
+        // CRITICAL: without STARTF_USESTDHANDLES (with NULL handles), Windows
+        // "std handle duplication" copies OUR std handles into the child when
+        // they aren't live console handles — overriding the pseudoconsole
+        // attachment. That made the shell write to zide's (dead, post-
+        // FreeConsole) handles instead of the ConPTY → blank terminal pane.
+        // NULL std handles let the console connect hand the child fresh
+        // ConPTY handles. (Same approach as wezterm's portable-pty.)
+        si.StartupInfo.dwFlags = STARTF_USESTDHANDLES;
 
         var pi: PROCESS_INFORMATION = std.mem.zeroes(PROCESS_INFORMATION);
 
@@ -327,6 +335,7 @@ const LPPROC_THREAD_ATTRIBUTE_LIST = *anyopaque;
 
 const EXTENDED_STARTUPINFO_PRESENT: u32 = 0x00080000;
 const PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE: usize = 0x00020016;
+const STARTF_USESTDHANDLES: u32 = 0x00000100;
 
 const STARTUPINFOW = extern struct {
     cb: u32 = 0,

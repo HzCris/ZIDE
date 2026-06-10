@@ -571,12 +571,14 @@ pub fn frame(editor: *Editor) bool {
         const status_text_color = toDvui(editor.theme.status_fg);
 
         // Left: Ln/Col (+ cursor count if multi-cursor)
-        var pos_buf: [64]u8 = undefined;
+        var pos_buf: [96]u8 = undefined;
         const cursor_count = doc.cursors.count();
+        // Show the detected language so it's obvious what syntax/LSP applies.
+        const lang_name: []const u8 = if (doc.language) |l| l.name else "plain text";
         const pos_str = if (cursor_count > 1)
-            std.fmt.bufPrint(&pos_buf, "{d} cursors | Ln {d}, Col {d}", .{ cursor_count, pos.line + 1, pos.col + 1 }) catch "?"
+            std.fmt.bufPrint(&pos_buf, "{d} cursors | Ln {d}, Col {d} | {s}", .{ cursor_count, pos.line + 1, pos.col + 1, lang_name }) catch "?"
         else
-            std.fmt.bufPrint(&pos_buf, "Ln {d}, Col {d}", .{ pos.line + 1, pos.col + 1 }) catch "?";
+            std.fmt.bufPrint(&pos_buf, "Ln {d}, Col {d} | {s}", .{ pos.line + 1, pos.col + 1, lang_name }) catch "?";
         dvui.renderText(.{
             .font = status_font,
             .text = pos_str,

@@ -460,7 +460,11 @@ fn drawEditor(win: Window, editor: *Editor, width: u16, height: u16) void {
         .height = content_height,
         .width = width,
     });
-    renderPaneLayout(content_win, editor, 0, tab_bar_height, 0, width, content_height);
+    // NOTE: screen_x comes before screen_y — the tab bar offsets Y only.
+    // (These were swapped once: with 2+ tabs open every pane rect shifted
+    // one row up / one col right, drawing the cursor next to the wrong line
+    // and skewing mouse hit-testing.)
+    renderPaneLayout(content_win, editor, 0, 0, tab_bar_height, width, content_height);
 
     // Status bar
     const status_win = win.child(.{
@@ -1328,12 +1332,14 @@ fn drawStatusBar(win: Window, editor: *Editor, width: u16) void {
     }
 
     // Right side: cursor position — use writeStr (stack buffer)
-    var right_buf: [64]u8 = undefined;
+    var right_buf: [96]u8 = undefined;
     const cursor_count = doc.cursors.count();
+    // Show the detected language so it's obvious what syntax/LSP applies.
+    const lang_name: []const u8 = if (doc.language) |l| l.name else "plain text";
     const right = if (cursor_count > 1)
-        std.fmt.bufPrint(&right_buf, "{d} cursors | Ln {d}, Col {d} ", .{ cursor_count, pos.line + 1, pos.col + 1 }) catch ""
+        std.fmt.bufPrint(&right_buf, "{d} cursors | Ln {d}, Col {d} | {s} ", .{ cursor_count, pos.line + 1, pos.col + 1, lang_name }) catch ""
     else
-        std.fmt.bufPrint(&right_buf, "Ln {d}, Col {d} ", .{ pos.line + 1, pos.col + 1 }) catch "";
+        std.fmt.bufPrint(&right_buf, "Ln {d}, Col {d} | {s} ", .{ pos.line + 1, pos.col + 1, lang_name }) catch "";
     const right_len: u16 = @intCast(@min(right.len, width));
     const right_x = width -| right_len;
     _ = writeStr(win, right_x, 0, right, style);

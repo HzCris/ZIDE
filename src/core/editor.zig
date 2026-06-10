@@ -122,6 +122,11 @@ pub const Editor = struct {
     /// LSP client (null if not started).
     lsp: ?*lsp_mod.LspClient = null,
 
+    /// Language served by `lsp`. Documents in any other language are not
+    /// synced to the server — zls would otherwise receive (and squiggle)
+    /// .txt/.md/etc. buffers as if they were Zig source.
+    lsp_language: []const u8 = "zig",
+
     /// Completion items from LSP.
     completion_items: std.ArrayList(EditorCompletionItem),
     /// Whether the completion popup is active.
@@ -509,15 +514,15 @@ pub const Editor = struct {
         }
         // Terminal actions — only available in the GUI frontend (TUI can't host PTYs)
         if (std.mem.eql(u8, action, "toggle_terminal")) {
-            if (self.gui_available) self.toggleTerminal();
+            if (self.gui_available) self.toggleTerminal() else self.status_message = "Embedded terminal is GUI-only";
             return true;
         }
         if (std.mem.eql(u8, action, "close_terminal")) {
-            if (self.gui_available) self.closeActiveTerminal();
+            if (self.gui_available) self.closeActiveTerminal() else self.status_message = "Embedded terminal is GUI-only";
             return true;
         }
         if (std.mem.eql(u8, action, "open_terminal_right")) {
-            if (self.gui_available) self.openTerminalRight();
+            if (self.gui_available) self.openTerminalRight() else self.status_message = "Embedded terminal is GUI-only";
             return true;
         }
         // LSP actions
@@ -616,7 +621,12 @@ pub const Editor = struct {
 
     /// Close the currently focused pane. If it's the last pane, does nothing.
     pub fn closePaneAction(self: *Editor) void {
-        if (self.layout.paneCount() <= 1) return;
+        if (self.layout.paneCount() <= 1) {
+            // Common confusion: panes are splits, not tabs. Say so instead
+            // of silently doing nothing.
+            self.status_message = "No split panes open — Ctrl+W closes the current tab";
+            return;
+        }
         const closed_pane = self.active_pane;
         // If closing a terminal pane, clean up the terminal
         if (closed_pane < self.layout.panes.items.len) {
@@ -815,17 +825,20 @@ pub const Editor = struct {
 
     // ---- LSP integration ----
 
-    /// Send didOpen notification if LSP is ready and the document has a file path.
+    /// Send didOpen notification if LSP is ready, the document has a file
+    /// path, and its language is the one the server understands.
     pub fn lspNotifyOpen(self: *Editor, doc: *Document) void {
         const lsp_client = self.lsp orelse return;
         if (!lsp_client.isReady()) return;
         const path = doc.file_path orelse return;
         if (doc.lsp_opened) return;
+        const lang = doc.language orelse return;
+        if (!std.ascii.eqlIgnoreCase(lang.name, self.lsp_language)) return;
 
         const uri = lsp_mod.pathToUri(self.allocator, path) catch return;
         defer self.allocator.free(uri);
 
-        const lang_id: []const u8 = if (doc.language) |lang| lang.name else "plaintext";
+        const lang_id: []const u8 = lang.name;
         const text = doc.buffer.slice(0, doc.buffer.byteLen());
 
         lsp_client.sendDidOpen(uri, lang_id, doc.lsp_version, text) catch return;
