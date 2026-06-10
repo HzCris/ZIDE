@@ -351,6 +351,9 @@ comptime {
     _ = @import("core/syntax.zig");
     _ = @import("core/theme.zig");
     _ = @import("core/lsp.zig");
+    _ = @import("core/ansi.zig");
+    _ = @import("core/terminal.zig");
+    _ = @import("core/pty.zig");
     _ = @import("frontend/gui.zig");
     _ = @import("frontend/tui.zig");
 }

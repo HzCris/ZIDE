@@ -107,12 +107,17 @@ const MessageQueue = struct {
     write_idx: usize = 0,
     mutex: std.Thread.Mutex = .{},
 
-    fn push(self: *MessageQueue, msg: IncomingMessage) void {
+    fn push(self: *MessageQueue, msg: IncomingMessage, allocator: Allocator) void {
         self.mutex.lock();
         defer self.mutex.unlock();
+        // If full, drop (and free) the oldest unread message — previously the
+        // overwritten slot's heap buffer leaked.
+        if (self.write_idx -% self.read_idx >= QUEUE_CAP) {
+            allocator.free(self.buf[self.read_idx % QUEUE_CAP].json_bytes);
+            self.read_idx +%= 1;
+        }
         self.buf[self.write_idx % QUEUE_CAP] = msg;
         self.write_idx +%= 1;
-        // If full, oldest message is overwritten (drop it)
     }
 
     fn tryPop(self: *MessageQueue) ?IncomingMessage {
@@ -618,7 +623,7 @@ pub const LspClient = struct {
             };
 
             // Push to queue
-            self.incoming.push(.{ .json_bytes = json_buf });
+            self.incoming.push(.{ .json_bytes = json_buf }, self.allocator);
 
             // Wake TUI if needed
             if (self.tui_wake_fn) |wake| {
@@ -897,9 +902,27 @@ test "MessageQueue push pop" {
     var q = MessageQueue{};
     const alloc = std.testing.allocator;
     const msg1 = try alloc.dupe(u8, "hello");
-    q.push(.{ .json_bytes = msg1 });
+    q.push(.{ .json_bytes = msg1 }, alloc);
     const popped = q.tryPop().?;
     try std.testing.expectEqualStrings("hello", popped.json_bytes);
     alloc.free(popped.json_bytes);
     try std.testing.expect(q.tryPop() == null);
+}
+
+test "MessageQueue overflow frees dropped messages" {
+    var q = MessageQueue{};
+    const alloc = std.testing.allocator;
+    // Push past capacity — the overwritten oldest messages must be freed
+    // (std.testing.allocator fails the test on any leak).
+    var i: usize = 0;
+    while (i < QUEUE_CAP + 16) : (i += 1) {
+        const msg = try alloc.dupe(u8, "x");
+        q.push(.{ .json_bytes = msg }, alloc);
+    }
+    var popped: usize = 0;
+    while (q.tryPop()) |msg| {
+        alloc.free(msg.json_bytes);
+        popped += 1;
+    }
+    try std.testing.expectEqual(@as(usize, QUEUE_CAP), popped);
 }

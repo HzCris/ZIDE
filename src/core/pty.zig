@@ -75,70 +75,58 @@ pub const Pty = struct {
     fn spawnWindows(allocator: Allocator, command: []const u8, cols: u16, rows: u16) !Pty {
         if (!is_windows) unreachable;
 
-        // Create pipes for PTY I/O
+        // Create pipes for PTY I/O. Handles are nulled as ownership moves so
+        // the errdefer can never double-close (previously every error path
+        // after CreatePseudoConsole closed all four handles twice).
         var pty_read_in: ?HANDLE = null;
         var app_write_in: ?HANDLE = null;
         var app_read_out: ?HANDLE = null;
         var pty_write_out: ?HANDLE = null;
+        errdefer {
+            if (pty_read_in) |h| _ = CloseHandle(h);
+            if (app_write_in) |h| _ = CloseHandle(h);
+            if (app_read_out) |h| _ = CloseHandle(h);
+            if (pty_write_out) |h| _ = CloseHandle(h);
+        }
 
         if (CreatePipe(&pty_read_in, &app_write_in, null, 0) == 0) return error.PipeCreationFailed;
-        errdefer {
-            _ = CloseHandle(pty_read_in);
-            _ = CloseHandle(app_write_in);
-        }
         if (CreatePipe(&app_read_out, &pty_write_out, null, 0) == 0) return error.PipeCreationFailed;
-        errdefer {
-            _ = CloseHandle(app_read_out);
-            _ = CloseHandle(pty_write_out);
-        }
 
         // Create pseudo console
         const size = COORD{ .X = @intCast(cols), .Y = @intCast(rows) };
         var hpc: HPCON = undefined;
         const hr = CreatePseudoConsole(size, pty_read_in, pty_write_out, 0, &hpc);
         if (hr != 0) return error.ConPtyCreationFailed;
+        errdefer ClosePseudoConsole(hpc);
 
         // Close the PTY-side pipe ends — ConPTY owns them now
-        _ = CloseHandle(pty_read_in);
-        _ = CloseHandle(pty_write_out);
+        _ = CloseHandle(pty_read_in.?);
+        pty_read_in = null;
+        _ = CloseHandle(pty_write_out.?);
+        pty_write_out = null;
 
         // Set up STARTUPINFOEX with pseudo console attribute
         var attr_list_size: usize = 0;
         _ = InitializeProcThreadAttributeList(null, 1, 0, &attr_list_size);
 
-        const attr_list_buf = allocator.alloc(u8, attr_list_size) catch {
-            ClosePseudoConsole(hpc);
-            _ = CloseHandle(app_write_in);
-            _ = CloseHandle(app_read_out);
-            return error.OutOfMemory;
-        };
+        const attr_list_buf = try allocator.alloc(u8, attr_list_size);
         defer allocator.free(attr_list_buf);
 
         const attr_list: LPPROC_THREAD_ATTRIBUTE_LIST = @ptrCast(attr_list_buf.ptr);
         if (InitializeProcThreadAttributeList(attr_list, 1, 0, &attr_list_size) == 0) {
-            ClosePseudoConsole(hpc);
-            _ = CloseHandle(app_write_in);
-            _ = CloseHandle(app_read_out);
             return error.AttributeListFailed;
         }
         defer DeleteProcThreadAttributeList(attr_list);
 
         // PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE = 0x00020016
         if (UpdateProcThreadAttribute(attr_list, 0, PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE, hpc, @sizeOf(HPCON), null, null) == 0) {
-            ClosePseudoConsole(hpc);
-            _ = CloseHandle(app_write_in);
-            _ = CloseHandle(app_read_out);
             return error.AttributeUpdateFailed;
         }
 
-        // Build command line as wide string
+        // Build command line as wide string. Reserve one slot for the null
+        // terminator — an exactly-buffer-sized command would write OOB.
         var cmd_buf: [512]u16 = undefined;
-        const cmd_len = std.unicode.utf8ToUtf16Le(&cmd_buf, command) catch {
-            ClosePseudoConsole(hpc);
-            _ = CloseHandle(app_write_in);
-            _ = CloseHandle(app_read_out);
-            return error.CommandTooLong;
-        };
+        const cmd_len = std.unicode.utf8ToUtf16Le(cmd_buf[0 .. cmd_buf.len - 1], command) catch return error.CommandTooLong;
         cmd_buf[cmd_len] = 0;
 
         var si: STARTUPINFOEXW = std.mem.zeroes(STARTUPINFOEXW);
@@ -160,12 +148,7 @@ pub const Pty = struct {
             &pi,
         );
 
-        if (create_result == 0) {
-            ClosePseudoConsole(hpc);
-            _ = CloseHandle(app_write_in);
-            _ = CloseHandle(app_read_out);
-            return error.ProcessCreationFailed;
-        }
+        if (create_result == 0) return error.ProcessCreationFailed;
 
         // We don't need the main thread handle
         _ = CloseHandle(pi.hThread);

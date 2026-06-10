@@ -30,6 +30,8 @@ pub const Action = union(enum) {
     csi: CsiParams,
     /// OSC string content.
     osc: void, // We ignore OSC content for now
+    /// Plain escape sequence final byte (e.g. '7' for DECSC, '8' for DECRC).
+    esc: u8,
 };
 
 /// VT/ANSI escape sequence state machine parser.
@@ -55,6 +57,7 @@ pub const Parser = struct {
         csi_param,
         csi_intermediate,
         osc_string,
+        osc_esc,
     };
 
     /// Feed a single byte. Returns an action if one is complete, else null.
@@ -67,6 +70,7 @@ pub const Parser = struct {
             .csi_param => self.handleCsiParam(byte),
             .csi_intermediate => self.handleCsiIntermediate(byte),
             .osc_string => self.handleOscString(byte),
+            .osc_esc => self.handleOscEsc(byte),
         };
     }
 
@@ -157,14 +161,14 @@ pub const Parser = struct {
                 return null;
             },
             '7' => {
-                // Save cursor (DECSC) — treat as no-op for now
+                // Save cursor (DECSC)
                 self.state = .ground;
-                return null;
+                return .{ .esc = '7' };
             },
             '8' => {
-                // Restore cursor (DECRC) — treat as no-op for now
+                // Restore cursor (DECRC)
                 self.state = .ground;
-                return null;
+                return .{ .esc = '8' };
             },
             'M' => {
                 // Reverse index — scroll down. Emit as CSI 'T' with param 1
@@ -270,26 +274,37 @@ pub const Parser = struct {
             return .{ .osc = {} };
         }
         if (byte == 0x1B) {
-            // Could be ESC \ (ST) — for simplicity, just go to ground
-            self.state = .ground;
-            return .{ .osc = {} };
+            // Likely ST (ESC \) — consume the next byte instead of letting
+            // the '\' print into the terminal.
+            self.state = .osc_esc;
+            return null;
         }
         // Absorb OSC content (we don't use it)
         return null;
     }
 
+    fn handleOscEsc(self: *Parser, byte: u8) ?Action {
+        if (byte == '\\') {
+            // ST — OSC complete
+            self.state = .ground;
+            return .{ .osc = {} };
+        }
+        // ESC followed by something else: abandon the OSC and process the
+        // byte as the start of a fresh escape sequence.
+        self.state = .escape;
+        return self.handleEscape(byte);
+    }
+
     fn dispatchCsi(self: *Parser, final: u8) ?Action {
         self.state = .ground;
-        var csi = CsiParams{
+        return .{ .csi = .{
             .params = self.params,
             .param_count = self.param_count,
             .intermediates = self.intermediates,
             .intermediate_count = self.intermediate_count,
             .final_byte = final,
             .private_marker = self.private_marker,
-        };
-        _ = &csi;
-        return .{ .csi = csi };
+        } };
     }
 
     fn resetCsiState(self: *Parser) void {

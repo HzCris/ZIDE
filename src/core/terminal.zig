@@ -131,7 +131,9 @@ pub const Terminal = struct {
         self.pty.write(data) catch {};
     }
 
-    /// Resize terminal grid and PTY.
+    /// Resize terminal grid and PTY. Also resizes the saved screen when the
+    /// alternate screen is active — otherwise leaving the alt screen would
+    /// restore an old-sized buffer under the new cols/rows (out-of-bounds).
     pub fn resizeGrid(self: *Terminal, new_cols: u16, new_rows: u16) void {
         if (new_cols == self.cols and new_rows == self.rows) return;
         if (new_cols == 0 or new_rows == 0) return;
@@ -141,24 +143,53 @@ pub const Terminal = struct {
 
         const new_total = @as(usize, new_cols) * @as(usize, new_rows);
         const new_cells = self.allocator.alloc(Cell, new_total) catch return;
-        @memset(new_cells, Cell{});
 
-        // Copy existing content
+        // Allocate the saved-screen replacement up front so we never end up
+        // with the two buffers at different sizes.
+        var new_saved: ?[]Cell = null;
+        if (self.alt_cells != null) {
+            new_saved = self.allocator.alloc(Cell, new_total) catch {
+                self.allocator.free(new_cells);
+                return;
+            };
+        }
+
         const copy_rows = @min(self.rows, new_rows);
         const copy_cols = @min(self.cols, new_cols);
+
+        // Copy active screen content
+        @memset(new_cells, Cell{});
         for (0..copy_rows) |r| {
             const src_start = r * @as(usize, self.cols);
             const dst_start = r * @as(usize, new_cols);
             @memcpy(new_cells[dst_start..][0..copy_cols], self.cells[src_start..][0..copy_cols]);
         }
-
         self.allocator.free(self.cells);
         self.cells = new_cells;
+
+        // Copy saved screen content (same old dimensions as the active one)
+        if (new_saved) |saved| {
+            const old_saved = self.alt_cells.?;
+            @memset(saved, Cell{});
+            for (0..copy_rows) |r| {
+                const src_start = r * @as(usize, self.cols);
+                const dst_start = r * @as(usize, new_cols);
+                @memcpy(saved[dst_start..][0..copy_cols], old_saved[src_start..][0..copy_cols]);
+            }
+            self.allocator.free(old_saved);
+            self.alt_cells = saved;
+        }
+
         self.cols = new_cols;
         self.rows = new_rows;
         self.scroll_bottom = new_rows -| 1;
+        self.scroll_top = @min(self.scroll_top, new_rows -| 1);
         if (self.cursor_row >= new_rows) self.cursor_row = new_rows -| 1;
         if (self.cursor_col >= new_cols) self.cursor_col = new_cols -| 1;
+        if (self.alt_cursor_row >= new_rows) self.alt_cursor_row = new_rows -| 1;
+        if (self.alt_cursor_col >= new_cols) self.alt_cursor_col = new_cols -| 1;
+        if (self.saved_cursor_row >= new_rows) self.saved_cursor_row = new_rows -| 1;
+        if (self.saved_cursor_col >= new_cols) self.saved_cursor_col = new_cols -| 1;
 
         // Resize PTY
         self.pty.resize(new_cols, new_rows);
@@ -193,6 +224,17 @@ pub const Terminal = struct {
             .execute => |byte| self.handleExecute(byte),
             .csi => |csi| self.handleCsi(csi),
             .osc => {}, // Ignore OSC sequences (window title etc.)
+            .esc => |final| switch (final) {
+                '7' => { // DECSC — save cursor
+                    self.saved_cursor_row = self.cursor_row;
+                    self.saved_cursor_col = self.cursor_col;
+                },
+                '8' => { // DECRC — restore cursor
+                    self.cursor_row = @min(self.saved_cursor_row, self.rows -| 1);
+                    self.cursor_col = @min(self.saved_cursor_col, self.cols -| 1);
+                },
+                else => {},
+            },
         }
     }
 
@@ -281,12 +323,12 @@ pub const Terminal = struct {
             'L' => self.handleInsertLines(csi),
             'M' => self.handleDeleteLines(csi),
             'P' => self.handleDeleteChars(csi),
-            'S' => { // Scroll Up
-                const n = csi.get(0, 1);
+            'S' => { // Scroll Up (clamp: > rows scrolls everything out anyway)
+                const n = @min(csi.get(0, 1), self.rows);
                 for (0..n) |_| self.scrollUp();
             },
             'T' => { // Scroll Down
-                const n = csi.get(0, 1);
+                const n = @min(csi.get(0, 1), self.rows);
                 for (0..n) |_| self.scrollDown();
             },
             'X' => { // Erase Characters
@@ -394,14 +436,18 @@ pub const Terminal = struct {
     }
 
     fn handleInsertLines(self: *Terminal, csi: ansi.CsiParams) void {
-        const n = @min(csi.get(0, 1), self.scroll_bottom - self.cursor_row + 1);
-        // Shift lines down
-        var r = self.scroll_bottom;
-        while (r >= self.cursor_row + n) : (r -= 1) {
-            const src_row = r - n;
+        // IL only acts when the cursor is inside the scroll region (per spec);
+        // a cursor below the region would also underflow the count below.
+        if (self.cursor_row < self.scroll_top or self.cursor_row > self.scroll_bottom) return;
+        const max_n: usize = @as(usize, self.scroll_bottom - self.cursor_row) + 1;
+        const n: usize = @min(@as(usize, csi.get(0, 1)), max_n);
+        // Shift lines down (usize math — params are untrusted u16)
+        var r: usize = self.scroll_bottom;
+        while (r >= @as(usize, self.cursor_row) + n) : (r -= 1) {
+            const src_row: u16 = @intCast(r - n);
             for (0..self.cols) |c| {
                 const cell = self.cellAtUnsafe(src_row, @intCast(c));
-                self.setCellAt(r, @intCast(c), cell);
+                self.setCellAt(@intCast(r), @intCast(c), cell);
             }
             if (r == 0) break;
         }
@@ -415,9 +461,12 @@ pub const Terminal = struct {
     }
 
     fn handleDeleteLines(self: *Terminal, csi: ansi.CsiParams) void {
-        const n = @min(csi.get(0, 1), self.scroll_bottom - self.cursor_row + 1);
+        // DL only acts when the cursor is inside the scroll region (per spec).
+        if (self.cursor_row < self.scroll_top or self.cursor_row > self.scroll_bottom) return;
+        const max_n: usize = @as(usize, self.scroll_bottom - self.cursor_row) + 1;
+        const n: usize = @min(@as(usize, csi.get(0, 1)), max_n);
         // Shift lines up
-        for (self.cursor_row..(self.scroll_bottom + 1 - n)) |r| {
+        for (self.cursor_row..(@as(usize, self.scroll_bottom) + 1 - n)) |r| {
             const src_row: u16 = @intCast(r + n);
             for (0..self.cols) |c| {
                 const cell = self.cellAtUnsafe(src_row, @intCast(c));
@@ -426,7 +475,7 @@ pub const Terminal = struct {
         }
         // Clear bottom lines
         const blank = Cell{ .fg = self.current_fg, .bg = self.current_bg };
-        for ((self.scroll_bottom + 1 - n)..(self.scroll_bottom + 1)) |r| {
+        for ((@as(usize, self.scroll_bottom) + 1 - n)..(@as(usize, self.scroll_bottom) + 1)) |r| {
             for (0..self.cols) |c| {
                 self.setCellAt(@intCast(r), @intCast(c), blank);
             }
@@ -434,34 +483,38 @@ pub const Terminal = struct {
     }
 
     fn handleDeleteChars(self: *Terminal, csi: ansi.CsiParams) void {
-        const n = csi.get(0, 1);
+        // usize math: c + n on u16 overflows for hostile params (e.g. \e[65535P)
+        const n: usize = csi.get(0, 1);
         const row = self.cursor_row;
         // Shift chars left
-        var c = self.cursor_col;
+        var c: usize = self.cursor_col;
         while (c + n < self.cols) : (c += 1) {
-            const cell = self.cellAtUnsafe(row, c + n);
-            self.setCellAt(row, c, cell);
+            const cell = self.cellAtUnsafe(row, @intCast(c + n));
+            self.setCellAt(row, @intCast(c), cell);
         }
         // Clear end
         const blank = Cell{ .fg = self.current_fg, .bg = self.current_bg };
         while (c < self.cols) : (c += 1) {
-            self.setCellAt(row, c, blank);
+            self.setCellAt(row, @intCast(c), blank);
         }
     }
 
     fn handleInsertChars(self: *Terminal, csi: ansi.CsiParams) void {
-        const n = csi.get(0, 1);
+        if (self.cols == 0) return;
+        // usize math: cursor_col + n on u16 overflows for hostile params
+        const n: usize = csi.get(0, 1);
         const row = self.cursor_row;
+        const limit = @as(usize, self.cursor_col) + n;
         // Shift chars right
-        var c: u16 = self.cols -| 1;
-        while (c >= self.cursor_col + n) : (c -= 1) {
-            const cell = self.cellAtUnsafe(row, c - n);
-            self.setCellAt(row, c, cell);
+        var c: usize = self.cols - 1;
+        while (c >= limit) : (c -= 1) {
+            const cell = self.cellAtUnsafe(row, @intCast(c - n));
+            self.setCellAt(row, @intCast(c), cell);
             if (c == 0) break;
         }
         // Clear inserted positions
         const blank = Cell{ .fg = self.current_fg, .bg = self.current_bg };
-        for (self.cursor_col..@min(self.cursor_col + n, self.cols)) |cc| {
+        for (self.cursor_col..@min(limit, self.cols)) |cc| {
             self.setCellAt(row, @intCast(cc), blank);
         }
     }
@@ -502,12 +555,13 @@ pub const Terminal = struct {
                             i += 2;
                         }
                     } else if (i + 1 < csi.param_count and csi.params[i + 1] == 2) {
-                        // 24-bit RGB
+                        // 24-bit RGB — clamp: params are u16 and a hostile
+                        // program can send values > 255 (would panic @intCast)
                         if (i + 4 < csi.param_count) {
                             self.current_fg = .{
-                                .r = @intCast(csi.params[i + 2]),
-                                .g = @intCast(csi.params[i + 3]),
-                                .b = @intCast(csi.params[i + 4]),
+                                .r = @intCast(@min(csi.params[i + 2], 255)),
+                                .g = @intCast(@min(csi.params[i + 3], 255)),
+                                .b = @intCast(@min(csi.params[i + 4], 255)),
                             };
                             i += 4;
                         }
@@ -522,9 +576,9 @@ pub const Terminal = struct {
                     } else if (i + 1 < csi.param_count and csi.params[i + 1] == 2) {
                         if (i + 4 < csi.param_count) {
                             self.current_bg = .{
-                                .r = @intCast(csi.params[i + 2]),
-                                .g = @intCast(csi.params[i + 3]),
-                                .b = @intCast(csi.params[i + 4]),
+                                .r = @intCast(@min(csi.params[i + 2], 255)),
+                                .g = @intCast(@min(csi.params[i + 3], 255)),
+                                .b = @intCast(@min(csi.params[i + 4], 255)),
                             };
                             i += 4;
                         }
@@ -560,9 +614,10 @@ pub const Terminal = struct {
             const dst_start = r * @as(usize, self.cols);
             @memcpy(self.cells[dst_start..][0..self.cols], self.cells[src_start..][0..self.cols]);
         }
-        // Clear bottom line of scroll region
+        // Clear bottom line of scroll region (BCE: use current background)
+        const blank = Cell{ .fg = self.current_fg, .bg = self.current_bg };
         const bottom_start = @as(usize, self.scroll_bottom) * @as(usize, self.cols);
-        @memset(self.cells[bottom_start..][0..self.cols], Cell{});
+        @memset(self.cells[bottom_start..][0..self.cols], blank);
     }
 
     fn scrollDown(self: *Terminal) void {
@@ -573,9 +628,10 @@ pub const Terminal = struct {
             const dst_start = r * @as(usize, self.cols);
             @memcpy(self.cells[dst_start..][0..self.cols], self.cells[src_start..][0..self.cols]);
         }
-        // Clear top line of scroll region
+        // Clear top line of scroll region (BCE: use current background)
+        const blank = Cell{ .fg = self.current_fg, .bg = self.current_bg };
         const top_start = @as(usize, self.scroll_top) * @as(usize, self.cols);
-        @memset(self.cells[top_start..][0..self.cols], Cell{});
+        @memset(self.cells[top_start..][0..self.cols], blank);
     }
 
     fn enterAltScreen(self: *Terminal) void {
@@ -690,8 +746,10 @@ pub const Terminal = struct {
     }
 };
 
-/// Convert 256-color index to RGB.
-fn color256(idx: u16) Color {
+/// Convert 256-color index to RGB. Out-of-range indices are clamped
+/// (params come straight from untrusted CSI sequences).
+fn color256(raw_idx: u16) Color {
+    const idx = @min(raw_idx, 255);
     if (idx < 16) return ansi_colors[idx];
     if (idx < 232) {
         // 216 color cube (6x6x6)
@@ -713,6 +771,87 @@ fn color256(idx: u16) Color {
 // =============================================================================
 // Tests
 // =============================================================================
+
+/// Build a PTY-less terminal for parser/grid tests (no process spawned).
+fn makeTestTerminal(allocator: Allocator, cols: u16, rows: u16) !Terminal {
+    const total = @as(usize, cols) * @as(usize, rows);
+    const cells = try allocator.alloc(Cell, total);
+    @memset(cells, Cell{});
+    return .{
+        .allocator = allocator,
+        .pty = .{ .allocator = allocator },
+        .cells = cells,
+        .cols = cols,
+        .rows = rows,
+        .scroll_bottom = rows -| 1,
+    };
+}
+
+fn freeTestTerminal(allocator: Allocator, term: *Terminal) void {
+    allocator.free(term.cells);
+    if (term.alt_cells) |ac| allocator.free(ac);
+}
+
+test "hostile SGR truecolor params are clamped" {
+    const alloc = std.testing.allocator;
+    var term = try makeTestTerminal(alloc, 20, 4);
+    defer freeTestTerminal(alloc, &term);
+    // RGB components > 255 and a 256-color index > 255 — previously @intCast panics
+    term.processOutput("\x1b[38;2;300;999;65535m\x1b[48;5;9999mA");
+    const cell = term.cellAtUnsafe(0, 0);
+    try std.testing.expectEqual(@as(u21, 'A'), cell.codepoint);
+    try std.testing.expectEqual(@as(u8, 255), cell.fg.r);
+    try std.testing.expectEqual(@as(u8, 255), cell.fg.g);
+    try std.testing.expectEqual(@as(u8, 255), cell.fg.b);
+}
+
+test "hostile CSI repeat and region params don't crash" {
+    const alloc = std.testing.allocator;
+    var term = try makeTestTerminal(alloc, 20, 8);
+    defer freeTestTerminal(alloc, &term);
+    // Huge delete/insert-chars counts (u16 add previously overflowed)
+    term.processOutput("hello\x1b[65535P\x1b[65535@");
+    // Scroll region rows 2..4, cursor below it, then IL/DL (previously underflowed)
+    term.processOutput("\x1b[2;4r\x1b[6;1H\x1b[5L\x1b[5M");
+    // Huge scroll counts (now clamped to grid height)
+    term.processOutput("\x1b[65535S\x1b[65535T");
+}
+
+test "alt screen survives resize" {
+    const alloc = std.testing.allocator;
+    var term = try makeTestTerminal(alloc, 10, 4);
+    defer freeTestTerminal(alloc, &term);
+    term.processOutput("main");
+    term.processOutput("\x1b[?1049h"); // enter alt screen
+    term.processOutput("alt!");
+    term.resizeGrid(20, 8); // resize while in alt screen
+    term.processOutput("\x1b[?1049l"); // leave alt screen
+    try std.testing.expectEqual(@as(u16, 20), term.cols);
+    try std.testing.expectEqual(@as(u16, 8), term.rows);
+    // Saved main screen was resized along: content intact, far corner in bounds
+    try std.testing.expectEqual(@as(u21, 'm'), term.cellAtUnsafe(0, 0).codepoint);
+    _ = term.cellAtUnsafe(7, 19);
+}
+
+test "DECSC/DECRC save and restore cursor" {
+    const alloc = std.testing.allocator;
+    var term = try makeTestTerminal(alloc, 20, 6);
+    defer freeTestTerminal(alloc, &term);
+    term.processOutput("\x1b[3;5H\x1b7"); // move to (2,4), save
+    term.processOutput("\x1b[1;1H"); // move home
+    try std.testing.expectEqual(@as(u16, 0), term.cursor_row);
+    term.processOutput("\x1b8"); // restore
+    try std.testing.expectEqual(@as(u16, 2), term.cursor_row);
+    try std.testing.expectEqual(@as(u16, 4), term.cursor_col);
+}
+
+test "OSC terminated by ST doesn't print a backslash" {
+    const alloc = std.testing.allocator;
+    var term = try makeTestTerminal(alloc, 20, 4);
+    defer freeTestTerminal(alloc, &term);
+    term.processOutput("\x1b]0;title\x1b\\A");
+    try std.testing.expectEqual(@as(u21, 'A'), term.cellAtUnsafe(0, 0).codepoint);
+}
 
 test "color256 basic" {
     // Color 0 = black
