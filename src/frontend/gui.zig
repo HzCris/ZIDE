@@ -3094,7 +3094,10 @@ fn settingsDialog(editor: *Editor) void {
                     .id_extra = i,
                     .gravity_x = 1.0,
                     .gravity_y = 0.5,
-                    .min_size_content = .{ .w = 90 },
+                    // 8 M-widths wide, full text line tall — overriding
+                    // min_size_content replaces the widget default, so the
+                    // height must be supplied too or the box collapses.
+                    .min_size_content = dvui.Font.theme(.body).sizeM(8, 1),
                 });
                 if (res.changed) {
                     applySettingNumber(editor, def.key, val);
