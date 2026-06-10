@@ -145,6 +145,7 @@ pub const SystemClipboard = struct {
     extern "kernel32" fn GlobalAlloc(uFlags: c_uint, dwBytes: usize) callconv(.winapi) ?*anyopaque;
     extern "kernel32" fn GlobalLock(hMem: *anyopaque) callconv(.winapi) ?[*]u8;
     extern "kernel32" fn GlobalUnlock(hMem: *anyopaque) callconv(.winapi) c_int;
+    extern "kernel32" fn GlobalFree(hMem: ?*anyopaque) callconv(.winapi) ?*anyopaque;
 
     fn getTextWindows(allocator: Allocator) ?[]const u8 {
         if (OpenClipboard(null) == 0) return null;
@@ -173,13 +174,17 @@ pub const SystemClipboard = struct {
 
         const hmem = GlobalAlloc(GMEM_MOVEABLE, byte_size) orelse return false;
         const ptr: ?[*]u16 = @ptrCast(@alignCast(GlobalLock(hmem)));
-        if (ptr == null) return false;
+        if (ptr == null) {
+            _ = GlobalFree(hmem);
+            return false;
+        }
         const wide = ptr.?;
 
         // Encode UTF-8 to UTF-16LE
         var i: usize = 0;
         var view = std.unicode.Utf8View.init(text) catch {
             _ = GlobalUnlock(hmem);
+            _ = GlobalFree(hmem);
             return false;
         };
         var iter = view.iterator();
@@ -199,9 +204,17 @@ pub const SystemClipboard = struct {
 
         _ = GlobalUnlock(hmem);
 
-        if (OpenClipboard(null) == 0) return false;
+        if (OpenClipboard(null) == 0) {
+            _ = GlobalFree(hmem);
+            return false;
+        }
         _ = EmptyClipboard();
-        _ = SetClipboardData(CF_UNICODETEXT, hmem);
+        if (SetClipboardData(CF_UNICODETEXT, hmem) == null) {
+            // Clipboard did not take ownership — free our allocation.
+            _ = GlobalFree(hmem);
+            _ = CloseClipboard();
+            return false;
+        }
         _ = CloseClipboard();
         return true;
     }

@@ -64,6 +64,7 @@ pub const CommandRegistry = struct {
     pub fn allNames(self: *CommandRegistry) ![][]const u8 {
         if (self.cached_names) |names| return names;
         var names = try std.ArrayList([]const u8).initCapacity(self.allocator, self.commands.count());
+        errdefer names.deinit(self.allocator);
         var iter = self.commands.iterator();
         while (iter.next()) |entry| {
             names.appendAssumeCapacity(entry.key_ptr.*);
@@ -73,8 +74,12 @@ pub const CommandRegistry = struct {
                 return std.mem.order(u8, a, b) == .lt;
             }
         }.lessThan);
-        self.cached_names = names.items;
-        return names.items;
+        // toOwnedSlice: invalidateCache frees this with allocator.free, which
+        // requires an exactly-sized allocation (items.len == capacity is not
+        // guaranteed by ArrayList in general).
+        const owned = try names.toOwnedSlice(self.allocator);
+        self.cached_names = owned;
+        return owned;
     }
 
     fn invalidateCache(self: *CommandRegistry) void {

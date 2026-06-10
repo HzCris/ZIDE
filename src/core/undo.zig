@@ -129,6 +129,9 @@ pub const UndoHistory = struct {
 
             const op = self.undo_stack.pop().?;
             cursor_pos = op.cursor_before;
+            // If re-applying or re-stacking fails, the op is already popped —
+            // free its text instead of leaking it.
+            errdefer self.allocator.free(op.text);
 
             // Reverse the operation
             switch (op.op_type) {
@@ -165,6 +168,7 @@ pub const UndoHistory = struct {
 
             const op = self.redo_stack.pop().?;
             cursor_pos = op.cursor_after;
+            errdefer self.allocator.free(op.text);
 
             // Re-apply the operation
             switch (op.op_type) {
@@ -293,7 +297,7 @@ pub const UndoHistory = struct {
 
 test "undo single insert" {
     const allocator = std.testing.allocator;
-    var buf = @import("buffer.zig").Buffer.init(allocator);
+    var buf = try @import("buffer.zig").Buffer.init(allocator);
     defer buf.deinit();
     try buf.loadText("hello");
 
@@ -313,7 +317,7 @@ test "undo single insert" {
 
 test "redo after undo" {
     const allocator = std.testing.allocator;
-    var buf = @import("buffer.zig").Buffer.init(allocator);
+    var buf = try @import("buffer.zig").Buffer.init(allocator);
     defer buf.deinit();
     try buf.loadText("hello");
 
@@ -335,7 +339,7 @@ test "redo after undo" {
 
 test "undo delete" {
     const allocator = std.testing.allocator;
-    var buf = @import("buffer.zig").Buffer.init(allocator);
+    var buf = try @import("buffer.zig").Buffer.init(allocator);
     defer buf.deinit();
     try buf.loadText("hello world");
 
@@ -355,7 +359,7 @@ test "undo delete" {
 
 test "grouping adjacent inserts" {
     const allocator = std.testing.allocator;
-    var buf = @import("buffer.zig").Buffer.init(allocator);
+    var buf = try @import("buffer.zig").Buffer.init(allocator);
     defer buf.deinit();
     try buf.loadText("");
 
@@ -379,7 +383,7 @@ test "grouping adjacent inserts" {
 
 test "newline breaks group" {
     const allocator = std.testing.allocator;
-    var buf = @import("buffer.zig").Buffer.init(allocator);
+    var buf = try @import("buffer.zig").Buffer.init(allocator);
     defer buf.deinit();
     try buf.loadText("");
 
@@ -413,7 +417,7 @@ test "newline breaks group" {
 
 test "explicit group undone as one step" {
     const allocator = std.testing.allocator;
-    var buf = @import("buffer.zig").Buffer.init(allocator);
+    var buf = try @import("buffer.zig").Buffer.init(allocator);
     defer buf.deinit();
     try buf.loadText("hello");
 
@@ -441,7 +445,7 @@ test "explicit group undone as one step" {
 
 test "nested groups join the outermost group" {
     const allocator = std.testing.allocator;
-    var buf = @import("buffer.zig").Buffer.init(allocator);
+    var buf = try @import("buffer.zig").Buffer.init(allocator);
     defer buf.deinit();
     try buf.loadText("");
 
@@ -465,7 +469,7 @@ test "nested groups join the outermost group" {
 
 test "trim evicts whole groups only" {
     const allocator = std.testing.allocator;
-    var buf = @import("buffer.zig").Buffer.init(allocator);
+    var buf = try @import("buffer.zig").Buffer.init(allocator);
     defer buf.deinit();
     try buf.loadText("");
 
@@ -497,7 +501,7 @@ test "trim evicts whole groups only" {
 
 test "open group exempt from trim until endGroup" {
     const allocator = std.testing.allocator;
-    var buf = @import("buffer.zig").Buffer.init(allocator);
+    var buf = try @import("buffer.zig").Buffer.init(allocator);
     defer buf.deinit();
     try buf.loadText("");
 
@@ -520,7 +524,7 @@ test "open group exempt from trim until endGroup" {
 
 test "new edit clears redo" {
     const allocator = std.testing.allocator;
-    var buf = @import("buffer.zig").Buffer.init(allocator);
+    var buf = try @import("buffer.zig").Buffer.init(allocator);
     defer buf.deinit();
     try buf.loadText("hello");
 

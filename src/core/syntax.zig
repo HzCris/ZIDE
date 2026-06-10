@@ -91,20 +91,9 @@ pub const LanguageDef = struct {
     }
 
     pub fn deinit(self: *LanguageDef) void {
-        if (self.arena) |*a| {
-            const alloc = a.allocator();
-            // Free heap-allocated string slices
-            if (self.line_comment) |lc| {
-                if (lc.len > 0) alloc.free(lc);
-            }
-            if (self.block_comment_start) |bcs| {
-                if (bcs.len > 0) alloc.free(bcs);
-            }
-            if (self.block_comment_end) |bce| {
-                if (bce.len > 0) alloc.free(bce);
-            }
-            a.deinit();
-        }
+        // Every string in a Lua-registered language is arena-allocated —
+        // tearing down the arena frees them all.
+        if (self.arena) |*a| a.deinit();
     }
 };
 

@@ -35,12 +35,23 @@ pub const LayoutNode = union(enum) {
 pub const Layout = struct {
     nodes: std.ArrayList(LayoutNode),
     panes: std.ArrayList(Pane),
+    /// Recyclable node slots orphaned by closePane. Without reuse the u8
+    /// index space (255 slots) ran out after ~127 splits in a session.
+    free_nodes: std.ArrayList(u8),
+    /// Recyclable pane slots orphaned by closePane.
+    free_panes: std.ArrayList(u8),
     allocator: Allocator,
+
+    /// Sentinel pane id for orphaned node slots. allocPane never hands out
+    /// 255, so a dead leaf can never match a live pane lookup.
+    const dead_pane: u8 = 255;
 
     pub fn init(allocator: Allocator) !Layout {
         var layout = Layout{
             .nodes = .empty,
             .panes = .empty,
+            .free_nodes = .empty,
+            .free_panes = .empty,
             .allocator = allocator,
         };
         // Start with a single pane (pane 0) showing document 0
@@ -53,11 +64,46 @@ pub const Layout = struct {
     pub fn deinit(self: *Layout) void {
         self.nodes.deinit(self.allocator);
         self.panes.deinit(self.allocator);
+        self.free_nodes.deinit(self.allocator);
+        self.free_panes.deinit(self.allocator);
     }
 
-    /// Number of panes.
+    /// Number of live panes (leaves reachable from the root — the panes list
+    /// itself retains recyclable orphaned slots).
     pub fn paneCount(self: *const Layout) usize {
-        return self.panes.items.len;
+        return self.countLeaves(0);
+    }
+
+    fn countLeaves(self: *const Layout, node_idx: u8) usize {
+        if (node_idx >= self.nodes.items.len) return 0;
+        return switch (self.nodes.items[node_idx]) {
+            .leaf => 1,
+            .split => |s| self.countLeaves(s.first) + self.countLeaves(s.second),
+        };
+    }
+
+    /// Get a node slot: reuse a recycled slot or append a new one.
+    fn allocNode(self: *Layout, node: LayoutNode) !u8 {
+        if (self.free_nodes.pop()) |idx| {
+            self.nodes.items[idx] = node;
+            return idx;
+        }
+        if (self.nodes.items.len >= 255) return error.LayoutFull;
+        const idx: u8 = @intCast(self.nodes.items.len);
+        try self.nodes.append(self.allocator, node);
+        return idx;
+    }
+
+    /// Get a pane slot: reuse a recycled slot or append a new one.
+    fn allocPane(self: *Layout, content: PaneContent) !u8 {
+        if (self.free_panes.pop()) |idx| {
+            self.panes.items[idx] = .{ .content = content };
+            return idx;
+        }
+        if (self.panes.items.len >= dead_pane) return error.LayoutFull;
+        const idx: u8 = @intCast(self.panes.items.len);
+        try self.panes.append(self.allocator, .{ .content = content });
+        return idx;
     }
 
     /// Split a pane into two. The existing pane stays as the first child,
@@ -68,14 +114,13 @@ pub const Layout = struct {
         const leaf_node_idx = self.findLeafNode(pane_id) orelse return error.PaneNotFound;
 
         // Create the new pane
-        const new_pane_id: u8 = @intCast(self.panes.items.len);
-        try self.panes.append(self.allocator, .{ .content = new_content });
+        const new_pane_id = try self.allocPane(new_content);
+        errdefer self.free_panes.append(self.allocator, new_pane_id) catch {};
 
         // Create two new leaf nodes
-        const first_leaf_idx: u8 = @intCast(self.nodes.items.len);
-        try self.nodes.append(self.allocator, .{ .leaf = pane_id });
-        const second_leaf_idx: u8 = @intCast(self.nodes.items.len);
-        try self.nodes.append(self.allocator, .{ .leaf = new_pane_id });
+        const first_leaf_idx = try self.allocNode(.{ .leaf = pane_id });
+        errdefer self.free_nodes.append(self.allocator, first_leaf_idx) catch {};
+        const second_leaf_idx = try self.allocNode(.{ .leaf = new_pane_id });
 
         // Replace the original leaf with a split node
         self.nodes.items[leaf_node_idx] = .{ .split = .{
@@ -88,10 +133,11 @@ pub const Layout = struct {
         return new_pane_id;
     }
 
-    /// Close a pane. Replaces its parent split with the sibling.
+    /// Close a pane. Replaces its parent split with the sibling and recycles
+    /// the orphaned node and pane slots.
     /// Returns true if the pane was closed, false if it's the last pane.
     pub fn closePane(self: *Layout, pane_id: u8) bool {
-        if (self.panes.items.len <= 1) return false;
+        if (self.paneCount() <= 1) return false;
 
         const leaf_node_idx = self.findLeafNode(pane_id) orelse return false;
         const parent_info = self.findParent(leaf_node_idx) orelse return false;
@@ -103,6 +149,16 @@ pub const Layout = struct {
 
         // Replace parent split with sibling content
         self.nodes.items[parent_idx] = self.nodes.items[sibling_idx];
+
+        // Recycle the orphaned slots. Overwrite with dead content so stale
+        // split/terminal references can never confuse linear scans
+        // (findParent walks ALL node slots, including recycled ones).
+        self.nodes.items[leaf_node_idx] = .{ .leaf = dead_pane };
+        self.nodes.items[sibling_idx] = .{ .leaf = dead_pane };
+        self.free_nodes.append(self.allocator, @intCast(leaf_node_idx)) catch {};
+        self.free_nodes.append(self.allocator, @intCast(sibling_idx)) catch {};
+        self.panes.items[pane_id] = .{ .content = .{ .editor = 0 } };
+        self.free_panes.append(self.allocator, pane_id) catch {};
 
         return true;
     }
@@ -258,6 +314,25 @@ test "layout cannot close last pane" {
     defer layout.deinit();
 
     try std.testing.expect(!layout.closePane(0));
+}
+
+test "layout survives split/close churn past 255 slots" {
+    const allocator = std.testing.allocator;
+    var layout = try Layout.init(allocator);
+    defer layout.deinit();
+
+    // Each split adds 2 nodes; without slot recycling this panicked at
+    // ~127 splits when the u8 index space ran out.
+    var i: usize = 0;
+    while (i < 300) : (i += 1) {
+        const new_pane = try layout.splitPane(0, .horizontal, .{ .editor = 1 });
+        try std.testing.expectEqual(@as(usize, 2), layout.paneCount());
+        try std.testing.expect(layout.closePane(new_pane));
+        try std.testing.expectEqual(@as(usize, 1), layout.paneCount());
+    }
+    // Slot recycling keeps the backing arrays tiny
+    try std.testing.expect(layout.nodes.items.len < 8);
+    try std.testing.expect(layout.panes.items.len < 8);
 }
 
 test "layout next/prev pane" {

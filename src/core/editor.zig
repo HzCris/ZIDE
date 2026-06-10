@@ -136,7 +136,9 @@ pub const Editor = struct {
     terminals: std.ArrayList(?*terminal_mod.Terminal),
 
     /// Registered languages (Zig built-in + Lua-loaded extensions).
-    languages: std.ArrayList(syntax.LanguageDef),
+    /// SegmentedList: documents hold `*const LanguageDef` into this — element
+    /// pointers must stay stable when extensions register new languages.
+    languages: std.SegmentedList(syntax.LanguageDef, 4),
     /// GUI syntax highlight colors.
     syntax_theme: SyntaxTheme = theme_mod.syn_gui_dark,
     /// TUI syntax highlight colors.
@@ -183,13 +185,13 @@ pub const Editor = struct {
             .completion_items = .empty,
             .lsp_configs = .empty,
             .terminals = .empty,
-            .languages = .empty,
+            .languages = .{},
             .lang_syntax_overrides = .empty,
         };
         // Register built-in Zig language
         try editor.languages.append(allocator, syntax.lang_zig);
         // Always have at least one empty document
-        var doc = Document.init(allocator);
+        var doc = try Document.init(allocator);
         doc.history.max_size = editor.max_undo_history;
         try doc.loadText("");
         try editor.documents.append(allocator, doc);
@@ -209,7 +211,8 @@ pub const Editor = struct {
         self.keybinds.deinit();
         self.layout.deinit();
         // Free Lua-registered languages (built-in Zig has null arena)
-        for (self.languages.items) |*lang| {
+        var lang_it = self.languages.iterator(0);
+        while (lang_it.next()) |lang| {
             lang.deinit();
         }
         self.clearCompletionItems();
@@ -276,7 +279,8 @@ pub const Editor = struct {
 
     /// Open a new empty document and make it active (in the focused pane).
     pub fn newDocument(self: *Editor) !*Document {
-        var doc = Document.init(self.allocator);
+        var doc = try Document.init(self.allocator);
+        errdefer doc.deinit();
         doc.history.max_size = self.max_undo_history;
         try doc.loadText("");
         try self.documents.append(self.allocator, doc);
@@ -288,7 +292,8 @@ pub const Editor = struct {
 
     /// Open a file into a new document tab (in the focused pane).
     pub fn openFile(self: *Editor, path: []const u8) !*Document {
-        var doc = Document.init(self.allocator);
+        var doc = try Document.init(self.allocator);
+        errdefer doc.deinit();
         doc.history.max_size = self.max_undo_history;
         try doc.open(path);
         try self.documents.append(self.allocator, doc);
@@ -305,11 +310,15 @@ pub const Editor = struct {
     /// (creates a new empty document in that case).
     pub fn closeActiveDoc(self: *Editor) bool {
         if (self.documents.items.len <= 1) {
+            // Build the replacement first — deinit'ing the old document and
+            // then failing to construct a new one would leave items[0] invalid.
+            var fresh = Document.init(self.allocator) catch return false;
+            fresh.history.max_size = self.max_undo_history;
+            fresh.loadText("") catch {};
             // Send didClose before resetting
             self.lspDidClose(&self.documents.items[0]);
             self.documents.items[0].deinit();
-            self.documents.items[0] = Document.init(self.allocator);
-            self.documents.items[0].loadText("") catch {};
+            self.documents.items[0] = fresh;
             self.active_doc_idx = 0;
             self.paneShowDoc(0);
             return false;
@@ -527,6 +536,9 @@ pub const Editor = struct {
                 // Update internal clipboard (don't free — frontend owns this memory)
                 if (self.clipboard.len > 0) {
                     self.allocator.free(self.clipboard);
+                    // Reset before the fallible dupe — returning the freed
+                    // slice on OOM was a use-after-free.
+                    self.clipboard = "";
                 }
                 self.clipboard = self.allocator.dupe(u8, text) catch return self.clipboard;
                 return self.clipboard;
@@ -744,8 +756,11 @@ pub const Editor = struct {
     // ---- Language / syntax theme operations ----
 
     /// Find a registered language by file extension.
+    /// The returned pointer stays valid for the editor's lifetime
+    /// (languages live in a SegmentedList — appends never relocate).
     pub fn findLanguage(self: *const Editor, ext: []const u8) ?*const syntax.LanguageDef {
-        for (self.languages.items) |*lang| {
+        var it = self.languages.constIterator(0);
+        while (it.next()) |lang| {
             if (lang.matchesExtension(ext)) return lang;
         }
         return null;

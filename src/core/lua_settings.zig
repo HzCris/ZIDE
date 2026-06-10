@@ -632,6 +632,8 @@ fn luaRegisterLanguage(state: ?*zlua.LuaState) callconv(.c) c_int {
 
     editor.languages.append(editor.allocator, lang) catch {
         std.log.err("zide.register_language: failed to register '{s}'", .{name});
+        var failed = lang;
+        failed.deinit(); // frees the arena (previously leaked on this path)
         return 0;
     };
 

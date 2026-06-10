@@ -195,13 +195,14 @@ pub const CursorSet = struct {
     cursors: std.ArrayList(Cursor),
     allocator: Allocator,
 
-    pub fn init(allocator: Allocator) CursorSet {
+    pub fn init(allocator: Allocator) !CursorSet {
         var cs = CursorSet{
             .cursors = .empty,
             .allocator = allocator,
         };
-        // Always have at least one cursor
-        cs.cursors.append(allocator, .{}) catch {};
+        // Always at least one cursor — primary() indexes [0] unconditionally,
+        // so a swallowed failure here would be a guaranteed crash later.
+        try cs.cursors.append(allocator, .{});
         return cs;
     }
 
@@ -369,7 +370,7 @@ fn utf8ByteLen(first_byte: u8) usize {
 
 test "cursor movement" {
     const allocator = std.testing.allocator;
-    var buf = Buffer.init(allocator);
+    var buf = try Buffer.init(allocator);
     defer buf.deinit();
     try buf.loadText("hello\nworld");
 
@@ -393,7 +394,7 @@ test "cursor movement" {
 
 test "cursor preferred column" {
     const allocator = std.testing.allocator;
-    var buf = Buffer.init(allocator);
+    var buf = try Buffer.init(allocator);
     defer buf.deinit();
     try buf.loadText("long line here\nhi\nanother long line");
 
@@ -432,7 +433,7 @@ test "selection" {
 
 test "cursor set adjust after insert" {
     const allocator = std.testing.allocator;
-    var cs = CursorSet.init(allocator);
+    var cs = try CursorSet.init(allocator);
     defer cs.deinit();
 
     cs.primary().offset = 10;

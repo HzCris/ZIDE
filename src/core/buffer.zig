@@ -36,9 +36,12 @@ pub const Buffer = struct {
         return logical + self.gapLen();
     }
 
-    pub fn init(allocator: Allocator) Buffer {
+    pub fn init(allocator: Allocator) !Buffer {
         var line_starts: std.ArrayList(usize) = .empty;
-        line_starts.append(allocator, 0) catch {};
+        errdefer line_starts.deinit(allocator);
+        // line_starts[0] == 0 is a hard invariant (offsetToPos underflows
+        // without it) — propagate failure instead of silently breaking it.
+        try line_starts.append(allocator, 0);
         return .{
             .line_starts = line_starts,
             .allocator = allocator,
@@ -63,7 +66,7 @@ pub const Buffer = struct {
         @memcpy(self.data[0..text.len], text);
         self.content_len = text.len;
         self.gap_start = text.len;
-        self.rebuildLineIndex();
+        try self.rebuildLineIndex();
     }
 
     /// Load a file into the buffer.
@@ -82,7 +85,7 @@ pub const Buffer = struct {
         const bytes = try file.readAll(self.data[0..size]);
         self.content_len = bytes;
         self.gap_start = bytes;
-        self.rebuildLineIndex();
+        try self.rebuildLineIndex();
     }
 
     /// Save the buffer to a file.
@@ -169,7 +172,7 @@ pub const Buffer = struct {
         @memcpy(self.data[self.gap_start .. self.gap_start + text.len], text);
         self.gap_start += text.len;
         self.content_len += text.len;
-        self.updateLineIndexAfterInsert(pos, text);
+        try self.updateLineIndexAfterInsert(pos, text);
         return text.len;
     }
 
@@ -272,32 +275,34 @@ pub const Buffer = struct {
     }
 
     /// Rebuild the entire line index from scratch.
-    fn rebuildLineIndex(self: *Buffer) void {
+    fn rebuildLineIndex(self: *Buffer) !void {
         self.line_starts.clearRetainingCapacity();
-        self.line_starts.append(self.allocator, 0) catch {};
+        try self.line_starts.append(self.allocator, 0);
         // Pre-gap content
         for (self.data[0..self.gap_start], 0..) |byte, i| {
             if (byte == '\n') {
-                self.line_starts.append(self.allocator, i + 1) catch {};
+                try self.line_starts.append(self.allocator, i + 1);
             }
         }
         // Post-gap content
         const ge = self.gapEnd();
         for (self.data[ge..], 0..) |byte, i| {
             if (byte == '\n') {
-                self.line_starts.append(self.allocator, self.gap_start + i + 1) catch {};
+                try self.line_starts.append(self.allocator, self.gap_start + i + 1);
             }
         }
     }
 
     /// Incrementally update line index after inserting text at `pos`.
-    fn updateLineIndexAfterInsert(self: *Buffer, pos: usize, text: []const u8) void {
+    /// A swallowed failure here would silently corrupt the line index, so
+    /// errors propagate to the caller.
+    fn updateLineIndexAfterInsert(self: *Buffer, pos: usize, text: []const u8) !void {
         // Count newlines in inserted text and collect their positions
         var new_lines: std.ArrayList(usize) = .empty;
         defer new_lines.deinit(self.allocator);
         for (text, 0..) |byte, i| {
             if (byte == '\n') {
-                new_lines.append(self.allocator, pos + i + 1) catch {};
+                try new_lines.append(self.allocator, pos + i + 1);
             }
         }
 
@@ -321,7 +326,7 @@ pub const Buffer = struct {
                     hi = mid;
                 }
             }
-            self.line_starts.insertSlice(self.allocator, lo, new_lines.items) catch {};
+            try self.line_starts.insertSlice(self.allocator, lo, new_lines.items);
         }
     }
 
@@ -359,7 +364,7 @@ pub const Buffer = struct {
 
 test "empty buffer" {
     const allocator = std.testing.allocator;
-    var buf = Buffer.init(allocator);
+    var buf = try Buffer.init(allocator);
     defer buf.deinit();
 
     try std.testing.expectEqual(@as(usize, 0), buf.byteLen());
@@ -369,7 +374,7 @@ test "empty buffer" {
 
 test "load text and line access" {
     const allocator = std.testing.allocator;
-    var buf = Buffer.init(allocator);
+    var buf = try Buffer.init(allocator);
     defer buf.deinit();
 
     try buf.loadText("hello\nworld\nfoo");
@@ -381,7 +386,7 @@ test "load text and line access" {
 
 test "insert and delete" {
     const allocator = std.testing.allocator;
-    var buf = Buffer.init(allocator);
+    var buf = try Buffer.init(allocator);
     defer buf.deinit();
 
     try buf.loadText("hello world");
@@ -398,7 +403,7 @@ test "insert and delete" {
 
 test "offset to pos conversion" {
     const allocator = std.testing.allocator;
-    var buf = Buffer.init(allocator);
+    var buf = try Buffer.init(allocator);
     defer buf.deinit();
 
     try buf.loadText("abc\ndef\nghi");
@@ -417,7 +422,7 @@ test "offset to pos conversion" {
 
 test "insert multiline text" {
     const allocator = std.testing.allocator;
-    var buf = Buffer.init(allocator);
+    var buf = try Buffer.init(allocator);
     defer buf.deinit();
 
     try buf.loadText("ab");
@@ -431,7 +436,7 @@ test "insert multiline text" {
 
 test "gap buffer insert at different positions" {
     const allocator = std.testing.allocator;
-    var buf = Buffer.init(allocator);
+    var buf = try Buffer.init(allocator);
     defer buf.deinit();
 
     try buf.loadText("abcdef");
@@ -449,7 +454,7 @@ test "gap buffer insert at different positions" {
 
 test "gap buffer delete and re-insert" {
     const allocator = std.testing.allocator;
-    var buf = Buffer.init(allocator);
+    var buf = try Buffer.init(allocator);
     defer buf.deinit();
 
     try buf.loadText("hello world");
@@ -463,7 +468,7 @@ test "gap buffer delete and re-insert" {
 
 test "gap buffer byteAt" {
     const allocator = std.testing.allocator;
-    var buf = Buffer.init(allocator);
+    var buf = try Buffer.init(allocator);
     defer buf.deinit();
 
     try buf.loadText("abc");
@@ -482,7 +487,7 @@ test "gap buffer byteAt" {
 
 test "gap buffer slice spanning gap" {
     const allocator = std.testing.allocator;
-    var buf = Buffer.init(allocator);
+    var buf = try Buffer.init(allocator);
     defer buf.deinit();
 
     try buf.loadText("abcdefghij");

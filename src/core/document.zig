@@ -8,6 +8,10 @@ const UndoHistory = @import("undo.zig").UndoHistory;
 const syntax = @import("syntax.zig");
 const lsp = @import("lsp.zig");
 
+/// Default display name. Ownership is tracked by pointer identity — a file
+/// literally named "untitled" must still get its heap name freed.
+const default_display_name: []const u8 = "untitled";
+
 /// A document represents an open file (or unsaved buffer) being edited.
 /// It owns the text buffer, cursor state, file metadata, and undo history.
 pub const Document = struct {
@@ -19,7 +23,7 @@ pub const Document = struct {
     /// Absolute file path, or null for unsaved/new buffers.
     file_path: ?[]const u8 = null,
     /// Display name shown in tabs (filename portion or "untitled").
-    display_name: []const u8 = "untitled",
+    display_name: []const u8 = default_display_name,
 
     /// Whether the buffer has unsaved modifications.
     dirty: bool = false,
@@ -47,10 +51,13 @@ pub const Document = struct {
     /// Cached line states for syntax highlighting (state entering each line).
     line_states: std.ArrayList(syntax.LineState),
 
-    pub fn init(allocator: Allocator) Document {
+    pub fn init(allocator: Allocator) !Document {
+        var buffer = try Buffer.init(allocator);
+        errdefer buffer.deinit();
+        const cursors = try CursorSet.init(allocator);
         return .{
-            .buffer = Buffer.init(allocator),
-            .cursors = CursorSet.init(allocator),
+            .buffer = buffer,
+            .cursors = cursors,
             .history = UndoHistory.init(allocator),
             .allocator = allocator,
             .diagnostics = .empty,
@@ -70,13 +77,14 @@ pub const Document = struct {
         if (self.file_path) |p| {
             self.allocator.free(p);
         }
-        // Free display_name only if it was heap-allocated (not the default "untitled")
-        if (!std.mem.eql(u8, self.display_name, "untitled")) {
+        // Free display_name only if heap-allocated. Compare by pointer, not
+        // content — a file literally named "untitled" must still be freed.
+        if (self.display_name.ptr != default_display_name.ptr) {
             self.allocator.free(self.display_name);
         }
     }
 
-    /// Open a file into this document.
+    /// Open a file into this document, replacing its current content.
     pub fn open(self: *Document, path: []const u8) !void {
         try self.buffer.loadFile(path);
         // Store owned copy of path
@@ -87,6 +95,10 @@ pub const Document = struct {
         // Extract filename for display
         self.setDisplayNameFromPath(path);
         self.dirty = false;
+        // Stale history/highlight state from the previous content must not
+        // survive — undoing across a file swap would corrupt the new buffer.
+        self.history.clear();
+        self.invalidateLineStates(0);
         self.resetCursors();
         self.detectLineEndings();
     }
@@ -613,13 +625,13 @@ pub const Document = struct {
     }
 
     fn setDisplayNameFromPath(self: *Document, path: []const u8) void {
-        // Free old display name if heap-allocated
-        if (!std.mem.eql(u8, self.display_name, "untitled")) {
+        // Free old display name if heap-allocated (pointer identity, see deinit)
+        if (self.display_name.ptr != default_display_name.ptr) {
             self.allocator.free(self.display_name);
         }
         // Extract basename
         const basename = std.fs.path.basename(path);
-        self.display_name = self.allocator.dupe(u8, basename) catch "untitled";
+        self.display_name = self.allocator.dupe(u8, basename) catch default_display_name;
     }
 
     fn detectLineEndings(self: *Document) void {
@@ -690,7 +702,7 @@ pub const Document = struct {
 
 test "document new and load text" {
     const allocator = std.testing.allocator;
-    var doc = Document.init(allocator);
+    var doc = try Document.init(allocator);
     defer doc.deinit();
 
     try doc.loadText("hello\nworld");
@@ -703,7 +715,7 @@ test "document new and load text" {
 
 test "document insert and dirty tracking" {
     const allocator = std.testing.allocator;
-    var doc = Document.init(allocator);
+    var doc = try Document.init(allocator);
     defer doc.deinit();
 
     try doc.loadText("hello world");
@@ -716,7 +728,7 @@ test "document insert and dirty tracking" {
 
 test "document delete forward" {
     const allocator = std.testing.allocator;
-    var doc = Document.init(allocator);
+    var doc = try Document.init(allocator);
     defer doc.deinit();
 
     try doc.loadText("hello");
@@ -727,7 +739,7 @@ test "document delete forward" {
 
 test "document delete backward" {
     const allocator = std.testing.allocator;
-    var doc = Document.init(allocator);
+    var doc = try Document.init(allocator);
     defer doc.deinit();
 
     try doc.loadText("hello");
@@ -739,7 +751,7 @@ test "document delete backward" {
 
 test "document selection delete" {
     const allocator = std.testing.allocator;
-    var doc = Document.init(allocator);
+    var doc = try Document.init(allocator);
     defer doc.deinit();
 
     try doc.loadText("hello world");
@@ -754,7 +766,7 @@ test "document selection delete" {
 
 test "document cursor position" {
     const allocator = std.testing.allocator;
-    var doc = Document.init(allocator);
+    var doc = try Document.init(allocator);
     defer doc.deinit();
 
     try doc.loadText("line one\nline two\nline three");
@@ -766,7 +778,7 @@ test "document cursor position" {
 
 test "document ensure cursor visible" {
     const allocator = std.testing.allocator;
-    var doc = Document.init(allocator);
+    var doc = try Document.init(allocator);
     defer doc.deinit();
 
     try doc.loadText("a\nb\nc\nd\ne\nf\ng\nh\ni\nj");
@@ -780,7 +792,7 @@ test "document ensure cursor visible" {
 
 test "document undo redo" {
     const allocator = std.testing.allocator;
-    var doc = Document.init(allocator);
+    var doc = try Document.init(allocator);
     defer doc.deinit();
 
     try doc.loadText("hello");
@@ -800,7 +812,7 @@ test "document undo redo" {
 
 test "backspace deletes the selection" {
     const allocator = std.testing.allocator;
-    var doc = Document.init(allocator);
+    var doc = try Document.init(allocator);
     defer doc.deinit();
 
     try doc.loadText("hello world");
@@ -816,7 +828,7 @@ test "backspace deletes the selection" {
 
 test "delete key deletes the selection" {
     const allocator = std.testing.allocator;
-    var doc = Document.init(allocator);
+    var doc = try Document.init(allocator);
     defer doc.deinit();
 
     try doc.loadText("hello world");
@@ -831,7 +843,7 @@ test "delete key deletes the selection" {
 
 test "insert replaces selection as one undo step" {
     const allocator = std.testing.allocator;
-    var doc = Document.init(allocator);
+    var doc = try Document.init(allocator);
     defer doc.deinit();
 
     try doc.loadText("hello world");
@@ -849,7 +861,7 @@ test "insert replaces selection as one undo step" {
 
 test "paste path replaces selection (insertAtAllCursors, single cursor)" {
     const allocator = std.testing.allocator;
-    var doc = Document.init(allocator);
+    var doc = try Document.init(allocator);
     defer doc.deinit();
 
     try doc.loadText("abc def");
@@ -863,7 +875,7 @@ test "paste path replaces selection (insertAtAllCursors, single cursor)" {
 
 test "move line up/down with undo restores exactly" {
     const allocator = std.testing.allocator;
-    var doc = Document.init(allocator);
+    var doc = try Document.init(allocator);
     defer doc.deinit();
 
     try doc.loadText("one\ntwo\nthree");
@@ -896,7 +908,7 @@ test "move line up/down with undo restores exactly" {
 
 test "move line preserves CRLF endings" {
     const allocator = std.testing.allocator;
-    var doc = Document.init(allocator);
+    var doc = try Document.init(allocator);
     defer doc.deinit();
 
     try doc.loadText("aaa\r\nbbb\r\nccc");
@@ -916,7 +928,7 @@ test "move line preserves CRLF endings" {
 
 test "multi-cursor insert is one undo step" {
     const allocator = std.testing.allocator;
-    var doc = Document.init(allocator);
+    var doc = try Document.init(allocator);
     defer doc.deinit();
 
     try doc.loadText("a\nb\nc");
@@ -935,7 +947,7 @@ test "multi-cursor insert is one undo step" {
 
 test "duplicate line uses CRLF in CRLF documents" {
     const allocator = std.testing.allocator;
-    var doc = Document.init(allocator);
+    var doc = try Document.init(allocator);
     defer doc.deinit();
 
     try doc.loadText("aaa\r\nbbb");
@@ -946,7 +958,7 @@ test "duplicate line uses CRLF in CRLF documents" {
 
 test "document line ending detection" {
     const allocator = std.testing.allocator;
-    var doc = Document.init(allocator);
+    var doc = try Document.init(allocator);
     defer doc.deinit();
 
     try doc.loadText("hello\r\nworld");
