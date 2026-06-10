@@ -483,6 +483,34 @@ zide.register_lsp({
 - `zig build run-gui` — Build and run GUI (alias: `run`)
 - `zig build test` — Run unit tests
 
+### Toolchain & Dependencies (Zig 0.16)
+
+ZIDE builds with **Zig 0.16.0** (pinned in `build.zig.zon`'s
+`minimum_zig_version` — anyzig dispatches this exact version). Vendored deps
+in `libs/` are upstream-main snapshots that target 0.16: **dvui** (GUI,
+exposes `dvui_sdl3`/`dvui_sdl3gpu`), **ziglua** (upstream now calls itself
+*zlua*; the module name we import was already `zlua`), and **libvaxis**
+(TUI). The old `zit` dependency was removed entirely (imported nowhere).
+Their transitive deps (SDL3, freetype, Lua 5.4, zigimg, uucode, translate-c,
+…) are fetched by the build into the project-local `zig-pkg/` directory
+(gitignored; the global cache keeps the compressed tarballs).
+
+Migration conventions from the 0.16 `std.Io` era, for anyone touching core:
+
+- **`Editor.io: std.Io`** is threaded through like an Allocator: file I/O
+  (`Document.open/save`, `Buffer.loadFile/saveFile`), process spawning
+  (LSP, "open folder"), and timestamps (`std.Io.Clock.now(.awake, io)`)
+  all take or use it. Tests use `std.testing.io`.
+- **Mutexes** are `std.Io.Mutex` locked with `lockUncancelable(io)` /
+  `unlock(io)` — `Terminal` and the LSP message queue store the io they
+  lock with.
+- **`lua_settings.process_environ` / `global_io`** are module-level
+  context set first thing in `main()` (env vars and Io are no longer
+  global in std; the file logger needs config paths before an Editor
+  exists). `std.Options.debug_io` powers the logger itself.
+- **Juicy Main**: `pub fn main(init: std.process.Init)` supplies the gpa
+  (leak-checked in Debug), io, args, and environ map.
+
 ### Hybrid Launch (Frontend Auto-Detection)
 
 The `zide` binary contains **both** frontends and picks one at launch:
