@@ -7,7 +7,7 @@
 - [] LLM support using OpenAI API for various cloud providers and local LLMs (And claude if allowed)
 - [] Git integration (gutter signs)
 - [] Terminal Splitting
-- [] Block/column selection
+- [x] Block/column selection (Alt+drag; Ctrl+Shift+Up/Down and Alt+click already stacked cursors)
 - [x] Ctrl+/ to comment highlighted text (uses register_language's line_comment/block_comment fields — upkeep lives in Lua configs)
 - [] Debug Support
 - [] Nerdfont/Custom Icon integration

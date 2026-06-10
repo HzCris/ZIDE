@@ -229,12 +229,16 @@ var scroll_pinned: bool = false;
 var last_click_time_ns: i128 = 0;
 var last_click_offset: usize = 0;
 var click_count: u8 = 1;
-/// Selection mode for drag after multi-click (extends by word/line).
-const DragMode = enum { char, word, line };
+/// Selection mode for drag after multi-click (extends by word/line) or
+/// Shift+Alt+drag (block/column selection).
+const DragMode = enum { char, word, line, block };
 var drag_mode: DragMode = .char;
 /// Word/line boundaries anchored by double/triple-click for drag extension.
 var drag_word_start: usize = 0;
 var drag_word_end: usize = 0;
+/// Anchor (line, col) for block-selection drags.
+var block_anchor_line: usize = 0;
+var block_anchor_col: usize = 0;
 
 /// Auto-save timer (nanosecond timestamp of last auto-save check).
 var last_auto_save_ns: i128 = 0;
@@ -1741,9 +1745,23 @@ fn handleMouseEvents(editor: *Editor, pane_id: u8, wd: *dvui.WidgetData, area: d
 
                 const offset = screenToOffset(doc, area, font, line_height, scale, me.p, tab_width, do_wrap);
 
-                // Alt+click: add a cursor at click position
+                // Alt+click: add a cursor; Shift+Alt+drag: block selection
                 if (me.mod.alt()) {
-                    doc.cursors.addCursor(offset) catch {};
+                    if (me.mod.shift()) {
+                        const p = doc.buffer.offsetToPos(offset);
+                        doc.cursors.clearSecondary();
+                        const c = doc.cursors.primary();
+                        c.clearSelection();
+                        c.offset = offset;
+                        c.preferred_col = p.col;
+                        drag_active = true;
+                        drag_pane = pane_id;
+                        drag_mode = .block;
+                        block_anchor_line = p.line;
+                        block_anchor_col = p.col;
+                    } else {
+                        doc.cursors.addCursor(offset) catch {};
+                    }
                     continue;
                 }
 
@@ -1877,6 +1895,17 @@ fn handleMouseEvents(editor: *Editor, pane_id: u8, wd: *dvui.WidgetData, area: d
                                 c.offset = drag_word_end;
                             }
                             c.preferred_col = doc.buffer.offsetToPos(c.offset).col;
+                        },
+                        .block => {
+                            // Block (column) selection: cursor per line, same col span
+                            const p = doc.buffer.offsetToPos(offset);
+                            doc.cursors.setBlockSelection(
+                                &doc.buffer,
+                                block_anchor_line,
+                                block_anchor_col,
+                                p.line,
+                                p.col,
+                            ) catch {};
                         },
                     }
                 }

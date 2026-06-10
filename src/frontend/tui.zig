@@ -177,6 +177,13 @@ fn terminalWakeFn() void {
 /// Cleared when the cursor moves (key press, click, etc.).
 var scroll_pinned: bool = false;
 
+/// Block (column) selection drag state — armed on Alt+press, engaged once
+/// the drag leaves the press cell.
+var block_drag: bool = false;
+var block_engaged: bool = false;
+var block_anchor_line: usize = 0;
+var block_anchor_col: usize = 0;
+
 /// Run the TUI editor.
 pub fn run(allocator: std.mem.Allocator, editor: *Editor) !void {
     // Initialize TTY
@@ -1555,11 +1562,29 @@ fn handleMouse(editor: *Editor, mouse: vaxis.Mouse) void {
                     }
                 }
 
+                block_drag = false;
+                block_engaged = false;
                 if (screenToOffset(editor, mouse.col, mouse.row)) |offset| {
                     const doc = editor.activeDoc();
                     if (mouse.mods.alt) {
-                        // Alt+click: add cursor at click position
-                        doc.cursors.addCursor(offset) catch {};
+                        // Alt+click adds a cursor; if a drag follows and leaves
+                        // the press cell, it promotes to a block (column)
+                        // selection. Plain Alt (not Shift+Alt) must arm it too:
+                        // Windows Terminal swallows Shift+drag for its own
+                        // selection and never forwards it.
+                        const p = doc.buffer.offsetToPos(offset);
+                        block_drag = true;
+                        block_anchor_line = p.line;
+                        block_anchor_col = p.col;
+                        if (mouse.mods.shift) {
+                            doc.cursors.clearSecondary();
+                            const c = doc.cursors.primary();
+                            c.clearSelection();
+                            c.offset = offset;
+                            c.preferred_col = p.col;
+                        } else {
+                            doc.cursors.addCursor(offset) catch {};
+                        }
                     } else {
                         // Regular click: clear secondary cursors if enabled
                         if (editor.click_clears_cursors and doc.cursors.count() > 1) {
@@ -1572,13 +1597,35 @@ fn handleMouse(editor: *Editor, mouse: vaxis.Mouse) void {
                     }
                 }
             } else if (mouse.type == .drag) {
-                // Drag: extend selection
                 if (screenToOffset(editor, mouse.col, mouse.row)) |offset| {
-                    const c = editor.activeDoc().cursors.primary();
-                    if (!c.hasSelection()) c.startSelection();
-                    c.offset = offset;
-                    c.preferred_col = editor.activeDoc().buffer.offsetToPos(offset).col;
+                    const doc = editor.activeDoc();
+                    if (block_drag) {
+                        // Block (column) selection: cursor per line, same col
+                        // span. Only engage once the drag leaves the press
+                        // cell, so a steady Alt+click never disturbs other
+                        // alt-clicked cursors.
+                        const p = doc.buffer.offsetToPos(offset);
+                        if (block_engaged or p.line != block_anchor_line or p.col != block_anchor_col) {
+                            block_engaged = true;
+                            doc.cursors.setBlockSelection(
+                                &doc.buffer,
+                                block_anchor_line,
+                                block_anchor_col,
+                                p.line,
+                                p.col,
+                            ) catch {};
+                        }
+                    } else {
+                        // Drag: extend selection
+                        const c = doc.cursors.primary();
+                        if (!c.hasSelection()) c.startSelection();
+                        c.offset = offset;
+                        c.preferred_col = doc.buffer.offsetToPos(offset).col;
+                    }
                 }
+            } else if (mouse.type == .release) {
+                block_drag = false;
+                block_engaged = false;
             }
         },
         .wheel_up => {

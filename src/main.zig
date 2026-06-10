@@ -108,7 +108,8 @@ const welcome_text =
     \\// Multi-cursor
     \\//   Ctrl+D            select next occurrence of selection
     \\//   Ctrl+Shift+Up/Dn  add cursor above / below  (also Ctrl+Alt+Up/Dn)
-    \\//   Alt+Click         add cursor at mouse       (GUI)
+    \\//   Alt+Click         add cursor at mouse
+    \\//   Shift+Alt+Drag    block / column selection  (TUI: plain Alt+Drag)
     \\//
     \\// Tabs & panes (a pane is a split, a tab is a document)
     \\//   Ctrl+W            close tab          Ctrl+Tab         next tab

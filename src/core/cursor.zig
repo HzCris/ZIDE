@@ -251,6 +251,50 @@ pub const CursorSet = struct {
         _ = self.cursors.orderedRemove(idx);
     }
 
+    /// Replace all cursors with a block (column) selection: one cursor per
+    /// line between `anchor_line` and `head_line`, each selecting the byte
+    /// column span anchor_col..head_col (clamped to that line's length).
+    /// Lines shorter than the span get a zero-width cursor at their end —
+    /// they still take part in subsequent multi-cursor edits. The head
+    /// line's cursor becomes primary so continued dragging extends from it.
+    pub fn setBlockSelection(
+        self: *CursorSet,
+        buffer: *Buffer,
+        anchor_line: usize,
+        anchor_col: usize,
+        head_line: usize,
+        head_col: usize,
+    ) !void {
+        const last_line = buffer.lineCount() -| 1;
+        const lo = @min(@min(anchor_line, head_line), last_line);
+        const hi = @min(@max(anchor_line, head_line), last_line);
+
+        self.cursors.clearRetainingCapacity();
+        // Never leave the set empty — primary() indexes [0] unconditionally.
+        // Capacity for one cursor is guaranteed: init() appended one.
+        errdefer if (self.cursors.items.len == 0) self.cursors.appendAssumeCapacity(.{});
+
+        var line = lo;
+        while (line <= hi) : (line += 1) {
+            const line_len = buffer.lineContent(line).len;
+            const a = @min(anchor_col, line_len);
+            const h = @min(head_col, line_len);
+            var cur = Cursor{
+                .offset = buffer.posToOffset(line, h),
+                .preferred_col = head_col,
+            };
+            if (a != h) cur.anchor = buffer.posToOffset(line, a);
+            try self.cursors.append(self.allocator, cur);
+        }
+
+        // The drag head must be the primary cursor (index 0). Cursors were
+        // appended top-down, so a downward drag leaves the head at the end.
+        if (head_line > anchor_line and self.cursors.items.len > 1) {
+            const last = self.cursors.items.len - 1;
+            std.mem.swap(Cursor, &self.cursors.items[0], &self.cursors.items[last]);
+        }
+    }
+
     /// Merge cursors that ended up at the same offset. Keeps primary (index 0) if duplicated.
     pub fn mergeCursors(self: *CursorSet) void {
         if (self.cursors.items.len <= 1) return;
@@ -434,6 +478,81 @@ test "selection" {
 
     cursor.clearSelection();
     try std.testing.expect(!cursor.hasSelection());
+}
+
+test "block selection: one selecting cursor per line, head is primary" {
+    const allocator = std.testing.allocator;
+    var buf = try Buffer.init(allocator);
+    defer buf.deinit();
+    try buf.loadText("alpha one\nbeta two\ngamma three");
+
+    var cs = try CursorSet.init(allocator);
+    defer cs.deinit();
+
+    // Drag from (0, 2) down to (2, 7): cols 2..7 on each line
+    try cs.setBlockSelection(&buf, 0, 2, 2, 7);
+    try std.testing.expectEqual(@as(usize, 3), cs.count());
+
+    // Primary is the drag head (line 2)
+    const p = cs.primary().pos(&buf);
+    try std.testing.expectEqual(@as(usize, 2), p.line);
+    try std.testing.expectEqual(@as(usize, 7), p.col);
+
+    // Every cursor selects bytes 2..7 of its line
+    for (cs.cursors.items) |c| {
+        const r = c.selectionRange().?;
+        const line = buf.offsetToPos(c.offset).line;
+        try std.testing.expectEqual(buf.posToOffset(line, 2), r.start);
+        try std.testing.expectEqual(buf.posToOffset(line, 7), r.end);
+    }
+}
+
+test "block selection: short lines clamp, zero-width cursor kept" {
+    const allocator = std.testing.allocator;
+    var buf = try Buffer.init(allocator);
+    defer buf.deinit();
+    try buf.loadText("longer line\nab\n\nlonger again");
+
+    var cs = try CursorSet.init(allocator);
+    defer cs.deinit();
+
+    // Column span 4..8 — "ab" and the empty line are shorter than 4
+    try cs.setBlockSelection(&buf, 0, 4, 3, 8);
+    try std.testing.expectEqual(@as(usize, 4), cs.count());
+
+    var zero_width: usize = 0;
+    for (cs.cursors.items) |c| {
+        const pos = buf.offsetToPos(c.offset);
+        if (pos.line == 1 or pos.line == 2) {
+            // Clamped to line end, no selection
+            try std.testing.expect(!c.hasSelection());
+            zero_width += 1;
+        } else {
+            try std.testing.expect(c.hasSelection());
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 2), zero_width);
+}
+
+test "block selection: upward drag keeps head primary, lines clamp to buffer" {
+    const allocator = std.testing.allocator;
+    var buf = try Buffer.init(allocator);
+    defer buf.deinit();
+    try buf.loadText("one\ntwo\nthree");
+
+    var cs = try CursorSet.init(allocator);
+    defer cs.deinit();
+
+    // Drag upward from (2, 3) to (0, 1)
+    try cs.setBlockSelection(&buf, 2, 3, 0, 1);
+    try std.testing.expectEqual(@as(usize, 3), cs.count());
+    const p = cs.primary().pos(&buf);
+    try std.testing.expectEqual(@as(usize, 0), p.line); // head on top line
+    try std.testing.expectEqual(@as(usize, 1), p.col);
+
+    // Anchor/head lines past the end clamp instead of crashing
+    try cs.setBlockSelection(&buf, 1, 0, 99, 2);
+    try std.testing.expectEqual(@as(usize, 2), cs.count());
 }
 
 test "cursor set adjust after insert" {

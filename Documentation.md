@@ -33,6 +33,7 @@
 | Ctrl+` | Toggle terminal (bottom split) |
 | Ctrl+Shift+` | Open terminal (side-by-side split) |
 | Alt+Click | Add cursor at click position |
+| Shift+Alt+Drag (GUI) / Alt+Drag (TUI) | Block (column) selection — one cursor per line over the dragged column span |
 | Ctrl+K | Delete line |
 | Ctrl+/ | Toggle comment on selected lines (uses the language's line comment; wraps in block comments for languages without one, e.g. CSS) |
 | Escape / Left-click | Remove secondary cursors |
@@ -105,6 +106,7 @@ Windows terminals commonly intercept Alt combos (Windows Terminal binds Alt+arro
 **Mouse:**
 - Left click to position cursor (clears secondary cursors, configurable)
 - Alt+click to add cursor at position
+- Alt+drag for block (column) selection: one cursor per line over the dragged column span; short lines get a zero-width cursor at their end. Shift+Alt+drag also works in terminals that forward Shift+drag (Windows Terminal keeps it for its own selection, hence plain Alt+drag)
 - Left drag to select text
 - Scroll wheel to scroll viewport (independent of cursor position)
 - Click a tab in the tab bar to switch to it
@@ -181,7 +183,7 @@ Windows terminals commonly intercept Alt combos (Windows Terminal binds Alt+arro
 - Find/Replace match count display (shows "N matches" in overlay bar)
 - Command palette Tab/arrow cycling with highlighted selection (Enter executes selected)
 - Configurable line number gutter width (`zide.set("gutter_min_digits", N)` in init.lua, default 3)
-- Mouse selection: double-click selects word, triple-click selects line, drag extends by word/line accordingly, Shift+click extends selection, Alt+click adds cursor
+- Mouse selection: double-click selects word, triple-click selects line, drag extends by word/line accordingly, Shift+click extends selection, Alt+click adds cursor, Shift+Alt+drag for block (column) selection (one cursor per line over the dragged column span)
 
 - Settings dialog (Preferences menu — modal DVUI floating window with native widgets: checkboxes for booleans, validated numeric entries with min/max, dropdown for theme; draggable by header, auto-centered, dims the background; changes apply live and write to init.lua immediately; close via header X or Escape; Tab/Shift+Tab cycles controls)
 - Open Settings File (Preferences menu — opens init.lua directly in the editor for power users)
