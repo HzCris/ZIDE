@@ -309,6 +309,14 @@ pub const Editor = struct {
     /// Close the active document. Returns false if it was the last one
     /// (creates a new empty document in that case).
     pub fn closeActiveDoc(self: *Editor) bool {
+        return self.closeDocAt(self.active_doc_idx);
+    }
+
+    /// Close the document at `idx` (e.g. a tab's close button) without
+    /// stealing a focused terminal pane. Returns false if it was the last
+    /// document (replaced with a fresh empty one in that case).
+    pub fn closeDocAt(self: *Editor, doc_idx: usize) bool {
+        if (doc_idx >= self.documents.items.len) return false;
         if (self.documents.items.len <= 1) {
             // Build the replacement first — deinit'ing the old document and
             // then failing to construct a new one would leave items[0] invalid.
@@ -320,14 +328,17 @@ pub const Editor = struct {
             self.documents.items[0].deinit();
             self.documents.items[0] = fresh;
             self.active_doc_idx = 0;
-            self.paneShowDoc(0);
+            // Don't convert a focused terminal pane into an editor pane.
+            if (!self.activePaneIsTerminal()) self.paneShowDoc(0);
             return false;
         }
-        const removed_idx = self.active_doc_idx;
+        const removed_idx = doc_idx;
         self.lspDidClose(&self.documents.items[removed_idx]);
         self.documents.items[removed_idx].deinit();
         _ = self.documents.orderedRemove(removed_idx);
-        if (self.active_doc_idx >= self.documents.items.len) {
+        if (self.active_doc_idx > removed_idx) {
+            self.active_doc_idx -= 1;
+        } else if (self.active_doc_idx >= self.documents.items.len) {
             self.active_doc_idx = self.documents.items.len - 1;
         }
         // Fix up all pane doc indices after document removal:
@@ -393,8 +404,19 @@ pub const Editor = struct {
         }
         if (std.mem.eql(u8, action, "save")) {
             const doc = self.activeDoc();
-            doc.save() catch {};
+            doc.save() catch |err| {
+                if (err == error.NoFilePath) {
+                    // Untitled buffer — route to Save As instead of silently
+                    // dropping the save.
+                    return self.execAction("save_as");
+                }
+                const msg = std.fmt.bufPrint(&self.status_buf, "Save failed: {s}", .{@errorName(err)}) catch "Save failed";
+                self.status_message = msg;
+                return true;
+            };
             self.lspDidSave(doc);
+            const msg = std.fmt.bufPrint(&self.status_buf, "Saved {s}", .{doc.display_name}) catch "Saved";
+            self.status_message = msg;
             return true;
         }
         if (std.mem.eql(u8, action, "find")) {
@@ -892,8 +914,10 @@ pub const Editor = struct {
 
         const cursor = doc.cursors.primary();
         const pos = doc.buffer.offsetToPos(cursor.offset);
+        // LSP positions are UTF-16 code units, not bytes
+        const utf16_col = lsp_mod.byteColToUtf16(doc.buffer.lineContent(pos.line), pos.col);
 
-        _ = lsp_client.sendCompletion(uri, @intCast(pos.line), @intCast(pos.col)) catch return;
+        _ = lsp_client.sendCompletion(uri, @intCast(pos.line), utf16_col) catch return;
     }
 
     /// Trigger LSP go-to-definition at the current cursor position.
@@ -909,8 +933,10 @@ pub const Editor = struct {
 
         const cursor = doc.cursors.primary();
         const pos = doc.buffer.offsetToPos(cursor.offset);
+        // LSP positions are UTF-16 code units, not bytes
+        const utf16_col = lsp_mod.byteColToUtf16(doc.buffer.lineContent(pos.line), pos.col);
 
-        _ = lsp_client.sendGotoDefinition(uri, @intCast(pos.line), @intCast(pos.col)) catch return;
+        _ = lsp_client.sendGotoDefinition(uri, @intCast(pos.line), utf16_col) catch return;
     }
 
     /// Accept the currently selected completion item.

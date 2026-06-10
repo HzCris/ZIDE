@@ -489,14 +489,19 @@ pub const LspClient = struct {
                 }
                 doc.diagnostics.clearRetainingCapacity();
 
-                // Add new diagnostics
+                // Add new diagnostics (server columns are UTF-16 code units;
+                // convert to byte columns, which is what rendering uses)
                 for (params.diagnostics) |lsp_diag| {
                     const msg = self.allocator.dupe(u8, lsp_diag.message) catch continue;
+                    const start_line_text = doc.buffer.lineContent(lsp_diag.range.start.line);
+                    const start_col: u32 = @intCast(utf16ColToByte(start_line_text, lsp_diag.range.start.character));
+                    const end_line_text = doc.buffer.lineContent(lsp_diag.range.end.line);
+                    const end_col: u32 = @intCast(utf16ColToByte(end_line_text, lsp_diag.range.end.character));
                     doc.diagnostics.append(doc.allocator, .{
                         .start_line = lsp_diag.range.start.line,
-                        .start_col = lsp_diag.range.start.character,
+                        .start_col = start_col,
                         .end_line = lsp_diag.range.end.line,
-                        .end_col = lsp_diag.range.end.character,
+                        .end_col = end_col,
                         .severity = if (lsp_diag.severity) |s| switch (s) {
                             1 => .err,
                             2 => .warning,
@@ -805,6 +810,57 @@ pub fn uriToPath(allocator: Allocator, uri: []const u8) ![]const u8 {
 }
 
 // ---------------------------------------------------------------------------
+// LSP position encoding (UTF-16 code units <-> byte columns)
+// ---------------------------------------------------------------------------
+
+/// Convert a byte column within `line` to a UTF-16 code-unit column.
+/// LSP positions default to UTF-16; sending byte columns misplaces
+/// completions/definitions on any line with non-ASCII text.
+pub fn byteColToUtf16(line: []const u8, byte_col: usize) u32 {
+    var units: u32 = 0;
+    var i: usize = 0;
+    const end = @min(byte_col, line.len);
+    while (i < end) {
+        const len = std.unicode.utf8ByteSequenceLength(line[i]) catch {
+            units += 1;
+            i += 1;
+            continue;
+        };
+        if (i + len > line.len) break;
+        const cp = std.unicode.utf8Decode(line[i .. i + len]) catch {
+            units += 1;
+            i += 1;
+            continue;
+        };
+        units += if (cp >= 0x10000) 2 else 1;
+        i += len;
+    }
+    return units;
+}
+
+/// Convert a UTF-16 code-unit column to a byte column within `line`.
+pub fn utf16ColToByte(line: []const u8, utf16_col: u32) usize {
+    var units: u32 = 0;
+    var i: usize = 0;
+    while (i < line.len and units < utf16_col) {
+        const len = std.unicode.utf8ByteSequenceLength(line[i]) catch {
+            units += 1;
+            i += 1;
+            continue;
+        };
+        if (i + len > line.len) break;
+        const cp = std.unicode.utf8Decode(line[i .. i + len]) catch {
+            units += 1;
+            i += 1;
+            continue;
+        };
+        units += if (cp >= 0x10000) 2 else 1;
+        i += len;
+    }
+    return i;
+}
+
+// ---------------------------------------------------------------------------
 // JSON string escaping
 // ---------------------------------------------------------------------------
 
@@ -896,6 +952,27 @@ test "pathsEqual" {
         try std.testing.expect(pathsEqual("/foo/bar.zig", "/foo/bar.zig"));
         try std.testing.expect(!pathsEqual("/foo/Bar.zig", "/foo/bar.zig"));
     }
+}
+
+test "utf16 column conversion" {
+    // ASCII: byte col == utf16 col
+    try std.testing.expectEqual(@as(u32, 5), byteColToUtf16("hello", 5));
+    try std.testing.expectEqual(@as(usize, 5), utf16ColToByte("hello", 5));
+
+    // 2-byte é (1 UTF-16 unit, 2 bytes): "héllo"
+    const accented = "h\u{e9}llo";
+    try std.testing.expectEqual(@as(u32, 2), byteColToUtf16(accented, 3)); // after é
+    try std.testing.expectEqual(@as(usize, 3), utf16ColToByte(accented, 2));
+
+    // Emoji 😀 (surrogate pair: 2 UTF-16 units, 4 bytes): "a😀b"
+    const emoji = "a\u{1F600}b";
+    try std.testing.expectEqual(@as(u32, 3), byteColToUtf16(emoji, 5)); // after emoji
+    try std.testing.expectEqual(@as(usize, 5), utf16ColToByte(emoji, 3));
+    try std.testing.expectEqual(@as(usize, 6), utf16ColToByte(emoji, 4)); // after b
+
+    // Clamping: past end of line
+    try std.testing.expectEqual(@as(u32, 2), byteColToUtf16("ab", 99));
+    try std.testing.expectEqual(@as(usize, 2), utf16ColToByte("ab", 99));
 }
 
 test "MessageQueue push pop" {

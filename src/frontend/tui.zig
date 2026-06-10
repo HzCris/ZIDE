@@ -49,16 +49,63 @@ const ByteLut = struct {
     }
 };
 
-/// Write an ASCII string to the window cell-by-cell (safe for stack buffers).
-/// Returns the column after the last character written.
+/// Per-frame storage for multi-byte grapheme strings referenced by vaxis
+/// cells (see header comment — cell text must outlive vx.render). Reset at
+/// the top of each frame in `run`.
+var grapheme_arena: [128 * 1024]u8 = undefined;
+var grapheme_arena_len: usize = 0;
+
+fn frameArenaReset() void {
+    grapheme_arena_len = 0;
+}
+
+/// Copy `bytes` into the frame arena, returning a slice that stays valid
+/// until the next frameArenaReset. Falls back to "?" if the arena is full.
+fn frameArenaDupe(bytes: []const u8) []const u8 {
+    if (bytes.len == 1) return ByteLut.grapheme(bytes[0]);
+    if (grapheme_arena_len + bytes.len > grapheme_arena.len) return "?";
+    const dst = grapheme_arena[grapheme_arena_len..][0..bytes.len];
+    @memcpy(dst, bytes);
+    grapheme_arena_len += bytes.len;
+    return dst;
+}
+
+/// Write a UTF-8 string to the window, one cell per codepoint (previously
+/// byte-per-cell, which rendered non-ASCII text as mojibake). Multi-byte
+/// codepoints are copied into the frame arena so the cell references stay
+/// valid through render. Returns the column after the last cell written.
 fn writeStr(win: Window, col: u16, row: u16, text: []const u8, style: Style) u16 {
     var x = col;
-    for (text) |byte| {
+    var i: usize = 0;
+    while (i < text.len) {
         if (x >= win.width) break;
+        const b = text[i];
+        if (b < 0x80) {
+            // ASCII fast path — static lookup, no arena
+            win.writeCell(x, row, .{
+                .char = .{ .grapheme = ByteLut.grapheme(b), .width = 1 },
+                .style = style,
+            });
+            i += 1;
+            x += 1;
+            continue;
+        }
+        const seq_len = std.unicode.utf8ByteSequenceLength(b) catch 0;
+        if (seq_len == 0 or i + seq_len > text.len or !std.unicode.utf8ValidateSlice(text[i .. i + seq_len])) {
+            // Invalid byte — render replacement char, advance one byte to resync
+            win.writeCell(x, row, .{
+                .char = .{ .grapheme = "\u{FFFD}", .width = 1 },
+                .style = style,
+            });
+            i += 1;
+            x += 1;
+            continue;
+        }
         win.writeCell(x, row, .{
-            .char = .{ .grapheme = ByteLut.grapheme(byte), .width = 1 },
+            .char = .{ .grapheme = frameArenaDupe(text[i .. i + seq_len]), .width = 1 },
             .style = style,
         });
+        i += seq_len;
         x += 1;
     }
     return x;
@@ -193,6 +240,8 @@ pub fn run(allocator: std.mem.Allocator, editor: *Editor) !void {
         }
 
         win.clear();
+        // New frame: previous frame's grapheme references are now dead
+        frameArenaReset();
 
         if (height < 3 or width < 10) {
             try vx.render(tty.writer());
@@ -528,14 +577,14 @@ fn drawPane(win: Window, editor: *Editor, pane_id: u8, width: u16, height: u16) 
             // Only the active pane's doc drives editor.text_width and cursor-visible logic
             if (is_active) {
                 const total_lines = doc.lineCount();
-                const gutter_w = lineNumberWidth(total_lines);
+                const gutter_w = lineNumberWidth(total_lines, editor.gutter_min_digits);
                 const tw: u16 = if (width > gutter_w + 1) width - gutter_w - 1 else 1;
                 editor.text_width = tw;
 
                 if (!scroll_pinned) {
                     if (editor.word_wrap) {
                         doc.scroll_left = 0;
-                        ensureCursorVisibleWrapped(doc, height, width);
+                        ensureCursorVisibleWrapped(doc, height, width, editor.gutter_min_digits);
                     } else {
                         doc.ensureCursorVisible(height, width -| 5);
                     }
@@ -579,8 +628,15 @@ fn drawTerminalInPane(win: Window, editor: *Editor, term: *terminal_mod.Terminal
             const fg: Color = .{ .rgb = .{ fg_tc.r, fg_tc.g, fg_tc.b } };
             const bg: Color = .{ .rgb = .{ bg_tc.r, bg_tc.g, bg_tc.b } };
 
-            var glyph_buf: [4]u8 = undefined;
-            const glyph_len = std.unicode.utf8Encode(cell.codepoint, &glyph_buf) catch 0;
+            // vaxis stores grapheme slices by reference — a stack buffer here
+            // dangles before render. ASCII uses the static LUT; multi-byte
+            // goes through the frame arena.
+            var enc_buf: [4]u8 = undefined;
+            const glyph_len = std.unicode.utf8Encode(cell.codepoint, &enc_buf) catch 0;
+            const grapheme: []const u8 = if (glyph_len == 0)
+                " "
+            else
+                frameArenaDupe(enc_buf[0..glyph_len]);
             const style: Style = .{
                 .fg = fg,
                 .bg = bg,
@@ -588,7 +644,7 @@ fn drawTerminalInPane(win: Window, editor: *Editor, term: *terminal_mod.Terminal
                 .ul_style = if (cell.underline) .single else .off,
             };
             win.writeCell(@intCast(c), @intCast(r), .{
-                .char = if (glyph_len > 0) .{ .grapheme = glyph_buf[0..glyph_len], .width = 1 } else .{ .grapheme = " ", .width = 1 },
+                .char = .{ .grapheme = grapheme, .width = 1 },
                 .style = style,
             });
         }
@@ -735,6 +791,10 @@ fn moveVisualVertical(editor: *Editor, direction: enum { up, down }, extend_sele
         const pos = buf.offsetToPos(c.offset);
         const cur_line = doc.lineContent(pos.line);
         const wrap_pos = wrapColToVisual(cur_line, text_width, pos.col);
+        // Target column is the DISPLAY column within the current visual row —
+        // preferred_col is a byte column within the whole logical line, which
+        // made vertical movement in wrapped lines snap to row ends.
+        const target_dcol: usize = wrap_pos.col;
 
         if (!extend_selection) {
             c.clearSelection();
@@ -745,23 +805,23 @@ fn moveVisualVertical(editor: *Editor, direction: enum { up, down }, extend_sele
         switch (direction) {
             .up => {
                 if (wrap_pos.row > 0) {
-                    const target_col = wrapVisualToCol(cur_line, text_width, wrap_pos.row - 1, c.preferred_col);
+                    const target_col = wrapVisualToCol(cur_line, text_width, wrap_pos.row - 1, target_dcol);
                     c.offset = buf.posToOffset(pos.line, target_col);
                 } else if (pos.line > 0) {
                     const prev_line = doc.lineContent(pos.line - 1);
                     const prev_rows = wrapLineRows(prev_line, text_width);
-                    const target_col = wrapVisualToCol(prev_line, text_width, prev_rows - 1, c.preferred_col);
+                    const target_col = wrapVisualToCol(prev_line, text_width, prev_rows - 1, target_dcol);
                     c.offset = buf.posToOffset(pos.line - 1, target_col);
                 }
             },
             .down => {
                 const cur_rows = wrapLineRows(cur_line, text_width);
                 if (wrap_pos.row + 1 < cur_rows) {
-                    const target_col = wrapVisualToCol(cur_line, text_width, wrap_pos.row + 1, c.preferred_col);
+                    const target_col = wrapVisualToCol(cur_line, text_width, wrap_pos.row + 1, target_dcol);
                     c.offset = buf.posToOffset(pos.line, target_col);
                 } else if (pos.line + 1 < total_lines) {
                     const next_line = doc.lineContent(pos.line + 1);
-                    const target_col = wrapVisualToCol(next_line, text_width, 0, c.preferred_col);
+                    const target_col = wrapVisualToCol(next_line, text_width, 0, target_dcol);
                     c.offset = buf.posToOffset(pos.line + 1, target_col);
                 }
             },
@@ -817,27 +877,31 @@ fn tuiAddCursorVisual(editor: *Editor, direction: enum { up, down }) void {
 
     const ref_cursor = doc.cursors.cursors.items[edge_idx];
     const cur_line = doc.lineContent(edge_line);
+    // Use the edge cursor's display column within its visual row (see
+    // moveVisualVertical — preferred_col is the wrong unit here).
+    const ref_pos = buf.offsetToPos(ref_cursor.offset);
+    const ref_dcol: usize = wrapColToVisual(cur_line, text_width, ref_pos.col).col;
 
     switch (direction) {
         .up => {
             if (edge_wrap_row > 0) {
-                const target_col = wrapVisualToCol(cur_line, text_width, edge_wrap_row - 1, ref_cursor.preferred_col);
+                const target_col = wrapVisualToCol(cur_line, text_width, edge_wrap_row - 1, ref_dcol);
                 doc.cursors.addCursor(buf.posToOffset(edge_line, target_col)) catch {};
             } else if (edge_line > 0) {
                 const prev_line = doc.lineContent(edge_line - 1);
                 const prev_rows = wrapLineRows(prev_line, text_width);
-                const target_col = wrapVisualToCol(prev_line, text_width, prev_rows - 1, ref_cursor.preferred_col);
+                const target_col = wrapVisualToCol(prev_line, text_width, prev_rows - 1, ref_dcol);
                 doc.cursors.addCursor(buf.posToOffset(edge_line - 1, target_col)) catch {};
             }
         },
         .down => {
             const cur_rows = wrapLineRows(cur_line, text_width);
             if (edge_wrap_row + 1 < cur_rows) {
-                const target_col = wrapVisualToCol(cur_line, text_width, edge_wrap_row + 1, ref_cursor.preferred_col);
+                const target_col = wrapVisualToCol(cur_line, text_width, edge_wrap_row + 1, ref_dcol);
                 doc.cursors.addCursor(buf.posToOffset(edge_line, target_col)) catch {};
             } else if (edge_line + 1 < total_lines) {
                 const next_line = doc.lineContent(edge_line + 1);
-                const target_col = wrapVisualToCol(next_line, text_width, 0, ref_cursor.preferred_col);
+                const target_col = wrapVisualToCol(next_line, text_width, 0, ref_dcol);
                 doc.cursors.addCursor(buf.posToOffset(edge_line + 1, target_col)) catch {};
             }
         },
@@ -884,10 +948,10 @@ fn wrapVisualToCol(line: []const u8, text_width: u16, target_row: u16, preferred
 
 /// Ensure the cursor is visible when word wrapping is active.
 /// Accounts for variable visual row heights per logical line.
-fn ensureCursorVisibleWrapped(doc: *Document, editor_height: u16, width: u16) void {
+fn ensureCursorVisibleWrapped(doc: *Document, editor_height: u16, width: u16, min_digits: usize) void {
     if (editor_height == 0) return;
     const total_lines = doc.lineCount();
-    const gutter_width = lineNumberWidth(total_lines);
+    const gutter_width = lineNumberWidth(total_lines, min_digits);
     const text_start_x = gutter_width + 1;
     const text_width: u16 = if (width > text_start_x) width - text_start_x else 1;
     const cursor_pos = doc.cursorPos();
@@ -929,7 +993,7 @@ fn ensureCursorVisibleWrapped(doc: *Document, editor_height: u16, width: u16) vo
 /// Draw the editor content area with line numbers and optional word wrap.
 fn drawContent(win: Window, doc: *Document, editor: *Editor, width: u16, height: u16, wrap: bool) void {
     const total_lines = doc.lineCount();
-    const gutter_width = lineNumberWidth(total_lines);
+    const gutter_width = lineNumberWidth(total_lines, editor.gutter_min_digits);
     const text_start_x = gutter_width + 1; // +1 for separator
     const text_width: u16 = if (width > text_start_x) width - text_start_x else 1;
 
@@ -1161,7 +1225,7 @@ fn drawContent(win: Window, doc: *Document, editor: *Editor, width: u16, height:
 /// Draw secondary cursors as reverse-video cells.
 fn drawSecondaryCursors(win: Window, doc: *Document, editor: *Editor, width: u16, height: u16, wrap: bool) void {
     const total_lines = doc.lineCount();
-    const gutter_width = lineNumberWidth(total_lines);
+    const gutter_width = lineNumberWidth(total_lines, editor.gutter_min_digits);
     const text_start_x = gutter_width + 1;
     const text_width: u16 = if (width > text_start_x) width - text_start_x else 1;
     const cursor_style: Style = .{ .bg = toVaxis(editor.tui_theme.cursor_bg), .fg = toVaxis(editor.tui_theme.cursor_fg) };
@@ -1276,14 +1340,16 @@ fn drawStatusBar(win: Window, editor: *Editor, width: u16) void {
 }
 
 /// Calculate gutter width needed for line numbers.
-fn lineNumberWidth(total_lines: usize) u16 {
+/// Honors the user's gutter_min_digits setting (GUI already did).
+fn lineNumberWidth(total_lines: usize, min_digits: usize) u16 {
     var digits: u16 = 1;
     var n = total_lines;
     while (n >= 10) {
         n /= 10;
         digits += 1;
     }
-    return @max(digits, 3); // minimum 3 chars
+    const min: u16 = @intCast(@min(min_digits, 10));
+    return @max(digits, @max(min, 1));
 }
 
 /// Position the real terminal cursor at the editor cursor location.
@@ -1311,7 +1377,7 @@ fn positionCursor(win: Window, editor: *Editor, width: u16, height: u16) void {
     const pos = doc.cursorPos();
 
     const total_lines = doc.lineCount();
-    const gutter_width = lineNumberWidth(total_lines);
+    const gutter_width = lineNumberWidth(total_lines, editor.gutter_min_digits);
     const text_start_x = gutter_width + 1;
     const text_width: u16 = if (rect.w > text_start_x) rect.w - text_start_x else 1;
 
@@ -1364,7 +1430,7 @@ fn screenToOffset(editor: *Editor, screen_x: i16, screen_y: i16) ?usize {
     const doc = &editor.documents.items[doc_idx];
 
     const total_lines = doc.lineCount();
-    const gutter_width = lineNumberWidth(total_lines);
+    const gutter_width = lineNumberWidth(total_lines, editor.gutter_min_digits);
     const text_start_x: u16 = gutter_width + 1;
 
     // Must be in the text area of the pane
@@ -2069,13 +2135,24 @@ fn handleConfirmQuitKey(editor: *Editor, key: Key) void {
 
     switch (key.codepoint) {
         's', 'S' => {
-            // Save all dirty documents, then quit
+            // Save all dirty documents, then quit — but only if every save
+            // succeeded (silently discarding on failure loses work).
+            var failures: usize = 0;
             for (editor.documents.items) |*doc| {
                 if (doc.dirty) {
-                    doc.save() catch {};
+                    doc.save() catch {
+                        failures += 1;
+                        continue;
+                    };
                 }
             }
-            editor.running = false;
+            if (failures == 0) {
+                editor.running = false;
+            } else {
+                editor.mode = .normal;
+                const msg = std.fmt.bufPrint(&editor.status_buf, "{d} file(s) not saved — use Save As for untitled buffers", .{failures}) catch "Save failed";
+                editor.status_message = msg;
+            }
         },
         'd', 'D' => {
             // Discard and quit
@@ -2095,9 +2172,9 @@ fn findIncremental(editor: *Editor) void {
     const doc = editor.activeDoc();
     const needle = editor.find_buf[0..editor.find_buf_len];
     if (needle.len == 0) {
-        // Empty query — restore cursor to origin
+        // Empty query — restore cursor to origin (no empty selection)
         doc.cursors.primary().offset = editor.find_origin;
-        doc.cursors.primary().anchor = editor.find_origin;
+        doc.cursors.primary().clearSelection();
         editor.status_message = "";
         return;
     }
@@ -2123,9 +2200,9 @@ fn findIncremental(editor: *Editor) void {
         editor.status_message = "Search wrapped";
         return;
     }
-    // No match — keep cursor at origin
+    // No match — keep cursor at origin (no empty selection)
     doc.cursors.primary().offset = editor.find_origin;
-    doc.cursors.primary().anchor = editor.find_origin;
+    doc.cursors.primary().clearSelection();
     editor.status_message = "No matches found";
 }
 

@@ -702,16 +702,20 @@ fn isWordCharByte(byte: u8) bool {
 
 // ---- Theme commands ----
 
-fn setGuiTheme(editor: *Editor, name: []const u8, preset: theme_mod.EditorTheme) void {
+fn setGuiTheme(editor: *Editor, name: []const u8, preset: theme_mod.EditorTheme, syn: theme_mod.SyntaxTheme) void {
     editor.theme = preset;
+    // Keep syntax colors in step — previously only the Lua config path set
+    // them, so live theme switches left a stale syntax palette.
+    editor.syntax_theme = syn;
     editor.theme_name = name;
     var val_buf: [32]u8 = undefined;
     const quoted = std.fmt.bufPrint(&val_buf, "\"{s}\"", .{name}) catch return;
     lua_settings.writeSettingToFile("theme", quoted) catch {};
 }
 
-fn setTuiTheme(editor: *Editor, name: []const u8, preset: theme_mod.TuiTheme) void {
+fn setTuiTheme(editor: *Editor, name: []const u8, preset: theme_mod.TuiTheme, syn: theme_mod.TuiSyntaxTheme) void {
     editor.tui_theme = preset;
+    editor.tui_syntax_theme = syn;
     editor.tui_theme_name = name;
     var val_buf: [32]u8 = undefined;
     const quoted = std.fmt.bufPrint(&val_buf, "\"{s}\"", .{name}) catch return;
@@ -719,44 +723,44 @@ fn setTuiTheme(editor: *Editor, name: []const u8, preset: theme_mod.TuiTheme) vo
 }
 
 fn cmdThemeDark(editor: *Editor, _: ?[]const u8) void {
-    setGuiTheme(editor, "dark", theme_mod.gui_dark);
-    setTuiTheme(editor, "dark", theme_mod.tui_dark);
+    setGuiTheme(editor, "dark", theme_mod.gui_dark, theme_mod.syn_gui_dark);
+    setTuiTheme(editor, "dark", theme_mod.tui_dark, theme_mod.syn_tui_dark);
 }
 
 fn cmdThemeLight(editor: *Editor, _: ?[]const u8) void {
-    setGuiTheme(editor, "light", theme_mod.gui_light);
-    setTuiTheme(editor, "light", theme_mod.tui_light);
+    setGuiTheme(editor, "light", theme_mod.gui_light, theme_mod.syn_gui_light);
+    setTuiTheme(editor, "light", theme_mod.tui_light, theme_mod.syn_tui_light);
 }
 
 fn cmdThemeHighContrast(editor: *Editor, _: ?[]const u8) void {
-    setGuiTheme(editor, "high_contrast", theme_mod.gui_high_contrast);
-    setTuiTheme(editor, "high_contrast", theme_mod.tui_high_contrast);
+    setGuiTheme(editor, "high_contrast", theme_mod.gui_high_contrast, theme_mod.syn_gui_high_contrast);
+    setTuiTheme(editor, "high_contrast", theme_mod.tui_high_contrast, theme_mod.syn_tui_high_contrast);
 }
 
 fn cmdThemeTerminal(editor: *Editor, _: ?[]const u8) void {
-    setTuiTheme(editor, "terminal", theme_mod.tui_terminal);
+    setTuiTheme(editor, "terminal", theme_mod.tui_terminal, theme_mod.syn_tui_terminal);
 }
 
 // GUI-only theme commands (don't touch TUI theme)
 fn cmdGuiThemeDark(editor: *Editor, _: ?[]const u8) void {
-    setGuiTheme(editor, "dark", theme_mod.gui_dark);
+    setGuiTheme(editor, "dark", theme_mod.gui_dark, theme_mod.syn_gui_dark);
 }
 fn cmdGuiThemeLight(editor: *Editor, _: ?[]const u8) void {
-    setGuiTheme(editor, "light", theme_mod.gui_light);
+    setGuiTheme(editor, "light", theme_mod.gui_light, theme_mod.syn_gui_light);
 }
 fn cmdGuiThemeHighContrast(editor: *Editor, _: ?[]const u8) void {
-    setGuiTheme(editor, "high_contrast", theme_mod.gui_high_contrast);
+    setGuiTheme(editor, "high_contrast", theme_mod.gui_high_contrast, theme_mod.syn_gui_high_contrast);
 }
 
 // TUI-only theme commands (don't touch GUI theme)
 fn cmdTuiThemeDark(editor: *Editor, _: ?[]const u8) void {
-    setTuiTheme(editor, "dark", theme_mod.tui_dark);
+    setTuiTheme(editor, "dark", theme_mod.tui_dark, theme_mod.syn_tui_dark);
 }
 fn cmdTuiThemeLight(editor: *Editor, _: ?[]const u8) void {
-    setTuiTheme(editor, "light", theme_mod.tui_light);
+    setTuiTheme(editor, "light", theme_mod.tui_light, theme_mod.syn_tui_light);
 }
 fn cmdTuiThemeHighContrast(editor: *Editor, _: ?[]const u8) void {
-    setTuiTheme(editor, "high_contrast", theme_mod.tui_high_contrast);
+    setTuiTheme(editor, "high_contrast", theme_mod.tui_high_contrast, theme_mod.syn_tui_high_contrast);
 }
 
 // ---- Tests ----

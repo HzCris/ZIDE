@@ -211,6 +211,10 @@ const dvui_high_contrast: dvui.Theme = blk: {
 /// Persistent state across frames for mouse drag tracking.
 var drag_active: bool = false;
 var drag_anchor_offset: usize = 0;
+/// Pane that owns the active drag. Every editor pane iterates the global
+/// event list; without ownership the first-rendered pane consumed drags
+/// that started in another pane and moved the wrong document's cursor.
+var drag_pane: u8 = 0;
 
 /// Cached editor area for stable mouse mapping during drag.
 /// Without this, subpixel layout shifts cause the mouse-to-offset mapping
@@ -535,10 +539,11 @@ pub fn frame(editor: *Editor) bool {
             }
         }
 
-        // Handle deferred tab close (after iteration is complete)
+        // Handle deferred tab close (after iteration is complete).
+        // closeDocAt closes by index — switching first would hijack a
+        // focused terminal pane's content.
         if (close_tab_idx) |idx| {
-            editor.switchToDoc(idx);
-            _ = editor.closeActiveDoc();
+            _ = editor.closeDocAt(idx);
         }
     }
 
@@ -713,6 +718,12 @@ fn editorPane(editor: *Editor, pane_id: u8) void {
     const visible_lines_f = area.h / line_height;
     const visible_lines: usize = @intFromFloat(@floor(visible_lines_f));
     if (visible_lines == 0) return;
+
+    // Keep Page Up/Down in step with the viewport (the TUI does the same;
+    // previously the GUI paged by a fixed count regardless of window size).
+    if (is_active_pane and visible_lines > 1) {
+        editor.page_size = visible_lines - 1;
+    }
 
     // Estimate visible columns for horizontal scroll (approximate with 'M' width)
     const m_width = font.textSize("M").w * scale;
@@ -1617,6 +1628,7 @@ fn handleMouseEvents(editor: *Editor, pane_id: u8, wd: *dvui.WidgetData, area: d
     };
     const doc = &editor.documents.items[pane_doc_idx];
     const tab_width = editor.tab_width;
+    const do_wrap = editor.word_wrap;
     const double_click_threshold_ms: u64 = 400;
     const double_click_distance: f32 = 5; // pixels
 
@@ -1646,7 +1658,7 @@ fn handleMouseEvents(editor: *Editor, pane_id: u8, wd: *dvui.WidgetData, area: d
                 // Focus this pane on click
                 editor.focusPane(pane_id);
 
-                const offset = screenToOffset(doc, area, font, line_height, scale, me.p, tab_width);
+                const offset = screenToOffset(doc, area, font, line_height, scale, me.p, tab_width, do_wrap);
 
                 // Alt+click: add a cursor at click position
                 if (me.mod.alt()) {
@@ -1697,6 +1709,7 @@ fn handleMouseEvents(editor: *Editor, pane_id: u8, wd: *dvui.WidgetData, area: d
                     c.offset = ws.end;
                     c.preferred_col = doc.buffer.offsetToPos(ws.end).col;
                     drag_active = true;
+                    drag_pane = pane_id;
                     drag_mode = .word;
                     drag_word_start = ws.start;
                     drag_word_end = ws.end;
@@ -1707,6 +1720,7 @@ fn handleMouseEvents(editor: *Editor, pane_id: u8, wd: *dvui.WidgetData, area: d
                     c.offset = ls.end;
                     c.preferred_col = doc.buffer.offsetToPos(ls.end).col;
                     drag_active = true;
+                    drag_pane = pane_id;
                     drag_mode = .line;
                     drag_word_start = ls.start;
                     drag_word_end = ls.end;
@@ -1716,18 +1730,19 @@ fn handleMouseEvents(editor: *Editor, pane_id: u8, wd: *dvui.WidgetData, area: d
                     c.preferred_col = doc.buffer.offsetToPos(offset).col;
                     c.clearSelection();
                     drag_active = true;
+                    drag_pane = pane_id;
                     drag_mode = .char;
                     drag_anchor_offset = offset;
                 }
             },
             .release => {
-                if (drag_active) {
+                if (drag_active and drag_pane == pane_id) {
                     e.handle(@src(), wd);
                     drag_active = false;
                 }
             },
             .motion => {
-                if (drag_active) {
+                if (drag_active and drag_pane == pane_id) {
                     e.handle(@src(), wd);
                     // Auto-scroll when dragging past edges
                     const live_area = wd.contentRectScale().r;
@@ -1740,7 +1755,7 @@ fn handleMouseEvents(editor: *Editor, pane_id: u8, wd: *dvui.WidgetData, area: d
                             doc.scroll_top += 1;
                         }
                     }
-                    const offset = screenToOffset(doc, area, font, line_height, scale, me.p, tab_width);
+                    const offset = screenToOffset(doc, area, font, line_height, scale, me.p, tab_width, do_wrap);
                     const c = doc.cursors.primary();
 
                     switch (drag_mode) {
@@ -1848,8 +1863,9 @@ fn isWordCharGui(byte: u8) bool {
 }
 
 /// Convert a screen position (physical pixels) to a byte offset in the buffer.
-/// When word_wrap is true, walks through wrapped visual rows to find the correct position.
-fn screenToOffset(doc: *Document, area: dvui.Rect.Physical, font: dvui.Font, line_height: f32, scale: f32, p: dvui.Point.Physical, tab_width: usize) usize {
+/// `do_wrap` must match the rendering mode — mapping clicks through wrapped
+/// rows while rendering unwrapped (or vice versa) lands on the wrong line.
+fn screenToOffset(doc: *Document, area: dvui.Rect.Physical, font: dvui.Font, line_height: f32, scale: f32, p: dvui.Point.Physical, tab_width: usize, do_wrap: bool) usize {
     const rel_y = p.y - area.y;
     const clicked_visual_row: usize = if (rel_y >= 0) @intFromFloat(@floor(rel_y / line_height)) else 0;
 
@@ -1867,7 +1883,7 @@ fn screenToOffset(doc: *Document, area: dvui.Rect.Physical, font: dvui.Font, lin
         const orig_line = doc.buffer.lineContent(line_idx);
         var exp_buf: [16384]u8 = undefined;
         const line_text = expandTabs(orig_line, tab_width, &exp_buf);
-        const needs_wrap = line_text.len > 0 and @as(f32, @floatFromInt(line_text.len)) * (char_width / scale) > text_area_w;
+        const needs_wrap = do_wrap and line_text.len > 0 and @as(f32, @floatFromInt(line_text.len)) * (char_width / scale) > text_area_w;
 
         var byte_pos: usize = 0;
         while (true) {
@@ -2850,10 +2866,24 @@ fn handlePaletteKeyGui(editor: *Editor, key: dvui.Event.Key) void {
 fn handleConfirmQuitKeyGui(editor: *Editor, key: dvui.Event.Key) void {
     switch (key.code) {
         .s => {
+            // Only quit when every dirty document actually saved — silently
+            // discarding on save failure (e.g. untitled buffers) loses work.
+            var failures: usize = 0;
             for (editor.documents.items) |*doc| {
-                if (doc.dirty) doc.save() catch {};
+                if (doc.dirty) {
+                    doc.save() catch {
+                        failures += 1;
+                        continue;
+                    };
+                }
             }
-            editor.running = false;
+            if (failures == 0) {
+                editor.running = false;
+            } else {
+                editor.mode = .normal;
+                const msg = std.fmt.bufPrint(&editor.status_buf, "{d} file(s) not saved — use Save As for untitled buffers", .{failures}) catch "Save failed";
+                editor.status_message = msg;
+            }
         },
         .d => editor.running = false,
         .c, .escape => editor.mode = .normal,
@@ -3106,12 +3136,15 @@ fn switchTheme(editor: *Editor, name: []const u8) void {
     const lua_settings = @import("../core/lua_settings.zig");
     if (std.mem.eql(u8, name, "dark")) {
         editor.theme = theme_mod.gui_dark;
+        editor.syntax_theme = theme_mod.syn_gui_dark;
         editor.theme_name = "dark";
     } else if (std.mem.eql(u8, name, "light")) {
         editor.theme = theme_mod.gui_light;
+        editor.syntax_theme = theme_mod.syn_gui_light;
         editor.theme_name = "light";
     } else if (std.mem.eql(u8, name, "high_contrast")) {
         editor.theme = theme_mod.gui_high_contrast;
+        editor.syntax_theme = theme_mod.syn_gui_high_contrast;
         editor.theme_name = "high_contrast";
     } else return;
 
@@ -3199,7 +3232,7 @@ fn guiFindIncremental(editor: *Editor) void {
     const needle = editor.find_buf[0..editor.find_buf_len];
     if (needle.len == 0) {
         doc.cursors.primary().offset = editor.find_origin;
-        doc.cursors.primary().anchor = editor.find_origin;
+        doc.cursors.primary().clearSelection();
         editor.status_message = "";
         return;
     }
@@ -3223,7 +3256,7 @@ fn guiFindIncremental(editor: *Editor) void {
         return;
     }
     doc.cursors.primary().offset = editor.find_origin;
-    doc.cursors.primary().anchor = editor.find_origin;
+    doc.cursors.primary().clearSelection();
     editor.status_message = "No matches found";
 }
 

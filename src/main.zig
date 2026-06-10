@@ -70,9 +70,18 @@ pub fn main() !void {
         }
     }
 
-    // Detect frontend mode if not explicitly set
-    // GUI build defaults to GUI, TUI-only build defaults to TUI
-    const frontend = mode orelse if (build_options.has_gui) FrontendMode.gui else FrontendMode.tui;
+    // Detect frontend mode if not explicitly set: launched from an
+    // interactive terminal -> TUI in that terminal; desktop launch -> GUI.
+    // (TUI-only builds always run the TUI.)
+    const frontend = mode orelse if (build_options.has_gui) detectFrontend() else FrontendMode.tui;
+
+    if (builtin.os.tag == .windows and frontend == .gui) {
+        // Console-subsystem exe launched from the desktop gets a freshly
+        // allocated console (the "flash" window). If ours isn't shared with a
+        // parent shell, release it so it doesn't linger behind the GUI.
+        var pids: [4]u32 = undefined;
+        if (GetConsoleProcessList(&pids, pids.len) <= 1) _ = FreeConsole();
+    }
 
     std.log.info("ZIDE starting in {s} mode", .{@tagName(frontend)});
     if (files.items.len > 0) {
@@ -97,20 +106,34 @@ pub fn main() !void {
     }
 }
 
+extern "kernel32" fn GetConsoleProcessList(lpdwProcessList: [*]u32, dwProcessCount: u32) callconv(.winapi) u32;
+extern "kernel32" fn FreeConsole() callconv(.winapi) c_int;
+
+/// Hybrid launch detection: `zide` typed in a terminal opens the TUI there;
+/// launching the binary from the desktop opens the GUI.
 fn detectFrontend() FrontendMode {
-    const out: std.fs.File = .stdout();
     if (builtin.os.tag == .windows) {
-        var console_mode: u32 = 0;
-        if (std.os.windows.kernel32.GetConsoleMode(out.handle, &console_mode) != 0) {
-            return .tui;
-        }
-        return .gui;
+        // The exe is console-subsystem, so a naive "do we have a console"
+        // check is wrong: Explorer double-click ALLOCATES a fresh console.
+        // A real terminal launch SHARES the parent shell's console, which
+        // shows up as more than one process attached to it.
+        var pids: [4]u32 = undefined;
+        const shared = GetConsoleProcessList(&pids, pids.len) > 1;
+        const in_tty = isConsoleHandle(std.fs.File.stdin().handle);
+        const out_tty = isConsoleHandle(std.fs.File.stdout().handle);
+        return if (shared and in_tty and out_tty) .tui else .gui;
     } else {
-        if (std.posix.isatty(out.handle)) {
-            return .tui;
-        }
-        return .gui;
+        // Both ends must be a terminal — piped stdin/stdout means scripts or
+        // redirection, where popping a TUI would be wrong.
+        const in_tty = std.posix.isatty(std.fs.File.stdin().handle);
+        const out_tty = std.posix.isatty(std.fs.File.stdout().handle);
+        return if (in_tty and out_tty) .tui else .gui;
     }
+}
+
+fn isConsoleHandle(handle: std.fs.File.Handle) bool {
+    var console_mode: u32 = 0;
+    return std.os.windows.kernel32.GetConsoleMode(handle, &console_mode) != 0;
 }
 
 fn runGui(allocator: std.mem.Allocator, lua: *zlua.Lua, cli_files: []const []const u8) !void {
