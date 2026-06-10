@@ -866,6 +866,7 @@ fn editorPane(editor: *Editor, pane_id: u8) void {
     const cursor_pos = doc.cursorPos();
     const text_color = toDvui(editor.theme.text);
     const sel_color = toDvui(editor.theme.selection);
+    const caret_color = toDvui(editor.theme.cursor);
     const gutter_text_color = toDvui(editor.theme.gutter_text);
     const gutter_active_color = toDvui(editor.theme.gutter_text_active);
     const gutter_bg_color = toDvui(editor.theme.gutter_bg);
@@ -1168,7 +1169,7 @@ fn editorPane(editor: *Editor, pane_id: u8) void {
                             const clamped = @min(col_in_seg, segment.len);
                             const cx = font.textSize(segment[0..clamped]).w * scale;
                             const cr: dvui.Rect.Physical = .{ .x = row_x + cx - 1, .y = y, .w = 3, .h = line_height };
-                            cr.fill(.{}, .{ .color = sel_color, .fade = 1.0 });
+                            cr.fill(.{}, .{ .color = caret_color, .fade = 1.0 });
                         }
                         // Schedule wakeup for next blink transition instead of continuous refresh
                         const time_until_toggle: i128 = if (blink_on)
@@ -1193,7 +1194,7 @@ fn editorPane(editor: *Editor, pane_id: u8) void {
                             const sc_clamped = @min(sc_in_seg, segment.len);
                             const sc_cx = font.textSize(segment[0..sc_clamped]).w * scale;
                             const sc_r: dvui.Rect.Physical = .{ .x = row_x + sc_cx - 1, .y = y, .w = 3, .h = line_height };
-                            sc_r.fill(.{}, .{ .color = sel_color, .fade = 0.7 });
+                            sc_r.fill(.{}, .{ .color = caret_color, .fade = 0.7 });
                         }
                     }
                 }

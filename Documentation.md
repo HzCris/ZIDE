@@ -191,7 +191,7 @@ Windows terminals commonly intercept Alt combos (Windows Terminal binds Alt+arro
 - Settings dialog (Preferences menu — modal DVUI floating window with native widgets: checkboxes for booleans, validated numeric entries with min/max, dropdown for theme; draggable by header, auto-centered, dims the background; changes apply live and write to init.lua immediately; close via header X or Escape; Tab/Shift+Tab cycles controls)
 - Open Settings File (Preferences menu — opens init.lua directly in the editor for power users)
 - Tab character display (expands `\t` to spaces for rendering, cursor, selection, and wrapping)
-- Blinking caret (530ms cycle, resets on cursor movement)
+- Blinking caret (530ms cycle, resets on cursor movement) — drawn in the theme's `cursor` color (override via `zide.set("color_cursor", "#hex")`) so it stands out from selection highlights; secondary multi-cursor carets use the same color dimmed
 - Multiple cursor editing (Ctrl+Shift or Ctrl+Alt+Up/Down, Ctrl+D, Alt+click, Escape/click to clear)
 - Split panes: vertical (Alt+\) and horizontal (Alt+Shift+\) splits with draggable dividers
   - Binary layout tree — nested splits supported (split a split)
