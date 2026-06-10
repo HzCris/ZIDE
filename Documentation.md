@@ -285,6 +285,12 @@ zide.set("syn_builtin", "#e5c07b")    -- @builtins in gold
 zide.set("syn_attribute", "#d19a66")  -- comptime attrs in orange
 ```
 
+`<lang>` is matched against the registered language `name`
+**case-insensitively** — `syn_theme_python.lua` applies to a language
+registered as `"Python"`. Colors set inside these files only affect that
+language; everything else keeps the global syntax theme. `tui_syn_*` keys
+work here too for TUI-only per-language overrides.
+
 #### Built-in Presets
 
 Syntax theme presets automatically match when you switch editor themes:
@@ -464,6 +470,26 @@ zide.register_lsp({
 - `zig build run-tui` — Build and run TUI
 - `zig build run-gui` — Build and run GUI (alias: `run`)
 - `zig build test` — Run unit tests
+
+### Hybrid Launch (Frontend Auto-Detection)
+
+The `zide` binary contains **both** frontends and picks one at launch:
+
+- **Typed in a terminal** (`zide`, `zide file.zig`) → opens the **TUI** in that terminal
+- **Launched from the desktop** (Explorer double-click, Start menu, `start zide`) → opens the **GUI** window
+- **Piped/redirected** (`zide file.zig | ...`) → GUI (a TUI would fight the redirection)
+- `--gui` / `--tui` always override detection; `zide-tui` is TUI-only
+
+On Windows the check uses `GetConsoleProcessList`: a console shared with a
+parent shell means a real terminal launch, while a freshly allocated console
+means a desktop launch (the stray console window is released). On Linux/macOS
+both stdin and stdout must be a TTY.
+
+### Saving
+
+- `Ctrl+S` on a buffer **with** a file path saves it; failures show in the status bar
+- `Ctrl+S` on an **untitled** buffer opens Save As (native dialog in the GUI, path prompt in the TUI)
+- Quit-with-unsaved-changes (`[S]ave`) only quits if **every** dirty document saved; otherwise it cancels and reports how many failed
 
 ### Command System
 

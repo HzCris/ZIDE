@@ -227,6 +227,9 @@ pub const Editor = struct {
         }
         self.terminals.deinit(self.allocator);
         self.languages.deinit(self.allocator);
+        for (self.lang_syntax_overrides.items) |ov| {
+            self.allocator.free(ov.name);
+        }
         self.lang_syntax_overrides.deinit(self.allocator);
         if (self.clipboard.len > 0) {
             self.allocator.free(self.clipboard);
@@ -789,20 +792,22 @@ pub const Editor = struct {
     }
 
     /// Get the resolved GUI syntax theme for a language (per-lang override or global).
+    /// Case-insensitive: syn_theme_python.lua matches a language named "Python".
     pub fn syntaxThemeFor(self: *const Editor, lang_name: ?[]const u8) *const SyntaxTheme {
         if (lang_name) |name| {
             for (self.lang_syntax_overrides.items) |*ov| {
-                if (std.mem.eql(u8, ov.name, name)) return &ov.gui_theme;
+                if (std.ascii.eqlIgnoreCase(ov.name, name)) return &ov.gui_theme;
             }
         }
         return &self.syntax_theme;
     }
 
     /// Get the resolved TUI syntax theme for a language (per-lang override or global).
+    /// Case-insensitive: syn_theme_python.lua matches a language named "Python".
     pub fn tuiSyntaxThemeFor(self: *const Editor, lang_name: ?[]const u8) *const TuiSyntaxTheme {
         if (lang_name) |name| {
             for (self.lang_syntax_overrides.items) |*ov| {
-                if (std.mem.eql(u8, ov.name, name)) return &ov.tui_theme;
+                if (std.ascii.eqlIgnoreCase(ov.name, name)) return &ov.tui_theme;
             }
         }
         return &self.tui_syntax_theme;
@@ -1043,6 +1048,28 @@ test "editor multiple documents" {
 
     editor.nextDoc();
     try std.testing.expectEqualStrings("doc2", editor.activeDoc().lineContent(0));
+}
+
+test "per-language syntax theme override resolution" {
+    const allocator = std.testing.allocator;
+    var editor = try Editor.init(allocator);
+    defer editor.deinit();
+
+    const name = try allocator.dupe(u8, "python");
+    var ov_gui = editor.syntax_theme;
+    ov_gui.keyword = .{ .r = 1, .g = 2, .b = 3 };
+    try editor.lang_syntax_overrides.append(allocator, .{
+        .name = name,
+        .gui_theme = ov_gui,
+        .tui_theme = editor.tui_syntax_theme,
+    });
+
+    // Case-insensitive match (file syn_theme_python.lua vs language "Python")
+    const resolved = editor.syntaxThemeFor("Python");
+    try std.testing.expectEqual(@as(u8, 1), resolved.keyword.r);
+    // Unknown language falls back to the global theme
+    const fallback = editor.syntaxThemeFor("ruby");
+    try std.testing.expectEqual(editor.syntax_theme.keyword.r, fallback.keyword.r);
 }
 
 test "editor undo via command" {

@@ -336,6 +336,35 @@ pub fn getConfigDir() ?[]const u8 {
 // Lua callback implementations
 // ---------------------------------------------------------------------------
 
+/// While loadLangSyntaxThemes runs a syn_theme_<lang>.lua file it stores the
+/// language name under `_zide_syn_lang`; syntax color sets are then routed
+/// into that language's override instead of the global theme. Creates the
+/// override (seeded from the current global themes) on first use.
+/// Returns null outside per-language theme loading.
+fn currentLangOverride(lua: *Lua, editor: *Editor) ?*Editor.LangSyntaxOverride {
+    _ = lua.getField(zlua.registry_index, "_zide_syn_lang");
+    defer lua.pop(1);
+    if (lua.typeOf(-1) != .string) return null;
+    const lang_z = lua.toString(-1) catch return null;
+    const lang_name: []const u8 = lang_z;
+    if (lang_name.len == 0) return null;
+
+    for (editor.lang_syntax_overrides.items) |*ov| {
+        if (std.ascii.eqlIgnoreCase(ov.name, lang_name)) return ov;
+    }
+
+    const owned = editor.allocator.dupe(u8, lang_name) catch return null;
+    editor.lang_syntax_overrides.append(editor.allocator, .{
+        .name = owned,
+        .gui_theme = editor.syntax_theme,
+        .tui_theme = editor.tui_syntax_theme,
+    }) catch {
+        editor.allocator.free(owned);
+        return null;
+    };
+    return &editor.lang_syntax_overrides.items[editor.lang_syntax_overrides.items.len - 1];
+}
+
 fn getEditor(state: ?*zlua.LuaState) ?*Editor {
     var lua: *Lua = @ptrCast(@alignCast(state orelse return null));
     _ = lua.getField(zlua.registry_index, EDITOR_KEY);
@@ -478,24 +507,35 @@ fn luaSet(state: ?*zlua.LuaState) callconv(.c) c_int {
         } else {
             std.log.warn("zide.set: invalid hex color '{s}'", .{val_str});
         }
-    } else if (std.mem.startsWith(u8, key_str, "syn_")) {
-        // zide.set("syn_keyword", "#c678dd") — override syntax theme color (GUI + TUI)
-        const val = lua.toString(2) catch return 0;
-        const val_str: []const u8 = val;
-        const field_name = key_str["syn_".len..];
-        if (ThemeColor.fromHex(val_str)) |color| {
-            _ = theme_mod.setSyntaxColor(&editor.syntax_theme, field_name, color);
-            _ = theme_mod.setTuiSyntaxColor(&editor.tui_syntax_theme, field_name, color);
-        } else {
-            std.log.warn("zide.set: invalid hex color '{s}'", .{val_str});
-        }
     } else if (std.mem.startsWith(u8, key_str, "tui_syn_")) {
-        // zide.set("tui_syn_keyword", "#c678dd") — override TUI syntax color only
+        // zide.set("tui_syn_keyword", "#c678dd") — override TUI syntax color only.
         const val = lua.toString(2) catch return 0;
         const val_str: []const u8 = val;
         const field_name = key_str["tui_syn_".len..];
         if (ThemeColor.fromHex(val_str)) |color| {
-            _ = theme_mod.setTuiSyntaxColor(&editor.tui_syntax_theme, field_name, color);
+            if (currentLangOverride(lua, editor)) |ov| {
+                _ = theme_mod.setTuiSyntaxColor(&ov.tui_theme, field_name, color);
+            } else {
+                _ = theme_mod.setTuiSyntaxColor(&editor.tui_syntax_theme, field_name, color);
+            }
+        } else {
+            std.log.warn("zide.set: invalid hex color '{s}'", .{val_str});
+        }
+    } else if (std.mem.startsWith(u8, key_str, "syn_")) {
+        // zide.set("syn_keyword", "#c678dd") — override syntax theme color (GUI + TUI).
+        // Inside a syn_theme_<lang>.lua file this targets that language's
+        // override instead of the global theme.
+        const val = lua.toString(2) catch return 0;
+        const val_str: []const u8 = val;
+        const field_name = key_str["syn_".len..];
+        if (ThemeColor.fromHex(val_str)) |color| {
+            if (currentLangOverride(lua, editor)) |ov| {
+                _ = theme_mod.setSyntaxColor(&ov.gui_theme, field_name, color);
+                _ = theme_mod.setTuiSyntaxColor(&ov.tui_theme, field_name, color);
+            } else {
+                _ = theme_mod.setSyntaxColor(&editor.syntax_theme, field_name, color);
+                _ = theme_mod.setTuiSyntaxColor(&editor.tui_syntax_theme, field_name, color);
+            }
         } else {
             std.log.warn("zide.set: invalid hex color '{s}'", .{val_str});
         }
@@ -797,18 +837,6 @@ pub fn loadSyntaxTheme(lua: *Lua) void {
 
 /// Load per-language syntax theme files from ~/.config/zide/themes/syn_theme_*.lua.
 pub fn loadLangSyntaxThemes(lua: *Lua) void {
-    const editor = blk: {
-        var l = lua;
-        _ = l.getField(zlua.registry_index, EDITOR_KEY);
-        const e = l.toUserdata(Editor, -1) catch {
-            l.pop(1);
-            break :blk null;
-        };
-        l.pop(1);
-        break :blk e;
-    } orelse return;
-    _ = editor;
-
     const dir = getConfigDir() orelse return;
     var themes_buf: [512]u8 = undefined;
     const themes_path = std.fmt.bufPrint(&themes_buf, "{s}/themes", .{dir}) catch return;
