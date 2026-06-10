@@ -118,7 +118,7 @@ inline fn parseGround(input: []const u8) !Result {
             var grapheme_len: usize = 0;
             var cp_count: usize = 0;
 
-            while (grapheme_iter.next()) |result| {
+            while (grapheme_iter.nextCodePoint()) |result| {
                 cp_count += 1;
                 if (result.is_break) {
                     // Found the first grapheme boundary
@@ -314,6 +314,7 @@ inline fn parseOsc(input: []const u8, paste_allocator: ?std.mem.Allocator) !Resu
                 input[semicolon_idx + 3 .. sequence.len - 2];
             const decoder = std.base64.standard.Decoder;
             const text = try paste_allocator.?.alloc(u8, try decoder.calcSizeForSlice(payload));
+            errdefer paste_allocator.?.free(text);
             try decoder.decode(text, payload);
             log.debug("decoded paste: {s}", .{text});
             return .{
@@ -1324,4 +1325,8 @@ test "parse: disambiguate shift + space" {
 
     try testing.expectEqual(7, result.n);
     try testing.expectEqualDeep(expected_event, result.event);
+}
+
+test {
+    std.testing.refAllDecls(@This());
 }

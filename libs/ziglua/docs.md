@@ -26,8 +26,6 @@ In general, most functions are named similarly to the original C functions. The 
 
 In the few cases when the [auxiliary library](https://www.lua.org/manual/5.4/manual.html#5) functions have the same name as a normal C API function, the auxlib function is given a more descriptive name.
 
-For example, the functions `lua_newstate` and `luaL_newstate` are translated to `Lua.newState` and `Lua.newStateLibc` respectively.
-
 Because Zig best practice is to communicate intent precisely, some abbreviations are expanded to make names more clear, like renaming `pcall` to `protectedCall`.
 
 ### Lua Initialization
@@ -45,8 +43,6 @@ Here is a list of the features Ziglua uses for greater safety:
 ### Errors
 
 Many functions now return Zig errors rather than an integer code. The Zig compiler will then ensure that the error is handled, or ignored. There are specific error types like `ziglua.error.LuaRuntime` for errors that have a specific meaning.
-
-On the other hand, many functions either succeed or return an error. Rather than returning a boolean success code, these functions return the generic `ziglua.Error.LuaError` to indicate failure. The type of failure can be determined in the context of the function called.
 
 ### Booleans
 

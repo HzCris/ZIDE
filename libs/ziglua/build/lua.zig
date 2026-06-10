@@ -5,21 +5,17 @@ const Step = std.Build.Step;
 
 const applyPatchToFile = @import("utils.zig").applyPatchToFile;
 
-pub const Language = enum {
-    lua51,
-    lua52,
-    lua53,
-    lua54,
-    lua55,
-    luajit,
-    luau,
-};
+const build = @import("../build.zig");
+
+const ApiCheck = build.ApiCheck;
+const Language = build.Language;
 
 pub const Options = struct {
     lang: Language,
     shared: bool,
     library_name: []const u8,
     lua_user_h: ?Build.LazyPath,
+    api_check: ApiCheck,
 };
 
 pub fn configure(
@@ -47,6 +43,7 @@ pub fn configure(
         .target = target,
         .optimize = optimize,
         .link_libc = true,
+        .sanitize_c = .off,
     });
     const library = b.addLibrary(.{
         .name = library_name,
@@ -72,7 +69,7 @@ pub fn configure(
         },
 
         // Enable api check
-        if (optimize == .Debug) "-DLUA_USE_APICHECK" else "",
+        if (opts.api_check == .on or (opts.api_check == .debug and optimize == .Debug)) "-DLUA_USE_APICHECK" else "",
 
         // Build as DLL for windows if shared
         if (target.result.os.tag == .windows and shared) "-DLUA_BUILD_AS_DLL" else "",

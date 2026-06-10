@@ -109,12 +109,12 @@ test "number conversion success and failure" {
     try expectEqual(1234, try lua.toInteger(-1));
 
     lua.pushNil();
-    try expectError(error.LuaError, lua.toNumber(-1));
-    try expectError(error.LuaError, lua.toInteger(-1));
+    try expectError(error.ExpectedNumber, lua.toNumber(-1));
+    try expectError(error.ExpectedInteger, lua.toInteger(-1));
 
     _ = lua.pushString("fail");
-    try expectError(error.LuaError, lua.toNumber(-1));
-    try expectError(error.LuaError, lua.toInteger(-1));
+    try expectError(error.ExpectedNumber, lua.toNumber(-1));
+    try expectError(error.ExpectedInteger, lua.toInteger(-1));
 }
 
 test "arithmetic (lua_arith)" {
@@ -198,9 +198,9 @@ test "compare" {
         try expect(lua.compare(-2, -1, .le));
         try expect(lua.compare(-2, -1, .lt));
 
-        try expect(!lua.rawEqual(-1, -2));
+        try expect(!lua.equalRaw(-1, -2));
         lua.pushNumber(2);
-        try expect(lua.rawEqual(-1, -2));
+        try expect(lua.equalRaw(-1, -2));
     } else {
         try testing.expect(!lua.equal(1, 2));
         try testing.expect(lua.lessThan(1, 2));
@@ -314,7 +314,7 @@ test "unsigned" {
     try expectEqual(123456, try lua.toUnsigned(-1));
 
     _ = lua.pushString("hello");
-    try expectError(error.LuaError, lua.toUnsigned(-1));
+    try expectError(error.ExpectedNumber, lua.toUnsigned(-1));
 }
 
 test "executing string contents" {
@@ -327,10 +327,10 @@ test "executing string contents" {
     try lua.loadString("a = f(2)");
     try lua.protectedCall(.{});
 
-    try expectEqual(.number, try lua.getGlobal("a"));
+    try expectEqual(.number, lua.getGlobal("a"));
     try expectEqual(12, try lua.toInteger(1));
 
-    try expectError(if (zlua.lang == .luau) error.LuaError else error.LuaSyntax, lua.loadString("bad syntax"));
+    try expectError(if (zlua.lang == .luau) error.InvalidBytecode else error.LuaSyntax, lua.loadString("bad syntax"));
     try lua.loadString("a = g()");
     try expectError(error.LuaRuntime, lua.protectedCall(.{}));
 }
@@ -353,7 +353,7 @@ test "filling and checking the stack" {
     try expectEqual(30, lua.getTop());
 
     // this should fail (beyond max stack size)
-    try expectError(error.LuaError, lua.checkStack(1_000_000));
+    try expectError(error.NoSpace, lua.checkStack(1_000_000));
 
     // this is small enough it won't fail (would raise an error if it did)
     lua.checkStackErr(40, null);
@@ -439,7 +439,7 @@ test "calling a function" {
 
     lua.register("zigadd", zlua.wrap(add));
 
-    _ = try lua.getGlobal("zigadd");
+    _ = lua.getGlobal("zigadd");
     lua.pushInteger(10);
     lua.pushInteger(32);
 
@@ -449,7 +449,7 @@ test "calling a function" {
 }
 
 test "calling a function with cProtectedCall" {
-    if (zlua.lang != .lua51) return;
+    if (zlua.lang != .lua51 and zlua.lang != .luau and zlua.lang != .luajit) return;
 
     const lua: *Lua = try .init(testing.allocator);
     defer lua.deinit();
@@ -607,7 +607,7 @@ test "function registration" {
         lua.registerFns("testlib", &funcs);
 
         // testlib.add(1, 2)
-        _ = try lua.getGlobal("testlib");
+        _ = lua.getGlobal("testlib");
         _ = lua.getField(-1, "add");
         lua.pushInteger(1);
         lua.pushInteger(2);
@@ -670,7 +670,7 @@ test "panic fn" {
 }
 
 test "warn fn" {
-    if (zlua.lang != .lua54) return;
+    if (zlua.lang != .lua54 and zlua.lang != .lua55) return;
 
     const lua: *Lua = try .init(testing.allocator);
     defer lua.deinit();
@@ -720,7 +720,7 @@ test "garbage collector" {
 
     if (zlua.lang != .lua51 and zlua.lang != .luajit) _ = lua.gcIsRunning();
 
-    if (langIn(.{ .lua51, .lua52, .lua53 })) {
+    if (langIn(.{ .lua51, .lua52, .lua53, .luajit })) {
         _ = lua.gcSetPause(2);
         _ = lua.gcSetStepMul(2);
     }
@@ -757,16 +757,16 @@ test "table access" {
     defer lua.deinit();
 
     try lua.doString("a = { [1] = 'first', key = 'value', ['other one'] = 1234 }");
-    _ = try lua.getGlobal("a");
+    _ = lua.getGlobal("a");
 
     if (zlua.lang == .lua53 or zlua.lang == .lua54 or zlua.lang == .lua55) {
-        try expectEqual(.string, lua.rawGetIndex(1, 1));
+        try expectEqual(.string, lua.getIndexRaw(1, 1));
         try expectEqualStrings("first", try lua.toString(-1));
     }
 
     try expectEqual(.string, switch (zlua.lang) {
         .lua53, .lua54, .lua55 => lua.getIndex(1, 1),
-        else => lua.rawGetIndex(1, 1),
+        else => lua.getIndexRaw(1, 1),
     });
     try expectEqualStrings("first", try lua.toString(-1));
 
@@ -775,7 +775,7 @@ test "table access" {
     try expectEqualStrings("value", try lua.toString(-1));
 
     _ = lua.pushStringZ("other one");
-    try expectEqual(.number, lua.rawGetTable(1));
+    try expectEqual(.number, lua.getTableRaw(1));
     try expectEqual(1234, try lua.toInteger(-1));
 
     // a.name = "ziglua"
@@ -786,9 +786,9 @@ test "table access" {
     // a.lang = "zig"
     _ = lua.pushStringZ("lang");
     _ = lua.pushStringZ("zig");
-    lua.rawSetTable(1);
+    lua.setTableRaw(1);
 
-    try expectError(error.LuaError, lua.getMetatable(1));
+    try expectError(error.NoMetatable, lua.getMetatable(1));
 
     // create a metatable (it isn't a useful one)
     lua.newTable();
@@ -798,14 +798,14 @@ test "table access" {
     lua.setMetatable(1);
 
     try lua.getMetatable(1);
-    _ = try lua.getMetaField(1, "__len");
-    try expectError(error.LuaError, lua.getMetaField(1, "__index"));
+    _ = lua.getMetaField(1, "__len");
+    try expectEqual(.nil, lua.getMetaField(1, "__index"));
 
     lua.pushBoolean(true);
     lua.setField(1, "bool");
 
     try lua.doString("b = a.bool");
-    try expectEqual(.boolean, try lua.getGlobal("b"));
+    try expectEqual(.boolean, lua.getGlobal("b"));
     try expect(lua.toBoolean(-1));
 
     // create array [1, 2, 3, 4, 5]
@@ -813,18 +813,18 @@ test "table access" {
     var index: i32 = 1;
     while (index <= 5) : (index += 1) {
         lua.pushInteger(index);
-        if (zlua.lang == .lua53 or zlua.lang == .lua54 or zlua.lang == .lua55) lua.setIndex(-2, index) else lua.rawSetIndex(-2, index);
+        if (zlua.lang == .lua53 or zlua.lang == .lua54 or zlua.lang == .lua55) lua.setIndex(-2, index) else lua.setIndexRaw(-2, index);
     }
 
     if (!langIn(.{ .lua51, .luajit, .luau })) {
-        try expectEqual(5, lua.rawLen(-1));
+        try expectEqual(5, lua.lenRaw(-1));
         try expectEqual(5, lua.lenRaiseErr(-1));
     }
 
     // add a few more
     while (index <= 10) : (index += 1) {
         lua.pushInteger(index);
-        lua.rawSetIndex(-2, index);
+        lua.setIndexRaw(-2, index);
     }
 }
 
@@ -836,7 +836,7 @@ test "conversions" {
 
     // number conversion
     try expectEqual(3, Lua.numberToInteger(3.14));
-    try expectError(error.LuaError, Lua.numberToInteger(@as(zlua.Number, @floatFromInt(zlua.max_integer)) + 10));
+    try expectError(error.Overflow, Lua.numberToInteger(@as(zlua.Number, @floatFromInt(zlua.max_integer)) + 10));
 
     // string conversion
     try lua.stringToNumber("1");
@@ -847,9 +847,9 @@ test "conversions" {
     try expect(lua.isNumber(-1));
     try expectEqual(1.0, try lua.toNumber(-1));
 
-    try expectError(error.LuaError, lua.stringToNumber("a"));
-    try expectError(error.LuaError, lua.stringToNumber("1.a"));
-    try expectError(error.LuaError, lua.stringToNumber(""));
+    try expectError(error.InvalidNumber, lua.stringToNumber("a"));
+    try expectError(error.InvalidNumber, lua.stringToNumber("1.a"));
+    try expectError(error.InvalidNumber, lua.stringToNumber(""));
 }
 
 test "absIndex" {
@@ -871,7 +871,7 @@ test "dump and load" {
     // store a function in a global
     try lua.doString("f = function(x) return function(n) return n + x end end");
     // put the function on the stack
-    _ = try lua.getGlobal("f");
+    _ = lua.getGlobal("f");
 
     const writer = struct {
         fn inner(l: *Lua, buf: []const u8, data: *anyopaque) bool {
@@ -958,12 +958,12 @@ test "userdata and uservalues" {
     @memcpy(&data.code, "abcd");
 
     try expectEqual(data, try lua.toUserdata(Data, 1));
-    try expectEqual(@as(*const anyopaque, @ptrCast(data)), try lua.toPointer(1));
+    try expectEqual(@as(*const anyopaque, @ptrCast(data)), lua.toPointer(1));
 
     if (zlua.lang == .lua52 or zlua.lang == .lua53) {
         // assign the associated user value
         lua.pushNil();
-        try lua.setUserValue(1);
+        lua.setUserValue(1);
 
         _ = lua.getUserValue(1);
         try expectEqual(.nil, lua.typeOf(-1));
@@ -975,13 +975,13 @@ test "userdata and uservalues" {
         _ = lua.pushStringZ("test string");
         try lua.setUserValue(1, 2);
 
-        try expectEqual(.number, try lua.getUserValue(1, 1));
+        try expectEqual(.number, lua.getUserValue(1, 1));
         try expectEqual(1234.56, try lua.toNumber(-1));
-        try expectEqual(.string, try lua.getUserValue(1, 2));
+        try expectEqual(.string, lua.getUserValue(1, 2));
         try expectEqualStrings("test string", try lua.toString(-1));
 
-        try expectError(error.LuaError, lua.setUserValue(1, 3));
-        try expectError(error.LuaError, lua.getUserValue(1, 3));
+        try expectError(error.OutOfBounds, lua.setUserValue(1, 3));
+        try expectEqual(.none, lua.getUserValue(1, 3));
     }
 }
 
@@ -1009,7 +1009,7 @@ test "upvalues" {
     // call the function repeatedly, each time ensuring the result increases by one
     var expected: i32 = 1;
     while (expected <= 10) : (expected += 1) {
-        _ = try lua.getGlobal("counter");
+        _ = lua.getGlobal("counter");
         lua.call(.{ .results = 1 });
         try expectEqual(expected, try lua.toInteger(-1));
         lua.pop(1);
@@ -1021,7 +1021,7 @@ test "table traversal" {
     defer lua.deinit();
 
     try lua.doString("t = { key = 'value', second = true, third = 1 }");
-    _ = try lua.getGlobal("t");
+    _ = lua.getGlobal("t");
 
     lua.pushNil();
 
@@ -1046,7 +1046,7 @@ test "table traversal" {
 }
 
 test "registry" {
-    if (langIn(.{ .lua51, .luajit, .luau })) return;
+    if (langIn(.{ .lua51, .luajit })) return;
 
     const lua: *Lua = try .init(testing.allocator);
     defer lua.deinit();
@@ -1055,15 +1055,15 @@ test "registry" {
 
     // store a string in the registry
     _ = lua.pushStringZ("hello there");
-    lua.rawSetPtr(zlua.registry_index, key);
+    lua.setPtrRaw(zlua.registry_index, key);
 
     // get key from the registry
-    _ = lua.rawGetPtr(zlua.registry_index, key);
+    _ = lua.getPtrRaw(zlua.registry_index, key);
     try expectEqualStrings("hello there", try lua.toString(-1));
 }
 
 test "closing vars" {
-    if (zlua.lang != .lua54) return;
+    if (zlua.lang != .lua54 and zlua.lang != .lua55) return;
 
     const lua: *Lua = try .init(testing.allocator);
     defer lua.deinit();
@@ -1077,21 +1077,21 @@ test "closing vars" {
     );
 
     lua.newTable();
-    _ = try lua.getGlobal("mt");
+    _ = lua.getGlobal("mt");
     lua.setMetatable(-2);
     lua.toClose(-1);
     lua.closeSlot(-1);
     lua.pop(1);
 
     lua.newTable();
-    _ = try lua.getGlobal("mt");
+    _ = lua.getGlobal("mt");
     lua.setMetatable(-2);
     lua.toClose(-1);
     lua.closeSlot(-1);
     lua.pop(1);
 
     // this should have incremented "closed_vars" to 2
-    _ = try lua.getGlobal("closed_vars");
+    _ = lua.getGlobal("closed_vars");
     try expectEqual(2, try lua.toNumber(-1));
 }
 
@@ -1172,8 +1172,12 @@ test "yielding" {
 }
 
 fn continuation52(l: *Lua) !i32 {
-    const ctxOrNull = try l.getContext();
-    const ctx = ctxOrNull orelse 0;
+    // When called in the continuation function, the original value of ctx will not
+    // be changed. When called from a continuation function, the value will be set
+    // to the context information passed to yield.
+    var ctx: i32 = 0;
+    try l.getContext(&ctx);
+
     if (ctx == 5) {
         _ = l.pushStringZ("done");
         return 1;
@@ -1252,7 +1256,7 @@ test "resuming" {
         \\  return "done"
         \\end
     );
-    _ = try thread.getGlobal("counter");
+    _ = thread.getGlobal("counter");
 
     var num_results: i32 = 0;
     var i: i32 = 1;
@@ -1442,7 +1446,7 @@ test "get global fail" {
     const lua: *Lua = try .init(testing.allocator);
     defer lua.deinit();
 
-    try expectError(error.LuaError, lua.getGlobal("foo"));
+    try expectEqual(.nil, lua.getGlobal("foo"));
 }
 
 test "globalSub" {
@@ -1466,7 +1470,7 @@ test "loadBuffer" {
     } else _ = try lua.loadBuffer("global = 10", "chunkname", .text);
 
     try lua.protectedCall(.{ .args = 0, .results = zlua.mult_return });
-    _ = try lua.getGlobal("global");
+    _ = lua.getGlobal("global");
     try expectEqual(10, try lua.toInteger(-1));
 }
 
@@ -1489,7 +1493,7 @@ test "where" {
         \\ret = whereFn()
     );
 
-    _ = try lua.getGlobal("ret");
+    _ = lua.getGlobal("ret");
     try expectEqualStrings("[string \"...\"]:2: ", try lua.toString(-1));
 }
 
@@ -1500,13 +1504,13 @@ test "ref" {
     defer lua.deinit();
 
     lua.pushNil();
-    try expectError(error.LuaError, lua.ref(zlua.registry_index));
+    try expectEqual(zlua.ref_nil, lua.ref(zlua.registry_index));
     try expectEqual(0, lua.getTop());
 
     _ = lua.pushString("Hello there");
-    const ref = try lua.ref(zlua.registry_index);
+    const ref = lua.ref(zlua.registry_index);
 
-    _ = lua.rawGetIndex(zlua.registry_index, ref);
+    _ = lua.getIndexRaw(zlua.registry_index, ref);
     try expectEqualStrings("Hello there", try lua.toString(-1));
 
     lua.unref(zlua.registry_index, ref);
@@ -1519,15 +1523,15 @@ test "ref luau" {
     defer lua.deinit();
 
     lua.pushNil();
-    try expectError(error.LuaError, lua.ref(1));
+    try expectEqual(zlua.ref_nil, lua.ref(1));
     try expectEqual(1, lua.getTop());
 
     // In luau lua.ref does not pop the item from the stack
     // and the data is stored in the registry_index by default
     _ = lua.pushString("Hello there");
-    const ref = try lua.ref(2);
+    const ref = lua.ref(2);
 
-    _ = lua.rawGetIndex(zlua.registry_index, ref);
+    _ = lua.getIndexRaw(zlua.registry_index, ref);
     try expectEqualStrings("Hello there", try lua.toString(-1));
 
     lua.unref(ref);
@@ -1548,7 +1552,7 @@ test "metatables" {
     }
 
     // set the len metamethod to the function f
-    _ = try lua.getGlobal("f");
+    _ = lua.getGlobal("f");
     lua.setField(1, "__len");
 
     lua.newTable();
@@ -1602,7 +1606,7 @@ test "args and errors" {
 }
 
 test "traceback" {
-    if (langIn(.{ .lua51, .luajit, .luau })) return;
+    if (langIn(.{ .lua51, .luajit })) return;
 
     const lua: *Lua = try .init(testing.allocator);
     defer lua.deinit();
@@ -1618,8 +1622,12 @@ test "traceback" {
     lua.setGlobal("tracebackFn");
     try lua.doString("res = tracebackFn()");
 
-    _ = try lua.getGlobal("res");
-    try expectEqualStrings("\nstack traceback:\n\t[string \"res = tracebackFn()\"]:1: in main chunk", try lua.toString(-1));
+    _ = lua.getGlobal("res");
+    if (zlua.lang == .luau) {
+        try expectEqualStrings("\n[string \"...\"]:1\n", try lua.toString(-1));
+    } else {
+        try expectEqualStrings("\nstack traceback:\n\t[string \"res = tracebackFn()\"]:1: in main chunk", try lua.toString(-1));
+    }
 }
 
 test "getSubtable" {
@@ -1633,7 +1641,7 @@ test "getSubtable" {
         \\  b = {},
         \\}
     );
-    _ = try lua.getGlobal("a");
+    _ = lua.getGlobal("a");
 
     // get the subtable a.b
     _ = lua.getSubtable(-1, "b");
@@ -1756,7 +1764,7 @@ test "userdata slices" {
 }
 
 test "function environments" {
-    if (zlua.lang != .lua51 and zlua.lang != .luau) return;
+    if (zlua.lang != .lua51 and zlua.lang != .luajit and zlua.lang != .luau) return;
 
     const lua: *Lua = try .init(testing.allocator);
     defer lua.deinit();
@@ -1767,13 +1775,13 @@ test "function environments" {
     lua.pushInteger(10);
     lua.setGlobal("x");
 
-    _ = try lua.getGlobal("test");
+    _ = lua.getGlobal("test");
     try lua.protectedCall(.{ .results = 1 });
     try testing.expectEqual(10, lua.toInteger(1));
     lua.pop(1);
 
     // now set the functions table to have a different value of x
-    _ = try lua.getGlobal("test");
+    _ = lua.getGlobal("test");
     lua.newTable();
     lua.pushInteger(20);
     lua.setField(2, "x");
@@ -1783,14 +1791,14 @@ test "function environments" {
     try testing.expectEqual(20, lua.toInteger(1));
     lua.pop(1);
 
-    _ = try lua.getGlobal("test");
+    _ = lua.getGlobal("test");
     lua.getFnEnvironment(1);
     _ = lua.getField(2, "x");
     try testing.expectEqual(20, lua.toInteger(3));
 }
 
 test "objectLen" {
-    if (zlua.lang != .lua51 and zlua.lang != .luau) return;
+    if (zlua.lang != .lua51 and zlua.lang != .luau and zlua.lang != .luajit) return;
 
     const lua: *Lua = try .init(testing.allocator);
     defer lua.deinit();
@@ -1814,7 +1822,7 @@ test "debug interface" {
         \\  return x + y
         \\end
     );
-    _ = try lua.getGlobal("f");
+    _ = lua.getGlobal("f");
 
     var info: DebugInfo = undefined;
     lua.getInfo(.{
@@ -1873,7 +1881,7 @@ test "debug interface" {
     try expectEqual(zlua.wrap(hook), lua.getHook());
     try expectEqual(zlua.HookMask{ .call = true, .line = true, .ret = true }, lua.getHookMask());
 
-    _ = try lua.getGlobal("f");
+    _ = lua.getGlobal("f");
     lua.pushNumber(3);
     try lua.protectedCall(.{ .args = 1, .results = 1 });
 }
@@ -1891,7 +1899,7 @@ test "debug interface Lua 5.1 and Luau" {
         \\  return x + y
         \\end
     );
-    _ = try lua.getGlobal("f");
+    _ = lua.getGlobal("f");
 
     var info: DebugInfo = undefined;
 
@@ -1963,7 +1971,7 @@ test "debug interface Lua 5.1 and Luau" {
     try expectEqual(@as(?zlua.CHookFn, zlua.wrap(hook)), lua.getHook());
     try expectEqual(zlua.HookMask{ .call = true, .line = true, .ret = true }, lua.getHookMask());
 
-    _ = try lua.getGlobal("f");
+    _ = lua.getGlobal("f");
     lua.pushNumber(3);
     try lua.protectedCall(.{ .args = 1, .results = 1 });
 }
@@ -1980,10 +1988,10 @@ test "debug upvalues" {
         \\end
         \\addone = f(1)
     );
-    _ = try lua.getGlobal("addone");
+    _ = lua.getGlobal("addone");
 
     // index doesn't exist
-    try expectError(error.LuaError, lua.getUpvalue(1, 2));
+    try expectError(error.OutOfBounds, lua.getUpvalue(1, 2));
 
     // inspect the upvalue (should be x)
     try expectEqualStrings(if (zlua.lang == .luau) "" else "x", try lua.getUpvalue(-1, 1));
@@ -1995,7 +2003,7 @@ test "debug upvalues" {
     _ = try lua.setUpvalue(-2, 1);
 
     // test a bad index (the valid one's result is unpredicable)
-    if (zlua.lang == .lua54 or zlua.lang == .lua55) try expectError(error.LuaError, lua.upvalueId(-1, 2));
+    if (zlua.lang == .lua54 or zlua.lang == .lua55) try expectEqual(null, lua.upvalueId(-1, 2));
 
     // call the new function (should return 7)
     lua.pushNumber(2);
@@ -2010,12 +2018,12 @@ test "debug upvalues" {
         \\addthree = f(3)
     );
 
-    _ = try lua.getGlobal("addone");
-    _ = try lua.getGlobal("addthree");
+    _ = lua.getGlobal("addone");
+    _ = lua.getGlobal("addthree");
 
     // now addone and addthree share the same upvalue
     lua.upvalueJoin(-2, 1, -1, 1);
-    try expect((try lua.upvalueId(-2, 1)) == try lua.upvalueId(-1, 1));
+    try expect(lua.upvalueId(-2, 1) == lua.upvalueId(-1, 1));
 }
 
 test "getstack" {
@@ -2024,7 +2032,7 @@ test "getstack" {
     const lua: *Lua = try .init(testing.allocator);
     defer lua.deinit();
 
-    try expectError(error.LuaError, lua.getStack(1));
+    try expectError(error.OutOfBounds, lua.getStack(1));
 
     const function = struct {
         fn inner(l: *Lua) !i32 {
@@ -2099,7 +2107,7 @@ test "userdata dtor" {
 
         var data = lua.newUserdataDtor(Data, zlua.wrap(Data.dtor));
         data.gc_hits_ptr = &gc_hits;
-        try expectEqual(@as(*anyopaque, @ptrCast(data)), try lua.toPointer(1));
+        try expectEqual(@as(*anyopaque, @ptrCast(data)), lua.toPointer(1));
         try expectEqual(0, gc_hits);
         lua.pop(1); // don't let the stack hold a ref to the user data
         lua.gcCollect();
@@ -2126,22 +2134,44 @@ test "tagged userdata" {
     const data2 = try lua.toUserdataTagged(Data, -1, 13);
     try testing.expectEqual(data.val, data2.val);
 
-    var tag = try lua.userdataTag(-1);
+    var tag = try lua.getUserdataTag(-1);
     try testing.expectEqual(13, tag);
 
     lua.setUserdataTag(-1, 100);
-    tag = try lua.userdataTag(-1);
+    tag = try lua.getUserdataTag(-1);
     try testing.expectEqual(100, tag);
 
     // Test that tag mismatch error handling works.  Userdata is not tagged with 123.
-    try expectError(error.LuaError, lua.toUserdataTagged(Data, -1, 123));
+    try expectError(error.ExpectedTaggedUserdata, lua.toUserdataTagged(Data, -1, 123));
 
     // should not fail
     _ = try lua.toUserdataTagged(Data, -1, 100);
 
-    // Integer is not userdata, so userdataTag should fail.
+    // Integer is not userdata, so getUserdataTag should fail.
     lua.pushInteger(13);
-    try expectError(error.LuaError, lua.userdataTag(-1));
+    try expectError(error.ExpectedTaggedUserdata, lua.getUserdataTag(-1));
+}
+
+test "tagged raw get and set" {
+    if (zlua.lang != .luau) return;
+
+    var lua: *Lua = try .init(testing.allocator);
+    defer lua.deinit();
+
+    lua.newTable();
+
+    var value: usize = 42;
+    const tag = 5;
+
+    _ = lua.pushString("Some string");
+    lua.setPtrRawTagged(1, &value, tag);
+
+    const lua_type = lua.getPtrRawTagged(1, &value, tag);
+    try expectEqual(.string, lua_type);
+
+    // Wrong tag will return nil.
+    const fail = lua.getPtrRawTagged(1, &value, 6);
+    try expectEqual(.nil, fail);
 }
 
 fn vectorCtor(l: *Lua) !i32 {
@@ -2173,7 +2203,7 @@ test "luau vectors" {
         \\  return vector(c.x, c.y, c.z)
         \\end
     );
-    _ = try lua.getGlobal("test");
+    _ = lua.getGlobal("test");
     try lua.protectedCall(.{ .results = 1 });
     var v = try lua.toVector(-1);
     try testing.expectEqualSlices(f32, &[3]f32{ 10, 14, 18 }, v[0..3]);
@@ -2213,7 +2243,8 @@ test "useratom" {
     if (zlua.lang != .luau) return;
 
     const useratomCb = struct {
-        pub fn inner(str: []const u8) i16 {
+        pub fn inner(l: *Lua, str: []const u8) i16 {
+            _ = l;
             if (std.mem.eql(u8, str, "method_one")) {
                 return 0;
             } else if (std.mem.eql(u8, str, "another_method")) {
@@ -2243,7 +2274,7 @@ test "useratom" {
     try expectEqual(-1, atom_idx2);
 
     lua.pushInteger(13);
-    try expectError(error.LuaError, lua.toStringAtom(-1));
+    try expectError(error.ExpectedString, lua.toStringAtom(-1));
 }
 
 test "namecall" {
@@ -2256,7 +2287,8 @@ test "namecall" {
         // The useratom callback to initially form a mapping from method names to
         // integer indices. The indices can then be used to quickly dispatch the right
         // method in namecalls without needing to perform string compares.
-        pub fn useratomCb(str: []const u8) i16 {
+        pub fn useratomCb(l: *Lua, str: []const u8) i16 {
+            _ = l;
             if (std.mem.eql(u8, str, "dot")) {
                 return dot_idx;
             }
@@ -2375,9 +2407,9 @@ test "toAny" {
 
     //void
     try lua.doString("value = {}\nvalue_err = {a = 5}");
-    _ = try lua.getGlobal("value");
+    _ = lua.getGlobal("value");
     try testing.expectEqual(void{}, try lua.toAny(void, -1));
-    _ = try lua.getGlobal("value_err");
+    _ = lua.getGlobal("value_err");
     try testing.expectError(error.LuaVoidTableIsNotEmpty, lua.toAny(void, -1));
 }
 
@@ -2391,7 +2423,7 @@ test "toAny struct" {
         bizz: []const u8 = "hi",
     };
     try lua.doString("value = {[\"foo\"] = 10, [\"bar\"] = false}");
-    const lua_type = try lua.getGlobal("value");
+    const lua_type = lua.getGlobal("value");
     try testing.expect(lua_type == .table);
     const my_struct = try lua.toAny(MyType, 1);
     try testing.expect(std.meta.eql(
@@ -2441,7 +2473,7 @@ test "toAny tuple from struct" {
         \\ }
     );
 
-    const lua_type = try lua.getGlobal("value");
+    const lua_type = lua.getGlobal("value");
     try testing.expect(lua_type == .table);
     const my_struct = try lua.toAny(MyType, 1);
     try testing.expect(std.meta.eql(
@@ -2475,7 +2507,7 @@ test "toAny from struct with fromLua" {
         \\ }
     );
 
-    const lua_type = try lua.getGlobal("value");
+    const lua_type = lua.getGlobal("value");
     try testing.expect(lua_type == .table);
     const my_struct = try lua.toAny(MyType, 1);
     try testing.expect(std.meta.eql(
@@ -2508,7 +2540,7 @@ test "toAny mutable string in struct" {
         bar: bool,
     };
     try lua.doString("value = {[\"name\"] = \"hi\", [\"sentinel\"] = \"ss\", [\"bar\"] = false}");
-    const lua_type = try lua.getGlobal("value");
+    const lua_type = lua.getGlobal("value");
     try testing.expect(lua_type == .table);
     const parsed = try lua.toAnyAlloc(MyType, 1);
     defer parsed.deinit();
@@ -2546,7 +2578,7 @@ test "toAny struct recursive" {
         \\}
     );
 
-    _ = try lua.getGlobal("value");
+    _ = lua.getGlobal("value");
     const my_struct = try lua.toAny(MyType, -1);
     try testing.expectEqualDeep(MyType{}, my_struct);
 }
@@ -2574,15 +2606,15 @@ test "toAny tagged union" {
         \\}
     );
 
-    _ = try lua.getGlobal("value0");
+    _ = lua.getGlobal("value0");
     const my_struct0 = try lua.toAny(MyType, -1);
     try testing.expectEqualDeep(MyType{ .c = "Hello, world!" }, my_struct0);
 
-    _ = try lua.getGlobal("value1");
+    _ = lua.getGlobal("value1");
     const my_struct1 = try lua.toAny(MyType, -1);
     try testing.expectEqualDeep(MyType{ .d = .{ .t0 = 5.0, .t1 = -3.0 } }, my_struct1);
 
-    _ = try lua.getGlobal("value2");
+    _ = lua.getGlobal("value2");
     const my_struct2 = try lua.toAny(MyType, -1);
     try testing.expectEqualDeep(MyType{ .a = 1000 }, my_struct2);
 }
@@ -2595,7 +2627,7 @@ test "toAny slice" {
         \\list = {1, 2, 3, 4, 5}
     ;
     try lua.doString(program);
-    _ = try lua.getGlobal("list");
+    _ = lua.getGlobal("list");
     const sliced = try lua.toAnyAlloc([]u32, -1);
     defer sliced.deinit();
 
@@ -2613,7 +2645,7 @@ test "toAny array" {
         \\array= {1, 2, nil, 4, 5}
     ;
     try lua.doString(program);
-    _ = try lua.getGlobal("array");
+    _ = lua.getGlobal("array");
     const array = try lua.toAny([5]?u32, -1);
     try testing.expectEqual(arr, array);
 }
@@ -2627,7 +2659,7 @@ test "toAny vector" {
         \\vector= {true, false, false, true}
     ;
     try lua.doString(program);
-    _ = try lua.getGlobal("vector");
+    _ = lua.getGlobal("vector");
     const vector = try lua.toAny(@Vector(4, bool), -1);
     try testing.expectEqual(vec, vector);
 }
@@ -2715,7 +2747,7 @@ test "pushAny from struct with toLua" {
         foo: i32,
         tuple: std.meta.Tuple(&.{ i32, i32 }),
 
-        pub fn toLua(self: Self, l: *Lua) void {
+        pub fn toLua(self: Self, l: *Lua) !void {
             l.newTable();
 
             inline for (@typeInfo(Self).@"struct".fields) |f| {

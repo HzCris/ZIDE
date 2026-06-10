@@ -3,7 +3,7 @@
     .version = "0.0.1",
     // anyzig dispatches this EXACT version (despite the "minimum" name) —
     // keep it matching the toolchain the project is actually tested with.
-    .minimum_zig_version = "0.15.2",
+    .minimum_zig_version = "0.16.0",
     .fingerprint = 0x5e89543fc18082dd,
     .paths = .{
         "build.zig",
@@ -14,7 +14,6 @@
     .dependencies = .{
         .dvui = .{ .path = "libs/dvui" },
         .ziglua = .{ .path = "libs/ziglua" },
-        .zit = .{ .path = "libs/zit" },
         .vaxis = .{ .path = "libs/libvaxis" },
     },
 }

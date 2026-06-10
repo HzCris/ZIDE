@@ -8,6 +8,22 @@ pub fn styling() void {
         var hbox = dvui.box(@src(), .{ .dir = .horizontal }, .{});
         defer hbox.deinit();
 
+        const start = dvui.dataGetPtrDefault(null, hbox.data().id, "start", f32, 5);
+        const end = dvui.dataGetPtrDefault(null, hbox.data().id, "end", f32, 7);
+
+        const txt = "Highlighted Label";
+        dvui.labelEx(@src(), txt, .{}, .{ .sel_start = @trunc(@min(start.*, end.*)), .sel_end = @trunc(@max(start.*, end.*)) }, .{});
+
+        _ = dvui.sliderEntry(@src(), "start: {d:0.0}", .{ .value = start, .min = 0, .max = txt.len, .interval = 1 }, .{});
+        _ = dvui.sliderEntry(@src(), "end: {d:0.0}", .{ .value = end, .min = 0, .max = txt.len, .interval = 1 }, .{});
+    }
+
+    {
+        dvui.label(@src(), "Styling Buttons", .{}, .{});
+
+        var hbox = dvui.box(@src(), .{ .dir = .horizontal }, .{});
+        defer hbox.deinit();
+
         _ = dvui.button(@src(), "Highlight", .{}, .{ .style = .highlight });
         _ = dvui.button(@src(), "Error", .{}, .{ .style = .err });
         _ = dvui.button(@src(), "Window", .{}, .{ .style = .window });
@@ -230,9 +246,9 @@ pub fn rgbSliders(src: std.builtin.SourceLocation, color: *dvui.Color, opts: Opt
     var hbox = dvui.box(src, .{ .dir = .horizontal, .equal_space = true }, opts);
     defer hbox.deinit();
 
-    var red: f32 = @floatFromInt(color.r);
-    var green: f32 = @floatFromInt(color.g);
-    var blue: f32 = @floatFromInt(color.b);
+    var red: f32 = color.r;
+    var green: f32 = color.g;
+    var blue: f32 = color.b;
 
     var changed = false;
     if (dvui.sliderEntry(@src(), "R: {d:0.0}", .{ .value = &red, .min = 0, .max = 255, .interval = 1 }, .{ .gravity_y = 0.5 })) {
@@ -245,9 +261,9 @@ pub fn rgbSliders(src: std.builtin.SourceLocation, color: *dvui.Color, opts: Opt
         changed = true;
     }
 
-    color.r = @intFromFloat(red);
-    color.g = @intFromFloat(green);
-    color.b = @intFromFloat(blue);
+    color.r = @trunc(red);
+    color.g = @trunc(green);
+    color.b = @trunc(blue);
 
     return changed;
 }

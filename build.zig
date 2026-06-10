@@ -20,12 +20,6 @@ pub fn build(b: *std.Build) void {
         .lang = .lua54,
     });
 
-    // zit TUI library
-    const zit_dep = b.dependency("zit", .{
-        .target = target,
-        .optimize = optimize,
-    });
-
     // libvaxis TUI rendering
     const vaxis_dep = b.dependency("vaxis", .{
         .target = target,
@@ -61,7 +55,6 @@ pub fn build(b: *std.Build) void {
             gui_mod.addImport("sdl-backend", dvui_dep.module("sdl3"));
         }
         gui_mod.addImport("zlua", ziglua_dep.module("zlua"));
-        gui_mod.addImport("zit", zit_dep.module("zit"));
         gui_mod.addImport("vaxis", vaxis_dep.module("vaxis"));
 
         // Bundled mono font (Fira Code Nerd Font Mono) — embedded into the binary
@@ -106,7 +99,6 @@ pub fn build(b: *std.Build) void {
 
         tui_mod.addOptions("build_options", tui_options);
         tui_mod.addImport("zlua", ziglua_dep.module("zlua"));
-        tui_mod.addImport("zit", zit_dep.module("zit"));
         tui_mod.addImport("vaxis", vaxis_dep.module("vaxis"));
 
         // Windows application icon
@@ -140,7 +132,6 @@ pub fn build(b: *std.Build) void {
 
     test_mod.addOptions("build_options", test_options);
     test_mod.addImport("zlua", ziglua_dep.module("zlua"));
-    test_mod.addImport("zit", zit_dep.module("zit"));
     test_mod.addImport("vaxis", vaxis_dep.module("vaxis"));
 
     const tests = b.addTest(.{
