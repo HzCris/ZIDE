@@ -8,7 +8,7 @@
 - [] Git integration (gutter signs)
 - [] Terminal Splitting
 - [] Block/column selection
-- [] Ctrl+/ to comment highlighted text (Requires a lot of language/file maintenance/upkeeping)
+- [x] Ctrl+/ to comment highlighted text (uses register_language's line_comment/block_comment fields — upkeep lives in Lua configs)
 - [] Debug Support
 - [] Nerdfont/Custom Icon integration
 - [] Session Persistance Option
@@ -24,7 +24,7 @@
 - [] File tree / project browser (Including a Starting Directory option)
 - [] LLM support using OpenAI API for various cloud providers and local LLMs (And claude if allowed)
 - [] Git integration (gutter signs)
-- [] Ctrl+/ to comment highlighted text (Requires a lot of language/file maintenance/upkeeping)
+- [x] Ctrl+/ to comment highlighted text (uses register_language's line_comment/block_comment fields — upkeep lives in Lua configs)
 - [] Debug Support
 - [] Nerdfont/Custom Icon integration
 - [] Session Persistance Option

@@ -34,6 +34,7 @@
 | Ctrl+Shift+` | Open terminal (side-by-side split) |
 | Alt+Click | Add cursor at click position |
 | Ctrl+K | Delete line |
+| Ctrl+/ | Toggle comment on selected lines (uses the language's line comment; wraps in block comments for languages without one, e.g. CSS) |
 | Escape / Left-click | Remove secondary cursors |
 | Ctrl+Left/Right | Word movement |
 | Ctrl+Shift+Left/Right | Word selection |
@@ -73,6 +74,7 @@ Windows terminals commonly intercept Alt combos (Windows Terminal binds Alt+arro
 - Undo/redo history
 - Word movement and word delete (Ctrl+Left/Right, Ctrl+Backspace/Delete)
 - Line operations: delete (Ctrl+K), duplicate (Ctrl+D), move up/down (Alt+Up/Down)
+- Comment toggle (Ctrl+/): comments/uncomments all selected lines as one undo step, aligned at the block's minimum indent, skipping blank lines; uses `line_comment` from the language definition, falling back to per-line `block_comment_start/end` wrapping (CSS/HTML); works in legacy terminals too (Ctrl+/ arrives as byte 0x1F and is normalized)
 - Smart Home (first non-whitespace or column 0)
 - Indent/Dedent (Tab/Shift+Tab, respects tab_width and use_tabs settings)
 - Auto-closing brackets and quotes (skip-over, smart quote detection)
@@ -604,36 +606,3 @@ ZIDE includes a built-in terminal emulator that integrates with the split pane s
 - GUI: tab expansion columns pre-computed once per line, not per wrap row
 - TUI: vaxis cell-level diffing (only changed cells sent to terminal)
 
-# Extensions that every IDE has over a text editor.
-
-## TUI
-- [x] Syntax highlighting
-- [x] LSP support
-- [] File tree / project browser (Including a Starting Directory option)
-- [] LLM support using OpenAI API for various cloud providers and local LLMs (And claude if allowed)
-- [] Git integration (gutter signs)
-- [] Terminal Splitting
-- [] Block/column selection
-- [] Ctrl+/ to comment highlighted text (Requires a lot of language/file maintenance/upkeeping)
-- [] Debug Support
-- [] Nerdfont/Custom Icon integration
-- [] Session Persistance Option
-- [] TODO comment integration
-- [] Linting
-- [] Extension fetching (Think like how neovim pulls from github/codeberg)
-
-## GUI
-- [x] LSP support
-- [x] Embedded Terminal
-- [x] Syntax highlighting
-- [x] Block/column selection
-- [] File tree / project browser (Including a Starting Directory option)
-- [] LLM support using OpenAI API for various cloud providers and local LLMs (And claude if allowed)
-- [] Git integration (gutter signs)
-- [] Ctrl+/ to comment highlighted text (Requires a lot of language/file maintenance/upkeeping)
-- [] Debug Support
-- [] Nerdfont/Custom Icon integration
-- [] Session Persistance Option
-- [] TODO comment integration
-- [] Linting
-- [] Extension fetching (Think like how neovim pulls from github/codeberg)

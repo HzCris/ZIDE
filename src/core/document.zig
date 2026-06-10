@@ -596,6 +596,136 @@ pub const Document = struct {
         self.invalidateLineStates(pos.line);
     }
 
+    /// Toggle comments on every line covered by the primary selection (or the
+    /// cursor's line). `prefix` is inserted after the block's minimum
+    /// indentation; for languages without line comments (CSS, HTML) pass the
+    /// block markers and each line is wrapped `prefix line suffix`.
+    /// Uncomments when every non-blank covered line is already commented.
+    /// One undo step; selections and secondary cursors are preserved.
+    pub fn toggleComment(self: *Document, prefix: []const u8, suffix: ?[]const u8) !void {
+        if (prefix.len == 0) return;
+        const c = self.cursors.primary();
+
+        // Line range covered by the selection (or just the cursor line).
+        var first_line: usize = undefined;
+        var last_line: usize = undefined;
+        if (c.selectionRange()) |range| {
+            first_line = self.buffer.offsetToPos(range.start).line;
+            const end_pos = self.buffer.offsetToPos(range.end);
+            last_line = end_pos.line;
+            // A selection ending at column 0 doesn't include that line.
+            if (last_line > first_line and end_pos.col == 0) last_line -= 1;
+        } else {
+            first_line = self.cursorPos().line;
+            last_line = first_line;
+        }
+
+        // Pass 1: are all non-blank lines commented? Where is the min indent?
+        var all_commented = true;
+        var any_nonblank = false;
+        var min_indent: usize = std.math.maxInt(usize);
+        var scan = first_line;
+        while (scan <= last_line) : (scan += 1) {
+            const content = self.lineContent(scan);
+            const ws = leadingWhitespace(content);
+            if (ws == content.len) continue; // blank line
+            any_nonblank = true;
+            min_indent = @min(min_indent, ws);
+            if (!lineIsCommented(content[ws..], prefix, suffix)) all_commented = false;
+        }
+
+        const cursor_before = c.offset;
+        self.history.beginGroup();
+        defer self.history.endGroup();
+
+        // Process bottom-up so earlier lines' offsets stay valid; within a
+        // line, the higher-offset edit (suffix) goes first for the same reason.
+        if (any_nonblank and all_commented) {
+            // --- Uncomment ---
+            var ln = last_line + 1;
+            while (ln > first_line) {
+                ln -= 1;
+                const content = self.lineContent(ln);
+                const ws = leadingWhitespace(content);
+                if (ws == content.len) continue;
+                const trimmed = content[ws..];
+                if (!std.mem.startsWith(u8, trimmed, prefix)) continue;
+                const line_start = self.buffer.posToOffset(ln, 0);
+
+                // Plan both deletions before mutating (content is invalidated
+                // by the first edit). Each strips one space we likely added.
+                var suf_at: ?usize = null;
+                var suf_len: usize = 0;
+                if (suffix) |suf| {
+                    const t = std.mem.trimEnd(u8, trimmed, " \t");
+                    if (!(t.len >= prefix.len + suf.len and std.mem.endsWith(u8, t, suf))) continue;
+                    var start_in_line = ws + t.len - suf.len;
+                    suf_len = suf.len;
+                    if (start_in_line > ws + prefix.len and content[start_in_line - 1] == ' ') {
+                        start_in_line -= 1;
+                        suf_len += 1;
+                    }
+                    suf_at = line_start + start_in_line;
+                }
+                var pre_len = prefix.len;
+                if (trimmed.len > prefix.len and trimmed[prefix.len] == ' ') pre_len += 1;
+                if (suf_at) |sa| {
+                    // Degenerate "/* */": don't let the prefix's space-eat
+                    // overlap the suffix region that's about to be deleted.
+                    if (line_start + ws + pre_len > sa) pre_len = prefix.len;
+                }
+
+                if (suf_at) |sa| {
+                    const deleted = self.buffer.slice(sa, sa + suf_len);
+                    try self.history.recordDelete(sa, deleted, cursor_before, cursor_before);
+                    _ = self.buffer.delete(sa, suf_len);
+                    self.cursors.adjustAfterDelete(sa, suf_len);
+                }
+                const pre_at = line_start + ws;
+                const deleted = self.buffer.slice(pre_at, pre_at + pre_len);
+                try self.history.recordDelete(pre_at, deleted, cursor_before, cursor_before);
+                _ = self.buffer.delete(pre_at, pre_len);
+                self.cursors.adjustAfterDelete(pre_at, pre_len);
+            }
+        } else {
+            // --- Comment ---
+            const lead = try std.mem.concat(self.allocator, u8, &.{ prefix, " " });
+            defer self.allocator.free(lead);
+            const trail: ?[]u8 = if (suffix) |suf|
+                try std.mem.concat(self.allocator, u8, &.{ " ", suf })
+            else
+                null;
+            defer if (trail) |t| self.allocator.free(t);
+
+            var ln = last_line + 1;
+            while (ln > first_line) {
+                ln -= 1;
+                const content = self.lineContent(ln);
+                const ws = leadingWhitespace(content);
+                // Skip blank lines, unless the whole block is blank (then the
+                // single-blank-line case should still produce a comment).
+                if (any_nonblank and ws == content.len) continue;
+                const line_start = self.buffer.posToOffset(ln, 0);
+                const line_len = content.len;
+
+                if (trail) |t| {
+                    const at = line_start + line_len;
+                    const len = try self.buffer.insert(at, t);
+                    self.cursors.adjustAfterInsert(at, len);
+                    try self.history.recordInsert(at, t, cursor_before, cursor_before);
+                }
+                const indent = if (any_nonblank) @min(min_indent, ws) else ws;
+                const at = line_start + indent;
+                const len = try self.buffer.insert(at, lead);
+                self.cursors.adjustAfterInsert(at, len);
+                try self.history.recordInsert(at, lead, cursor_before, cursor_before);
+            }
+        }
+
+        self.markDirty();
+        self.invalidateLineStates(first_line);
+    }
+
     /// Go to a specific line number (1-based), placing cursor at start.
     pub fn gotoLine(self: *Document, line_num: usize) void {
         const target = if (line_num > 0) line_num - 1 else 0;
@@ -697,6 +827,25 @@ pub const Document = struct {
         return .normal;
     }
 };
+
+/// Count leading spaces/tabs.
+fn leadingWhitespace(line: []const u8) usize {
+    var i: usize = 0;
+    while (i < line.len and (line[i] == ' ' or line[i] == '\t')) i += 1;
+    return i;
+}
+
+/// Whether a line (already trimmed of leading whitespace) carries a comment:
+/// starts with `prefix`, and — when `suffix` is given — also ends with it
+/// (ignoring trailing whitespace) without overlapping the prefix.
+fn lineIsCommented(trimmed: []const u8, prefix: []const u8, suffix: ?[]const u8) bool {
+    if (!std.mem.startsWith(u8, trimmed, prefix)) return false;
+    if (suffix) |suf| {
+        const t = std.mem.trimEnd(u8, trimmed, " \t");
+        return t.len >= prefix.len + suf.len and std.mem.endsWith(u8, t, suf);
+    }
+    return true;
+}
 
 // ---- Tests ----
 
@@ -954,6 +1103,136 @@ test "duplicate line uses CRLF in CRLF documents" {
     doc.cursors.primary().gotoPos(&doc.buffer, 0, 0);
     try doc.duplicateLine();
     try std.testing.expectEqualStrings("aaa\r\naaa\r\nbbb", doc.buffer.slice(0, doc.buffer.byteLen()));
+}
+
+test "toggle comment single line round trip" {
+    const allocator = std.testing.allocator;
+    var doc = try Document.init(allocator);
+    defer doc.deinit();
+
+    try doc.loadText("    const x = 1;");
+    doc.cursors.primary().offset = 8;
+
+    try doc.toggleComment("//", null);
+    try std.testing.expectEqualStrings("    // const x = 1;", doc.lineContent(0));
+    // Cursor shifted with the inserted prefix
+    try std.testing.expectEqual(@as(usize, 11), doc.cursors.primary().offset);
+
+    try doc.toggleComment("//", null);
+    try std.testing.expectEqualStrings("    const x = 1;", doc.lineContent(0));
+    try std.testing.expectEqual(@as(usize, 8), doc.cursors.primary().offset);
+}
+
+test "toggle comment multi-line selection aligns at min indent, skips blanks" {
+    const allocator = std.testing.allocator;
+    var doc = try Document.init(allocator);
+    defer doc.deinit();
+
+    try doc.loadText("if (x) {\n    a();\n\n        b();\n}");
+    const c = doc.cursors.primary();
+    c.offset = 0;
+    c.startSelection();
+    c.offset = doc.buffer.byteLen();
+
+    try doc.toggleComment("//", null);
+    try std.testing.expectEqualStrings("// if (x) {", doc.lineContent(0));
+    try std.testing.expectEqualStrings("//     a();", doc.lineContent(1));
+    try std.testing.expectEqualStrings("", doc.lineContent(2)); // blank untouched
+    try std.testing.expectEqualStrings("//         b();", doc.lineContent(3));
+    try std.testing.expectEqualStrings("// }", doc.lineContent(4));
+    // Selection survives the edit
+    try std.testing.expect(c.hasSelection());
+
+    // All commented now -> toggling again uncomments
+    try doc.toggleComment("//", null);
+    try std.testing.expectEqualStrings("if (x) {\n    a();\n\n        b();\n}", doc.buffer.slice(0, doc.buffer.byteLen()));
+}
+
+test "toggle comment mixed selection comments everything" {
+    const allocator = std.testing.allocator;
+    var doc = try Document.init(allocator);
+    defer doc.deinit();
+
+    try doc.loadText("// done\npending");
+    const c = doc.cursors.primary();
+    c.offset = 0;
+    c.startSelection();
+    c.offset = doc.buffer.byteLen();
+
+    try doc.toggleComment("//", null);
+    try std.testing.expectEqualStrings("// // done", doc.lineContent(0));
+    try std.testing.expectEqualStrings("// pending", doc.lineContent(1));
+}
+
+test "toggle comment is one undo step" {
+    const allocator = std.testing.allocator;
+    var doc = try Document.init(allocator);
+    defer doc.deinit();
+
+    try doc.loadText("a\nb\nc");
+    const c = doc.cursors.primary();
+    c.offset = 0;
+    c.startSelection();
+    c.offset = doc.buffer.byteLen();
+
+    try doc.toggleComment("//", null);
+    try std.testing.expectEqualStrings("// a\n// b\n// c", doc.buffer.slice(0, doc.buffer.byteLen()));
+    _ = try doc.undoAction();
+    try std.testing.expectEqualStrings("a\nb\nc", doc.buffer.slice(0, doc.buffer.byteLen()));
+}
+
+test "toggle comment block style wraps each line" {
+    const allocator = std.testing.allocator;
+    var doc = try Document.init(allocator);
+    defer doc.deinit();
+
+    try doc.loadText("color: red;\n  margin: 0;");
+    const c = doc.cursors.primary();
+    c.offset = 0;
+    c.startSelection();
+    c.offset = doc.buffer.byteLen();
+
+    try doc.toggleComment("/*", "*/");
+    try std.testing.expectEqualStrings("/* color: red; */", doc.lineContent(0));
+    try std.testing.expectEqualStrings("/*   margin: 0; */", doc.lineContent(1));
+
+    try doc.toggleComment("/*", "*/");
+    try std.testing.expectEqualStrings("color: red;\n  margin: 0;", doc.buffer.slice(0, doc.buffer.byteLen()));
+}
+
+test "toggle comment selection ending at column 0 excludes that line" {
+    const allocator = std.testing.allocator;
+    var doc = try Document.init(allocator);
+    defer doc.deinit();
+
+    try doc.loadText("one\ntwo\nthree");
+    const c = doc.cursors.primary();
+    c.offset = 0;
+    c.startSelection();
+    c.offset = doc.buffer.posToOffset(2, 0); // selects "one\ntwo\n"
+
+    try doc.toggleComment("#", null);
+    try std.testing.expectEqualStrings("# one", doc.lineContent(0));
+    try std.testing.expectEqualStrings("# two", doc.lineContent(1));
+    try std.testing.expectEqualStrings("three", doc.lineContent(2));
+}
+
+test "toggle comment CRLF document keeps line endings" {
+    const allocator = std.testing.allocator;
+    var doc = try Document.init(allocator);
+    defer doc.deinit();
+
+    try doc.loadText("aaa\r\nbbb");
+    const c = doc.cursors.primary();
+    c.offset = 0;
+    c.startSelection();
+    c.offset = doc.buffer.byteLen();
+
+    try doc.toggleComment("/*", "*/");
+    try std.testing.expectEqualStrings("/* aaa */\r\n/* bbb */", doc.buffer.slice(0, doc.buffer.byteLen()));
+
+    try doc.toggleComment("/*", "*/");
+    try std.testing.expectEqualStrings("aaa\r\nbbb", doc.buffer.slice(0, doc.buffer.byteLen()));
 }
 
 test "document line ending detection" {

@@ -97,6 +97,7 @@ const welcome_text =
     \\//   Ctrl+A            select all
     \\//   Ctrl+Shift+D      duplicate line     Ctrl+K           delete line
     \\//   Alt+Up / Down     move line          Ctrl+Bksp / Del  delete word
+    \\//   Ctrl+/            toggle comment on selected lines
     \\//
     \\// Find & go
     \\//   Ctrl+F            find               Ctrl+H           find & replace

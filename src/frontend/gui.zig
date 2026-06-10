@@ -398,6 +398,10 @@ pub fn frame(editor: *Editor) bool {
                 _ = editor.execCommand("select_all", null);
                 m.close();
             }
+            if (dvui.menuItemLabel(@src(), "Toggle Comment   Ctrl+/", .{}, .{ .expand = .horizontal }) != null) {
+                _ = editor.execCommand("toggle_comment", null);
+                m.close();
+            }
             if (dvui.menuItemLabel(@src(), "Find             Ctrl+F", .{}, .{ .expand = .horizontal }) != null) {
                 _ = editor.execAction("find");
                 m.close();

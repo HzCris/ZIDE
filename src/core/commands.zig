@@ -137,6 +137,7 @@ pub fn registerBuiltins(registry: *CommandRegistry) !void {
     try registry.register("smart_home_select", "Extend selection to smart home", cmdSmartHomeSelect);
     try registry.register("indent", "Indent (insert tab/spaces)", cmdIndent);
     try registry.register("dedent", "Dedent (remove leading whitespace)", cmdDedent);
+    try registry.register("toggle_comment", "Toggle comment on selected lines", cmdToggleComment);
     try registry.register("cursor_file_start", "Move to start of file", cmdCursorFileStart);
     try registry.register("cursor_file_end", "Move to end of file", cmdCursorFileEnd);
     try registry.register("cursor_file_start_select", "Select to start of file", cmdCursorFileStartSelect);
@@ -499,6 +500,29 @@ fn cmdIndent(editor: *Editor, _: ?[]const u8) void {
 
 fn cmdDedent(editor: *Editor, _: ?[]const u8) void {
     editor.activeDoc().dedentLine(editor.tab_width) catch {};
+}
+
+// --- Comment toggle ---
+
+fn cmdToggleComment(editor: *Editor, _: ?[]const u8) void {
+    const doc = editor.activeDoc();
+    const lang = doc.language orelse {
+        editor.status_message = "Comment toggle: no language detected for this file";
+        return;
+    };
+    // Prefer line comments; fall back to wrapping each line in block
+    // markers for languages without them (CSS, HTML).
+    if (lang.line_comment) |lc| {
+        doc.toggleComment(lc, null) catch {};
+    } else if (lang.block_comment_start) |bs| {
+        if (lang.block_comment_end) |be| {
+            doc.toggleComment(bs, be) catch {};
+        } else {
+            editor.status_message = "Comment toggle: language has no comment syntax";
+        }
+    } else {
+        editor.status_message = "Comment toggle: language has no comment syntax";
+    }
 }
 
 // --- File start/end ---

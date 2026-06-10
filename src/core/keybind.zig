@@ -71,6 +71,7 @@ pub const KeybindMap = struct {
         try self.set("ctrl+g", "goto_line");
         try self.set("ctrl+shift+d", "duplicate_line");
         try self.set("ctrl+k", "delete_line");
+        try self.set("ctrl+/", "toggle_comment");
         try self.set("ctrl+w", "close_tab");
         // Ctrl+navigation
         try self.set("ctrl+backspace", "delete_word_backward");
@@ -149,6 +150,7 @@ test "keybind defaults" {
     try std.testing.expectEqualStrings("save", kb.get("ctrl+s").?);
     try std.testing.expectEqualStrings("undo", kb.get("ctrl+z").?);
     try std.testing.expectEqualStrings("delete_line", kb.get("ctrl+k").?);
+    try std.testing.expectEqualStrings("toggle_comment", kb.get("ctrl+/").?);
     try std.testing.expectEqualStrings("move_line_up", kb.get("alt+up").?);
     try std.testing.expectEqualStrings("add_next_occurrence", kb.get("ctrl+d").?);
     try std.testing.expectEqualStrings("duplicate_line", kb.get("ctrl+shift+d").?);

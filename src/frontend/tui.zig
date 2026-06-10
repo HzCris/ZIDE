@@ -1676,9 +1676,19 @@ fn keyToStr(key: Key, buf: *[64]u8) []const u8 {
 }
 
 /// Handle a keyboard event from libvaxis.
-fn handleKey(editor: *Editor, key: Key) void {
+fn handleKey(editor: *Editor, key_in: Key) void {
+    var key = key_in;
     // Ignore modifier-only keys
     if (key.isModifier()) return;
+
+    // Terminals without the kitty keyboard protocol send Ctrl+/ as the bare
+    // C0 byte 0x1F with no mods (vaxis's legacy map stops at 0x1A) —
+    // normalize so the "ctrl+/" keybind works everywhere.
+    if (key.codepoint == 0x1f) {
+        key.codepoint = '/';
+        key.mods.ctrl = true;
+        key.text = null;
+    }
 
     // Any key press un-pins scroll (cursor tracking resumes)
     scroll_pinned = false;
