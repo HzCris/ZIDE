@@ -103,6 +103,17 @@ pub const Document = struct {
         self.detectLineEndings();
     }
 
+    /// Update the stored file path (e.g. after a rename on disk) without
+    /// touching buffer contents, history, or dirty state.
+    pub fn setFilePath(self: *Document, path: []const u8) !void {
+        const duped = try self.allocator.dupe(u8, path);
+        if (self.file_path) |old| {
+            self.allocator.free(old);
+        }
+        self.file_path = duped;
+        self.setDisplayNameFromPath(path);
+    }
+
     /// Load text directly (for new buffers, testing, etc.).
     pub fn loadText(self: *Document, text: []const u8) !void {
         try self.buffer.loadText(text);

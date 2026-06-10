@@ -16,6 +16,7 @@ const SyntaxTheme = theme_mod.SyntaxTheme;
 const TuiSyntaxTheme = theme_mod.TuiSyntaxTheme;
 const syntax = @import("syntax.zig");
 pub const lsp_mod = @import("lsp.zig");
+pub const filetree_mod = @import("filetree.zig");
 
 /// The central editor state. NOT a global singleton — passed explicitly.
 /// Owns open documents, the command registry, and global editor settings.
@@ -159,6 +160,27 @@ pub const Editor = struct {
     /// Per-language GUI syntax theme overrides (keyed by language name).
     lang_syntax_overrides: std.ArrayList(LangSyntaxOverride),
 
+    /// File tree side panel model (created lazily by `ensureFiletree`).
+    filetree: ?filetree_mod.FileTree = null,
+    /// Whether the file tree side panel is shown.
+    filetree_visible: bool = true,
+    /// Whether the file tree has keyboard focus (frontends route keys to it).
+    filetree_focused: bool = false,
+    /// Which side of the window the file tree docks on.
+    filetree_side: FiletreeSide = .left,
+    /// GUI file tree panel width in pixels.
+    filetree_width: f32 = 240,
+    /// TUI file tree panel width in columns.
+    tui_filetree_width: u16 = 30,
+    /// TUI file tree scroll offset (rows).
+    tui_filetree_scroll: usize = 0,
+    /// Starting directory for the file tree (null = current directory). Owned.
+    filetree_root: ?[]const u8 = null,
+    /// Which file-tree prompt is active while mode == .filetree_prompt.
+    filetree_prompt_kind: FiletreePromptKind = .create,
+    /// Rel-path of the prompt's target node (owned; survives refreshes).
+    filetree_prompt_target: ?[]u8 = null,
+
     pub const EditorCompletionItem = struct {
         label: []const u8,
         detail: ?[]const u8 = null,
@@ -176,6 +198,10 @@ pub const Editor = struct {
         tui_theme: TuiSyntaxTheme,
     };
 
+    pub const FiletreeSide = enum { left, right };
+
+    pub const FiletreePromptKind = enum { create, rename, delete_confirm };
+
     pub const Mode = enum {
         normal,
         find,
@@ -186,6 +212,7 @@ pub const Editor = struct {
         goto_line,
         confirm_quit,
         settings,
+        filetree_prompt,
     };
 
     pub fn init(allocator: Allocator, io: std.Io) !Editor {
@@ -254,6 +281,9 @@ pub const Editor = struct {
         if (self.mono_font_path.len > 0) {
             self.allocator.free(self.mono_font_path);
         }
+        if (self.filetree) |*ft| ft.deinit();
+        if (self.filetree_root) |r| self.allocator.free(r);
+        if (self.filetree_prompt_target) |tgt| self.allocator.free(tgt);
     }
 
     /// Get the currently active document (from the focused pane).
@@ -324,6 +354,170 @@ pub const Editor = struct {
         active.detectLanguage(self);
         self.lspNotifyOpen(active);
         return active;
+    }
+
+    /// Open `path`, or switch to the tab that already has it open
+    /// (separator-normalized compare, case-insensitive on Windows).
+    pub fn openOrFocus(self: *Editor, path: []const u8) !*Document {
+        for (self.documents.items, 0..) |*doc, idx| {
+            const dp = doc.file_path orelse continue;
+            if (filetree_mod.normPathEql(dp, path)) {
+                self.switchToDoc(idx);
+                return self.activeDoc();
+            }
+        }
+        return try self.openFile(path);
+    }
+
+    /// Get the file tree, creating it on first use. Returns null (with a
+    /// status message, and the panel hidden so the failure doesn't repeat
+    /// every frame) if the root directory can't be opened.
+    pub fn ensureFiletree(self: *Editor) ?*filetree_mod.FileTree {
+        if (self.filetree == null) {
+            const root = self.filetree_root orelse ".";
+            self.filetree = filetree_mod.FileTree.init(self.allocator, self.io, root) catch |err| {
+                const msg = std.fmt.bufPrint(&self.status_buf, "File tree: cannot open '{s}': {s}", .{ root, @errorName(err) }) catch "File tree: open failed";
+                self.status_message = msg;
+                self.filetree_visible = false;
+                return null;
+            };
+        }
+        return &self.filetree.?;
+    }
+
+    /// Toggle the file tree panel. Showing it also focuses it (nvim-tree
+    /// style); hiding it returns focus to the editor.
+    pub fn toggleFiletree(self: *Editor) void {
+        if (self.filetree_visible) {
+            self.filetree_visible = false;
+            self.filetree_focused = false;
+        } else {
+            self.filetree_visible = true;
+            if (self.ensureFiletree() != null) self.filetree_focused = true;
+        }
+    }
+
+    /// Begin a file-tree prompt (mode → .filetree_prompt). For .create the
+    /// target is the selected directory (or the parent of a selected file);
+    /// rename/delete require a non-root selection.
+    pub fn startFiletreePrompt(self: *Editor, kind: FiletreePromptKind) void {
+        const ft = if (self.filetree) |*f| f else return;
+        var target_idx: u32 = 0;
+        switch (kind) {
+            .create => {
+                const sel = ft.selectedNodeIdx() orelse 0;
+                target_idx = if (ft.nodes.items[sel].kind == .dir) sel else ft.nodes.items[sel].parent;
+            },
+            .rename, .delete_confirm => {
+                const sel = ft.selectedNodeIdx() orelse {
+                    self.status_message = "File tree: nothing selected";
+                    return;
+                };
+                if (sel == 0) return;
+                target_idx = sel;
+            },
+        }
+        const target = self.allocator.dupe(u8, ft.nodes.items[target_idx].rel_path) catch return;
+        if (self.filetree_prompt_target) |old| self.allocator.free(old);
+        self.filetree_prompt_target = target;
+        self.filetree_prompt_kind = kind;
+        self.open_buf_len = 0;
+        if (kind == .rename) {
+            // Prefill the input with the current name
+            const name = ft.nodes.items[target_idx].name;
+            const n = @min(name.len, self.open_buf.len);
+            @memcpy(self.open_buf[0..n], name[0..n]);
+            self.open_buf_len = n;
+        }
+        self.mode = .filetree_prompt;
+    }
+
+    /// Cancel the file-tree prompt and return to normal mode.
+    pub fn cancelFiletreePrompt(self: *Editor) void {
+        if (self.filetree_prompt_target) |old| self.allocator.free(old);
+        self.filetree_prompt_target = null;
+        self.mode = .normal;
+    }
+
+    /// Apply the active file-tree prompt (Enter / 'y'): perform the file
+    /// operation, refresh the tree, report via status message, and return
+    /// to normal mode.
+    pub fn applyFiletreePrompt(self: *Editor) void {
+        defer self.cancelFiletreePrompt();
+        const ft = if (self.filetree) |*f| f else return;
+        const target = self.filetree_prompt_target orelse return;
+        const input = self.open_buf[0..self.open_buf_len];
+        switch (self.filetree_prompt_kind) {
+            .create => {
+                const parent_idx = ft.findByPath(target) orelse 0;
+                const created = ft.createEntry(self.allocator, parent_idx, input) catch |err| {
+                    self.filetreeOpError("Create", err);
+                    return;
+                };
+                defer self.allocator.free(created);
+                ft.refresh() catch {};
+                _ = ft.expandToPath(created) catch null;
+                const msg = std.fmt.bufPrint(&self.status_buf, "Created {s}", .{created}) catch "Created";
+                self.status_message = msg;
+            },
+            .rename => {
+                const idx = ft.findByPath(target) orelse {
+                    self.status_message = "Rename failed: entry no longer exists";
+                    return;
+                };
+                const new_rel = ft.renameEntry(self.allocator, idx, input) catch |err| {
+                    self.filetreeOpError("Rename", err);
+                    return;
+                };
+                defer self.allocator.free(new_rel);
+                self.fixupDocPathsAfterRename(ft, target, new_rel);
+                ft.refresh() catch {};
+                _ = ft.expandToPath(new_rel) catch null;
+                const msg = std.fmt.bufPrint(&self.status_buf, "Renamed to {s}", .{new_rel}) catch "Renamed";
+                self.status_message = msg;
+            },
+            .delete_confirm => {
+                const idx = ft.findByPath(target) orelse {
+                    self.status_message = "Delete failed: entry no longer exists";
+                    return;
+                };
+                ft.deleteEntry(idx) catch |err| {
+                    self.filetreeOpError("Delete", err);
+                    return;
+                };
+                ft.refresh() catch {};
+                const msg = std.fmt.bufPrint(&self.status_buf, "Deleted {s}", .{target}) catch "Deleted";
+                self.status_message = msg;
+            },
+        }
+    }
+
+    fn filetreeOpError(self: *Editor, op: []const u8, err: anyerror) void {
+        const msg = std.fmt.bufPrint(&self.status_buf, "{s} failed: {s}", .{ op, @errorName(err) }) catch "File operation failed";
+        self.status_message = msg;
+    }
+
+    /// After a rename on disk, point open documents at the new path —
+    /// both the renamed entry itself and anything inside a renamed dir.
+    fn fixupDocPathsAfterRename(self: *Editor, ft: *filetree_mod.FileTree, old_rel: []const u8, new_rel: []const u8) void {
+        const old_abs = std.fs.path.join(self.allocator, &.{ ft.root_path, old_rel }) catch return;
+        defer self.allocator.free(old_abs);
+        const new_abs = std.fs.path.join(self.allocator, &.{ ft.root_path, new_rel }) catch return;
+        defer self.allocator.free(new_abs);
+        for (self.documents.items) |*doc| {
+            const dp = doc.file_path orelse continue;
+            if (filetree_mod.normPathEql(dp, old_abs)) {
+                doc.setFilePath(new_abs) catch {};
+            } else if (dp.len > old_abs.len and
+                filetree_mod.normPathEql(dp[0..old_abs.len], old_abs) and
+                (dp[old_abs.len] == '/' or dp[old_abs.len] == '\\'))
+            {
+                // Document inside a renamed directory
+                const joined = std.mem.concat(self.allocator, u8, &.{ new_abs, dp[old_abs.len..] }) catch continue;
+                defer self.allocator.free(joined);
+                doc.setFilePath(joined) catch {};
+            }
+        }
     }
 
     /// Close the active document. Returns false if it was the last one

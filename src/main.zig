@@ -124,7 +124,8 @@ const welcome_text =
     \\//
     \\// Terminal & code intelligence
     \\//   Ctrl+`            toggle terminal    Ctrl+Shift+`     terminal in split
-    \\//   Ctrl+Space        completion (LSP)   F12              go to definition
+    \\//   Ctrl+B            toggle file tree   Ctrl+Space       completion (LSP)
+    \\//   F12               go to definition
     \\
 ;
 

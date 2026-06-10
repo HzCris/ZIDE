@@ -340,6 +340,18 @@ pub fn run(allocator: std.mem.Allocator, editor: *Editor) !void {
                 // Settings panel is GUI-only; in TUI just show a hint
                 drawOverlay(win, editor, "Settings: edit ~/.config/zide/init.lua (Esc to close)", "", width, height);
             },
+            .filetree_prompt => {
+                switch (editor.filetree_prompt_kind) {
+                    .create => drawOverlay(win, editor, "New (end with / for folder): ", editor.open_buf[0..editor.open_buf_len], width, height),
+                    .rename => drawOverlay(win, editor, "Rename: ", editor.open_buf[0..editor.open_buf_len], width, height),
+                    .delete_confirm => {
+                        var buf: [160]u8 = undefined;
+                        const target = editor.filetree_prompt_target orelse "";
+                        const title = std.fmt.bufPrint(&buf, "Delete {s}? [Y]es [N]o: ", .{target}) catch "Delete? [Y]es [N]o: ";
+                        drawOverlay(win, editor, title, "", width, height);
+                    },
+                }
+            },
             .normal => positionCursor(win, editor, width, height),
         }
 
@@ -389,6 +401,7 @@ fn dispatchKey(editor: *Editor, key: Key) void {
             // Settings panel is GUI-only; Escape returns to normal
             if (key.codepoint == 0x1b) editor.mode = .normal; // Escape
         },
+        .filetree_prompt => handleFiletreePromptKey(editor, key),
     }
 }
 
@@ -2446,6 +2459,33 @@ fn handleSaveAsKey(editor: *Editor, key: Key) void {
             editor.activeDoc().detectLanguage(editor);
         }
         editor.mode = .normal;
+        return;
+    }
+    if (key.codepoint == Key.backspace) {
+        if (editor.open_buf_len > 0) editor.open_buf_len -= 1;
+        return;
+    }
+    appendToInputBuf(&editor.open_buf, &editor.open_buf_len, key);
+}
+
+/// Handle keys in file-tree prompt mode (create / rename / delete confirm).
+fn handleFiletreePromptKey(editor: *Editor, key: Key) void {
+    if (key.isModifier()) return;
+
+    if (key.codepoint == Key.escape) {
+        editor.cancelFiletreePrompt();
+        return;
+    }
+    if (editor.filetree_prompt_kind == .delete_confirm) {
+        if (key.codepoint == 'y' or key.codepoint == 'Y' or key.codepoint == Key.enter) {
+            editor.applyFiletreePrompt();
+        } else if (key.codepoint == 'n' or key.codepoint == 'N') {
+            editor.cancelFiletreePrompt();
+        }
+        return;
+    }
+    if (key.codepoint == Key.enter) {
+        editor.applyFiletreePrompt();
         return;
     }
     if (key.codepoint == Key.backspace) {

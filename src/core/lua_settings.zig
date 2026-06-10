@@ -430,6 +430,43 @@ fn luaSet(state: ?*zlua.LuaState) callconv(.c) c_int {
         editor.click_clears_cursors = lua.toBoolean(2);
     } else if (std.mem.eql(u8, key_str, "session_persistence")) {
         editor.session_persistence = lua.toBoolean(2);
+    } else if (std.mem.eql(u8, key_str, "filetree_visible")) {
+        editor.filetree_visible = lua.toBoolean(2);
+    } else if (std.mem.eql(u8, key_str, "filetree_side")) {
+        // zide.set("filetree_side", "left") / "right"
+        const val = lua.toString(2) catch return 0;
+        const val_str: []const u8 = val;
+        if (std.mem.eql(u8, val_str, "left")) {
+            editor.filetree_side = .left;
+        } else if (std.mem.eql(u8, val_str, "right")) {
+            editor.filetree_side = .right;
+        } else {
+            std.log.warn("zide.set: filetree_side must be \"left\" or \"right\", got '{s}'", .{val_str});
+        }
+    } else if (std.mem.eql(u8, key_str, "filetree_width")) {
+        const val = lua.toInteger(2) catch return 0;
+        if (val >= 120 and val <= 600) {
+            editor.filetree_width = @floatFromInt(val);
+        }
+    } else if (std.mem.eql(u8, key_str, "tui_filetree_width")) {
+        const val = lua.toInteger(2) catch return 0;
+        if (val >= 16 and val <= 80) {
+            editor.tui_filetree_width = @intCast(val);
+        }
+    } else if (std.mem.eql(u8, key_str, "filetree_root")) {
+        // zide.set("filetree_root", "C:/path/to/project") — "" = cwd
+        const val = lua.toString(2) catch return 0;
+        const val_str: []const u8 = val;
+        if (editor.filetree_root) |old| editor.allocator.free(old);
+        editor.filetree_root = if (val_str.len == 0)
+            null
+        else
+            editor.allocator.dupe(u8, val_str) catch null;
+        // Drop any existing tree so the next use re-opens the new root
+        if (editor.filetree) |*ft| {
+            ft.deinit();
+            editor.filetree = null;
+        }
     } else if (std.mem.eql(u8, key_str, "max_undo_history")) {
         const val = lua.toInteger(2) catch return 0;
         if (val >= 0 and val <= 100000) {
@@ -598,6 +635,21 @@ fn luaGet(state: ?*zlua.LuaState) callconv(.c) c_int {
         return 1;
     } else if (std.mem.eql(u8, key_str, "session_persistence")) {
         lua.pushBoolean(editor.session_persistence);
+        return 1;
+    } else if (std.mem.eql(u8, key_str, "filetree_visible")) {
+        lua.pushBoolean(editor.filetree_visible);
+        return 1;
+    } else if (std.mem.eql(u8, key_str, "filetree_side")) {
+        _ = lua.pushString(@tagName(editor.filetree_side));
+        return 1;
+    } else if (std.mem.eql(u8, key_str, "filetree_width")) {
+        lua.pushInteger(@intFromFloat(editor.filetree_width));
+        return 1;
+    } else if (std.mem.eql(u8, key_str, "tui_filetree_width")) {
+        lua.pushInteger(@intCast(editor.tui_filetree_width));
+        return 1;
+    } else if (std.mem.eql(u8, key_str, "filetree_root")) {
+        _ = lua.pushString(editor.filetree_root orelse "");
         return 1;
     } else if (std.mem.eql(u8, key_str, "max_undo_history")) {
         lua.pushInteger(@intCast(editor.max_undo_history));

@@ -32,6 +32,7 @@
 | F12 | LSP go-to-definition |
 | Ctrl+` | Toggle terminal (bottom split) |
 | Ctrl+Shift+` | Open terminal (side-by-side split) |
+| Ctrl+B | Toggle file tree side panel |
 | Alt+Click | Add cursor at click position |
 | Shift+Alt+Drag (GUI) / Alt+Drag (TUI) | Block (column) selection — one cursor per line over the dragged column span |
 | Ctrl+K | Delete line |
@@ -132,7 +133,7 @@ Windows terminals commonly intercept Alt combos (Windows Terminal binds Alt+arro
 **Configuration:**
 - Config folder hierarchy: `~/.config/zide/` with `themes/` and `extensions/` subfolders
 - Lua settings file (`~/.config/zide/init.lua`)
-  - `zide.set(key, value)` — tab_width, use_tabs, word_wrap, auto_close_brackets, page_size, auto_save, auto_save_interval_ms, click_clears_cursors, max_undo_history, session_persistence
+  - `zide.set(key, value)` — tab_width, use_tabs, word_wrap, auto_close_brackets, page_size, auto_save, auto_save_interval_ms, click_clears_cursors, max_undo_history, session_persistence, filetree_visible, filetree_side ("left"/"right"), filetree_width (GUI px), tui_filetree_width (columns), filetree_root (starting directory, "" = cwd)
   - `zide.set("mono_font_path", "/path/to/font.ttf")` — use a custom monospace font (e.g. a Nerd Font for box-drawing and powerline glyphs in the embedded terminal)
   - `zide.set("mono_font_size", 14)` — override the default monospace font size
   - `zide.set("tui_theme", name)` — switch TUI theme ("terminal", "dark", "light", "high_contrast")

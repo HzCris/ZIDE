@@ -3,6 +3,7 @@ const Allocator = std.mem.Allocator;
 const theme_mod = @import("theme.zig");
 const lua_settings = @import("lua_settings.zig");
 const syntax = @import("syntax.zig");
+const filetree_mod = @import("filetree.zig");
 
 /// Forward declaration — Editor will be defined in editor.zig.
 /// Commands receive a pointer to the editor state.
@@ -140,6 +141,10 @@ pub fn registerBuiltins(registry: *CommandRegistry) !void {
     try registry.register("dedent", "Dedent (remove leading whitespace)", cmdDedent);
     try registry.register("toggle_comment", "Toggle comment on selected lines", cmdToggleComment);
     try registry.register("next_todo", "Jump to next TODO/FIXME/XXX/HACK/BUG/NOTE marker", cmdNextTodo);
+    // File tree commands
+    try registry.register("toggle_filetree", "Toggle the file tree side panel", cmdToggleFiletree);
+    try registry.register("filetree_reveal", "Reveal the current file in the file tree", cmdFiletreeReveal);
+    try registry.register("filetree_refresh", "Refresh the file tree from disk", cmdFiletreeRefresh);
     try registry.register("cursor_file_start", "Move to start of file", cmdCursorFileStart);
     try registry.register("cursor_file_end", "Move to end of file", cmdCursorFileEnd);
     try registry.register("cursor_file_start_select", "Select to start of file", cmdCursorFileStartSelect);
@@ -524,6 +529,51 @@ fn cmdToggleComment(editor: *Editor, _: ?[]const u8) void {
         }
     } else {
         editor.status_message = "Comment toggle: language has no comment syntax";
+    }
+}
+
+// --- File tree ---
+
+fn cmdToggleFiletree(editor: *Editor, _: ?[]const u8) void {
+    editor.toggleFiletree();
+}
+
+fn cmdFiletreeRefresh(editor: *Editor, _: ?[]const u8) void {
+    const ft = editor.ensureFiletree() orelse return;
+    ft.refresh() catch |err| {
+        const msg = std.fmt.bufPrint(&editor.status_buf, "File tree refresh failed: {s}", .{@errorName(err)}) catch "Refresh failed";
+        editor.status_message = msg;
+        return;
+    };
+    editor.status_message = "File tree refreshed";
+}
+
+fn cmdFiletreeReveal(editor: *Editor, _: ?[]const u8) void {
+    const ft = editor.ensureFiletree() orelse return;
+    const doc = editor.activeDoc();
+    const path = doc.file_path orelse {
+        editor.status_message = "Reveal: current tab has no file on disk";
+        return;
+    };
+    // Absolute paths map through the root; relative ones (CLI-opened) are
+    // tried as-is since the default root is the same cwd.
+    var rel_owned: ?[]u8 = ft.relFromAbs(editor.allocator, path) catch null;
+    if (rel_owned == null and !std.fs.path.isAbsolute(path)) {
+        const r = editor.allocator.dupe(u8, path) catch return;
+        filetree_mod.normalizeSeps(r);
+        rel_owned = r;
+    }
+    const rel = rel_owned orelse {
+        editor.status_message = "Reveal: file is outside the tree root";
+        return;
+    };
+    defer editor.allocator.free(rel);
+    editor.filetree_visible = true;
+    const found = ft.expandToPath(rel) catch null;
+    if (found != null) {
+        editor.filetree_focused = true;
+    } else {
+        editor.status_message = "Reveal: file not found under the tree root";
     }
 }
 

@@ -2823,6 +2823,7 @@ fn handleModalKey(editor: *Editor, key: dvui.Event.Key) void {
         .confirm_quit => handleConfirmQuitKeyGui(editor, key),
         .settings => {}, // DVUI dialog handles its own input (settingsDialog)
         .file_open, .save_as => {}, // handled by native dialogs in GUI
+        .filetree_prompt => handleFiletreePromptKeyGui(editor, key),
         .normal => {},
     }
 }
@@ -2838,6 +2839,11 @@ fn handleModalText(editor: *Editor, txt: []const u8) void {
                         editor.goto_buf_len += 1;
                     }
                 }
+            }
+        },
+        .filetree_prompt => {
+            if (editor.filetree_prompt_kind != .delete_confirm) {
+                guiAppendText(&editor.open_buf, &editor.open_buf_len, txt);
             }
         },
         .find => {
@@ -2990,6 +2996,27 @@ fn handlePaletteKeyGui(editor: *Editor, key: dvui.Event.Key) void {
                 editor.palette_buf_len -= 1;
                 editor.palette_selected = 0;
             }
+        },
+        else => {},
+    }
+}
+
+/// Keys for the file-tree prompt (create / rename / delete confirm).
+/// Printable input arrives via handleModalText; this handles the rest.
+fn handleFiletreePromptKeyGui(editor: *Editor, key: dvui.Event.Key) void {
+    if (editor.filetree_prompt_kind == .delete_confirm) {
+        switch (key.code) {
+            .y, .enter => editor.applyFiletreePrompt(),
+            .n, .escape => editor.cancelFiletreePrompt(),
+            else => {},
+        }
+        return;
+    }
+    switch (key.code) {
+        .escape => editor.cancelFiletreePrompt(),
+        .enter => editor.applyFiletreePrompt(),
+        .backspace => {
+            if (editor.open_buf_len > 0) editor.open_buf_len -= 1;
         },
         else => {},
     }
@@ -3649,6 +3676,17 @@ fn drawModalOverlay(editor: *Editor, render_area: dvui.Rect.Physical, render_rs:
     const warn_color = toDvui(editor.theme.overlay_warn);
 
     switch (editor.mode) {
+        .filetree_prompt => {
+            const h = lh + pad * 2;
+            fillBar(render_area, 0, h, bg);
+            var buf: [600]u8 = undefined;
+            const txt = switch (editor.filetree_prompt_kind) {
+                .create => std.fmt.bufPrint(&buf, "New (end with / for folder): {s}_", .{editor.open_buf[0..editor.open_buf_len]}) catch "New: ",
+                .rename => std.fmt.bufPrint(&buf, "Rename: {s}_", .{editor.open_buf[0..editor.open_buf_len]}) catch "Rename: ",
+                .delete_confirm => std.fmt.bufPrint(&buf, "Delete {s}? [Y]es [N]o", .{editor.filetree_prompt_target orelse ""}) catch "Delete? [Y]es [N]o",
+            };
+            renderOverlayText(font, txt, render_area.x + pad, render_area.y + pad, render_rs, fg);
+        },
         .goto_line => {
             const h = lh + pad * 2;
             fillBar(render_area, 0, h, bg);

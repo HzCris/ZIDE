@@ -119,6 +119,8 @@ pub const KeybindMap = struct {
         // Terminal
         try self.set("ctrl+`", "toggle_terminal");
         try self.set("ctrl+shift+`", "open_terminal_right");
+        // File tree
+        try self.set("ctrl+b", "toggle_filetree");
     }
 };
 
@@ -162,4 +164,5 @@ test "keybind defaults" {
     try std.testing.expectEqualStrings("close_pane", kb.get("ctrl+f4").?);
     try std.testing.expectEqualStrings("move_line_up", kb.get("ctrl+shift+page_up").?);
     try std.testing.expectEqualStrings("lsp_goto_definition", kb.get("f12").?);
+    try std.testing.expectEqualStrings("toggle_filetree", kb.get("ctrl+b").?);
 }
