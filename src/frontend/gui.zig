@@ -9,6 +9,8 @@ const theme_mod = @import("../core/theme.zig");
 const syntax = @import("../core/syntax.zig");
 const lsp = @import("../core/lsp.zig");
 const terminal_mod = @import("../core/terminal.zig");
+const filetree_mod = @import("../core/filetree.zig");
+const FileTree = filetree_mod.FileTree;
 
 /// Convert a ThemeColor to a dvui.Color.
 fn toDvui(c: ThemeColor) dvui.Color {
@@ -428,6 +430,14 @@ pub fn frame(editor: *Editor) bool {
                 _ = editor.execAction("command_palette");
                 m.close();
             }
+            if (dvui.menuItemLabel(@src(), "File Tree        Ctrl+B", .{}, .{ .expand = .horizontal }) != null) {
+                editor.toggleFiletree();
+                m.close();
+            }
+            if (dvui.menuItemLabel(@src(), "Reveal in Tree", .{}, .{ .expand = .horizontal }) != null) {
+                _ = editor.execCommand("filetree_reveal", null);
+                m.close();
+            }
             if (dvui.menuItemLabel(@src(), "Next Tab         Ctrl+Tab", .{}, .{ .expand = .horizontal }) != null) {
                 editor.nextDoc();
                 m.close();
@@ -647,7 +657,21 @@ pub fn frame(editor: *Editor) bool {
     }
 
     // --- Editor area (expand=.both, LAST child) ---
-    renderLayout(editor, 0);
+    // The file tree docks left or right of the split tree as a fixed-width
+    // sibling in an hbox; the splits expand into the rest.
+    if (editor.filetree_visible and editor.ensureFiletree() != null) {
+        var area_box = dvui.box(@src(), .{ .dir = .horizontal }, .{ .expand = .both });
+        defer area_box.deinit();
+        if (editor.filetree_side == .left) {
+            filetreePanel(editor);
+            renderLayout(editor, 0);
+        } else {
+            renderLayout(editor, 0);
+            filetreePanel(editor);
+        }
+    } else {
+        renderLayout(editor, 0);
+    }
 
     // --- Handle window close / quit events ---
     for (dvui.events()) |*e| {
@@ -698,6 +722,302 @@ fn renderLayout(editor: *Editor, node_idx: u8) void {
                 renderLayout(editor, s.second);
             }
         },
+    }
+}
+
+// ===========================================================================
+// File tree side panel
+// ===========================================================================
+
+/// GUI scroll offset (in rows) for the file tree panel.
+var filetree_scroll: usize = 0;
+
+/// File tree side panel — custom row rendering in the editorPane style
+/// (no per-row widgets; we own scrolling, selection, and input). Renders
+/// the core model's flattened visible list, which the TUI draws identically.
+fn filetreePanel(editor: *Editor) void {
+    if (!build_options.has_gui) return;
+    const ft = if (editor.filetree) |*f| f else return;
+
+    const panel_w = std.math.clamp(editor.filetree_width, 120, 600);
+    var pbox = dvui.box(@src(), .{ .dir = .vertical }, .{
+        .expand = .vertical,
+        .min_size_content = .{ .w = panel_w },
+        .background = true,
+        .style = .window,
+        .name = "filetree_panel",
+    });
+    defer pbox.deinit();
+
+    const wd = pbox.data();
+    const rs = wd.contentRectScale();
+    const scale = rs.s;
+    const area = rs.r;
+
+    const font = dvui.Font.theme(.mono);
+    const line_height = font.lineHeight() * scale;
+    if (line_height <= 0 or area.h <= 0 or area.w <= 0) return;
+
+    // Header row (root directory name), tree rows below.
+    const header_h = line_height + 4 * scale;
+    const rows_y = area.y + header_h;
+    const rows_h = area.h - header_h;
+    const visible_rows: usize = if (rows_h > line_height) @intFromFloat(@floor(rows_h / line_height)) else 1;
+
+    // Reveal/create flagged the selection for scroll-into-view.
+    if (ft.scroll_to_selected) {
+        ft.scroll_to_selected = false;
+        filetreeEnsureSelectedVisible(ft, visible_rows);
+    }
+    // Clamp scroll when rows disappeared (collapse/refresh).
+    const row_count = ft.visible.items.len;
+    if (filetree_scroll > 0 and filetree_scroll + visible_rows > row_count) {
+        filetree_scroll = row_count -| visible_rows;
+    }
+
+    // Input before rendering so changes draw this frame.
+    handleFiletreeMouse(editor, ft, wd, area, rows_y, line_height, visible_rows);
+    if (editor.filetree_focused and editor.mode == .normal and !editor.completion_active) {
+        handleFiletreeKeys(editor, ft, wd, visible_rows);
+    }
+
+    // --- Header ---
+    const header_fg = toDvui(editor.theme.overlay_fg);
+    const dim = toDvui(editor.theme.overlay_dim);
+    fillBar(area, 0, header_h, toDvui(editor.theme.gutter_bg));
+    const root_name = std.fs.path.basename(ft.root_path);
+    const header_txt = if (root_name.len > 0) root_name else ft.root_path;
+    renderOverlayText(font, header_txt, area.x + 6 * scale, area.y + 2 * scale, rs, if (editor.filetree_focused) header_fg else dim);
+
+    // --- Rows ---
+    const text_color = toDvui(editor.theme.text);
+    const sel_bg = toDvui(editor.theme.selection);
+    const indent_w = 12 * scale;
+    var row = filetree_scroll;
+    var y = rows_y;
+    while (row < row_count and y + line_height <= area.y + area.h + 0.5) : (row += 1) {
+        const idx = ft.visible.items[row];
+        const node = ft.nodes.items[idx];
+        if (row == ft.selected) {
+            fillBar(area, y - area.y, line_height, sel_bg);
+        }
+        const depth_f: f32 = @floatFromInt(node.depth -| 1);
+        const x = area.x + 6 * scale + depth_f * indent_w;
+        const glyph: []const u8 = switch (node.kind) {
+            .dir => if (node.expanded) "- " else "+ ",
+            .file => "  ",
+        };
+        var name_buf: [300]u8 = undefined;
+        const row_txt = std.fmt.bufPrint(&name_buf, "{s}{s}", .{ glyph, node.name }) catch node.name;
+        renderOverlayText(font, row_txt, x, y, rs, text_color);
+        y += line_height;
+    }
+
+    // Right-click context menu over the panel.
+    filetreeContextMenu(editor, area);
+}
+
+/// Keep the tree selection inside the visible row window.
+fn filetreeEnsureSelectedVisible(ft: *FileTree, visible_rows: usize) void {
+    if (ft.selected < filetree_scroll) {
+        filetree_scroll = ft.selected;
+    } else if (visible_rows > 0 and ft.selected >= filetree_scroll + visible_rows) {
+        filetree_scroll = ft.selected - visible_rows + 1;
+    }
+}
+
+/// Visible row index under a physical y position, or null.
+fn filetreeRowAt(ft: *const FileTree, rows_y: f32, line_height: f32, my: f32) ?usize {
+    if (my < rows_y or line_height <= 0) return null;
+    const rel: usize = @intFromFloat(@floor((my - rows_y) / line_height));
+    const row = filetree_scroll + rel;
+    if (row >= ft.visible.items.len) return null;
+    return row;
+}
+
+fn handleFiletreeMouse(editor: *Editor, ft: *FileTree, wd: *dvui.WidgetData, area: dvui.Rect.Physical, rows_y: f32, line_height: f32, visible_rows: usize) void {
+    for (dvui.events()) |*e| {
+        if (e.handled) continue;
+        if (e.evt != .mouse) continue;
+        const me = e.evt.mouse;
+        if (me.p.x < area.x or me.p.x > area.x + area.w or
+            me.p.y < area.y or me.p.y > area.y + area.h) continue;
+
+        switch (me.action) {
+            .press => {
+                const row = filetreeRowAt(ft, rows_y, line_height, me.p.y);
+                if (me.button == .right) {
+                    // Select the row under the cursor but leave the press
+                    // unhandled — the panel's ContextWidget consumes it.
+                    if (row) |r| ft.selected = r;
+                    editor.filetree_focused = true;
+                    continue;
+                }
+                e.handle(@src(), wd);
+                dvui.focusWidget(wd.id, null, e.num);
+                editor.filetree_focused = true;
+                if (editor.mode != .normal) continue;
+                if (row) |r| {
+                    ft.selected = r;
+                    const idx = ft.visible.items[r];
+                    if (ft.nodes.items[idx].kind == .dir) {
+                        ft.toggle(idx) catch {};
+                    } else {
+                        openFiletreeFile(editor, ft, idx);
+                    }
+                }
+            },
+            .wheel_y => |delta| {
+                e.handle(@src(), wd);
+                const rows_per_notch: f32 = 3;
+                const pixels_per_notch: f32 = dvui.scroll_speed;
+                const scroll_rows: i32 = @intFromFloat(@round(-delta / pixels_per_notch * rows_per_notch));
+                const max_top: i64 = @intCast(ft.visible.items.len -| visible_rows);
+                const new_top = @as(i64, @intCast(filetree_scroll)) + scroll_rows;
+                filetree_scroll = @intCast(@max(0, @min(new_top, max_top)));
+            },
+            .position => {
+                dvui.cursorSet(.arrow);
+            },
+            else => {},
+        }
+    }
+}
+
+/// Keys while the tree owns the keyboard (filetree_focused, normal mode).
+/// Ctrl/Alt chords are left for the global keybind map.
+fn handleFiletreeKeys(editor: *Editor, ft: *FileTree, wd: *dvui.WidgetData, visible_rows: usize) void {
+    for (dvui.events()) |*e| {
+        if (e.handled) continue;
+        switch (e.evt) {
+            .key => |key| {
+                if (key.action != .down and key.action != .repeat) continue;
+                if (key.mod.control() or key.mod.alt()) continue;
+                switch (key.code) {
+                    .up, .k => {
+                        e.handle(@src(), wd);
+                        ft.moveSelection(-1);
+                        filetreeEnsureSelectedVisible(ft, visible_rows);
+                    },
+                    .down, .j => {
+                        e.handle(@src(), wd);
+                        ft.moveSelection(1);
+                        filetreeEnsureSelectedVisible(ft, visible_rows);
+                    },
+                    .home => {
+                        e.handle(@src(), wd);
+                        ft.selected = 0;
+                        filetreeEnsureSelectedVisible(ft, visible_rows);
+                    },
+                    .end => {
+                        e.handle(@src(), wd);
+                        ft.selected = ft.visible.items.len -| 1;
+                        filetreeEnsureSelectedVisible(ft, visible_rows);
+                    },
+                    .enter, .right => {
+                        e.handle(@src(), wd);
+                        const idx = ft.selectedNodeIdx() orelse continue;
+                        if (ft.nodes.items[idx].kind == .dir) {
+                            if (key.code == .right) {
+                                ft.expand(idx) catch {};
+                            } else {
+                                ft.toggle(idx) catch {};
+                            }
+                        } else {
+                            openFiletreeFile(editor, ft, idx);
+                            editor.filetree_focused = false;
+                        }
+                    },
+                    .left => {
+                        e.handle(@src(), wd);
+                        const idx = ft.selectedNodeIdx() orelse continue;
+                        const node = ft.nodes.items[idx];
+                        if (node.kind == .dir and node.expanded) {
+                            ft.collapse(idx) catch {};
+                        } else if (idx != 0 and node.parent != 0) {
+                            if (ft.rowOf(node.parent)) |prow| {
+                                ft.selected = prow;
+                                filetreeEnsureSelectedVisible(ft, visible_rows);
+                            }
+                        }
+                    },
+                    .a => {
+                        e.handle(@src(), wd);
+                        editor.startFiletreePrompt(.create);
+                    },
+                    .r => {
+                        e.handle(@src(), wd);
+                        if (key.mod.shift()) {
+                            ft.refresh() catch {};
+                            editor.status_message = "File tree refreshed";
+                        } else {
+                            editor.startFiletreePrompt(.rename);
+                        }
+                    },
+                    .d => {
+                        e.handle(@src(), wd);
+                        editor.startFiletreePrompt(.delete_confirm);
+                    },
+                    .escape => {
+                        e.handle(@src(), wd);
+                        editor.filetree_focused = false;
+                    },
+                    else => {},
+                }
+            },
+            .text => |te| {
+                // Swallow stray text while the tree owns the keyboard so
+                // letters never insert into the document behind it.
+                switch (te.action) {
+                    .value => e.handle(@src(), wd),
+                    else => {},
+                }
+            },
+            else => {},
+        }
+    }
+}
+
+/// Open the file behind a tree node (deduped against open tabs).
+fn openFiletreeFile(editor: *Editor, ft: *FileTree, idx: u32) void {
+    const abs = ft.absPathAlloc(editor.allocator, idx) catch return;
+    defer editor.allocator.free(abs);
+    _ = editor.openOrFocus(abs) catch |err| {
+        const msg = std.fmt.bufPrint(&editor.status_buf, "Open failed: {s}", .{@errorName(err)}) catch "Open failed";
+        editor.status_message = msg;
+    };
+}
+
+/// Right-click context menu for the file tree panel. The right press has
+/// already selected the row (handleFiletreeMouse leaves it unhandled).
+fn filetreeContextMenu(editor: *Editor, area: dvui.Rect.Physical) void {
+    const ctext = dvui.context(@src(), .{ .rect = area }, .{});
+    defer ctext.deinit();
+
+    if (ctext.activePoint()) |cp| {
+        var fw = dvui.floatingMenu(@src(), .{ .from = dvui.Rect.Natural.fromPoint(cp) }, .{});
+        defer fw.deinit();
+
+        if (dvui.menuItemLabel(@src(), "New File/Folder    a", .{}, .{ .expand = .horizontal }) != null) {
+            editor.startFiletreePrompt(.create);
+            fw.close();
+        }
+        if (dvui.menuItemLabel(@src(), "Rename             r", .{}, .{ .expand = .horizontal }) != null) {
+            editor.startFiletreePrompt(.rename);
+            fw.close();
+        }
+        if (dvui.menuItemLabel(@src(), "Delete             d", .{}, .{ .expand = .horizontal }) != null) {
+            editor.startFiletreePrompt(.delete_confirm);
+            fw.close();
+        }
+        if (dvui.menuItemLabel(@src(), "Refresh            R", .{}, .{ .expand = .horizontal }) != null) {
+            _ = editor.execCommand("filetree_refresh", null);
+            fw.close();
+        }
+        if (dvui.menuItemLabel(@src(), "Reveal Current File", .{}, .{ .expand = .horizontal }) != null) {
+            _ = editor.execCommand("filetree_reveal", null);
+            fw.close();
+        }
     }
 }
 
@@ -764,8 +1084,10 @@ fn editorPane(editor: *Editor, pane_id: u8) void {
     editor.text_width = if (text_area_w_logical > 0) @intFromFloat(text_area_w_logical) else 80;
     const do_wrap = editor.word_wrap;
 
-    // --- Handle keyboard events (before rendering) — only for the focused pane ---
-    if (is_active_pane) {
+    // --- Handle keyboard events (before rendering) — only for the focused
+    // pane, and not while the file tree owns the keyboard. Modal prompts
+    // (mode != .normal) still route through here. ---
+    if (is_active_pane and !(editor.filetree_focused and editor.mode == .normal)) {
         _ = handleGuiKeyEvents(editor, wd);
 
         // Re-fetch doc after key events — close_tab may have changed/freed the active document
@@ -1727,6 +2049,7 @@ fn handleMouseEvents(editor: *Editor, pane_id: u8, wd: *dvui.WidgetData, area: d
                     // pane's ContextWidget (created after this) consumes the
                     // press and opens the context menu.
                     editor.focusPane(pane_id);
+                    editor.filetree_focused = false;
                     const offset = screenToOffset(doc, area, font, line_height, scale, me.p, tab_width, do_wrap);
                     const c = doc.cursors.primary();
                     const inside_selection = if (c.selectionRange()) |r|
@@ -1746,8 +2069,9 @@ fn handleMouseEvents(editor: *Editor, pane_id: u8, wd: *dvui.WidgetData, area: d
                 dvui.focusWidget(wd.id, null, e.num);
                 scroll_pinned = false;
 
-                // Focus this pane on click
+                // Focus this pane on click (and take focus back from the tree)
                 editor.focusPane(pane_id);
+                editor.filetree_focused = false;
 
                 const offset = screenToOffset(doc, area, font, line_height, scale, me.p, tab_width, do_wrap);
 
@@ -3076,6 +3400,10 @@ const settings_defs = [_]SettingDef{
     .{ .key = "session_persistence", .label = "Session Persistence", .kind = .boolean, .desc = "Reopen last session's files when launched bare" },
     .{ .key = "max_undo_history", .label = "Undo History Limit", .kind = .number, .desc = "Max undo operations per document, 0 = unlimited (0-100000)", .min = 0, .max = 100000 },
     .{ .key = "theme", .label = "Theme", .kind = .enum_choice, .desc = "Editor color theme", .choices = &.{ "dark", "light", "high_contrast" } },
+    .{ .key = "filetree_visible", .label = "File Tree Visible", .kind = .boolean, .desc = "Show the file tree side panel (Ctrl+B)" },
+    .{ .key = "filetree_side", .label = "File Tree Side", .kind = .enum_choice, .desc = "Dock the file tree on the left or right", .choices = &.{ "left", "right" } },
+    .{ .key = "filetree_width", .label = "File Tree Width (GUI)", .kind = .number, .desc = "Panel width in pixels (120-600)", .min = 120, .max = 600 },
+    .{ .key = "tui_filetree_width", .label = "File Tree Width (TUI)", .kind = .number, .desc = "Panel width in columns (16-80)", .min = 16, .max = 80 },
 };
 
 /// Modal settings dialog built from native DVUI widgets (floating window
@@ -3190,6 +3518,11 @@ fn settingsDialog(editor: *Editor) void {
                     if (std.mem.eql(u8, def.key, "theme")) {
                         // switchTheme persists to init.lua itself
                         switchTheme(editor, def.choices[choice]);
+                    } else if (std.mem.eql(u8, def.key, "filetree_side")) {
+                        editor.filetree_side = if (std.mem.eql(u8, def.choices[choice], "right")) .right else .left;
+                        var val_buf: [16]u8 = undefined;
+                        const quoted = std.fmt.bufPrint(&val_buf, "\"{s}\"", .{def.choices[choice]}) catch "";
+                        if (quoted.len > 0) lua_settings.writeSettingToFile(def.key, quoted) catch {};
                     }
                 }
             },
@@ -3204,6 +3537,7 @@ fn getSettingBool(editor: *const Editor, key: []const u8) bool {
     if (std.mem.eql(u8, key, "auto_save")) return editor.auto_save;
     if (std.mem.eql(u8, key, "click_clears_cursors")) return editor.click_clears_cursors;
     if (std.mem.eql(u8, key, "session_persistence")) return editor.session_persistence;
+    if (std.mem.eql(u8, key, "filetree_visible")) return editor.filetree_visible;
     return false;
 }
 
@@ -3214,6 +3548,10 @@ fn applySettingBool(editor: *Editor, key: []const u8, val: bool) void {
     if (std.mem.eql(u8, key, "auto_save")) editor.auto_save = val;
     if (std.mem.eql(u8, key, "click_clears_cursors")) editor.click_clears_cursors = val;
     if (std.mem.eql(u8, key, "session_persistence")) editor.session_persistence = val;
+    if (std.mem.eql(u8, key, "filetree_visible")) {
+        editor.filetree_visible = val;
+        if (!val) editor.filetree_focused = false;
+    }
 }
 
 fn getSettingNumber(editor: *const Editor, key: []const u8) i64 {
@@ -3222,6 +3560,8 @@ fn getSettingNumber(editor: *const Editor, key: []const u8) i64 {
     if (std.mem.eql(u8, key, "gutter_min_digits")) return @intCast(editor.gutter_min_digits);
     if (std.mem.eql(u8, key, "page_size")) return @intCast(editor.page_size);
     if (std.mem.eql(u8, key, "max_undo_history")) return @intCast(editor.max_undo_history);
+    if (std.mem.eql(u8, key, "filetree_width")) return @intFromFloat(editor.filetree_width);
+    if (std.mem.eql(u8, key, "tui_filetree_width")) return @intCast(editor.tui_filetree_width);
     return 0;
 }
 
@@ -3246,10 +3586,17 @@ fn applySettingNumber(editor: *Editor, key: []const u8, val: i64) void {
             }
         }
     }
+    if (std.mem.eql(u8, key, "filetree_width")) {
+        if (val >= 120 and val <= 600) editor.filetree_width = @floatFromInt(val);
+    }
+    if (std.mem.eql(u8, key, "tui_filetree_width")) {
+        if (val >= 16 and val <= 80) editor.tui_filetree_width = @intCast(val);
+    }
 }
 
 fn getSettingEnum(editor: *const Editor, key: []const u8) []const u8 {
     if (std.mem.eql(u8, key, "theme")) return editor.theme_name;
+    if (std.mem.eql(u8, key, "filetree_side")) return @tagName(editor.filetree_side);
     return "";
 }
 

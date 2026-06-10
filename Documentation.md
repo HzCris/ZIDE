@@ -189,6 +189,7 @@ Windows terminals commonly intercept Alt combos (Windows Terminal binds Alt+arro
 - Configurable line number gutter width (`zide.set("gutter_min_digits", N)` in init.lua, default 3)
 - Mouse selection: double-click selects word, triple-click selects line, drag extends by word/line accordingly, Shift+click extends selection, Alt+click adds cursor, Shift+Alt+drag for block (column) selection (one cursor per line over the dragged column span)
 
+- File tree side panel (Ctrl+B) — dockable left/right, click + keyboard browsing, create/rename/delete with prompts, right-click context menu, reveal-current-file (see File Tree section)
 - Settings dialog (Preferences menu — modal DVUI floating window with native widgets: checkboxes for booleans, validated numeric entries with min/max, dropdown for theme; draggable by header, auto-centered, dims the background; changes apply live and write to init.lua immediately; close via header X or Escape; Tab/Shift+Tab cycles controls)
 - Open Settings File (Preferences menu — opens init.lua directly in the editor for power users)
 - Tab character display (expands `\t` to spaces for rendering, cursor, selection, and wrapping)
@@ -603,7 +604,48 @@ ZIDE includes a built-in terminal emulator that integrates with the split pane s
 - Terminal panes use the same split pane layout system as editor panes — they can be placed anywhere (horizontal or vertical splits)
 - Background reader thread reads PTY output and updates a mutex-protected cell grid; the main thread reads the grid each frame for rendering
 
-### Performance
+## File Tree
+
+A toggleable side panel for browsing and managing the project directory, backed by a frontend-agnostic core model (`src/core/filetree.zig`) — both frontends render the same flattened row list, so expansion state, selection, and file operations behave identically. Currently rendered in the **GUI**; the TUI panel shares all the same model, commands, and prompts.
+
+### Basics
+- **Ctrl+B** (`toggle_filetree`): show/hide the panel. Showing it focuses the tree (nvim-tree style); hiding it returns focus to the editor.
+- Docks **left or right** (`filetree_side` setting, default left); width via `filetree_width` (GUI px) / `tui_filetree_width` (TUI columns).
+- Root = current directory by default, or `zide.set("filetree_root", "/path")` (Lua-only; "" resets to cwd).
+- Directories sort first, names case-insensitive; children scan lazily on first expand; `.git` is hidden, dotfiles are shown.
+- Opening a file that's already open switches to its existing tab instead of duplicating it.
+
+### Keys (while the tree is focused)
+| Key | Action |
+|-----|--------|
+| Up/Down or k/j | Move selection |
+| Home/End | First / last row |
+| Enter | Expand/collapse dir, or open file (focus moves to editor) |
+| Right / Left | Expand dir / collapse dir (or jump to parent) |
+| a | New file — end with `/` for a folder; nested paths like `sub/file.txt` create intermediate folders |
+| r | Rename (no-clobber; renaming updates open tabs, including files inside a renamed folder) |
+| Shift+R | Refresh from disk (expansion and selection preserved) |
+| d | Delete (y/n confirm; directories delete recursively) |
+| Escape | Return focus to the editor |
+
+Ctrl/Alt chords (Ctrl+P, Ctrl+B, ...) still work while the tree is focused.
+
+### Mouse (GUI)
+- Click: select; toggles a directory, opens a file
+- Wheel: scrolls the tree independently of the editor
+- Right-click: context menu (New / Rename / Delete / Refresh / Reveal Current File)
+
+### Commands (palette)
+| Command | Description |
+|---------|-------------|
+| `toggle_filetree` | Show/hide the panel (Ctrl+B) |
+| `filetree_reveal` | Expand to and select the current file (also View menu) |
+| `filetree_refresh` | Rescan from disk |
+
+### Settings
+Settings dialog (GUI) or `zide.set` in init.lua: `filetree_visible` (bool, default true), `filetree_side` ("left"/"right"), `filetree_width` (120–600 px), `tui_filetree_width` (16–80 cols), `filetree_root` (string, Lua-only).
+
+## Performance
 - **Gap buffer** text storage — inserts/deletes at cursor are O(1) amortized instead of O(n) memmove
 - Undo history capped at 100 operations per document (configurable via `zide.set("max_undo_history", N)`, 0 = unlimited)
 - Command palette names cached (no per-frame allocation)
