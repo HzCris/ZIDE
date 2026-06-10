@@ -72,8 +72,10 @@ pub const Terminal = struct {
     saved_cursor_row: u16 = 0,
     saved_cursor_col: u16 = 0,
 
-    // Thread safety
-    mutex: std.Thread.Mutex = .{},
+    // Thread safety. The mutex is std.Io-based (0.16): lock/unlock take the
+    // Io instance stored below; lockUncancelable keeps call sites infallible.
+    io: std.Io,
+    mutex: std.Io.Mutex = .init,
     reader_thread: ?std.Thread = null,
     running: std.atomic.Value(bool) = std.atomic.Value(bool).init(true),
 
@@ -86,7 +88,7 @@ pub const Terminal = struct {
     /// cadence and leaves it null.
     wake_fn: ?*const fn () void = null,
 
-    pub fn init(allocator: Allocator, cols: u16, rows: u16, command: []const u8) !*Terminal {
+    pub fn init(allocator: Allocator, io: std.Io, cols: u16, rows: u16, command: []const u8) !*Terminal {
         const total = @as(usize, cols) * @as(usize, rows);
         const cells = try allocator.alloc(Cell, total);
         @memset(cells, Cell{});
@@ -96,6 +98,7 @@ pub const Terminal = struct {
         const term = try allocator.create(Terminal);
         term.* = .{
             .allocator = allocator,
+            .io = io,
             .pty = pty,
             .cells = cells,
             .cols = cols,
@@ -144,8 +147,8 @@ pub const Terminal = struct {
         if (new_cols == self.cols and new_rows == self.rows) return;
         if (new_cols == 0 or new_rows == 0) return;
 
-        self.mutex.lock();
-        defer self.mutex.unlock();
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
 
         const new_total = @as(usize, new_cols) * @as(usize, new_rows);
         const new_cells = self.allocator.alloc(Cell, new_total) catch return;
@@ -203,8 +206,8 @@ pub const Terminal = struct {
 
     /// Get cell at position (for rendering). Locks mutex.
     pub fn cellAt(self: *Terminal, row: u16, col: u16) Cell {
-        self.mutex.lock();
-        defer self.mutex.unlock();
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
         return self.cellAtUnsafe(row, col);
     }
 
@@ -676,15 +679,15 @@ pub const Terminal = struct {
             const n = self.pty.read(&buf) catch break;
             if (n == 0) break;
 
-            self.mutex.lock();
+            self.mutex.lockUncancelable(self.io);
             self.processOutput(buf[0..n]);
-            self.mutex.unlock();
+            self.mutex.unlock(self.io);
             if (self.wake_fn) |f| f();
         }
         // Mark as exited
-        self.mutex.lock();
+        self.mutex.lockUncancelable(self.io);
         self.exited = true;
-        self.mutex.unlock();
+        self.mutex.unlock(self.io);
         if (self.wake_fn) |f| f();
     }
 
@@ -787,6 +790,7 @@ fn makeTestTerminal(allocator: Allocator, cols: u16, rows: u16) !Terminal {
     @memset(cells, Cell{});
     return .{
         .allocator = allocator,
+        .io = std.testing.io,
         .pty = .{ .allocator = allocator },
         .cells = cells,
         .cols = cols,

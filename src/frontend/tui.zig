@@ -111,11 +111,26 @@ fn writeStr(win: Window, col: u16, row: u16, text: []const u8, style: Style) u16
     return x;
 }
 
+// 0.16 removed these console types/functions from std.os.windows — declare
+// the minimal surface ourselves.
+const SMALL_RECT = extern struct { Left: i16, Top: i16, Right: i16, Bottom: i16 };
+const CONSOLE_SCREEN_BUFFER_INFO = extern struct {
+    dwSize: std.os.windows.COORD,
+    dwCursorPosition: std.os.windows.COORD,
+    wAttributes: u16,
+    srWindow: SMALL_RECT,
+    dwMaximumWindowSize: std.os.windows.COORD,
+};
+extern "kernel32" fn GetConsoleScreenBufferInfo(
+    hConsoleOutput: std.os.windows.HANDLE,
+    lpConsoleScreenBufferInfo: *CONSOLE_SCREEN_BUFFER_INFO,
+) callconv(.winapi) c_int;
+
 /// Get terminal size on Windows using the console API.
 fn getWinsizeWindows() ?vaxis.Winsize {
-    const stdout: std.fs.File = .stdout();
-    var info: std.os.windows.CONSOLE_SCREEN_BUFFER_INFO = undefined;
-    if (std.os.windows.kernel32.GetConsoleScreenBufferInfo(stdout.handle, &info) != 0) {
+    const stdout: std.Io.File = .stdout();
+    var info: CONSOLE_SCREEN_BUFFER_INFO = undefined;
+    if (GetConsoleScreenBufferInfo(stdout.handle, &info) != 0) {
         const cols: u16 = @intCast(info.srWindow.Right - info.srWindow.Left + 1);
         const rows: u16 = @intCast(info.srWindow.Bottom - info.srWindow.Top + 1);
         return .{ .rows = rows, .cols = cols, .x_pixel = 0, .y_pixel = 0 };
@@ -144,7 +159,9 @@ var global_loop: ?*vaxis.Loop(Event) = null;
 /// Wake function called from LSP reader thread to unblock nextEvent.
 fn lspWakeFn() void {
     if (global_loop) |loop_ptr| {
-        loop_ptr.postEvent(.lsp_data);
+        // Queue full or canceled: drop the wake — pending events already
+        // guarantee the main loop runs again.
+        loop_ptr.postEvent(.lsp_data) catch {};
     }
 }
 
@@ -152,7 +169,7 @@ fn lspWakeFn() void {
 /// landed in a grid — unblocks nextEvent so the pane repaints.
 fn terminalWakeFn() void {
     if (global_loop) |loop_ptr| {
-        loop_ptr.postEvent(.terminal_data);
+        loop_ptr.postEvent(.terminal_data) catch {};
     }
 }
 
@@ -164,16 +181,21 @@ var scroll_pinned: bool = false;
 pub fn run(allocator: std.mem.Allocator, editor: *Editor) !void {
     // Initialize TTY
     var tty_buf: [4096]u8 = undefined;
-    var tty = try vaxis.Tty.init(&tty_buf);
+    var tty = try vaxis.Tty.init(editor.io, &tty_buf);
     defer tty.deinit();
 
-    // Initialize Vaxis
-    var vx = try vaxis.init(allocator, .{});
+    // Initialize Vaxis (0.16 API wants the Io instance + mutable env map;
+    // main() stashed the process env map in lua_settings for module-level use)
+    const lua_settings = @import("../core/lua_settings.zig");
+    const env_map = lua_settings.process_environ orelse return error.NoEnvironMap;
+    var vx = try vaxis.init(editor.io, allocator, env_map, .{});
     defer vx.deinit(allocator, tty.writer());
 
-    // Event loop (threaded input reader)
-    var loop: vaxis.Loop(Event) = .{ .tty = &tty, .vaxis = &vx };
-    try loop.init();
+    // Event loop (threaded input reader). 0.16 vaxis: init(io, ...) is the
+    // constructor; installResizeHandler replaces the old init()'s SIGWINCH
+    // registration (no-op on Windows — resize arrives via console events).
+    var loop: vaxis.Loop(Event) = .init(editor.io, &tty, &vx);
+    try loop.installResizeHandler();
     try loop.start();
     defer loop.stop();
 
@@ -196,7 +218,7 @@ pub fn run(allocator: std.mem.Allocator, editor: *Editor) !void {
     } else {
         // Wait for initial resize to get terminal dimensions
         while (true) {
-            const event = loop.nextEvent();
+            const event = try loop.nextEvent();
             switch (event) {
                 .winsize => |ws| {
                     try vx.resize(allocator, tty.writer(), ws);
@@ -214,12 +236,12 @@ pub fn run(allocator: std.mem.Allocator, editor: *Editor) !void {
     }
 
     // Auto-save timer
-    var last_auto_save_ns: i128 = std.time.nanoTimestamp();
+    var last_auto_save_ns: i128 = std.Io.Clock.now(.awake, editor.io).nanoseconds;
 
     // Main loop
     while (editor.running) {
         // Drain all pending events
-        while (loop.tryEvent()) |event| {
+        while (loop.tryEvent() catch null) |event| {
             switch (event) {
                 .key_press => |key| dispatchKey(editor, key),
                 .mouse => |mouse| handleMouse(editor, mouse),
@@ -237,7 +259,7 @@ pub fn run(allocator: std.mem.Allocator, editor: *Editor) !void {
 
         // Auto-save check
         if (editor.auto_save and editor.hasUnsavedChanges()) {
-            const now_ns = std.time.nanoTimestamp();
+            const now_ns: i128 = std.Io.Clock.now(.awake, editor.io).nanoseconds;
             const elapsed_ms: u64 = @intCast(@divFloor(now_ns - last_auto_save_ns, std.time.ns_per_ms));
             if (elapsed_ms >= editor.auto_save_interval_ms) {
                 _ = editor.autoSaveAll();
@@ -259,7 +281,7 @@ pub fn run(allocator: std.mem.Allocator, editor: *Editor) !void {
 
         if (height < 3 or width < 10) {
             try vx.render(tty.writer());
-            const event = loop.nextEvent();
+            const event = try loop.nextEvent();
             switch (event) {
                 .key_press => |key| dispatchKey(editor, key),
                 .mouse => |mouse| handleMouse(editor, mouse),
@@ -322,7 +344,7 @@ pub fn run(allocator: std.mem.Allocator, editor: *Editor) !void {
         try vx.render(tty.writer());
 
         // Block until next event
-        const event = loop.nextEvent();
+        const event = try loop.nextEvent();
         switch (event) {
             .key_press => |key| dispatchKey(editor, key),
             .mouse => |mouse| handleMouse(editor, mouse),
@@ -632,8 +654,8 @@ fn drawTerminalInPane(win: Window, editor: *Editor, term: *terminal_mod.Terminal
         term.resizeGrid(width, height);
     }
 
-    term.mutex.lock();
-    defer term.mutex.unlock();
+    term.mutex.lockUncancelable(term.io);
+    defer term.mutex.unlock(term.io);
 
     const t_cols = term.cols;
     const t_rows = term.rows;
@@ -1399,11 +1421,11 @@ fn positionCursor(win: Window, editor: *Editor, width: u16, height: u16) void {
             win.hideCursor();
             return;
         };
-        t.mutex.lock();
+        t.mutex.lockUncancelable(t.io);
         const trow = t.cursor_row;
         const tcol = t.cursor_col;
         const visible = t.cursor_visible and !t.exited;
-        t.mutex.unlock();
+        t.mutex.unlock(t.io);
         if (visible and trow < rect.h and tcol < rect.w) {
             win.showCursor(rect.x +| tcol, rect.y +| trow);
             win.setCursorShape(.block);
@@ -2198,7 +2220,7 @@ fn handleConfirmQuitKey(editor: *Editor, key: Key) void {
             var failures: usize = 0;
             for (editor.documents.items) |*doc| {
                 if (doc.dirty) {
-                    doc.save() catch {
+                    doc.save(editor.io) catch {
                         failures += 1;
                         continue;
                     };
@@ -2330,7 +2352,7 @@ fn handleSaveAsKey(editor: *Editor, key: Key) void {
     if (key.codepoint == Key.enter) {
         if (editor.open_buf_len > 0) {
             const path = editor.open_buf[0..editor.open_buf_len];
-            editor.activeDoc().saveAs(path) catch {
+            editor.activeDoc().saveAs(editor.io, path) catch {
                 editor.status_message = "Save failed";
             };
             editor.activeDoc().detectLanguage(editor);

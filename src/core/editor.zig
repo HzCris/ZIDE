@@ -84,6 +84,10 @@ pub const Editor = struct {
     /// Command palette selection index (for Tab cycling).
     palette_selected: usize = 0,
 
+    /// The std.Io instance (from Juicy Main; std.testing.io in tests) —
+    /// threaded through file/process/timing operations like an Allocator.
+    io: std.Io,
+
     /// Data-driven keybinding map (populated with CUA defaults, modifiable via Lua).
     keybinds: KeybindMap,
 
@@ -142,9 +146,10 @@ pub const Editor = struct {
     terminals: std.ArrayList(?*terminal_mod.Terminal),
 
     /// Registered languages (Zig built-in + Lua-loaded extensions).
-    /// SegmentedList: documents hold `*const LanguageDef` into this — element
-    /// pointers must stay stable when extensions register new languages.
-    languages: std.SegmentedList(syntax.LanguageDef, 4),
+    /// Each LanguageDef is individually heap-allocated because documents hold
+    /// `*const LanguageDef` — pointers must stay stable when extensions
+    /// register new languages. (Was std.SegmentedList; removed in Zig 0.16.)
+    languages: std.ArrayList(*syntax.LanguageDef),
     /// GUI syntax highlight colors.
     syntax_theme: SyntaxTheme = theme_mod.syn_gui_dark,
     /// TUI syntax highlight colors.
@@ -181,21 +186,25 @@ pub const Editor = struct {
         settings,
     };
 
-    pub fn init(allocator: Allocator) !Editor {
+    pub fn init(allocator: Allocator, io: std.Io) !Editor {
         var editor = Editor{
             .documents = .empty,
             .commands = CommandRegistry.init(allocator),
             .allocator = allocator,
+            .io = io,
             .keybinds = KeybindMap.init(allocator),
             .layout = try Layout.init(allocator),
             .completion_items = .empty,
             .lsp_configs = .empty,
             .terminals = .empty,
-            .languages = .{},
+            .languages = .empty,
             .lang_syntax_overrides = .empty,
         };
-        // Register built-in Zig language
-        try editor.languages.append(allocator, syntax.lang_zig);
+        // Register built-in Zig language (heap-allocated: see `languages` doc)
+        const zig_lang = try allocator.create(syntax.LanguageDef);
+        zig_lang.* = syntax.lang_zig;
+        errdefer allocator.destroy(zig_lang);
+        try editor.languages.append(allocator, zig_lang);
         // Always have at least one empty document
         var doc = try Document.init(allocator);
         doc.history.max_size = editor.max_undo_history;
@@ -217,9 +226,9 @@ pub const Editor = struct {
         self.keybinds.deinit();
         self.layout.deinit();
         // Free Lua-registered languages (built-in Zig has null arena)
-        var lang_it = self.languages.iterator(0);
-        while (lang_it.next()) |lang| {
+        for (self.languages.items) |lang| {
             lang.deinit();
+            self.allocator.destroy(lang);
         }
         self.clearCompletionItems();
         self.completion_items.deinit(self.allocator);
@@ -304,7 +313,7 @@ pub const Editor = struct {
         var doc = try Document.init(self.allocator);
         errdefer doc.deinit();
         doc.history.max_size = self.max_undo_history;
-        try doc.open(path);
+        try doc.open(self.io, path);
         try self.documents.append(self.allocator, doc);
         const idx = self.documents.items.len - 1;
         self.active_doc_idx = idx;
@@ -413,7 +422,7 @@ pub const Editor = struct {
         }
         if (std.mem.eql(u8, action, "save")) {
             const doc = self.activeDoc();
-            doc.save() catch |err| {
+            doc.save(self.io) catch |err| {
                 if (err == error.NoFilePath) {
                     // Untitled buffer — route to Save As instead of silently
                     // dropping the save.
@@ -593,7 +602,7 @@ pub const Editor = struct {
         var saved: usize = 0;
         for (self.documents.items) |*doc| {
             if (doc.dirty and doc.file_path != null) {
-                doc.save() catch continue;
+                doc.save(self.io) catch continue;
                 saved += 1;
             }
         }
@@ -702,7 +711,7 @@ pub const Editor = struct {
     fn openTerminalSplit(self: *Editor, direction: @import("layout.zig").SplitDirection) void {
         const builtin = @import("builtin");
         const command = if (builtin.os.tag == .windows) "powershell.exe" else "/bin/bash";
-        const term = terminal_mod.Terminal.init(self.allocator, 80, 24, command) catch |err| {
+        const term = terminal_mod.Terminal.init(self.allocator, self.io, 80, 24, command) catch |err| {
             std.log.err("Failed to open terminal: {}", .{err});
             self.status_message = "Failed to open terminal (see zide.log)";
             return;
@@ -798,10 +807,9 @@ pub const Editor = struct {
 
     /// Find a registered language by file extension.
     /// The returned pointer stays valid for the editor's lifetime
-    /// (languages live in a SegmentedList — appends never relocate).
+    /// (each LanguageDef is its own heap allocation — appends never relocate).
     pub fn findLanguage(self: *const Editor, ext: []const u8) ?*const syntax.LanguageDef {
-        var it = self.languages.constIterator(0);
-        while (it.next()) |lang| {
+        for (self.languages.items) |lang| {
             if (lang.matchesExtension(ext)) return lang;
         }
         return null;
@@ -1017,7 +1025,7 @@ pub const Editor = struct {
 
 test "editor init and basic operations" {
     const allocator = std.testing.allocator;
-    var editor = try Editor.init(allocator);
+    var editor = try Editor.init(allocator, std.testing.io);
     defer editor.deinit();
 
     // Should start with one empty document
@@ -1027,7 +1035,7 @@ test "editor init and basic operations" {
 
 test "editor command execution" {
     const allocator = std.testing.allocator;
-    var editor = try Editor.init(allocator);
+    var editor = try Editor.init(allocator, std.testing.io);
     defer editor.deinit();
 
     try editor.activeDoc().loadText("hello");
@@ -1041,7 +1049,7 @@ test "editor command execution" {
 
 test "editor insert via command" {
     const allocator = std.testing.allocator;
-    var editor = try Editor.init(allocator);
+    var editor = try Editor.init(allocator, std.testing.io);
     defer editor.deinit();
 
     try editor.activeDoc().loadText("hello");
@@ -1051,7 +1059,7 @@ test "editor insert via command" {
 
 test "editor multiple documents" {
     const allocator = std.testing.allocator;
-    var editor = try Editor.init(allocator);
+    var editor = try Editor.init(allocator, std.testing.io);
     defer editor.deinit();
 
     try editor.activeDoc().loadText("doc1");
@@ -1071,7 +1079,7 @@ test "editor multiple documents" {
 
 test "per-language syntax theme override resolution" {
     const allocator = std.testing.allocator;
-    var editor = try Editor.init(allocator);
+    var editor = try Editor.init(allocator, std.testing.io);
     defer editor.deinit();
 
     const name = try allocator.dupe(u8, "python");
@@ -1093,7 +1101,7 @@ test "per-language syntax theme override resolution" {
 
 test "editor undo via command" {
     const allocator = std.testing.allocator;
-    var editor = try Editor.init(allocator);
+    var editor = try Editor.init(allocator, std.testing.io);
     defer editor.deinit();
 
     try editor.activeDoc().loadText("hello");

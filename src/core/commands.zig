@@ -767,7 +767,7 @@ fn cmdTuiThemeHighContrast(editor: *Editor, _: ?[]const u8) void {
 
 test "add_next_occurrence with selection spanning the gap" {
     const allocator = std.testing.allocator;
-    var editor = try Editor.init(allocator);
+    var editor = try Editor.init(allocator, std.testing.io);
     defer editor.deinit();
     const doc = editor.activeDoc();
     try doc.loadText("xx ab ab ab");
@@ -793,7 +793,7 @@ test "add_next_occurrence with selection spanning the gap" {
 
 test "add_next_occurrence selects word then finds next" {
     const allocator = std.testing.allocator;
-    var editor = try Editor.init(allocator);
+    var editor = try Editor.init(allocator, std.testing.io);
     defer editor.deinit();
     try editor.activeDoc().loadText("hello world hello there");
 

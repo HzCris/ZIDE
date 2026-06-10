@@ -85,8 +85,8 @@ pub const Document = struct {
     }
 
     /// Open a file into this document, replacing its current content.
-    pub fn open(self: *Document, path: []const u8) !void {
-        try self.buffer.loadFile(path);
+    pub fn open(self: *Document, io: std.Io, path: []const u8) !void {
+        try self.buffer.loadFile(io, path);
         // Store owned copy of path
         if (self.file_path) |old| {
             self.allocator.free(old);
@@ -114,15 +114,15 @@ pub const Document = struct {
     }
 
     /// Save the document to its file path.
-    pub fn save(self: *Document) !void {
+    pub fn save(self: *Document, io: std.Io) !void {
         const path = self.file_path orelse return error.NoFilePath;
-        try self.buffer.saveFile(path);
+        try self.buffer.saveFile(io, path);
         self.dirty = false;
     }
 
     /// Save to a new path (Save As).
-    pub fn saveAs(self: *Document, path: []const u8) !void {
-        try self.buffer.saveFile(path);
+    pub fn saveAs(self: *Document, io: std.Io, path: []const u8) !void {
+        try self.buffer.saveFile(io, path);
         if (self.file_path) |old| {
             self.allocator.free(old);
         }

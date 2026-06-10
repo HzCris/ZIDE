@@ -22,37 +22,41 @@ pub const std_options: std.Options = .{
 // (truncated each run).
 // ---------------------------------------------------------------------------
 
-var log_mutex: std.Thread.Mutex = .{};
-var log_file: ?std.fs.File = null;
+var log_mutex: std.Io.Mutex = .init;
+var log_file: ?std.Io.File = null;
 var log_open_failed = false;
 
 fn logToFile(
     comptime level: std.log.Level,
-    comptime scope: @Type(.enum_literal),
+    comptime scope: @EnumLiteral(),
     comptime format: []const u8,
     args: anytype,
 ) void {
-    // Mutex: the LSP reader thread and the main thread both log.
-    log_mutex.lock();
-    defer log_mutex.unlock();
+    // std.Options.debug_io is the statically-initialized Io singleton that
+    // std itself logs through — always available, independent of the app Io.
+    const io = std.Options.debug_io;
 
-    const file = openLogFile() orelse return;
+    // Mutex: the LSP reader thread and the main thread both log.
+    log_mutex.lockUncancelable(io);
+    defer log_mutex.unlock(io);
+
+    const file = openLogFile(io) orelse return;
     const prefix = comptime level.asText() ++ (if (scope == .default) ": " else "(" ++ @tagName(scope) ++ "): ");
     var line_buf: [2048]u8 = undefined;
     var w: std.Io.Writer = .fixed(&line_buf);
     w.print(prefix ++ format ++ "\n", args) catch {}; // overflow: keep what fit
-    file.writeAll(w.buffered()) catch {};
+    file.writeStreamingAll(io, w.buffered()) catch {};
 }
 
-fn openLogFile() ?std.fs.File {
+fn openLogFile(io: std.Io) ?std.Io.File {
     if (log_file) |f| return f;
     if (log_open_failed) return null;
     log_open_failed = true; // assume the worst; cleared on success
     const dir = lua_settings.getConfigDir() orelse return null;
-    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
     const path = std.fmt.bufPrint(&path_buf, "{s}/zide.log", .{dir}) catch return null;
-    std.fs.cwd().makePath(dir) catch {};
-    log_file = std.fs.cwd().createFile(path, .{ .truncate = true }) catch return null;
+    std.Io.Dir.cwd().createDirPath(io, dir) catch {};
+    log_file = std.Io.Dir.cwd().createFile(io, path, .{ .truncate = true }) catch return null;
     log_open_failed = false;
     return log_file;
 }
@@ -122,30 +126,32 @@ const welcome_text =
     \\
 ;
 
-pub fn main() !void {
-    var gpa_instance: std.heap.DebugAllocator(.{}) = .init;
-    defer _ = gpa_instance.deinit();
-    const allocator = gpa_instance.allocator();
+pub fn main(init: std.process.Init) !void {
+    // Juicy Main: gpa (leak-checked in Debug) and the Io instance come from
+    // std.process.Init instead of hand-rolled globals.
+    const allocator = init.gpa;
+    const io = init.io;
+
+    // Config-path helpers (and through them the file logger) need the
+    // environment + an Io before any Editor exists.
+    lua_settings.process_environ = init.environ_map;
+    lua_settings.global_io = io;
 
     var buf: [4096]u8 = undefined;
-    var stdout_w = std.fs.File.stdout().writer(&buf);
+    var stdout_w = std.Io.File.stdout().writer(io, &buf);
     const stdout = &stdout_w.interface;
     var stderr_buf: [4096]u8 = undefined;
-    var stderr_w = std.fs.File.stderr().writer(&stderr_buf);
+    var stderr_w = std.Io.File.stderr().writer(io, &stderr_buf);
     const stderr = &stderr_w.interface;
 
-    // Parse CLI arguments
-    var args = try std.process.argsWithAllocator(allocator);
-    defer args.deinit();
+    // Parse CLI arguments (arena-backed; freed automatically on exit)
+    const argv = try init.minimal.args.toSlice(init.arena.allocator());
 
     var mode: ?FrontendMode = null;
     var files: std.ArrayList([]const u8) = .empty;
     defer files.deinit(allocator);
 
-    // Skip executable name
-    _ = args.next();
-
-    while (args.next()) |arg| {
+    for (argv[1..]) |arg| {
         if (std.mem.eql(u8, arg, "--gui")) {
             mode = .gui;
         } else if (std.mem.eql(u8, arg, "--tui")) {
@@ -170,7 +176,7 @@ pub fn main() !void {
     // Detect frontend mode if not explicitly set: launched from an
     // interactive terminal -> TUI in that terminal; desktop launch -> GUI.
     // (TUI-only builds always run the TUI.)
-    const frontend = mode orelse if (build_options.has_gui) detectFrontend() else FrontendMode.tui;
+    const frontend = mode orelse if (build_options.has_gui) detectFrontend(io) else FrontendMode.tui;
 
     if (builtin.os.tag == .windows and frontend == .gui) {
         // Console-subsystem exe launched from the desktop gets a freshly
@@ -194,23 +200,25 @@ pub fn main() !void {
     switch (frontend) {
         .gui => {
             if (build_options.has_gui) {
-                try runGui(allocator, lua, files.items);
+                try runGui(allocator, io, lua, files.items);
             } else {
                 // CLI usage error — must reach the terminal (logs go to a file).
                 try stderr.print("GUI not available in this build. Use zide (not zide-tui) for GUI mode.\n", .{});
                 try stderr.flush();
             }
         },
-        .tui => try runTui(allocator, lua, files.items),
+        .tui => try runTui(allocator, io, lua, files.items),
     }
 }
 
 extern "kernel32" fn GetConsoleProcessList(lpdwProcessList: [*]u32, dwProcessCount: u32) callconv(.winapi) u32;
 extern "kernel32" fn FreeConsole() callconv(.winapi) c_int;
+// 0.16 removed this from std.os.windows.kernel32 — declare it ourselves.
+extern "kernel32" fn GetConsoleMode(hConsoleHandle: std.os.windows.HANDLE, lpMode: *u32) callconv(.winapi) c_int;
 
 /// Hybrid launch detection: `zide` typed in a terminal opens the TUI there;
 /// launching the binary from the desktop opens the GUI.
-fn detectFrontend() FrontendMode {
+fn detectFrontend(io: std.Io) FrontendMode {
     if (builtin.os.tag == .windows) {
         // The exe is console-subsystem, so a naive "do we have a console"
         // check is wrong: Explorer double-click ALLOCATES a fresh console.
@@ -218,24 +226,24 @@ fn detectFrontend() FrontendMode {
         // shows up as more than one process attached to it.
         var pids: [4]u32 = undefined;
         const shared = GetConsoleProcessList(&pids, pids.len) > 1;
-        const in_tty = isConsoleHandle(std.fs.File.stdin().handle);
-        const out_tty = isConsoleHandle(std.fs.File.stdout().handle);
+        const in_tty = isConsoleHandle(std.Io.File.stdin().handle);
+        const out_tty = isConsoleHandle(std.Io.File.stdout().handle);
         return if (shared and in_tty and out_tty) .tui else .gui;
     } else {
         // Both ends must be a terminal — piped stdin/stdout means scripts or
         // redirection, where popping a TUI would be wrong.
-        const in_tty = std.posix.isatty(std.fs.File.stdin().handle);
-        const out_tty = std.posix.isatty(std.fs.File.stdout().handle);
+        const in_tty = std.Io.File.stdin().isTty(io) catch false;
+        const out_tty = std.Io.File.stdout().isTty(io) catch false;
         return if (in_tty and out_tty) .tui else .gui;
     }
 }
 
-fn isConsoleHandle(handle: std.fs.File.Handle) bool {
+fn isConsoleHandle(handle: std.Io.File.Handle) bool {
     var console_mode: u32 = 0;
-    return std.os.windows.kernel32.GetConsoleMode(handle, &console_mode) != 0;
+    return GetConsoleMode(handle, &console_mode) != 0;
 }
 
-fn runGui(allocator: std.mem.Allocator, lua: *zlua.Lua, cli_files: []const []const u8) !void {
+fn runGui(allocator: std.mem.Allocator, io: std.Io, lua: *zlua.Lua, cli_files: []const []const u8) !void {
     if (!build_options.has_gui) return;
 
     if (builtin.os.tag == .windows) {
@@ -243,11 +251,11 @@ fn runGui(allocator: std.mem.Allocator, lua: *zlua.Lua, cli_files: []const []con
     }
 
     // Init editor state
-    var editor = try Editor.init(allocator);
+    var editor = try Editor.init(allocator, io);
     defer editor.deinit();
 
     // Start LSP client (ZLS)
-    var lsp_client = LspClient.init(allocator);
+    var lsp_client = LspClient.init(allocator, io);
     defer lsp_client.deinit();
     lsp_client.start("zls") catch |err| {
         std.log.warn("Failed to start ZLS: {}", .{err});
@@ -272,7 +280,7 @@ fn runGui(allocator: std.mem.Allocator, lua: *zlua.Lua, cli_files: []const []con
     // Open CLI files, or show welcome text
     if (cli_files.len > 0) {
         // Replace the default empty document with the first file
-        editor.activeDoc().open(cli_files[0]) catch |err| {
+        editor.activeDoc().open(io, cli_files[0]) catch |err| {
             std.log.err("Failed to open {s}: {}", .{ cli_files[0], err });
         };
         editor.activeDoc().detectLanguage(&editor);
@@ -291,7 +299,7 @@ fn runGui(allocator: std.mem.Allocator, lua: *zlua.Lua, cli_files: []const []con
 
     // Init SDL backend (creates OS window)
     var backend = try SDLBackend.initWindow(.{
-        .allocator = allocator,
+        .io = io,
         .size = .{ .w = 1024.0, .h = 768.0 },
         .min_size = .{ .w = 400.0, .h = 300.0 },
         .vsync = true,
@@ -309,12 +317,7 @@ fn runGui(allocator: std.mem.Allocator, lua: *zlua.Lua, cli_files: []const []con
     // if set; otherwise fall back to the bundled Fira Code Nerd Font.
     var mono_loaded = false;
     if (editor.mono_font_path.len > 0) blk: {
-        const f = std.fs.cwd().openFile(editor.mono_font_path, .{}) catch |err| {
-            std.log.warn("Failed to open mono font {s}: {} — falling back to bundled font", .{ editor.mono_font_path, err });
-            break :blk;
-        };
-        defer f.close();
-        const bytes = f.readToEndAlloc(allocator, 64 * 1024 * 1024) catch |err| {
+        const bytes = std.Io.Dir.cwd().readFileAlloc(io, editor.mono_font_path, allocator, .limited(64 * 1024 * 1024)) catch |err| {
             std.log.warn("Failed to read mono font {s}: {} — falling back to bundled font", .{ editor.mono_font_path, err });
             break :blk;
         };
@@ -360,21 +363,21 @@ fn runGui(allocator: std.mem.Allocator, lua: *zlua.Lua, cli_files: []const []con
         if (!gui.frame(&editor)) break :main_loop;
 
         const end_micros = try win.end(.{});
-        try backend.setCursor(win.cursorRequested());
-        try backend.textInputRect(win.textInputRequested());
-        try backend.renderPresent();
+        backend.setCursor(win.cursorRequested());
+        backend.textInputRect(win.textInputRequested());
+        backend.renderPresent();
 
         const wait_event_micros = win.waitTime(end_micros);
         interrupted = try backend.waitEventTimeout(wait_event_micros);
     }
 }
 
-fn runTui(allocator: std.mem.Allocator, lua: *zlua.Lua, cli_files: []const []const u8) !void {
-    var editor = try Editor.init(allocator);
+fn runTui(allocator: std.mem.Allocator, io: std.Io, lua: *zlua.Lua, cli_files: []const []const u8) !void {
+    var editor = try Editor.init(allocator, io);
     defer editor.deinit();
 
     // Start LSP client (ZLS)
-    var lsp_client = LspClient.init(allocator);
+    var lsp_client = LspClient.init(allocator, io);
     defer lsp_client.deinit();
     lsp_client.start("zls") catch |err| {
         std.log.warn("Failed to start ZLS: {}", .{err});
@@ -398,7 +401,7 @@ fn runTui(allocator: std.mem.Allocator, lua: *zlua.Lua, cli_files: []const []con
 
     // Open CLI files, or show welcome text
     if (cli_files.len > 0) {
-        editor.activeDoc().open(cli_files[0]) catch |err| {
+        editor.activeDoc().open(io, cli_files[0]) catch |err| {
             std.log.err("Failed to open {s}: {}", .{ cli_files[0], err });
         };
         editor.activeDoc().detectLanguage(&editor);
@@ -438,7 +441,7 @@ fn printUsage(stdout: *std.Io.Writer) void {
 }
 
 test "detect frontend does not crash" {
-    const result = detectFrontend();
+    const result = detectFrontend(std.testing.io);
     _ = result;
 }
 

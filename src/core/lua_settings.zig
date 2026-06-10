@@ -52,6 +52,19 @@ pub fn registerApi(lua: *Lua, editor: *Editor) void {
     lua.setGlobal("zide");
 }
 
+// ---------------------------------------------------------------------------
+// Process-wide context (Zig 0.16): env vars and Io are no longer global in
+// std — main() hands them to us before any config helper runs. The file
+// logger in main.zig calls getConfigDir() before an Editor exists, so these
+// can't live on the Editor.
+// ---------------------------------------------------------------------------
+
+/// Environment map from std.process.Init; set once in main().
+/// (Mutable pointer: libvaxis wants `*Environ.Map` for terminfo lookups.)
+pub var process_environ: ?*std.process.Environ.Map = null;
+/// Io instance from std.process.Init; set once in main().
+pub var global_io: ?std.Io = null;
+
 /// Load the user's init.lua from the config directory.
 /// Returns true if a config file was found and loaded successfully.
 pub fn loadConfig(lua: *Lua) bool {
@@ -68,14 +81,15 @@ pub fn loadConfig(lua: *Lua) bool {
 /// Also ensures the folder hierarchy exists (themes/, extensions/).
 pub fn loadThemeFiles(lua: *Lua) void {
     const dir = getConfigDir() orelse return;
+    const io = global_io orelse return;
 
     // Ensure subdirectory hierarchy exists
     var sub_buf: [512]u8 = undefined;
     if (std.fmt.bufPrint(&sub_buf, "{s}/themes", .{dir})) |p| {
-        std.fs.cwd().makePath(p) catch {};
+        std.Io.Dir.cwd().createDirPath(io, p) catch {};
     } else |_| {}
     if (std.fmt.bufPrint(&sub_buf, "{s}/extensions", .{dir})) |p| {
-        std.fs.cwd().makePath(p) catch {};
+        std.Io.Dir.cwd().createDirPath(io, p) catch {};
     } else |_| {}
 
     // gui-theme.lua — create template if missing, then load
@@ -85,7 +99,7 @@ pub fn loadThemeFiles(lua: *Lua) void {
             gui_buf[path.len] = 0;
             const z_path: [:0]const u8 = gui_buf[0..path.len :0];
             createGuiThemeTemplate(z_path);
-            if (std.fs.cwd().access(z_path, .{})) |_| {
+            if (std.Io.Dir.cwd().access(io, z_path, .{})) |_| {
                 lua.doFile(z_path) catch |err| {
                     std.log.err("Error loading gui-theme.lua: {}", .{err});
                 };
@@ -100,7 +114,7 @@ pub fn loadThemeFiles(lua: *Lua) void {
             tui_buf[path.len] = 0;
             const z_path: [:0]const u8 = tui_buf[0..path.len :0];
             createTuiThemeTemplate(z_path);
-            if (std.fs.cwd().access(z_path, .{})) |_| {
+            if (std.Io.Dir.cwd().access(io, z_path, .{})) |_| {
                 lua.doFile(z_path) catch |err| {
                     std.log.err("Error loading tui-theme.lua: {}", .{err});
                 };
@@ -111,10 +125,11 @@ pub fn loadThemeFiles(lua: *Lua) void {
 
 /// Create gui-theme.lua template with commented defaults if the file doesn't exist.
 fn createGuiThemeTemplate(path: [:0]const u8) void {
-    if (std.fs.cwd().access(path, .{})) |_| return else |_| {}
-    const f = std.fs.cwd().createFile(path, .{}) catch return;
-    defer f.close();
-    f.writeAll(
+    const io = global_io orelse return;
+    if (std.Io.Dir.cwd().access(io, path, .{})) |_| return else |_| {}
+    const f = std.Io.Dir.cwd().createFile(io, path, .{}) catch return;
+    defer f.close(io);
+    f.writeStreamingAll(io,
         \\-- ZIDE GUI Theme Overrides
         \\-- Colors use #RRGGBB or #RRGGBBAA format.
         \\-- Uncomment and edit the colors you want to change.
@@ -158,10 +173,11 @@ fn createGuiThemeTemplate(path: [:0]const u8) void {
 
 /// Create tui-theme.lua template with commented defaults if the file doesn't exist.
 fn createTuiThemeTemplate(path: [:0]const u8) void {
-    if (std.fs.cwd().access(path, .{})) |_| return else |_| {}
-    const f = std.fs.cwd().createFile(path, .{}) catch return;
-    defer f.close();
-    f.writeAll(
+    const io = global_io orelse return;
+    if (std.Io.Dir.cwd().access(io, path, .{})) |_| return else |_| {}
+    const f = std.Io.Dir.cwd().createFile(io, path, .{}) catch return;
+    defer f.close(io);
+    f.writeStreamingAll(io,
         \\-- ZIDE TUI Theme Overrides
         \\-- Colors use #RRGGBB format (no alpha — terminals don't support it).
         \\-- Uncomment and edit the colors you want to change.
@@ -215,7 +231,8 @@ fn createTuiThemeTemplate(path: [:0]const u8) void {
 /// (Windows: %USERPROFILE%/.config/zide/init.lua)
 fn getConfigPath() ?[:0]const u8 {
     const p = getConfigPathAlways() orelse return null;
-    std.fs.cwd().access(p, .{}) catch return null;
+    const io = global_io orelse return null;
+    std.Io.Dir.cwd().access(io, p, .{}) catch return null;
     return p;
 }
 
@@ -231,8 +248,8 @@ pub fn getConfigPathAlways() ?[:0]const u8 {
     S.computed = true;
 
     const home_var = if (@import("builtin").os.tag == .windows) "USERPROFILE" else "HOME";
-    const home = std.process.getEnvVarOwned(std.heap.page_allocator, home_var) catch return null;
-    defer std.heap.page_allocator.free(home);
+    const env = process_environ orelse return null;
+    const home = env.get(home_var) orelse return null;
     const path = std.fmt.bufPrint(&S.buf, "{s}/.config/zide/init.lua", .{home}) catch return null;
     if (path.len < S.buf.len) {
         S.buf[path.len] = 0;
@@ -246,25 +263,21 @@ pub fn getConfigPathAlways() ?[:0]const u8 {
 /// Creates the config directory and file if they don't exist.
 pub fn writeSettingToFile(key: []const u8, value: []const u8) !void {
     const config_path = getConfigPathAlways() orelse return error.NoConfigPath;
+    const io = global_io orelse return error.NoConfigPath;
 
     // Ensure config directory exists
     const config_dir = getConfigDir() orelse return error.NoConfigPath;
-    std.fs.cwd().makePath(config_dir) catch {};
+    std.Io.Dir.cwd().createDirPath(io, config_dir) catch {};
 
-    // Read existing file content (or empty if doesn't exist)
+    // Read existing file content (or empty if doesn't exist / oversized)
     var existing: []u8 = &.{};
     var file_existed = false;
-    if (std.fs.cwd().openFile(config_path, .{})) |f| {
-        defer f.close();
-        const stat = f.stat() catch return error.ReadFailed;
-        if (stat.size > 0 and stat.size < 1024 * 1024) {
-            existing = std.heap.page_allocator.alloc(u8, stat.size) catch return error.OutOfMemory;
-            const read = f.readAll(existing) catch {
-                std.heap.page_allocator.free(existing);
-                return error.ReadFailed;
-            };
-            existing = existing[0..read];
+    if (std.Io.Dir.cwd().readFileAlloc(io, config_path, std.heap.page_allocator, .limited(1024 * 1024))) |contents| {
+        if (contents.len > 0) {
+            existing = contents;
             file_existed = true;
+        } else {
+            std.heap.page_allocator.free(contents);
         }
     } else |_| {}
     defer if (file_existed) std.heap.page_allocator.free(existing);
@@ -278,8 +291,8 @@ pub fn writeSettingToFile(key: []const u8, value: []const u8) !void {
     const pattern = std.fmt.bufPrint(&pattern_buf, "zide.set(\"{s}\"", .{key}) catch return error.FormatFailed;
 
     // Write output file
-    const out_file = std.fs.cwd().createFile(config_path, .{}) catch return error.WriteFailed;
-    defer out_file.close();
+    const out_file = std.Io.Dir.cwd().createFile(io, config_path, .{}) catch return error.WriteFailed;
+    defer out_file.close(io);
 
     if (existing.len > 0) {
         var replaced = false;
@@ -292,14 +305,14 @@ pub fn writeSettingToFile(key: []const u8, value: []const u8) !void {
 
             if (!replaced and std.mem.indexOf(u8, cur_line, pattern) != null) {
                 // Replace this line
-                out_file.writeAll(new_line) catch return error.WriteFailed;
+                out_file.writeStreamingAll(io, new_line) catch return error.WriteFailed;
                 replaced = true;
             } else {
-                out_file.writeAll(cur_line) catch return error.WriteFailed;
+                out_file.writeStreamingAll(io, cur_line) catch return error.WriteFailed;
             }
 
             if (line_end) |_| {
-                out_file.writeAll("\n") catch return error.WriteFailed;
+                out_file.writeStreamingAll(io, "\n") catch return error.WriteFailed;
                 start = end + 1;
             } else {
                 break;
@@ -308,16 +321,16 @@ pub fn writeSettingToFile(key: []const u8, value: []const u8) !void {
         if (!replaced) {
             // Append new setting
             if (existing.len > 0 and existing[existing.len - 1] != '\n') {
-                out_file.writeAll("\n") catch return error.WriteFailed;
+                out_file.writeStreamingAll(io, "\n") catch return error.WriteFailed;
             }
-            out_file.writeAll(new_line) catch return error.WriteFailed;
-            out_file.writeAll("\n") catch return error.WriteFailed;
+            out_file.writeStreamingAll(io, new_line) catch return error.WriteFailed;
+            out_file.writeStreamingAll(io, "\n") catch return error.WriteFailed;
         }
     } else {
         // New file — write header + setting
-        out_file.writeAll("-- ZIDE settings\n") catch return error.WriteFailed;
-        out_file.writeAll(new_line) catch return error.WriteFailed;
-        out_file.writeAll("\n") catch return error.WriteFailed;
+        out_file.writeStreamingAll(io, "-- ZIDE settings\n") catch return error.WriteFailed;
+        out_file.writeStreamingAll(io, new_line) catch return error.WriteFailed;
+        out_file.writeStreamingAll(io, "\n") catch return error.WriteFailed;
     }
 }
 
@@ -670,10 +683,19 @@ fn luaRegisterLanguage(state: ?*zlua.LuaState) callconv(.c) c_int {
         .arena = arena,
     };
 
-    editor.languages.append(editor.allocator, lang) catch {
+    // Heap-allocate so the pointer documents hold stays stable (the editor's
+    // languages list stores *LanguageDef — see Editor.languages).
+    const lang_ptr = editor.allocator.create(syntax.LanguageDef) catch {
         std.log.err("zide.register_language: failed to register '{s}'", .{name});
         var failed = lang;
         failed.deinit(); // frees the arena (previously leaked on this path)
+        return 0;
+    };
+    lang_ptr.* = lang;
+    editor.languages.append(editor.allocator, lang_ptr) catch {
+        std.log.err("zide.register_language: failed to register '{s}'", .{name});
+        lang_ptr.deinit(); // frees the arena (previously leaked on this path)
+        editor.allocator.destroy(lang_ptr);
         return 0;
     };
 
@@ -746,13 +768,13 @@ fn readTableStringArray(lua: *Lua, alloc: std.mem.Allocator, field: [:0]const u8
     defer lua.pop(1);
     if (lua.typeOf(-1) != .table) return &.{};
 
-    const len = lua.rawLen(-1);
+    const len = lua.lenRaw(-1);
     if (len == 0) return &.{};
 
     var list = std.ArrayList([]const u8).initCapacity(alloc, len) catch return &.{};
     var i: usize = 1;
     while (i <= len) : (i += 1) {
-        _ = lua.rawGetIndex(-1, @intCast(i));
+        _ = lua.getIndexRaw(-1, @intCast(i));
         const s = lua.toString(-1) catch {
             lua.pop(1);
             continue;
@@ -791,14 +813,15 @@ fn readTableChar(lua: *Lua, field: [:0]const u8) ?u8 {
 /// Each file should call zide.register_language({...}) to add language support.
 pub fn loadExtensions(lua: *Lua) void {
     const dir = getConfigDir() orelse return;
+    const io = global_io orelse return;
     var ext_buf: [512]u8 = undefined;
     const ext_path = std.fmt.bufPrint(&ext_buf, "{s}/extensions", .{dir}) catch return;
 
-    var iter_dir = std.fs.cwd().openDir(ext_path, .{ .iterate = true }) catch return;
-    defer iter_dir.close();
+    var iter_dir = std.Io.Dir.cwd().openDir(io, ext_path, .{ .iterate = true }) catch return;
+    defer iter_dir.close(io);
 
     var iter = iter_dir.iterate();
-    while (iter.next() catch null) |entry| {
+    while (iter.next(io) catch null) |entry| {
         if (entry.kind != .file) continue;
         if (!std.mem.endsWith(u8, entry.name, ".lua")) continue;
 
@@ -828,7 +851,8 @@ pub fn loadSyntaxTheme(lua: *Lua) void {
 
     createSyntaxThemeTemplate(z_path);
 
-    if (std.fs.cwd().access(z_path, .{})) |_| {
+    const io = global_io orelse return;
+    if (std.Io.Dir.cwd().access(io, z_path, .{})) |_| {
         lua.doFile(z_path) catch |err| {
             std.log.err("Error loading syntax-theme.lua: {}", .{err});
         };
@@ -838,14 +862,15 @@ pub fn loadSyntaxTheme(lua: *Lua) void {
 /// Load per-language syntax theme files from ~/.config/zide/themes/syn_theme_*.lua.
 pub fn loadLangSyntaxThemes(lua: *Lua) void {
     const dir = getConfigDir() orelse return;
+    const io = global_io orelse return;
     var themes_buf: [512]u8 = undefined;
     const themes_path = std.fmt.bufPrint(&themes_buf, "{s}/themes", .{dir}) catch return;
 
-    var iter_dir = std.fs.cwd().openDir(themes_path, .{ .iterate = true }) catch return;
-    defer iter_dir.close();
+    var iter_dir = std.Io.Dir.cwd().openDir(io, themes_path, .{ .iterate = true }) catch return;
+    defer iter_dir.close(io);
 
     var iter = iter_dir.iterate();
-    while (iter.next() catch null) |entry| {
+    while (iter.next(io) catch null) |entry| {
         if (entry.kind != .file) continue;
         if (!std.mem.startsWith(u8, entry.name, "syn_theme_")) continue;
         if (!std.mem.endsWith(u8, entry.name, ".lua")) continue;
@@ -881,10 +906,11 @@ pub fn loadLangSyntaxThemes(lua: *Lua) void {
 
 /// Create syntax-theme.lua template with commented defaults if the file doesn't exist.
 fn createSyntaxThemeTemplate(path: [:0]const u8) void {
-    if (std.fs.cwd().access(path, .{})) |_| return else |_| {}
-    const f = std.fs.cwd().createFile(path, .{}) catch return;
-    defer f.close();
-    f.writeAll(
+    const io = global_io orelse return;
+    if (std.Io.Dir.cwd().access(io, path, .{})) |_| return else |_| {}
+    const f = std.Io.Dir.cwd().createFile(io, path, .{}) catch return;
+    defer f.close(io);
+    f.writeStreamingAll(io,
         \\-- ZIDE Syntax Theme
         \\-- Colors use #RRGGBB format.
         \\-- Uncomment and edit the colors you want to change.

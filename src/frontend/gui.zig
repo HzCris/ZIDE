@@ -317,7 +317,7 @@ pub fn frame(editor: *Editor) bool {
 
     // Auto-save check
     if (editor.auto_save and editor.hasUnsavedChanges()) {
-        const now_ns = std.time.nanoTimestamp();
+        const now_ns: i128 = std.Io.Clock.now(.awake, editor.io).nanoseconds;
         if (last_auto_save_ns == 0) {
             last_auto_save_ns = now_ns;
         }
@@ -478,7 +478,7 @@ pub fn frame(editor: *Editor) bool {
                 m.close();
             }
             if (dvui.menuItemLabel(@src(), "Open Theme Folder", .{}, .{ .expand = .horizontal }) != null) {
-                openThemeFolder();
+                openThemeFolder(editor.io);
                 m.close();
             }
         }
@@ -1139,7 +1139,7 @@ fn editorPane(editor: *Editor, pane_id: u8) void {
                     const on_last_seg = row_end >= line_text.len;
                     if (cursor_exp >= row_start and (cursor_exp < row_end or (on_last_seg and cursor_exp == row_end))) {
                         // Blink: reset timer when cursor moves, then toggle visibility
-                        const now_ns = std.time.nanoTimestamp();
+                        const now_ns: i128 = std.Io.Clock.now(.awake, editor.io).nanoseconds;
                         const cur_offset = doc.cursors.primary().offset;
                         if (cur_offset != blink_last_offset) {
                             blink_time_ns = now_ns;
@@ -1307,8 +1307,8 @@ fn terminalPane(editor: *Editor, pane_id: u8, term_idx: usize) void {
     const render_rs: dvui.RectScale = .{ .r = area, .s = scale };
 
     // Lock terminal mutex and render cell grid
-    term.mutex.lock();
-    defer term.mutex.unlock();
+    term.mutex.lockUncancelable(term.io);
+    defer term.mutex.unlock(term.io);
 
     const t_cols = term.cols;
     const t_rows = term.rows;
@@ -1745,7 +1745,7 @@ fn handleMouseEvents(editor: *Editor, pane_id: u8, wd: *dvui.WidgetData, area: d
                 }
 
                 // Detect multi-click (double/triple)
-                const now_ns = std.time.nanoTimestamp();
+                const now_ns: i128 = std.Io.Clock.now(.awake, editor.io).nanoseconds;
                 const elapsed_ms: u64 = if (now_ns > last_click_time_ns)
                     @intCast(@divFloor(now_ns - last_click_time_ns, std.time.ns_per_ms))
                 else
@@ -2350,7 +2350,7 @@ fn openFileDialog(editor: *Editor) void {
 fn save(editor: *Editor) void {
     const doc = editor.activeDoc();
     if (doc.file_path != null) {
-        doc.save() catch |err| {
+        doc.save(editor.io) catch |err| {
             editor.status_message = @errorName(err);
             return;
         };
@@ -2370,7 +2370,7 @@ fn saveAs(editor: *Editor) void {
 
     if (path) |p| {
         defer editor.allocator.free(p);
-        editor.activeDoc().saveAs(p) catch |err| {
+        editor.activeDoc().saveAs(editor.io, p) catch |err| {
             editor.status_message = @errorName(err);
             return;
         };
@@ -2948,7 +2948,7 @@ fn handleConfirmQuitKeyGui(editor: *Editor, key: dvui.Event.Key) void {
             var failures: usize = 0;
             for (editor.documents.items) |*doc| {
                 if (doc.dirty) {
-                    doc.save() catch {
+                    doc.save(editor.io) catch {
                         failures += 1;
                         continue;
                     };
@@ -3196,13 +3196,13 @@ fn openSettingsFile(editor: *Editor) void {
 
     // Ensure directory and file exist
     if (lua_settings.getConfigDir()) |dir| {
-        std.fs.cwd().makePath(dir) catch {};
+        std.Io.Dir.cwd().createDirPath(editor.io, dir) catch {};
     }
     // Create file if it doesn't exist
-    if (std.fs.cwd().access(config_path, .{})) |_| {} else |_| {
-        if (std.fs.cwd().createFile(config_path, .{})) |f| {
-            f.writeAll("-- ZIDE settings\n-- See Documentation.md for available settings\n") catch {};
-            f.close();
+    if (std.Io.Dir.cwd().access(editor.io, config_path, .{})) |_| {} else |_| {
+        if (std.Io.Dir.cwd().createFile(editor.io, config_path, .{})) |f| {
+            f.writeStreamingAll(editor.io, "-- ZIDE settings\n-- See Documentation.md for available settings\n") catch {};
+            f.close(editor.io);
         } else |_| {}
     }
     _ = editor.openFile(config_path) catch {};
@@ -3249,7 +3249,7 @@ fn openThemeFile(editor: *Editor) void {
 }
 
 /// Open the ZIDE config folder in the OS file explorer.
-fn openThemeFolder() void {
+fn openThemeFolder(io: std.Io) void {
     const lua_settings = @import("../core/lua_settings.zig");
     const config_dir = lua_settings.getConfigDir() orelse return;
 
@@ -3259,7 +3259,7 @@ fn openThemeFolder() void {
     if (dir_slice.len >= dir_buf.len) return;
 
     // Ensure directory exists
-    std.fs.cwd().makePath(dir_slice) catch {};
+    std.Io.Dir.cwd().createDirPath(io, dir_slice) catch {};
 
     const builtin = @import("builtin");
     // Windows explorer needs backslashes — the config path mixes \ and /
@@ -3274,28 +3274,28 @@ fn openThemeFolder() void {
     const opener: [:0]const u8 = if (builtin.os.tag == .windows) "explorer" else if (builtin.os.tag == .macos) "open" else "xdg-open";
 
     const argv = [_][]const u8{ opener, dir_z };
-    var child = std.process.Child.init(&argv, std.heap.page_allocator);
-    _ = child.spawn() catch return;
+    _ = std.process.spawn(io, .{ .argv = &argv }) catch return;
 }
 
 /// Open Documentation.md in the editor.
 fn openDocumentation(editor: *Editor) void {
     // Try to find Documentation.md relative to the executable
     var exe_dir_buf: [512]u8 = undefined;
-    if (std.fs.selfExeDirPath(&exe_dir_buf)) |exe_dir| {
+    if (std.process.executableDirPath(editor.io, &exe_dir_buf)) |exe_dir_len| {
+        const exe_dir = exe_dir_buf[0..exe_dir_len];
         var doc_buf: [600]u8 = undefined;
         const doc_path = std.fmt.bufPrint(&doc_buf, "{s}/Documentation.md", .{exe_dir}) catch return;
         if (doc_path.len >= doc_buf.len) return;
         doc_buf[doc_path.len] = 0;
         const z_path: [:0]const u8 = doc_buf[0..doc_path.len :0];
-        if (std.fs.cwd().access(z_path, .{})) |_| {
+        if (std.Io.Dir.cwd().access(editor.io, z_path, .{})) |_| {
             _ = editor.openFile(z_path) catch {};
             return;
         } else |_| {}
     } else |_| {}
 
     // Fallback: try current working directory
-    if (std.fs.cwd().access("Documentation.md", .{})) |_| {
+    if (std.Io.Dir.cwd().access(editor.io, "Documentation.md", .{})) |_| {
         _ = editor.openFile("Documentation.md") catch {};
     } else |_| {}
 }

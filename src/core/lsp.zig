@@ -86,11 +86,11 @@ const MessageQueue = struct {
     buf: [QUEUE_CAP]IncomingMessage = undefined,
     read_idx: usize = 0,
     write_idx: usize = 0,
-    mutex: std.Thread.Mutex = .{},
+    mutex: std.Io.Mutex = .init,
 
-    fn push(self: *MessageQueue, msg: IncomingMessage, allocator: Allocator) void {
-        self.mutex.lock();
-        defer self.mutex.unlock();
+    fn push(self: *MessageQueue, io: std.Io, msg: IncomingMessage, allocator: Allocator) void {
+        self.mutex.lockUncancelable(io);
+        defer self.mutex.unlock(io);
         // If full, drop (and free) the oldest unread message — previously the
         // overwritten slot's heap buffer leaked.
         if (self.write_idx -% self.read_idx >= QUEUE_CAP) {
@@ -101,9 +101,9 @@ const MessageQueue = struct {
         self.write_idx +%= 1;
     }
 
-    fn tryPop(self: *MessageQueue) ?IncomingMessage {
-        self.mutex.lock();
-        defer self.mutex.unlock();
+    fn tryPop(self: *MessageQueue, io: std.Io) ?IncomingMessage {
+        self.mutex.lockUncancelable(io);
+        defer self.mutex.unlock(io);
         if (self.read_idx == self.write_idx) return null;
         const msg = self.buf[self.read_idx % QUEUE_CAP];
         self.read_idx +%= 1;
@@ -117,6 +117,7 @@ const MessageQueue = struct {
 
 pub const LspClient = struct {
     allocator: Allocator,
+    io: std.Io,
     process: ?std.process.Child = null,
     reader_thread: ?std.Thread = null,
     running: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
@@ -137,9 +138,10 @@ pub const LspClient = struct {
         shutdown,
     };
 
-    pub fn init(allocator: Allocator) LspClient {
+    pub fn init(allocator: Allocator, io: std.Io) LspClient {
         return .{
             .allocator = allocator,
+            .io = io,
             .pending = std.AutoHashMap(i64, RequestMethod).init(allocator),
         };
     }
@@ -155,18 +157,18 @@ pub const LspClient = struct {
         if (self.process != null) return;
 
         const argv: []const []const u8 = &.{command};
-        var child = std.process.Child.init(argv, self.allocator);
-        child.stdin_behavior = .Pipe;
-        child.stdout_behavior = .Pipe;
-        // Nobody drains stderr — a .Pipe would fill up (~4KB) and block the
-        // server mid-write, freezing the whole LSP session. Discard it.
-        child.stderr_behavior = .Ignore;
-        // Windows: the GUI runs without a console (FreeConsole on desktop
-        // launch), so a console-subsystem server like zls.exe would otherwise
-        // get a brand-new visible console window.
-        child.create_no_window = true;
-
-        try child.spawn();
+        const child = try std.process.spawn(self.io, .{
+            .argv = argv,
+            .stdin = .pipe,
+            .stdout = .pipe,
+            // Nobody drains stderr — a pipe would fill up (~4KB) and block the
+            // server mid-write, freezing the whole LSP session. Discard it.
+            .stderr = .ignore,
+            // Windows: the GUI runs without a console (FreeConsole on desktop
+            // launch), so a console-subsystem server like zls.exe would
+            // otherwise get a brand-new visible console window.
+            .create_no_window = true,
+        });
         self.process = child;
         self.running.store(true, .release);
 
@@ -191,7 +193,7 @@ pub const LspClient = struct {
         // Close stdin to signal EOF to the process
         if (self.process) |*proc| {
             if (proc.stdin) |stdin| {
-                stdin.close();
+                stdin.close(self.io);
                 proc.stdin = null;
             }
         }
@@ -204,13 +206,13 @@ pub const LspClient = struct {
 
         // Wait for process and clean up
         if (self.process) |*proc| {
-            _ = proc.wait() catch {};
+            _ = proc.wait(self.io) catch {};
         }
         self.process = null;
         self.initialized = false;
 
         // Drain remaining messages
-        while (self.incoming.tryPop()) |msg| {
+        while (self.incoming.tryPop(self.io)) |msg| {
             self.allocator.free(msg.json_bytes);
         }
     }
@@ -229,7 +231,7 @@ pub const LspClient = struct {
         defer body.deinit(self.allocator);
 
         try body.appendSlice(self.allocator,"{\"jsonrpc\":\"2.0\",\"id\":");
-        try std.fmt.format(body.writer(self.allocator), "{d}", .{id});
+        try body.print(self.allocator, "{d}", .{id});
         try body.appendSlice(self.allocator,",\"method\":\"");
         try body.appendSlice(self.allocator,method);
         try body.appendSlice(self.allocator,"\",\"params\":");
@@ -260,16 +262,17 @@ pub const LspClient = struct {
         var header_buf: [64]u8 = undefined;
         const header = std.fmt.bufPrint(&header_buf, "Content-Length: {d}\r\n\r\n", .{body.len}) catch return error.NotRunning;
 
-        stdin.writeAll(header) catch return error.NotRunning;
-        stdin.writeAll(body) catch return error.NotRunning;
+        stdin.writeStreamingAll(self.io, header) catch return error.NotRunning;
+        stdin.writeStreamingAll(self.io, body) catch return error.NotRunning;
     }
 
     // ----- Initialize handshake -----
 
     fn sendInitialize(self: *LspClient) !void {
         // Build root URI from cwd
-        var cwd_buf: [std.fs.max_path_bytes]u8 = undefined;
-        const cwd = std.process.getCwd(&cwd_buf) catch ".";
+        var cwd_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+        const cwd_len = std.process.currentPath(self.io, &cwd_buf) catch 0;
+        const cwd: []const u8 = if (cwd_len > 0) cwd_buf[0..cwd_len] else ".";
         const root_uri = try pathToUri(self.allocator, cwd);
         defer self.allocator.free(root_uri);
 
@@ -303,10 +306,10 @@ pub const LspClient = struct {
         try params.appendSlice(self.allocator,"\",\"languageId\":\"");
         try params.appendSlice(self.allocator,language_id);
         try params.appendSlice(self.allocator,"\",\"version\":");
-        try std.fmt.format(params.writer(self.allocator), "{d}", .{version});
+        try params.print(self.allocator, "{d}", .{version});
         try params.appendSlice(self.allocator,",\"text\":");
         // JSON-escape the text
-        try writeJsonString(params.writer(self.allocator), text);
+        try writeJsonString(&params, self.allocator, text);
         try params.appendSlice(self.allocator,"}}");
 
         try self.sendNotification("textDocument/didOpen", params.items);
@@ -321,9 +324,9 @@ pub const LspClient = struct {
         try params.appendSlice(self.allocator,"{\"textDocument\":{\"uri\":\"");
         try params.appendSlice(self.allocator,uri);
         try params.appendSlice(self.allocator,"\",\"version\":");
-        try std.fmt.format(params.writer(self.allocator), "{d}", .{version});
+        try params.print(self.allocator, "{d}", .{version});
         try params.appendSlice(self.allocator,"},\"contentChanges\":[{\"text\":");
-        try writeJsonString(params.writer(self.allocator), text);
+        try writeJsonString(&params, self.allocator, text);
         try params.appendSlice(self.allocator,"}]}");
 
         try self.sendNotification("textDocument/didChange", params.items);
@@ -364,9 +367,9 @@ pub const LspClient = struct {
         try params.appendSlice(self.allocator,"{\"textDocument\":{\"uri\":\"");
         try params.appendSlice(self.allocator,uri);
         try params.appendSlice(self.allocator,"\"},\"position\":{\"line\":");
-        try std.fmt.format(params.writer(self.allocator), "{d}", .{line});
+        try params.print(self.allocator, "{d}", .{line});
         try params.appendSlice(self.allocator,",\"character\":");
-        try std.fmt.format(params.writer(self.allocator), "{d}", .{col});
+        try params.print(self.allocator, "{d}", .{col});
         try params.appendSlice(self.allocator,"}}");
 
         const id = try self.sendRequest("textDocument/completion", params.items);
@@ -383,9 +386,9 @@ pub const LspClient = struct {
         try params.appendSlice(self.allocator,"{\"textDocument\":{\"uri\":\"");
         try params.appendSlice(self.allocator,uri);
         try params.appendSlice(self.allocator,"\"},\"position\":{\"line\":");
-        try std.fmt.format(params.writer(self.allocator), "{d}", .{line});
+        try params.print(self.allocator, "{d}", .{line});
         try params.appendSlice(self.allocator,",\"character\":");
-        try std.fmt.format(params.writer(self.allocator), "{d}", .{col});
+        try params.print(self.allocator, "{d}", .{col});
         try params.appendSlice(self.allocator,"}}");
 
         const id = try self.sendRequest("textDocument/definition", params.items);
@@ -397,7 +400,7 @@ pub const LspClient = struct {
 
     pub fn pollMessages(self: *LspClient, editor: anytype) void {
         var count: usize = 0;
-        while (self.incoming.tryPop()) |msg| {
+        while (self.incoming.tryPop(self.io)) |msg| {
             defer self.allocator.free(msg.json_bytes);
             self.dispatchMessage(msg.json_bytes, editor);
             count += 1;
@@ -594,27 +597,28 @@ pub const LspClient = struct {
 
     fn readerThreadFn(self: *LspClient) void {
         const stdout_file = if (self.process) |*proc| (proc.stdout orelse return) else return;
+        const io = self.io;
 
-        // Manual read buffer — File.reader() uses pread (positional reads) which
-        // panics on Windows pipes. We use File.read() (streaming) instead.
+        // Manual read buffer — readStreaming is the pipe-safe primitive
+        // (positional reads are invalid on pipes).
         var buf: [8192]u8 = undefined;
         var buf_start: usize = 0;
         var buf_end: usize = 0;
 
         while (self.running.load(.acquire)) {
             // Read Content-Length header
-            const content_len = pipeReadContentLength(stdout_file, &buf, &buf_start, &buf_end) catch break;
+            const content_len = pipeReadContentLength(io, stdout_file, &buf, &buf_start, &buf_end) catch break;
             if (content_len == 0) continue;
 
             // Read the JSON body
             const json_buf = self.allocator.alloc(u8, content_len) catch break;
-            pipeReadExact(stdout_file, &buf, &buf_start, &buf_end, json_buf) catch {
+            pipeReadExact(io, stdout_file, &buf, &buf_start, &buf_end, json_buf) catch {
                 self.allocator.free(json_buf);
                 break;
             };
 
             // Push to queue
-            self.incoming.push(.{ .json_bytes = json_buf }, self.allocator);
+            self.incoming.push(io, .{ .json_bytes = json_buf }, self.allocator);
 
             // Wake TUI if needed
             if (self.tui_wake_fn) |wake| {
@@ -625,12 +629,13 @@ pub const LspClient = struct {
 };
 
 // ---------------------------------------------------------------------------
-// Pipe-safe reading helpers (use File.read instead of File.reader/pread)
+// Pipe-safe reading helpers (readStreaming only — never positional reads)
 // ---------------------------------------------------------------------------
 
 /// Read a single byte from the pipe, using the manual buffer for efficiency.
 fn pipeReadByte(
-    file: std.fs.File,
+    io: std.Io,
+    file: std.Io.File,
     buf: *[8192]u8,
     buf_start: *usize,
     buf_end: *usize,
@@ -641,10 +646,7 @@ fn pipeReadByte(
         return b;
     }
     // Buffer empty — refill
-    const n = file.read(buf) catch |err| switch (err) {
-        error.BrokenPipe => return error.EndOfStream,
-        else => return error.EndOfStream,
-    };
+    const n = file.readStreaming(io, &.{buf}) catch return error.EndOfStream;
     if (n == 0) return error.EndOfStream;
     buf_start.* = 1;
     buf_end.* = n;
@@ -653,7 +655,8 @@ fn pipeReadByte(
 
 /// Read exactly `dest.len` bytes from the pipe into `dest`.
 fn pipeReadExact(
-    file: std.fs.File,
+    io: std.Io,
+    file: std.Io.File,
     buf: *[8192]u8,
     buf_start: *usize,
     buf_end: *usize,
@@ -673,11 +676,11 @@ fn pipeReadExact(
             // Buffer empty — read directly if remaining is large, else refill buffer
             const remaining = dest.len - written;
             if (remaining >= buf.len) {
-                const n = file.read(dest[written..]) catch return error.EndOfStream;
+                const n = file.readStreaming(io, &.{dest[written..]}) catch return error.EndOfStream;
                 if (n == 0) return error.EndOfStream;
                 written += n;
             } else {
-                const n = file.read(buf) catch return error.EndOfStream;
+                const n = file.readStreaming(io, &.{buf}) catch return error.EndOfStream;
                 if (n == 0) return error.EndOfStream;
                 buf_start.* = 0;
                 buf_end.* = n;
@@ -688,7 +691,8 @@ fn pipeReadExact(
 
 /// Parse Content-Length from LSP JSON-RPC headers using pipe-safe reads.
 fn pipeReadContentLength(
-    file: std.fs.File,
+    io: std.Io,
+    file: std.Io.File,
     buf: *[8192]u8,
     buf_start: *usize,
     buf_end: *usize,
@@ -702,21 +706,21 @@ fn pipeReadContentLength(
 
         // Read until \n
         while (line_len < line_buf.len) {
-            const byte = pipeReadByte(file, buf, buf_start, buf_end) catch return error.EndOfStream;
+            const byte = pipeReadByte(io, file, buf, buf_start, buf_end) catch return error.EndOfStream;
             if (byte == '\n') break;
             line_buf[line_len] = byte;
             line_len += 1;
         }
 
         // Strip trailing \r
-        const line = std.mem.trimRight(u8, line_buf[0..line_len], "\r");
+        const line = std.mem.trimEnd(u8, line_buf[0..line_len], "\r");
 
         // Empty line = end of headers
         if (line.len == 0) break;
 
         // Parse Content-Length
         if (std.ascii.startsWithIgnoreCase(line, "content-length:")) {
-            const val_str = std.mem.trimLeft(u8, line["content-length:".len..], " ");
+            const val_str = std.mem.trimStart(u8, line["content-length:".len..], " ");
             content_length = std.fmt.parseInt(usize, val_str, 10) catch 0;
         }
     }
@@ -850,25 +854,25 @@ pub fn utf16ColToByte(line: []const u8, utf16_col: u32) usize {
 // JSON string escaping
 // ---------------------------------------------------------------------------
 
-fn writeJsonString(writer: anytype, text: []const u8) !void {
-    try writer.writeByte('"');
+fn writeJsonString(list: *std.ArrayList(u8), gpa: Allocator, text: []const u8) !void {
+    try list.append(gpa, '"');
     for (text) |ch| {
         switch (ch) {
-            '"' => try writer.writeAll("\\\""),
-            '\\' => try writer.writeAll("\\\\"),
-            '\n' => try writer.writeAll("\\n"),
-            '\r' => try writer.writeAll("\\r"),
-            '\t' => try writer.writeAll("\\t"),
+            '"' => try list.appendSlice(gpa, "\\\""),
+            '\\' => try list.appendSlice(gpa, "\\\\"),
+            '\n' => try list.appendSlice(gpa, "\\n"),
+            '\r' => try list.appendSlice(gpa, "\\r"),
+            '\t' => try list.appendSlice(gpa, "\\t"),
             else => {
                 if (ch < 0x20) {
-                    try std.fmt.format(writer, "\\u{x:0>4}", .{ch});
+                    try list.print(gpa, "\\u{x:0>4}", .{ch});
                 } else {
-                    try writer.writeByte(ch);
+                    try list.append(gpa, ch);
                 }
             },
         }
     }
-    try writer.writeByte('"');
+    try list.append(gpa, '"');
 }
 
 // ---------------------------------------------------------------------------
@@ -926,7 +930,7 @@ test "writeJsonString escaping" {
     const alloc = std.testing.allocator;
     var buf: std.ArrayList(u8) = .empty;
     defer buf.deinit(alloc);
-    try writeJsonString(buf.writer(alloc), "hello\n\"world\"\t\\end");
+    try writeJsonString(&buf, alloc, "hello\n\"world\"\t\\end");
     try std.testing.expectEqualStrings("\"hello\\n\\\"world\\\"\\t\\\\end\"", buf.items);
 }
 
@@ -964,26 +968,28 @@ test "utf16 column conversion" {
 test "MessageQueue push pop" {
     var q = MessageQueue{};
     const alloc = std.testing.allocator;
+    const io = std.testing.io;
     const msg1 = try alloc.dupe(u8, "hello");
-    q.push(.{ .json_bytes = msg1 }, alloc);
-    const popped = q.tryPop().?;
+    q.push(io, .{ .json_bytes = msg1 }, alloc);
+    const popped = q.tryPop(io).?;
     try std.testing.expectEqualStrings("hello", popped.json_bytes);
     alloc.free(popped.json_bytes);
-    try std.testing.expect(q.tryPop() == null);
+    try std.testing.expect(q.tryPop(io) == null);
 }
 
 test "MessageQueue overflow frees dropped messages" {
     var q = MessageQueue{};
     const alloc = std.testing.allocator;
+    const io = std.testing.io;
     // Push past capacity — the overwritten oldest messages must be freed
     // (std.testing.allocator fails the test on any leak).
     var i: usize = 0;
     while (i < QUEUE_CAP + 16) : (i += 1) {
         const msg = try alloc.dupe(u8, "x");
-        q.push(.{ .json_bytes = msg }, alloc);
+        q.push(io, .{ .json_bytes = msg }, alloc);
     }
     var popped: usize = 0;
-    while (q.tryPop()) |msg| {
+    while (q.tryPop(io)) |msg| {
         alloc.free(msg.json_bytes);
         popped += 1;
     }

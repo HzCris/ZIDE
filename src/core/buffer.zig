@@ -74,11 +74,10 @@ pub const Buffer = struct {
     }
 
     /// Load a file into the buffer.
-    pub fn loadFile(self: *Buffer, path: []const u8) !void {
-        const file = try std.fs.cwd().openFile(path, .{});
-        defer file.close();
-        const stat = try file.stat();
-        const size = stat.size;
+    pub fn loadFile(self: *Buffer, io: std.Io, path: []const u8) !void {
+        const file = try std.Io.Dir.cwd().openFile(io, path, .{});
+        defer file.close(io);
+        const size: usize = @intCast(try file.length(io));
 
         const gap_size: usize = @max(size / 4, 1024);
         const total = size + gap_size;
@@ -86,7 +85,9 @@ pub const Buffer = struct {
             if (self.data.len > 0) self.allocator.free(self.data);
             self.data = try self.allocator.alloc(u8, total);
         }
-        const bytes = try file.readAll(self.data[0..size]);
+        // Tolerate short reads (file shrank between length() and read).
+        var file_reader = file.reader(io, &.{});
+        const bytes = try file_reader.interface.readSliceShort(self.data[0..size]);
         self.content_len = bytes;
         self.gap_start = bytes;
         self.version +%= 1;
@@ -94,17 +95,17 @@ pub const Buffer = struct {
     }
 
     /// Save the buffer to a file.
-    pub fn saveFile(self: *const Buffer, path: []const u8) !void {
-        const file = try std.fs.cwd().createFile(path, .{});
-        defer file.close();
+    pub fn saveFile(self: *const Buffer, io: std.Io, path: []const u8) !void {
+        const file = try std.Io.Dir.cwd().createFile(io, path, .{});
+        defer file.close(io);
         // Write pre-gap content
         if (self.gap_start > 0) {
-            try file.writeAll(self.data[0..self.gap_start]);
+            try file.writeStreamingAll(io, self.data[0..self.gap_start]);
         }
         // Write post-gap content
         const ge = self.gapEnd();
         if (ge < self.data.len) {
-            try file.writeAll(self.data[ge..]);
+            try file.writeStreamingAll(io, self.data[ge..]);
         }
     }
 
