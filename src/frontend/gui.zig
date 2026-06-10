@@ -863,7 +863,6 @@ fn editorPane(editor: *Editor, pane_id: u8) void {
     };
 
     // --- Render visible lines ---
-    const sel_range = doc.cursors.primaryConst().selectionRange();
     const cursor_pos = doc.cursorPos();
     const text_color = toDvui(editor.theme.text);
     const sel_color = toDvui(editor.theme.selection);
@@ -914,30 +913,35 @@ fn editorPane(editor: *Editor, pane_id: u8) void {
         const has_tabs = line_text.ptr != orig_line.ptr;
         const needs_wrap = do_wrap and line_text.len > 0 and @as(f32, @floatFromInt(line_text.len)) * char_width > text_area_w;
 
-        // Pre-compute expanded columns for selection (constant across wrap rows)
-        const sel_start_exp: usize, const sel_end_exp: usize, const has_sel_on_line: bool = blk: {
-            if (sel_range) |sel| {
-                if (sel.end > line_start_offset and sel.start <= line_start_offset + orig_line.len) {
-                    const s_in: usize = if (sel.start > line_start_offset)
-                        @min(sel.start - line_start_offset, orig_line.len)
-                    else
-                        0;
-                    const e_in: usize = if (sel.end > line_start_offset)
-                        @min(sel.end - line_start_offset, orig_line.len)
-                    else
-                        0;
-                    const s_exp = if (has_tabs) bufColToExpCol(orig_line, s_in, editor.tab_width) else s_in;
-                    const e_exp = if (sel.end > line_start_offset + orig_line.len)
-                        line_text.len + 1
-                    else if (has_tabs)
-                        bufColToExpCol(orig_line, e_in, editor.tab_width)
-                    else
-                        e_in;
-                    break :blk .{ s_exp, e_exp, true };
-                }
-            }
-            break :blk .{ 0, 0, false };
-        };
+        // Pre-compute expanded selection ranges on this line (constant across
+        // wrap rows). Every cursor can carry one — block selection puts a
+        // selection on each secondary cursor, not just the primary.
+        const SelSpan = struct { start: usize, end: usize, to_eol: bool };
+        var line_sels: [64]SelSpan = undefined;
+        var line_sel_count: usize = 0;
+        for (doc.cursors.cursors.items) |cur| {
+            if (line_sel_count >= line_sels.len) break;
+            const sel = cur.selectionRange() orelse continue;
+            if (!(sel.end > line_start_offset and sel.start <= line_start_offset + orig_line.len)) continue;
+            const s_in: usize = if (sel.start > line_start_offset)
+                @min(sel.start - line_start_offset, orig_line.len)
+            else
+                0;
+            const e_in: usize = if (sel.end > line_start_offset)
+                @min(sel.end - line_start_offset, orig_line.len)
+            else
+                0;
+            const past_eol = sel.end > line_start_offset + orig_line.len;
+            const s_exp = if (has_tabs) bufColToExpCol(orig_line, s_in, editor.tab_width) else s_in;
+            const e_exp = if (past_eol)
+                line_text.len + 1
+            else if (has_tabs)
+                bufColToExpCol(orig_line, e_in, editor.tab_width)
+            else
+                e_in;
+            line_sels[line_sel_count] = .{ .start = s_exp, .end = e_exp, .to_eol = past_eol };
+            line_sel_count += 1;
+        }
 
         // Pre-compute expanded column for primary cursor on this line
         const cursor_on_line = focused and cursor_pos.line == line_idx;
@@ -1040,16 +1044,17 @@ fn editorPane(editor: *Editor, pane_id: u8) void {
                 // For wrapped rows, x is always text_area_x (no scroll)
                 const row_x = if (needs_wrap) text_area_x else base_x;
 
-                // Selection highlight (using pre-computed expanded coordinates)
-                if (has_sel_on_line) {
-                    if (sel_start_exp < row_end and sel_end_exp > row_start) {
-                        const sel_byte_start = if (sel_start_exp > row_start) sel_start_exp - row_start else 0;
-                        const sel_byte_end = if (sel_end_exp < row_end) sel_end_exp - row_start else segment.len;
+                // Selection highlights (every cursor's, pre-computed above)
+                for (line_sels[0..line_sel_count]) |ls| {
+                    if (ls.start < row_end and ls.end > row_start) {
+                        const sel_byte_start = if (ls.start > row_start) ls.start - row_start else 0;
+                        const sel_byte_end = if (ls.end < row_end) ls.end - row_start else segment.len;
 
                         const sx_start = font.textSize(segment[0..sel_byte_start]).w * scale;
                         const sx_end = font.textSize(segment[0..@min(sel_byte_end, segment.len)]).w * scale;
 
-                        const sw = if (sel_range != null and sel_range.?.end > line_start_offset + orig_line.len and row_end >= line_text.len)
+                        // Selection continuing past this line fills to the edge
+                        const sw = if (ls.to_eol and row_end >= line_text.len)
                             text_area_w - sx_start
                         else
                             sx_end - sx_start;

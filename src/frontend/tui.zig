@@ -1227,6 +1227,37 @@ fn drawContent(win: Window, doc: *Document, editor: *Editor, width: u16, height:
                 }
             }
 
+            // Secondary cursors' selections (block selection) — the segment
+            // renderer above only knows the primary's range, so restyle the
+            // covered cells post-hoc, same as the diagnostic underlines below.
+            if (doc.cursors.count() > 1 and text_start_x < width) {
+                const line_start_offset = doc.buffer.posToOffset(line_idx, 0);
+                const visible_start: usize = if (do_wrap) row_start else doc.scroll_left;
+                const seg_start = @min(visible_start, line.len);
+                const seg_end = if (do_wrap) row_end else @min(line.len, visible_start + text_width);
+                const seg = line[seg_start..seg_end];
+                const abs_seg_start = line_start_offset + seg_start;
+                const abs_seg_end = line_start_offset + seg_end;
+                for (doc.cursors.cursors.items[1..]) |sc| {
+                    const r = sc.selectionRange() orelse continue;
+                    if (!(r.start < abs_seg_end and r.end > abs_seg_start)) continue;
+                    const lo = if (r.start > abs_seg_start) r.start - abs_seg_start else 0;
+                    const hi = if (r.end < abs_seg_end) r.end - abs_seg_start else seg.len;
+                    const cx_start = displayWidth(seg[0..@min(lo, seg.len)]);
+                    const cx_end = displayWidth(seg[0..@min(hi, seg.len)]);
+                    var cx: u16 = @intCast(@min(cx_start, text_width));
+                    const cx_lim: u16 = @intCast(@min(cx_end, text_width));
+                    while (cx < cx_lim) : (cx += 1) {
+                        if (win.readCell(text_start_x + cx, y)) |cell| {
+                            var new_cell = cell;
+                            new_cell.style.bg = sel_style.bg;
+                            new_cell.style.fg = sel_style.fg;
+                            win.writeCell(text_start_x + cx, y, new_cell);
+                        }
+                    }
+                }
+            }
+
             // Apply diagnostic underlines to rendered text cells
             for (doc.diagnostics.items) |*diag| {
                 if (diag.start_line == line_idx and wrap_row == 0) {
