@@ -79,6 +79,8 @@ pub const Editor = struct {
     gutter_min_digits: usize = 3,
     /// Left-click clears secondary cursors (default true).
     click_clears_cursors: bool = true,
+    /// Save open files + cursors on quit and restore them on a bare launch.
+    session_persistence: bool = false,
     /// Maximum undo history size per document (0 = unlimited).
     max_undo_history: usize = 100,
     /// Command palette selection index (for Tab cycling).
@@ -619,6 +621,102 @@ pub const Editor = struct {
             if (doc.dirty) return true;
         }
         return false;
+    }
+
+    // ---- Session persistence ----
+
+    /// Path of the session file (~/.config/zide/session). Static buffer.
+    fn sessionFilePath() ?[]const u8 {
+        const lua_settings = @import("lua_settings.zig");
+        const dir = lua_settings.getConfigDir() orelse return null;
+        const S = struct {
+            var buf: [600]u8 = undefined;
+        };
+        return std.fmt.bufPrint(&S.buf, "{s}/session", .{dir}) catch null;
+    }
+
+    /// Write the session file: the active tab plus one
+    /// `doc <cursor> <scroll> <path>` line per open file (path last — it may
+    /// contain spaces). Untitled buffers are not recorded. Called on normal
+    /// exit by both frontends; no-op unless session_persistence is enabled.
+    pub fn saveSession(self: *Editor) void {
+        if (!self.session_persistence) return;
+        const lua_settings = @import("lua_settings.zig");
+        const path = sessionFilePath() orelse return;
+        if (lua_settings.getConfigDir()) |dir| {
+            std.Io.Dir.cwd().createDirPath(self.io, dir) catch {};
+        }
+
+        // Active index within the saved (path-bearing) list, not all docs.
+        var active_saved: usize = 0;
+        var n: usize = 0;
+        for (self.documents.items, 0..) |*doc, i| {
+            if (doc.file_path == null) continue;
+            if (i == self.active_doc_idx) active_saved = n;
+            n += 1;
+        }
+
+        const file = std.Io.Dir.cwd().createFile(self.io, path, .{}) catch return;
+        defer file.close(self.io);
+
+        var buf: [1024]u8 = undefined;
+        const head = std.fmt.bufPrint(&buf, "active {d}\n", .{active_saved}) catch return;
+        file.writeStreamingAll(self.io, head) catch return;
+        for (self.documents.items) |*doc| {
+            const fp = doc.file_path orelse continue;
+            const line = std.fmt.bufPrint(&buf, "doc {d} {d} {s}\n", .{
+                doc.cursors.primaryConst().offset, doc.scroll_top, fp,
+            }) catch continue; // path too long for buf — skip that file
+            file.writeStreamingAll(self.io, line) catch return;
+        }
+    }
+
+    /// Restore the session written by saveSession (files, cursor positions,
+    /// scroll, active tab). Files that no longer open are skipped. Returns
+    /// the number of documents restored; 0 unless session_persistence is on.
+    pub fn restoreSession(self: *Editor) usize {
+        if (!self.session_persistence) return 0;
+        const path = sessionFilePath() orelse return 0;
+        const content = std.Io.Dir.cwd().readFileAlloc(self.io, path, self.allocator, .limited(1024 * 1024)) catch return 0;
+        defer self.allocator.free(content);
+
+        var active: usize = 0;
+        var opened: usize = 0;
+        var lines = std.mem.splitScalar(u8, content, '\n');
+        while (lines.next()) |raw| {
+            const line = std.mem.trimEnd(u8, raw, "\r");
+            if (std.mem.startsWith(u8, line, "active ")) {
+                active = std.fmt.parseInt(usize, line["active ".len..], 10) catch 0;
+            } else if (std.mem.startsWith(u8, line, "doc ")) {
+                var fields = std.mem.splitScalar(u8, line["doc ".len..], ' ');
+                const off_str = fields.next() orelse continue;
+                const scroll_str = fields.next() orelse continue;
+                const file_path = fields.rest();
+                if (file_path.len == 0) continue;
+
+                var doc: *Document = undefined;
+                if (opened == 0) {
+                    // Replace the initial empty document, like a CLI file open.
+                    doc = self.activeDoc();
+                    doc.open(self.io, file_path) catch continue;
+                    doc.detectLanguage(self);
+                    self.lspNotifyOpen(doc);
+                } else {
+                    doc = self.openFile(file_path) catch continue;
+                }
+                const offset = std.fmt.parseInt(usize, off_str, 10) catch 0;
+                const scroll = std.fmt.parseInt(usize, scroll_str, 10) catch 0;
+                const c = doc.cursors.primary();
+                c.offset = @min(offset, doc.buffer.byteLen());
+                c.preferred_col = doc.buffer.offsetToPos(c.offset).col;
+                doc.scroll_top = @min(scroll, doc.buffer.lineCount() -| 1);
+                opened += 1;
+            }
+        }
+        if (opened > 0) {
+            self.switchToDoc(@min(active, self.documents.items.len - 1));
+        }
+        return opened;
     }
 
     // ---- Split pane operations ----

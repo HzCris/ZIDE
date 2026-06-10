@@ -428,6 +428,8 @@ fn luaSet(state: ?*zlua.LuaState) callconv(.c) c_int {
         }
     } else if (std.mem.eql(u8, key_str, "click_clears_cursors")) {
         editor.click_clears_cursors = lua.toBoolean(2);
+    } else if (std.mem.eql(u8, key_str, "session_persistence")) {
+        editor.session_persistence = lua.toBoolean(2);
     } else if (std.mem.eql(u8, key_str, "max_undo_history")) {
         const val = lua.toInteger(2) catch return 0;
         if (val >= 0 and val <= 100000) {
@@ -593,6 +595,9 @@ fn luaGet(state: ?*zlua.LuaState) callconv(.c) c_int {
         return 1;
     } else if (std.mem.eql(u8, key_str, "click_clears_cursors")) {
         lua.pushBoolean(editor.click_clears_cursors);
+        return 1;
+    } else if (std.mem.eql(u8, key_str, "session_persistence")) {
+        lua.pushBoolean(editor.session_persistence);
         return 1;
     } else if (std.mem.eql(u8, key_str, "max_undo_history")) {
         lua.pushInteger(@intCast(editor.max_undo_history));

@@ -299,7 +299,10 @@ fn runGui(allocator: std.mem.Allocator, io: std.Io, lua: *zlua.Lua, cli_files: [
             };
         }
     } else {
-        try editor.activeDoc().loadText(welcome_text);
+        // Opt-in session restore (session_persistence); welcome text otherwise
+        if (editor.restoreSession() == 0) {
+            try editor.activeDoc().loadText(welcome_text);
+        }
     }
 
     // Init SDL backend (creates OS window)
@@ -369,6 +372,9 @@ fn runGui(allocator: std.mem.Allocator, io: std.Io, lua: *zlua.Lua, cli_files: [
         const wait_event_micros = win.waitTime(end_micros);
         interrupted = try backend.waitEventTimeout(wait_event_micros);
     }
+
+    // Record the session for the next bare launch (no-op unless enabled).
+    editor.saveSession();
 }
 
 fn runTui(allocator: std.mem.Allocator, io: std.Io, lua: *zlua.Lua, cli_files: []const []const u8) !void {
@@ -415,10 +421,16 @@ fn runTui(allocator: std.mem.Allocator, io: std.Io, lua: *zlua.Lua, cli_files: [
             };
         }
     } else {
-        try editor.activeDoc().loadText(welcome_text);
+        // Opt-in session restore (session_persistence); welcome text otherwise
+        if (editor.restoreSession() == 0) {
+            try editor.activeDoc().loadText(welcome_text);
+        }
     }
 
     try tui.run(allocator, &editor);
+
+    // Record the session for the next bare launch (no-op unless enabled).
+    editor.saveSession();
 }
 
 fn printUsage(stdout: *std.Io.Writer) void {

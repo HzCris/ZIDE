@@ -11,7 +11,7 @@
 - [x] Ctrl+/ to comment highlighted text (uses register_language's line_comment/block_comment fields — upkeep lives in Lua configs)
 - [] Debug Support
 - [] Nerdfont/Custom Icon integration
-- [] Session Persistance Option
+- [x] Session Persistance Option (`zide.set("session_persistence", true)` — restores files/cursors/active tab on bare launch)
 - [x] TODO comment integration (TODO/FIXME/XXX/HACK/BUG/NOTE highlighted in comments, `next_todo` palette command, `syn_todo` color override)
 - [] Linting
 - [] Extension fetching (Think like how neovim pulls from github/codeberg)
@@ -27,7 +27,7 @@
 - [x] Ctrl+/ to comment highlighted text (uses register_language's line_comment/block_comment fields — upkeep lives in Lua configs)
 - [] Debug Support
 - [] Nerdfont/Custom Icon integration
-- [] Session Persistance Option
+- [x] Session Persistance Option (`zide.set("session_persistence", true)` or Settings dialog — restores files/cursors/active tab on bare launch)
 - [x] TODO comment integration (TODO/FIXME/XXX/HACK/BUG/NOTE highlighted in comments, `next_todo` palette command, `syn_todo` color override)
 - [] Linting
 - [] Extension fetching (Think like how neovim pulls from github/codeberg)
