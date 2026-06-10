@@ -6,6 +6,7 @@ const TuiColor = @import("../core/theme.zig").TuiColor;
 const syntax = @import("../core/syntax.zig");
 const lsp = @import("../core/lsp.zig");
 const terminal_mod = @import("../core/terminal.zig");
+const FileTree = @import("../core/filetree.zig").FileTree;
 
 const Key = vaxis.Key;
 const Cell = vaxis.Cell;
@@ -352,7 +353,9 @@ pub fn run(allocator: std.mem.Allocator, editor: *Editor) !void {
                     },
                 }
             },
-            .normal => positionCursor(win, editor, width, height),
+            // No terminal cursor while the file tree owns the keyboard —
+            // the tree shows its own selection bar instead.
+            .normal => if (!editor.filetree_focused) positionCursor(win, editor, width, height),
         }
 
         // Draw completion popup on top of everything (when active)
@@ -389,7 +392,7 @@ fn dispatchKey(editor: *Editor, key: Key) void {
         return;
     }
     switch (editor.mode) {
-        .normal => handleKey(editor, key),
+        .normal => if (editor.filetree_focused) handleFiletreeKey(editor, key) else handleKey(editor, key),
         .find => handleFindKey(editor, key),
         .find_replace => handleFindReplaceKey(editor, key),
         .file_open => handleFileOpenKey(editor, key),
@@ -496,9 +499,15 @@ fn resolvePaneAt(editor: *Editor, col: i16, row: i16) ?struct { pane_id: u8, loc
     return null;
 }
 
+/// File tree band geometry from the last draw (absolute screen coords),
+/// used for mouse hit-testing. Null when the panel isn't shown.
+const FiletreeBand = struct { x: u16, y: u16, w: u16, h: u16 };
+var filetree_band: ?FiletreeBand = null;
+
 /// Draw the full editor screen.
 fn drawEditor(win: Window, editor: *Editor, width: u16, height: u16) void {
     pane_rect_count = 0;
+    filetree_band = null;
 
     const tab_bar_height: u16 = if (editor.docCount() > 1) 1 else 0;
     const status_height: u16 = 1;
@@ -510,17 +519,41 @@ fn drawEditor(win: Window, editor: *Editor, width: u16, height: u16) void {
         drawTabBar(tab_win, editor, width);
     }
 
+    // File tree band — docks left or right of the pane area, below the
+    // tab bar. Skipped (focus released) when the terminal is too narrow.
+    var tree_w: u16 = 0;
+    if (editor.filetree_visible) {
+        if (width < 40) {
+            editor.filetree_focused = false;
+        } else if (editor.ensureFiletree() != null) {
+            tree_w = @min(editor.tui_filetree_width, width / 2);
+            if (tree_w < 16) tree_w = 16;
+            const band_x: u16 = if (editor.filetree_side == .left) 0 else width - tree_w;
+            const band_win = win.child(.{
+                .x_off = @intCast(band_x),
+                .y_off = @intCast(tab_bar_height),
+                .width = tree_w,
+                .height = content_height,
+            });
+            drawFileTree(band_win, editor, tree_w, content_height);
+            filetree_band = .{ .x = band_x, .y = tab_bar_height, .w = tree_w, .h = content_height };
+        }
+    }
+    const content_x: u16 = if (tree_w > 0 and editor.filetree_side == .left) tree_w else 0;
+    const content_width = width - tree_w;
+
     // Render pane tree into the content area
     const content_win = win.child(.{
+        .x_off = @intCast(content_x),
         .y_off = @intCast(tab_bar_height),
         .height = content_height,
-        .width = width,
+        .width = content_width,
     });
     // NOTE: screen_x comes before screen_y — the tab bar offsets Y only.
     // (These were swapped once: with 2+ tabs open every pane rect shifted
     // one row up / one col right, drawing the cursor next to the wrong line
     // and skewing mouse hit-testing.)
-    renderPaneLayout(content_win, editor, 0, 0, tab_bar_height, width, content_height);
+    renderPaneLayout(content_win, editor, 0, content_x, tab_bar_height, content_width, content_height);
 
     // Status bar
     const status_win = win.child(.{
@@ -529,6 +562,135 @@ fn drawEditor(win: Window, editor: *Editor, width: u16, height: u16) void {
         .width = width,
     });
     drawStatusBar(status_win, editor, width);
+}
+
+/// Truncate to at most `max_cols` display columns (codepoint-based; wide
+/// glyph handling is deferred with the rest of the CJK width work).
+fn truncToWidth(text: []const u8, max_cols: usize) []const u8 {
+    var cols: usize = 0;
+    var i: usize = 0;
+    while (i < text.len) {
+        const cp_len = std.unicode.utf8ByteSequenceLength(text[i]) catch 1;
+        if (cols + 1 > max_cols) break;
+        cols += 1;
+        i += @min(cp_len, text.len - i);
+    }
+    return text[0..i];
+}
+
+/// Draw the file tree band: header row with the root name, then one row
+/// per entry of the core model's flattened visible list.
+fn drawFileTree(win: Window, editor: *Editor, w: u16, h: u16) void {
+    const ft = if (editor.filetree) |*f| f else return;
+    if (w < 2 or h < 2) return;
+    const theme = editor.tui_theme;
+    const bg_style: Style = .{ .fg = toVaxis(theme.text_fg), .bg = toVaxis(theme.text_bg) };
+    win.fill(.{ .style = bg_style });
+
+    // Separator column on the edge facing the editor.
+    const sep_style: Style = .{ .fg = toVaxis(theme.gutter_separator), .bg = toVaxis(theme.text_bg) };
+    const sep_x: u16 = if (editor.filetree_side == .left) w - 1 else 0;
+    for (0..h) |r| {
+        win.writeCell(sep_x, @intCast(r), .{
+            .char = .{ .grapheme = "\u{2502}", .width = 1 }, // │
+            .style = sep_style,
+        });
+    }
+    const text_x: u16 = if (editor.filetree_side == .left) 0 else 1;
+    const text_w: u16 = w - 1;
+
+    // Header: root directory name (highlighted while the tree has focus).
+    const header_style: Style = .{
+        .fg = toVaxis(if (editor.filetree_focused) theme.overlay_accent else theme.gutter_text),
+        .bg = toVaxis(theme.text_bg),
+        .bold = editor.filetree_focused,
+    };
+    const root_name = std.fs.path.basename(ft.root_path);
+    const header_txt = if (root_name.len > 0) root_name else ft.root_path;
+    _ = writeStr(win, text_x, 0, truncToWidth(header_txt, text_w), header_style);
+
+    // Keep the selection in view (reveal/create/keyboard nav set the flag),
+    // then clamp the scroll when rows disappeared (collapse/refresh).
+    const visible_rows: usize = h - 1;
+    const row_count = ft.visible.items.len;
+    if (ft.scroll_to_selected) {
+        ft.scroll_to_selected = false;
+        if (ft.selected < editor.tui_filetree_scroll) {
+            editor.tui_filetree_scroll = ft.selected;
+        } else if (visible_rows > 0 and ft.selected >= editor.tui_filetree_scroll + visible_rows) {
+            editor.tui_filetree_scroll = ft.selected - visible_rows + 1;
+        }
+    }
+    if (editor.tui_filetree_scroll > 0 and editor.tui_filetree_scroll + visible_rows > row_count) {
+        editor.tui_filetree_scroll = row_count -| visible_rows;
+    }
+
+    const sel_style: Style = .{ .fg = toVaxis(theme.selection_fg), .bg = toVaxis(theme.selection_bg) };
+    var screen_row: u16 = 1;
+    var row = editor.tui_filetree_scroll;
+    while (row < row_count and screen_row < h) : ({
+        row += 1;
+        screen_row += 1;
+    }) {
+        const idx = ft.visible.items[row];
+        const node = ft.nodes.items[idx];
+        const style = if (row == ft.selected) sel_style else bg_style;
+        if (row == ft.selected) {
+            // Fill the whole row so the selection reads as a bar
+            for (0..text_w) |ci| {
+                win.writeCell(@intCast(text_x + ci), screen_row, .{
+                    .char = .{ .grapheme = " ", .width = 1 },
+                    .style = style,
+                });
+            }
+        }
+        const depth: usize = node.depth -| 1;
+        const indent: u16 = @intCast(@min(depth * 2, text_w / 2));
+        var x: u16 = text_x + indent;
+        const glyph: []const u8 = switch (node.kind) {
+            .dir => if (node.expanded) "- " else "+ ",
+            .file => "  ",
+        };
+        x = writeStr(win, x, screen_row, glyph, style);
+        const name_cols: usize = if (x < text_x + text_w) text_x + text_w - x else 0;
+        _ = writeStr(win, x, screen_row, truncToWidth(node.name, name_cols), style);
+    }
+}
+
+/// True when the mouse position is inside the file tree band.
+fn mouseOverFiletree(mouse: vaxis.Mouse) bool {
+    const band = filetree_band orelse return false;
+    const mc: i32 = @intCast(mouse.col);
+    const mr: i32 = @intCast(mouse.row);
+    return mc >= band.x and mc < @as(i32, band.x) + band.w and
+        mr >= band.y and mr < @as(i32, band.y) + band.h;
+}
+
+/// Left click inside the file tree band: focus the tree, select the row,
+/// toggle directories, open files.
+fn handleFiletreeClick(editor: *Editor, band: FiletreeBand, row_abs: u16) void {
+    const ft = editor.ensureFiletree() orelse return;
+    editor.filetree_focused = true;
+    if (row_abs <= band.y) return; // header row
+    const rel: usize = row_abs - band.y - 1;
+    const r = editor.tui_filetree_scroll + rel;
+    if (r >= ft.visible.items.len) return;
+    ft.selected = r;
+    const idx = ft.visible.items[r];
+    if (ft.nodes.items[idx].kind == .dir) {
+        ft.toggle(idx) catch {};
+    } else {
+        openFiletreeFileTui(editor, ft, idx);
+    }
+}
+
+/// Open the file behind a tree node (deduped against open tabs).
+fn openFiletreeFileTui(editor: *Editor, ft: *FileTree, idx: u32) void {
+    const abs = ft.absPathAlloc(editor.allocator, idx) catch return;
+    defer editor.allocator.free(abs);
+    _ = editor.openOrFocus(abs) catch {
+        editor.status_message = "Open failed";
+    };
 }
 
 /// Recursively render the layout tree into the given window.
@@ -1597,9 +1759,19 @@ fn handleMouse(editor: *Editor, mouse: vaxis.Mouse) void {
                     return;
                 }
 
-                // Route click to the pane it landed in
+                // File tree band: clicks focus/select/toggle/open in the tree
+                if (filetree_band) |band| {
+                    if (mouseOverFiletree(mouse)) {
+                        handleFiletreeClick(editor, band, @intCast(mouse.row));
+                        return;
+                    }
+                }
+
+                // Route click to the pane it landed in (takes focus back
+                // from the file tree)
                 if (resolvePaneAt(editor, mouse.col, mouse.row)) |hit| {
                     editor.active_pane = hit.pane_id;
+                    editor.filetree_focused = false;
                     const pane = editor.layout.panes.items[hit.pane_id];
                     if (pane.content == .editor) {
                         editor.active_doc_idx = pane.content.editor;
@@ -1673,15 +1845,23 @@ fn handleMouse(editor: *Editor, mouse: vaxis.Mouse) void {
             }
         },
         .wheel_up => {
-            const doc = editor.activeDoc();
-            doc.scroll_top -|= 5;
-            scroll_pinned = true;
+            if (mouseOverFiletree(mouse)) {
+                editor.tui_filetree_scroll -|= 3;
+            } else {
+                const doc = editor.activeDoc();
+                doc.scroll_top -|= 5;
+                scroll_pinned = true;
+            }
         },
         .wheel_down => {
-            const doc = editor.activeDoc();
-            const max_top = doc.lineCount() -| 1;
-            doc.scroll_top = @min(doc.scroll_top + 5, max_top);
-            scroll_pinned = true;
+            if (mouseOverFiletree(mouse)) {
+                editor.tui_filetree_scroll +|= 3; // clamped at draw time
+            } else {
+                const doc = editor.activeDoc();
+                const max_top = doc.lineCount() -| 1;
+                doc.scroll_top = @min(doc.scroll_top + 5, max_top);
+                scroll_pinned = true;
+            }
         },
         else => {},
     }
@@ -1766,6 +1946,105 @@ fn keyToStr(key: Key, buf: *[64]u8) []const u8 {
     return buf[0..0];
 }
 
+/// Try the data-driven keybind map for ctrl/alt/F-key chords. Returns true
+/// if the event was a chord (whether or not a binding ran) — chords never
+/// fall through to text insertion. F-keys are never text input, so they go
+/// through the map even unmodified (f12 = goto definition, f6 = focus pane).
+fn tryKeybindCommand(editor: *Editor, key: Key) bool {
+    const is_fkey = key.codepoint >= Key.f1 and key.codepoint <= Key.f12;
+    if (!(key.mods.ctrl or key.mods.alt or is_fkey)) return false;
+
+    var kbuf: [64]u8 = undefined;
+    const key_str = keyToStr(key, &kbuf);
+    if (key_str.len > 0) {
+        if (editor.keybinds.get(key_str)) |action| {
+            execTuiAction(editor, action);
+            return true;
+        }
+        // Fallback: if shift was held, try without shift
+        // (e.g. Ctrl+Shift+K falls back to Ctrl+K binding)
+        if (key.mods.shift) {
+            var kbuf2: [64]u8 = undefined;
+            var fallback_key = key;
+            fallback_key.mods.shift = false;
+            const fallback_str = keyToStr(fallback_key, &kbuf2);
+            if (fallback_str.len > 0) {
+                if (editor.keybinds.get(fallback_str)) |action| {
+                    execTuiAction(editor, action);
+                    return true;
+                }
+            }
+        }
+    }
+    return true;
+}
+
+/// Keys while the file tree owns the keyboard (filetree_focused, normal
+/// mode). Global ctrl/alt chords still hit the keybind map first.
+fn handleFiletreeKey(editor: *Editor, key: Key) void {
+    if (key.isModifier()) return;
+    if (tryKeybindCommand(editor, key)) return;
+    const ft = editor.ensureFiletree() orelse {
+        editor.filetree_focused = false;
+        return;
+    };
+    switch (key.codepoint) {
+        Key.escape => editor.filetree_focused = false,
+        Key.up, 'k' => {
+            ft.moveSelection(-1);
+            ft.scroll_to_selected = true;
+        },
+        Key.down, 'j' => {
+            ft.moveSelection(1);
+            ft.scroll_to_selected = true;
+        },
+        Key.home => {
+            ft.selected = 0;
+            ft.scroll_to_selected = true;
+        },
+        Key.end => {
+            ft.selected = ft.visible.items.len -| 1;
+            ft.scroll_to_selected = true;
+        },
+        Key.enter, Key.right => {
+            const idx = ft.selectedNodeIdx() orelse return;
+            if (ft.nodes.items[idx].kind == .dir) {
+                if (key.codepoint == Key.right) {
+                    ft.expand(idx) catch {};
+                } else {
+                    ft.toggle(idx) catch {};
+                }
+            } else {
+                openFiletreeFileTui(editor, ft, idx);
+                editor.filetree_focused = false;
+            }
+        },
+        Key.left => {
+            const idx = ft.selectedNodeIdx() orelse return;
+            const node = ft.nodes.items[idx];
+            if (node.kind == .dir and node.expanded) {
+                ft.collapse(idx) catch {};
+            } else if (idx != 0 and node.parent != 0) {
+                if (ft.rowOf(node.parent)) |prow| {
+                    ft.selected = prow;
+                    ft.scroll_to_selected = true;
+                }
+            }
+        },
+        'a' => editor.startFiletreePrompt(.create),
+        'd' => editor.startFiletreePrompt(.delete_confirm),
+        'r', 'R' => {
+            if (key.codepoint == 'R' or key.mods.shift) {
+                ft.refresh() catch {};
+                editor.status_message = "File tree refreshed";
+            } else {
+                editor.startFiletreePrompt(.rename);
+            }
+        },
+        else => {},
+    }
+}
+
 /// Handle a keyboard event from libvaxis.
 fn handleKey(editor: *Editor, key_in: Key) void {
     var key = key_in;
@@ -1784,35 +2063,8 @@ fn handleKey(editor: *Editor, key_in: Key) void {
     // Any key press un-pins scroll (cursor tracking resumes)
     scroll_pinned = false;
 
-    // Ctrl/Alt+key shortcuts — look up in keybind map. F-keys are never
-    // text input, so they go through the map even unmodified (f12 = goto
-    // definition, f6 = focus pane, ...).
-    const is_fkey = key.codepoint >= Key.f1 and key.codepoint <= Key.f12;
-    if (key.mods.ctrl or key.mods.alt or is_fkey) {
-        var kbuf: [64]u8 = undefined;
-        const key_str = keyToStr(key, &kbuf);
-        if (key_str.len > 0) {
-            if (editor.keybinds.get(key_str)) |action| {
-                execTuiAction(editor, action);
-                return;
-            }
-            // Fallback: if shift was held, try without shift
-            // (e.g. Ctrl+Shift+K falls back to Ctrl+K binding)
-            if (key.mods.shift) {
-                var kbuf2: [64]u8 = undefined;
-                var fallback_key = key;
-                fallback_key.mods.shift = false;
-                const fallback_str = keyToStr(fallback_key, &kbuf2);
-                if (fallback_str.len > 0) {
-                    if (editor.keybinds.get(fallback_str)) |action| {
-                        execTuiAction(editor, action);
-                        return;
-                    }
-                }
-            }
-        }
-        return;
-    }
+    // Ctrl/Alt+key shortcuts — look up in keybind map.
+    if (tryKeybindCommand(editor, key)) return;
 
     // Movement keys — check shift for selection-extending variants
     const shift = key.mods.shift;

@@ -146,6 +146,7 @@ Windows terminals commonly intercept Alt combos (Windows Terminal binds Alt+arro
   - `zide.bind(key_combo, command)` — remap keybindings
   - `zide.unbind(key_combo)` — remove a keybinding
 - Data-driven keybinding map (all Ctrl/Alt shortcuts remappable)
+- File tree side panel (Ctrl+B) — dockable left/right column band with mouse + keyboard browsing, create/rename/delete prompts, reveal-current-file (see File Tree section)
 - Auto-save (saves dirty documents with file paths after configurable interval, default 5s)
 - Application icon embedded in exe
 - Multiple cursor editing (Ctrl+Shift or Ctrl+Alt+Up/Down, Ctrl+D, Alt+click, Escape/click to clear)
@@ -606,7 +607,7 @@ ZIDE includes a built-in terminal emulator that integrates with the split pane s
 
 ## File Tree
 
-A toggleable side panel for browsing and managing the project directory, backed by a frontend-agnostic core model (`src/core/filetree.zig`) — both frontends render the same flattened row list, so expansion state, selection, and file operations behave identically. Currently rendered in the **GUI**; the TUI panel shares all the same model, commands, and prompts.
+A toggleable side panel for browsing and managing the project directory, backed by a frontend-agnostic core model (`src/core/filetree.zig`) — both frontends render the same flattened row list, so expansion state, selection, file operations, and prompts behave identically in the GUI and the TUI.
 
 ### Basics
 - **Ctrl+B** (`toggle_filetree`): show/hide the panel. Showing it focuses the tree (nvim-tree style); hiding it returns focus to the editor.
@@ -630,10 +631,15 @@ A toggleable side panel for browsing and managing the project directory, backed 
 
 Ctrl/Alt chords (Ctrl+P, Ctrl+B, ...) still work while the tree is focused.
 
-### Mouse (GUI)
-- Click: select; toggles a directory, opens a file
-- Wheel: scrolls the tree independently of the editor
-- Right-click: context menu (New / Rename / Delete / Refresh / Reveal Current File)
+### Mouse
+- Click: select; toggles a directory, opens a file (both frontends)
+- Wheel over the panel: scrolls the tree independently of the editor
+- Right-click (GUI): context menu (New / Rename / Delete / Refresh / Reveal Current File)
+
+### TUI specifics
+- Rendered as a column band with a `│` separator; the terminal cursor hides while the tree is focused (the selection bar takes its place) and the panel header brightens
+- Panel is skipped (and focus released) below 40 terminal columns; width is capped at half the terminal
+- Create/rename/delete prompts appear on the status line, same as Save As
 
 ### Commands (palette)
 | Command | Description |
