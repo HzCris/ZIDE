@@ -349,23 +349,17 @@ fn runGui(allocator: std.mem.Allocator, io: std.Io, lua: *zlua.Lua, cli_files: [
         try win.begin(nstime);
         _ = try backend.addAllEvents(&win);
 
-        if (!build_options.has_gpu) {
-            // SDL3 software renderer needs manual clear
-            _ = SDLBackend.c.SDL_SetRenderDrawColor(backend.renderer, 0, 0, 0, 0);
-            _ = SDLBackend.c.SDL_RenderClear(backend.renderer);
-        }
-        // SDL3GPU handles clearing via render pass (LOAD_OP_CLEAR)
-
         // Poll LSP messages and sync documents
         if (editor.lsp) |l| l.pollMessages(&editor);
         editor.syncLspDocuments();
 
         if (!gui.frame(&editor)) break :main_loop;
 
+        // New dvui (0.16 snapshot): win.end(.{}) manages the backend by
+        // default — it clears (on begin), renders, PRESENTS, and applies the
+        // requested cursor + text-input rect. Repeating any of that here
+        // double-presents and alternates UI/black frames (flicker).
         const end_micros = try win.end(.{});
-        backend.setCursor(win.cursorRequested());
-        backend.textInputRect(win.textInputRequested());
-        backend.renderPresent();
 
         const wait_event_micros = win.waitTime(end_micros);
         interrupted = try backend.waitEventTimeout(wait_event_micros);
