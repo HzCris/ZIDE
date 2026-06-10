@@ -181,7 +181,7 @@ Windows terminals commonly intercept Alt combos (Windows Terminal binds Alt+arro
 - Configurable line number gutter width (`zide.set("gutter_min_digits", N)` in init.lua, default 3)
 - Mouse selection: double-click selects word, triple-click selects line, drag extends by word/line accordingly, Shift+click extends selection, Alt+click adds cursor
 
-- Settings panel (Preferences menu — visual editor for all settings including theme, mouse-clickable, writes to init.lua)
+- Settings dialog (Preferences menu — modal DVUI floating window with native widgets: checkboxes for booleans, validated numeric entries with min/max, dropdown for theme; draggable by header, auto-centered, dims the background; changes apply live and write to init.lua immediately; close via header X or Escape; Tab/Shift+Tab cycles controls)
 - Open Settings File (Preferences menu — opens init.lua directly in the editor for power users)
 - Tab character display (expands `\t` to spaces for rendering, cursor, selection, and wrapping)
 - Blinking caret (530ms cycle, resets on cursor movement)
@@ -205,7 +205,7 @@ Windows terminals commonly intercept Alt combos (Windows Terminal binds Alt+arro
   - Preferences: Settings, Open Settings File, Theme > (Dark / Light / High Contrast), Open Theme File, Open Theme Folder
   - Help: Documentation, About ZIDE
 - Theme switcher: Preferences > Theme submenu switches themes live (updates editor + DVUI chrome, persists to init.lua)
-- Theme setting in Settings panel: cycleable enum (Enter/Space/Click cycles through dark/light/high_contrast)
+- Theme setting in Settings dialog: dropdown (dark/light/high_contrast) — TUI settings panel keeps the cycleable enum (Enter/Space cycles)
 - Open Theme File: opens `~/.config/zide/themes/gui-theme.lua` in editor (creates commented template with per-field descriptions if missing)
 - Open Theme Folder: opens `~/.config/zide/themes/` in OS file explorer
 - Help > Documentation: opens Documentation.md in the editor

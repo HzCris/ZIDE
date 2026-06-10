@@ -448,8 +448,6 @@ pub fn frame(editor: *Editor) bool {
             defer fw.deinit();
             if (dvui.menuItemLabel(@src(), "Settings", .{}, .{ .expand = .horizontal }) != null) {
                 editor.mode = .settings;
-                editor.settings_selected = 0;
-                editor.settings_editing = null;
                 m.close();
             }
             if (dvui.menuItemLabel(@src(), "Open Settings File", .{}, .{ .expand = .horizontal }) != null) {
@@ -493,6 +491,13 @@ pub fn frame(editor: *Editor) bool {
             }
             _ = dvui.menuItemLabel(@src(), "About ZIDE v0.0.1", .{}, .{ .expand = .horizontal });
         }
+    }
+
+    // --- Settings dialog (modal floating window) ---
+    // Declared before the panes so its widgets consume their events first;
+    // the panes' raw event loops only see what the dialog left unhandled.
+    if (editor.mode == .settings) {
+        settingsDialog(editor);
     }
 
     // --- Tab bar (if multiple documents) ---
@@ -764,22 +769,16 @@ fn editorPane(editor: *Editor, pane_id: u8) void {
     }
 
     // --- Handle mouse events ---
-    // Block mouse clicks/drags when a modal is active so they don't go to editor text.
-    // Only the active pane handles modal mouse events (settings click, etc.).
+    // Block mouse clicks/drags when a modal is active so they don't go to
+    // editor text. The settings dialog's widgets run before the panes, so
+    // anything still unhandled here is a click outside the dialog.
     if (editor.mode != .normal) {
         if (is_active_pane) {
             for (dvui.events()) |*e| {
                 if (e.handled) continue;
                 if (e.evt != .mouse) continue;
                 switch (e.evt.mouse.action) {
-                    .press => {
-                        e.handle(@src(), wd);
-                        // Handle clicks in settings panel
-                        if (editor.mode == .settings) {
-                            handleSettingsClick(editor, e.evt.mouse.p, area, font, lh, scale);
-                        }
-                    },
-                    .release, .motion => e.handle(@src(), wd),
+                    .press, .release, .motion => e.handle(@src(), wd),
                     else => {},
                 }
             }
@@ -813,9 +812,11 @@ fn editorPane(editor: *Editor, pane_id: u8) void {
     }
 
     // --- Request text input from SDL — only for the focused pane ---
+    // Settings is excluded: the DVUI dialog's own text entries request
+    // input and focus; grabbing it here would steal their focus each frame.
     const focused = if (dvui.focusedWidgetId()) |fid| fid == wd.id else false;
     if (is_active_pane) {
-        const needs_text = focused or editor.mode != .normal;
+        const needs_text = focused or (editor.mode != .normal and editor.mode != .settings);
         if (needs_text) {
             dvui.wantTextInput(area.toNatural());
             if (!focused) dvui.focusWidget(wd.id, null, 0);
@@ -1279,25 +1280,30 @@ fn terminalPane(editor: *Editor, pane_id: u8, term_idx: usize) void {
         term.resizeGrid(visible_cols, visible_rows);
     }
 
-    // Handle mouse clicks — focus this pane when clicked
-    for (dvui.events()) |*e| {
-        if (e.handled) continue;
-        if (e.evt != .mouse) continue;
-        const me = e.evt.mouse;
-        if (me.p.x < area.x or me.p.x > area.x + area.w or
-            me.p.y < area.y or me.p.y > area.y + area.h) continue;
-        switch (me.action) {
-            .focus, .press => {
-                e.handle(@src(), wd);
-                dvui.focusWidget(wd.id, null, e.num);
-                editor.focusPane(pane_id);
-            },
-            else => {},
+    // Handle mouse clicks — focus this pane when clicked.
+    // Gated to normal mode so clicks meant for a modal (settings dialog,
+    // find bar, ...) don't refocus the terminal behind it.
+    if (editor.mode == .normal) {
+        for (dvui.events()) |*e| {
+            if (e.handled) continue;
+            if (e.evt != .mouse) continue;
+            const me = e.evt.mouse;
+            if (me.p.x < area.x or me.p.x > area.x + area.w or
+                me.p.y < area.y or me.p.y > area.y + area.h) continue;
+            switch (me.action) {
+                .focus, .press => {
+                    e.handle(@src(), wd);
+                    dvui.focusWidget(wd.id, null, e.num);
+                    editor.focusPane(pane_id);
+                },
+                else => {},
+            }
         }
     }
 
-    // Handle keyboard input for terminal
-    if (is_active_pane) {
+    // Handle keyboard input for terminal — not while a modal is open,
+    // otherwise unconsumed keys would be typed into the shell.
+    if (is_active_pane and editor.mode == .normal) {
         if (handleTerminalKeyEvents(editor, term, wd)) return; // terminal was freed
     }
 
@@ -1999,6 +2005,28 @@ fn handleGuiKeyEvents(editor: *Editor, wd: *dvui.WidgetData) bool {
 
     // --- Modal input handling ---
     if (editor.mode != .normal) {
+        // Settings uses a real DVUI floating dialog whose widgets already
+        // consumed their events (it is declared before the panes). Only
+        // catch a leftover Escape to close it — swallowing everything here
+        // would break Tab navigation and text entry inside the dialog.
+        if (editor.mode == .settings) {
+            for (dvui.events()) |*e| {
+                if (e.handled) continue;
+                if (e.evt != .key) continue;
+                const key = e.evt.key;
+                if (key.action != .down and key.action != .repeat) continue;
+                if (key.code == .escape) {
+                    e.handle(@src(), wd);
+                    handled_any = true;
+                    editor.mode = .normal;
+                    // The dialog subwindow disappears next frame — refocus
+                    // the base window so editor keys work immediately.
+                    dvui.focusSubwindow(null, null);
+                }
+            }
+            return handled_any;
+        }
+
         for (dvui.events()) |*e| {
             if (e.handled) continue;
             switch (e.evt) {
@@ -2754,7 +2782,7 @@ fn handleModalKey(editor: *Editor, key: dvui.Event.Key) void {
         .find_replace => handleFindReplaceKeyGui(editor, key),
         .command_palette => handlePaletteKeyGui(editor, key),
         .confirm_quit => handleConfirmQuitKeyGui(editor, key),
-        .settings => handleSettingsKeyGui(editor, key),
+        .settings => {}, // DVUI dialog handles its own input (settingsDialog)
         .file_open, .save_as => {}, // handled by native dialogs in GUI
         .normal => {},
     }
@@ -2790,18 +2818,6 @@ fn handleModalText(editor: *Editor, txt: []const u8) void {
         .command_palette => {
             guiAppendText(&editor.palette_buf, &editor.palette_buf_len, txt);
             editor.palette_selected = 0;
-        },
-        .settings => {
-            if (editor.settings_editing != null) {
-                for (txt) |ch| {
-                    if (ch >= '0' and ch <= '9') {
-                        if (editor.settings_num_len < editor.settings_num_buf.len) {
-                            editor.settings_num_buf[editor.settings_num_len] = ch;
-                            editor.settings_num_len += 1;
-                        }
-                    }
-                }
-            }
         },
         else => {},
     }
@@ -2968,155 +2984,146 @@ fn handleConfirmQuitKeyGui(editor: *Editor, key: dvui.Event.Key) void {
     }
 }
 
-/// Settings definitions: name, type, description
+/// Settings definitions: name, type, description.
+/// min/max only apply to .number settings and must stay in sync with the
+/// validation ranges in applySettingNumber (which the TUI panel relies on).
 const SettingDef = struct {
     key: []const u8,
     label: []const u8,
     kind: enum { boolean, number, enum_choice },
     desc: []const u8,
     choices: []const []const u8 = &.{},
+    min: i64 = 0,
+    max: i64 = 0,
 };
 
 const settings_defs = [_]SettingDef{
-    .{ .key = "tab_width", .label = "Tab Width", .kind = .number, .desc = "Number of spaces per tab (1-16)" },
+    .{ .key = "tab_width", .label = "Tab Width", .kind = .number, .desc = "Number of spaces per tab (1-16)", .min = 1, .max = 16 },
     .{ .key = "use_tabs", .label = "Use Tabs", .kind = .boolean, .desc = "Insert tabs instead of spaces" },
     .{ .key = "word_wrap", .label = "Word Wrap", .kind = .boolean, .desc = "Soft-wrap long lines in display" },
     .{ .key = "auto_close_brackets", .label = "Auto Close Brackets", .kind = .boolean, .desc = "Auto-close brackets and quotes" },
     .{ .key = "auto_save", .label = "Auto Save", .kind = .boolean, .desc = "Auto-save dirty documents periodically" },
-    .{ .key = "auto_save_interval_ms", .label = "Auto Save Interval (ms)", .kind = .number, .desc = "Delay before auto-save (500-300000)" },
-    .{ .key = "gutter_min_digits", .label = "Gutter Min Digits", .kind = .number, .desc = "Minimum width of line number gutter (1-10)" },
-    .{ .key = "page_size", .label = "Page Size", .kind = .number, .desc = "Lines to scroll on Page Up/Down (5-200)" },
+    .{ .key = "auto_save_interval_ms", .label = "Auto Save Interval (ms)", .kind = .number, .desc = "Delay before auto-save (500-300000)", .min = 500, .max = 300000 },
+    .{ .key = "gutter_min_digits", .label = "Gutter Min Digits", .kind = .number, .desc = "Minimum width of line number gutter (1-10)", .min = 1, .max = 10 },
+    .{ .key = "page_size", .label = "Page Size", .kind = .number, .desc = "Lines to scroll on Page Up/Down (5-200)", .min = 5, .max = 200 },
     .{ .key = "click_clears_cursors", .label = "Click Clears Cursors", .kind = .boolean, .desc = "Left-click clears secondary cursors" },
-    .{ .key = "max_undo_history", .label = "Undo History Limit", .kind = .number, .desc = "Max undo operations per document, 0 = unlimited (0-100000)" },
+    .{ .key = "max_undo_history", .label = "Undo History Limit", .kind = .number, .desc = "Max undo operations per document, 0 = unlimited (0-100000)", .min = 0, .max = 100000 },
     .{ .key = "theme", .label = "Theme", .kind = .enum_choice, .desc = "Editor color theme", .choices = &.{ "dark", "light", "high_contrast" } },
 };
 
-/// Handle mouse clicks in the settings panel overlay.
-fn handleSettingsClick(editor: *Editor, p: dvui.Point.Physical, render_area: dvui.Rect.Physical, _: dvui.Font, lh: f32, scale: f32) void {
+/// Modal settings dialog built from native DVUI widgets (floating window
+/// with header, checkboxes, numeric entries, and a theme dropdown). Shown
+/// while editor.mode == .settings; the header X button or Escape closes it.
+/// Changes apply live and persist to init.lua immediately.
+///
+/// The TUI keeps its own custom-rendered panel; both share settings_defs
+/// and the get/apply helpers below.
+fn settingsDialog(editor: *Editor) void {
+    if (!build_options.has_gui) return;
     const lua_settings = @import("../core/lua_settings.zig");
-    const pad: f32 = 8 * scale;
-    const total = settings_defs.len;
-    const row_h = lh + pad;
 
-    // Recalculate panel geometry (must match drawModalOverlay .settings)
-    const panel_h = pad + row_h + @as(f32, @floatFromInt(total)) * row_h + row_h + pad;
-    const panel_w = @min(render_area.w * 0.8, 800 * scale);
-    const panel_x = render_area.x + (render_area.w - panel_w) / 2;
-    const panel_y = render_area.y + (render_area.h - panel_h) / 3;
-
-    // Check if click is outside the panel → close settings
-    if (p.x < panel_x or p.x > panel_x + panel_w or
-        p.y < panel_y or p.y > panel_y + panel_h)
-    {
-        editor.mode = .normal;
-        editor.settings_editing = null;
-        return;
-    }
-
-    // First row after title starts at panel_y + pad + row_h
-    const rows_start_y = panel_y + pad + row_h;
-
-    // Which setting row was clicked?
-    if (p.y < rows_start_y) return; // clicked on title
-    const row_offset = p.y - rows_start_y;
-    const clicked_row: usize = @intFromFloat(@floor(row_offset / row_h));
-    if (clicked_row >= total) return; // clicked on hint bar or below
-
-    // Select the clicked row
-    editor.settings_selected = clicked_row;
-
-    // If we're in numeric edit mode for a different row, cancel it
-    if (editor.settings_editing) |edit_idx| {
-        if (edit_idx != clicked_row) {
-            editor.settings_editing = null;
-        } else {
-            return; // already editing this row, don't re-toggle
-        }
-    }
-
-    // Toggle/edit the clicked setting (same logic as Enter/Space)
-    const def = settings_defs[clicked_row];
-    switch (def.kind) {
-        .boolean => {
-            const new_val = !getSettingBool(editor, def.key);
-            applySettingBool(editor, def.key, new_val);
-            const val_str: []const u8 = if (new_val) "true" else "false";
-            lua_settings.writeSettingToFile(def.key, val_str) catch {};
-        },
-        .number => {
-            editor.settings_editing = clicked_row;
-            const cur_val = getSettingNumber(editor, def.key);
-            const written = std.fmt.bufPrint(&editor.settings_num_buf, "{d}", .{cur_val}) catch "";
-            editor.settings_num_len = written.len;
-        },
-        .enum_choice => {
-            cycleEnumSetting(editor, def);
-        },
-    }
-}
-
-fn handleSettingsKeyGui(editor: *Editor, key: dvui.Event.Key) void {
-    const lua_settings = @import("../core/lua_settings.zig");
-    const total = settings_defs.len;
-
-    // If editing a numeric field
-    if (editor.settings_editing) |edit_idx| {
-        switch (key.code) {
-            .escape => {
-                editor.settings_editing = null;
-            },
-            .enter => {
-                // Apply the numeric value
-                if (editor.settings_num_len > 0) {
-                    const num_str = editor.settings_num_buf[0..editor.settings_num_len];
-                    const val = std.fmt.parseInt(i64, num_str, 10) catch 0;
-                    const def = settings_defs[edit_idx];
-                    applySettingNumber(editor, def.key, val);
-                    // Write to init.lua
-                    lua_settings.writeSettingToFile(def.key, num_str) catch {};
-                }
-                editor.settings_editing = null;
-            },
-            .backspace => {
-                if (editor.settings_num_len > 0) editor.settings_num_len -= 1;
-            },
-            else => {},
-        }
-        return;
-    }
-
-    switch (key.code) {
-        .escape => {
+    var open = true;
+    var float = dvui.floatingWindow(@src(), .{ .modal = true, .open_flag = &open }, .{
+        .min_size_content = .{ .w = 480 },
+    });
+    defer {
+        float.deinit();
+        if (!open) {
             editor.mode = .normal;
-        },
-        .up => {
-            editor.settings_selected -|= 1;
-        },
-        .down => {
-            if (editor.settings_selected + 1 < total)
-                editor.settings_selected += 1;
-        },
-        .enter, .space => {
-            const def = settings_defs[editor.settings_selected];
-            switch (def.kind) {
-                .boolean => {
-                    const new_val = !getSettingBool(editor, def.key);
-                    applySettingBool(editor, def.key, new_val);
-                    const val_str: []const u8 = if (new_val) "true" else "false";
+            // Return keyboard focus to the base window so the editor pane
+            // regains key handling without requiring a click.
+            dvui.focusSubwindow(null, null);
+        }
+    }
+
+    float.dragAreaSet(dvui.windowHeader("Settings", "", &open));
+
+    var vbox = dvui.box(@src(), .{ .dir = .vertical }, .{
+        .expand = .both,
+        .padding = dvui.Rect.all(8),
+    });
+    defer vbox.deinit();
+
+    const desc_color = toDvui(editor.theme.overlay_hint);
+
+    for (settings_defs, 0..) |def, i| {
+        var row = dvui.box(@src(), .{ .dir = .horizontal }, .{
+            .expand = .horizontal,
+            .id_extra = i,
+            .padding = .{ .x = 0, .y = 3, .w = 0, .h = 3 },
+        });
+        defer row.deinit();
+
+        // Left: setting name with description underneath
+        {
+            var labels = dvui.box(@src(), .{ .dir = .vertical }, .{
+                .expand = .horizontal,
+                .gravity_y = 0.5,
+            });
+            defer labels.deinit();
+            dvui.labelNoFmt(@src(), def.label, .{}, .{
+                .padding = .{ .x = 0, .y = 0, .w = 0, .h = 1 },
+            });
+            dvui.labelNoFmt(@src(), def.desc, .{}, .{
+                .color_text = desc_color,
+                .padding = .{ .x = 0, .y = 0, .w = 0, .h = 0 },
+            });
+        }
+
+        // Right: the control for this setting's type
+        switch (def.kind) {
+            .boolean => {
+                var val = getSettingBool(editor, def.key);
+                if (dvui.checkbox(@src(), &val, null, .{
+                    .id_extra = i,
+                    .gravity_x = 1.0,
+                    .gravity_y = 0.5,
+                })) {
+                    applySettingBool(editor, def.key, val);
+                    const val_str: []const u8 = if (val) "true" else "false";
                     lua_settings.writeSettingToFile(def.key, val_str) catch {};
-                },
-                .number => {
-                    editor.settings_editing = editor.settings_selected;
-                    const cur_val = getSettingNumber(editor, def.key);
-                    const written = std.fmt.bufPrint(&editor.settings_num_buf, "{d}", .{cur_val}) catch "";
-                    editor.settings_num_len = written.len;
-                },
-                .enum_choice => {
-                    cycleEnumSetting(editor, def);
-                },
-            }
-        },
-        else => {},
+                }
+            },
+            .number => {
+                var val = getSettingNumber(editor, def.key);
+                const res = dvui.textEntryNumber(@src(), i64, .{
+                    .min = def.min,
+                    .max = def.max,
+                    .value = &val,
+                }, .{
+                    .id_extra = i,
+                    .gravity_x = 1.0,
+                    .gravity_y = 0.5,
+                    .min_size_content = .{ .w = 90 },
+                });
+                if (res.changed) {
+                    applySettingNumber(editor, def.key, val);
+                    var num_buf: [32]u8 = undefined;
+                    const num_str = std.fmt.bufPrint(&num_buf, "{d}", .{val}) catch "";
+                    if (num_str.len > 0) {
+                        lua_settings.writeSettingToFile(def.key, num_str) catch {};
+                    }
+                }
+            },
+            .enum_choice => {
+                var choice: usize = 0;
+                const current = getSettingEnum(editor, def.key);
+                for (def.choices, 0..) |c, ci| {
+                    if (std.mem.eql(u8, c, current)) choice = ci;
+                }
+                if (dvui.dropdown(@src(), def.choices, .{ .choice = &choice }, .{}, .{
+                    .id_extra = i,
+                    .gravity_x = 1.0,
+                    .gravity_y = 0.5,
+                    .min_size_content = .{ .w = 130 },
+                })) {
+                    if (std.mem.eql(u8, def.key, "theme")) {
+                        // switchTheme persists to init.lua itself
+                        switchTheme(editor, def.choices[choice]);
+                    }
+                }
+            },
+        }
     }
 }
 
@@ -3166,21 +3173,6 @@ fn applySettingNumber(editor: *Editor, key: []const u8, val: i64) void {
                 doc.history.max_size = editor.max_undo_history;
             }
         }
-    }
-}
-
-fn cycleEnumSetting(editor: *Editor, def: SettingDef) void {
-    const current = getSettingEnum(editor, def.key);
-    var next_idx: usize = 0;
-    for (def.choices, 0..) |choice, i| {
-        if (std.mem.eql(u8, choice, current)) {
-            next_idx = (i + 1) % def.choices.len;
-            break;
-        }
-    }
-    const next = def.choices[next_idx];
-    if (std.mem.eql(u8, def.key, "theme")) {
-        switchTheme(editor, next);
     }
 }
 
@@ -3729,103 +3721,8 @@ fn drawModalOverlay(editor: *Editor, render_area: dvui.Rect.Physical, render_rs:
             fillBar(render_area, 0, h, bg);
             renderOverlayText(font, "Unsaved changes! [S]ave [D]iscard [C]ancel", render_area.x + pad, render_area.y + pad, render_rs, fg);
         },
-        .settings => {
-            const total = settings_defs.len;
-            const row_h = lh + pad;
-            // Title + settings rows + hint row
-            const panel_h = pad + row_h + @as(f32, @floatFromInt(total)) * row_h + row_h + pad;
-            // Center the panel
-            const panel_w = @min(render_area.w * 0.8, 800 * scale);
-            const panel_x = render_area.x + (render_area.w - panel_w) / 2;
-            const panel_y = render_area.y + (render_area.h - panel_h) / 3;
-            const panel_rect: dvui.Rect.Physical = .{ .x = panel_x, .y = panel_y, .w = panel_w, .h = panel_h };
-
-            // Dim background
-            render_area.fill(.{}, .{ .color = .{ .r = 0, .g = 0, .b = 0, .a = 140 }, .fade = 1.0 });
-            // Panel background
-            panel_rect.fill(.{}, .{ .color = bg, .fade = 1.0 });
-
-            var y = panel_y + pad;
-            const sel_highlight = toDvui(editor.theme.overlay_selection);
-
-            // Title
-            renderOverlayText(font, "Settings", panel_x + pad, y, render_rs, fg);
-            y += row_h;
-
-            // Setting rows
-            for (settings_defs, 0..) |def, i| {
-                const is_selected = i == editor.settings_selected;
-
-                // Highlight bar
-                if (is_selected) {
-                    const bar: dvui.Rect.Physical = .{ .x = panel_x, .y = y, .w = panel_w, .h = row_h };
-                    bar.fill(.{}, .{ .color = sel_highlight, .fade = 1.0 });
-                }
-
-                const label_color = if (is_selected) fg else dim;
-
-                // Label
-                renderOverlayText(font, def.label, panel_x + pad, y, render_rs, label_color);
-
-                // Value (right-aligned)
-                var val_buf: [64]u8 = undefined;
-                const val_str = blk: {
-                    if (editor.settings_editing != null and editor.settings_editing.? == i) {
-                        // Show editable numeric field
-                        break :blk std.fmt.bufPrint(&val_buf, "[{s}_]", .{editor.settings_num_buf[0..editor.settings_num_len]}) catch "?";
-                    }
-                    switch (def.kind) {
-                        .boolean => {
-                            const bval = getSettingBool(editor, def.key);
-                            break :blk if (bval) "ON" else "OFF";
-                        },
-                        .number => {
-                            const nval = getSettingNumber(editor, def.key);
-                            break :blk std.fmt.bufPrint(&val_buf, "{d}", .{nval}) catch "?";
-                        },
-                        .enum_choice => {
-                            break :blk getSettingEnum(editor, def.key);
-                        },
-                    }
-                };
-                const val_w = font.textSize(val_str).w * scale;
-                const val_color = blk: {
-                    if (editor.settings_editing != null and editor.settings_editing.? == i) break :blk fg;
-                    if (def.kind == .boolean) {
-                        break :blk if (getSettingBool(editor, def.key))
-                            toDvui(editor.theme.bool_true)
-                        else
-                            toDvui(editor.theme.bool_false);
-                    }
-                    break :blk label_color;
-                };
-                renderOverlayText(font, val_str, panel_x + panel_w - val_w - pad, y, render_rs, val_color);
-
-                // Description (between label and value, dimmer — clipped to avoid overlap)
-                if (is_selected) {
-                    const cw = font.textSize("W").w * scale;
-                    const desc_x = panel_x + pad + @as(f32, @floatFromInt(def.label.len)) * cw + pad * 2;
-                    const desc_max_x = panel_x + panel_w - val_w - pad - pad;
-                    if (desc_x < desc_max_x) {
-                        const desc_clip: dvui.Rect.Physical = .{ .x = desc_x, .y = y, .w = desc_max_x - desc_x, .h = row_h };
-                        const prev_clip2 = dvui.clip(desc_clip);
-                        defer dvui.clipSet(prev_clip2);
-                        const desc_color = toDvui(editor.theme.overlay_hint);
-                        renderOverlayText(font, def.desc, desc_x, y, render_rs, desc_color);
-                    }
-                }
-
-                y += row_h;
-            }
-
-            // Hint bar
-            const hint = if (editor.settings_editing != null)
-                "Type value, Enter: apply, Esc: cancel"
-            else
-                "Click/Up/Down: navigate | Enter/Space/Click: toggle/edit | Esc: close";
-            const hint_color = toDvui(editor.theme.overlay_hint);
-            renderOverlayText(font, hint, panel_x + pad, y, render_rs, hint_color);
-        },
+        // .settings is a real DVUI floating dialog now (settingsDialog),
+        // not a custom-rendered overlay.
         else => {},
     }
 }
