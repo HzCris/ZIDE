@@ -256,7 +256,14 @@ pub fn frame(editor: *Editor) bool {
         const key = e.evt.key;
         if (key.action != .down and key.action != .repeat) continue;
 
-        if (key.mod.control() or key.mod.alt()) {
+        // F-keys are never text input, so they go through the keybind map
+        // even unmodified (f12 = goto definition, f6 = focus pane, ...).
+        const is_fkey = switch (key.code) {
+            .f1, .f2, .f3, .f4, .f5, .f6, .f7, .f8, .f9, .f10, .f11, .f12 => true,
+            else => false,
+        };
+
+        if (key.mod.control() or key.mod.alt() or is_fkey) {
             // Tab switching always works (even during modals)
             if (key.mod.control() and key.code == .tab) {
                 e.handled = true;
@@ -2249,6 +2256,9 @@ fn dvuiKeyToStr(key: dvui.Event.Key, buf: *[64]u8) []const u8 {
         .m => "m", .n => "n", .o => "o", .p => "p", .q => "q", .r => "r",
         .s => "s", .t => "t", .u => "u", .v => "v", .w => "w", .x => "x",
         .y => "y", .z => "z",
+        .f1 => "f1", .f2 => "f2", .f3 => "f3", .f4 => "f4",
+        .f5 => "f5", .f6 => "f6", .f7 => "f7", .f8 => "f8",
+        .f9 => "f9", .f10 => "f10", .f11 => "f11", .f12 => "f12",
         else => null,
     };
 
@@ -2303,6 +2313,9 @@ fn dvuiKeyToStrNoShift(key: dvui.Event.Key, buf: *[64]u8) []const u8 {
         .m => "m", .n => "n", .o => "o", .p => "p", .q => "q", .r => "r",
         .s => "s", .t => "t", .u => "u", .v => "v", .w => "w", .x => "x",
         .y => "y", .z => "z",
+        .f1 => "f1", .f2 => "f2", .f3 => "f3", .f4 => "f4",
+        .f5 => "f5", .f6 => "f6", .f7 => "f7", .f8 => "f8",
+        .f9 => "f9", .f10 => "f10", .f11 => "f11", .f12 => "f12",
         else => null,
     };
 

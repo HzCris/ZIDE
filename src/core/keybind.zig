@@ -102,6 +102,16 @@ pub const KeybindMap = struct {
         try self.set("ctrl+shift+tab", "prev_doc");
         try self.set("alt+right", "focus_next_pane");
         try self.set("alt+left", "focus_prev_pane");
+        // Alt-free alternates — Windows terminals commonly eat Alt+keys
+        // (Windows Terminal binds Alt+arrows itself; Ctrl+Alt doubles as
+        // AltGr), so every Alt binding has a Ctrl/F-key twin.
+        try self.set("ctrl+backslash", "split_vertical");
+        try self.set("ctrl+shift+backslash", "split_horizontal");
+        try self.set("f6", "focus_next_pane");
+        try self.set("shift+f6", "focus_prev_pane");
+        try self.set("ctrl+f4", "close_pane");
+        try self.set("ctrl+shift+page_up", "move_line_up");
+        try self.set("ctrl+shift+page_down", "move_line_down");
         // LSP shortcuts
         try self.set("ctrl+space", "lsp_completion");
         try self.set("f12", "lsp_goto_definition");
@@ -144,4 +154,10 @@ test "keybind defaults" {
     try std.testing.expectEqualStrings("duplicate_line", kb.get("ctrl+shift+d").?);
     try std.testing.expectEqualStrings("add_cursor_above", kb.get("ctrl+shift+up").?);
     try std.testing.expectEqualStrings("add_cursor_below", kb.get("ctrl+alt+down").?);
+    // Alt-free alternates
+    try std.testing.expectEqualStrings("split_vertical", kb.get("ctrl+backslash").?);
+    try std.testing.expectEqualStrings("focus_next_pane", kb.get("f6").?);
+    try std.testing.expectEqualStrings("close_pane", kb.get("ctrl+f4").?);
+    try std.testing.expectEqualStrings("move_line_up", kb.get("ctrl+shift+page_up").?);
+    try std.testing.expectEqualStrings("lsp_goto_definition", kb.get("f12").?);
 }

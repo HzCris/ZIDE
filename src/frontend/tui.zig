@@ -1575,6 +1575,21 @@ fn keyToStr(key: Key, buf: *[64]u8) []const u8 {
         Key.tab => "tab",
         Key.enter => "enter",
         Key.escape => "escape",
+        Key.f1 => "f1",
+        Key.f2 => "f2",
+        Key.f3 => "f3",
+        Key.f4 => "f4",
+        Key.f5 => "f5",
+        Key.f6 => "f6",
+        Key.f7 => "f7",
+        Key.f8 => "f8",
+        Key.f9 => "f9",
+        Key.f10 => "f10",
+        Key.f11 => "f11",
+        Key.f12 => "f12",
+        // The keybind map spells this out ("alt+backslash"), and the GUI
+        // converter agrees — the raw '\' character would never match.
+        '\\' => "backslash",
         else => null,
     };
 
@@ -1612,8 +1627,11 @@ fn handleKey(editor: *Editor, key: Key) void {
     // Any key press un-pins scroll (cursor tracking resumes)
     scroll_pinned = false;
 
-    // Ctrl/Alt+key shortcuts — look up in keybind map
-    if (key.mods.ctrl or key.mods.alt) {
+    // Ctrl/Alt+key shortcuts — look up in keybind map. F-keys are never
+    // text input, so they go through the map even unmodified (f12 = goto
+    // definition, f6 = focus pane, ...).
+    const is_fkey = key.codepoint >= Key.f1 and key.codepoint <= Key.f12;
+    if (key.mods.ctrl or key.mods.alt or is_fkey) {
         var kbuf: [64]u8 = undefined;
         const key_str = keyToStr(key, &kbuf);
         if (key_str.len > 0) {

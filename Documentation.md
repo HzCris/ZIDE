@@ -24,6 +24,10 @@
 | Ctrl+Shift+D | Duplicate line |
 | Ctrl+Shift+Up/Down | Add cursor above/below |
 | Ctrl+Alt+Up/Down | Add cursor above/below (fallback for terminals that eat Ctrl+Shift) |
+| Ctrl+\ / Ctrl+Shift+\ | Split vertical / horizontal (Alt-free alternates) |
+| F6 / Shift+F6 | Focus next / previous pane (Alt-free alternates) |
+| Ctrl+F4 | Close split pane (Alt-free alternate) |
+| Ctrl+Shift+PgUp/PgDn | Move line up/down (Alt-free alternates) |
 | Ctrl+Space | LSP completion |
 | F12 | LSP go-to-definition |
 | Ctrl+` | Toggle terminal (bottom split) — GUI only |
@@ -59,6 +63,8 @@
 | Mouse scroll wheel | Scroll viewport (5 lines per tick) |
 
 All Ctrl/Alt shortcuts are remappable via `~/.config/zide/init.lua`.
+
+Windows terminals commonly intercept Alt combos (Windows Terminal binds Alt+arrows for its own panes; Ctrl+Alt doubles as AltGr), so every Alt-based default has an Alt-free twin (see table). F1–F12 are bindable in both frontends.
 
 ### TUI — Implemented Features
 

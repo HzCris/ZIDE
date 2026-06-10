@@ -85,7 +85,7 @@ const welcome_text =
     \\// File
     \\//   Ctrl+N            new file           Ctrl+O           open file
     \\//   Ctrl+S            save               Ctrl+Shift+S     save as
-    \\//   Ctrl+W            close tab          Ctrl+Q           quit
+    \\//   Ctrl+Q            quit
     \\//
     \\// Edit
     \\//   Ctrl+Z / Ctrl+Y   undo / redo
@@ -106,10 +106,15 @@ const welcome_text =
     \\//   Alt+Click         add cursor at mouse       (GUI)
     \\//
     \\// Tabs & panes (a pane is a split, a tab is a document)
-    \\//   Ctrl+Tab          next tab           Ctrl+Shift+Tab   previous tab
-    \\//   (also Ctrl+PgDn / Ctrl+PgUp)
+    \\//   Ctrl+W            close tab          Ctrl+Tab         next tab
+    \\//   Ctrl+Shift+Tab    previous tab       (also Ctrl+PgDn / Ctrl+PgUp)
     \\//   Alt+\             split vertical     Alt+Shift+\      split horizontal
     \\//   Alt+Left/Right    focus pane         Ctrl+Alt+Q       close split pane
+    \\//
+    \\// Terminal eats Alt+...? These always work:
+    \\//   Ctrl+\            split vertical     Ctrl+Shift+\     split horizontal
+    \\//   F6 / Shift+F6     focus pane         Ctrl+F4          close split pane
+    \\//   Ctrl+Shift+PgUp/PgDn                 move line
     \\//
     \\// Terminal & code intelligence
     \\//   Ctrl+`            toggle terminal    Ctrl+Shift+`     terminal in split   (GUI)
