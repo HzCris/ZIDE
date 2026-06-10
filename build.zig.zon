@@ -1,7 +1,9 @@
 .{
     .name = .zide,
     .version = "0.0.1",
-    .minimum_zig_version = "0.15.1",
+    // anyzig dispatches this EXACT version (despite the "minimum" name) —
+    // keep it matching the toolchain the project is actually tested with.
+    .minimum_zig_version = "0.15.2",
     .fingerprint = 0x5e89543fc18082dd,
     .paths = .{
         "build.zig",
