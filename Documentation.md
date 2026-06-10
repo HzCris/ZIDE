@@ -94,6 +94,7 @@ Windows terminals commonly intercept Alt combos (Windows Terminal binds Alt+arro
 
 **Display:**
 - Syntax highlighting (Zig built-in, extensible via Lua — see Syntax Highlighting section)
+- TODO comment highlighting: `TODO`/`FIXME`/`XXX`/`HACK`/`BUG`/`NOTE` inside comments get the `todo` syntax color; `next_todo` command (palette) jumps to the next marker with wrap-around
 - Line numbers with active line highlight
 - Visual-row cursor movement with word wrap (Up/Down navigate wrapped rows, not logical lines)
 - Status bar: filename, dirty marker (`*`), `Ln X, Col Y`
@@ -164,6 +165,7 @@ Windows terminals commonly intercept Alt combos (Windows Terminal binds Alt+arro
 - DVUI + SDL3 window with editor pane
 - Text editing via DVUI TextEntryWidget (undo/redo/clipboard handled by widget)
 - Syntax highlighting (Zig built-in, extensible via Lua — see Syntax Highlighting section)
+- TODO comment highlighting: `TODO`/`FIXME`/`XXX`/`HACK`/`BUG`/`NOTE` inside comments get the `todo` syntax color; `next_todo` command (palette) jumps to the next marker with wrap-around
 - Word wrap (word-boundary aware, configurable, wrap continuation markers)
 - Save / Save As (native OS file dialog)
 - Open file (native OS file dialog)
@@ -253,6 +255,7 @@ The tokenizer produces spans with one of these token types:
 | `punctuation` | Brackets, braces, semicolons | Light gray `#abb2bf` |
 | `preprocessor` | Preprocessor directives (`#include`, etc.) | Light purple `#be84d2` |
 | `attribute` | Attributes/decorators | Gold `#e5c07b` |
+| `todo` | `TODO`/`FIXME`/`XXX`/`HACK`/`BUG`/`NOTE` markers inside comments (word-boundary matched) | Gold `#e5c07b` |
 | `text` | Plain text / identifiers | Default text color |
 
 ### Syntax Themes

@@ -12,7 +12,7 @@
 - [] Debug Support
 - [] Nerdfont/Custom Icon integration
 - [] Session Persistance Option
-- [] TODO comment integration
+- [x] TODO comment integration (TODO/FIXME/XXX/HACK/BUG/NOTE highlighted in comments, `next_todo` palette command, `syn_todo` color override)
 - [] Linting
 - [] Extension fetching (Think like how neovim pulls from github/codeberg)
 
@@ -28,6 +28,6 @@
 - [] Debug Support
 - [] Nerdfont/Custom Icon integration
 - [] Session Persistance Option
-- [] TODO comment integration
+- [x] TODO comment integration (TODO/FIXME/XXX/HACK/BUG/NOTE highlighted in comments, `next_todo` palette command, `syn_todo` color override)
 - [] Linting
 - [] Extension fetching (Think like how neovim pulls from github/codeberg)

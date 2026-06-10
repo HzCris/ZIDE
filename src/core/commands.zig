@@ -2,6 +2,7 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 const theme_mod = @import("theme.zig");
 const lua_settings = @import("lua_settings.zig");
+const syntax = @import("syntax.zig");
 
 /// Forward declaration — Editor will be defined in editor.zig.
 /// Commands receive a pointer to the editor state.
@@ -138,6 +139,7 @@ pub fn registerBuiltins(registry: *CommandRegistry) !void {
     try registry.register("indent", "Indent (insert tab/spaces)", cmdIndent);
     try registry.register("dedent", "Dedent (remove leading whitespace)", cmdDedent);
     try registry.register("toggle_comment", "Toggle comment on selected lines", cmdToggleComment);
+    try registry.register("next_todo", "Jump to next TODO/FIXME/XXX/HACK/BUG/NOTE marker", cmdNextTodo);
     try registry.register("cursor_file_start", "Move to start of file", cmdCursorFileStart);
     try registry.register("cursor_file_end", "Move to end of file", cmdCursorFileEnd);
     try registry.register("cursor_file_start_select", "Select to start of file", cmdCursorFileStartSelect);
@@ -523,6 +525,54 @@ fn cmdToggleComment(editor: *Editor, _: ?[]const u8) void {
     } else {
         editor.status_message = "Comment toggle: language has no comment syntax";
     }
+}
+
+// --- TODO navigation ---
+
+fn cmdNextTodo(editor: *Editor, _: ?[]const u8) void {
+    const doc = editor.activeDoc();
+    const content = doc.buffer.slice(0, doc.buffer.byteLen());
+    if (content.len == 0) {
+        editor.status_message = "No TODO markers found";
+        return;
+    }
+    const c = doc.cursors.primary();
+    const from = @min(c.offset + 1, content.len);
+    var wrapped = false;
+    var found = findTodoMarker(content, from);
+    if (found == null and from > 0) {
+        found = findTodoMarker(content, 0);
+        wrapped = true;
+    }
+    if (found) |pos| {
+        doc.cursors.clearSecondary();
+        c.clearSelection();
+        c.offset = pos;
+        c.preferred_col = doc.buffer.offsetToPos(pos).col;
+        editor.status_message = if (wrapped) "TODO search wrapped" else "";
+    } else {
+        editor.status_message = "No TODO markers found";
+    }
+}
+
+/// Earliest word-boundary occurrence of any TODO-style marker at or after `from`.
+fn findTodoMarker(content: []const u8, from: usize) ?usize {
+    if (from >= content.len) return null;
+    var best: ?usize = null;
+    for (syntax.todo_markers) |m| {
+        var search_from = from;
+        while (std.mem.indexOf(u8, content[search_from..], m)) |rel| {
+            const pos = search_from + rel;
+            const before_ok = pos == 0 or !isWordCharByte(content[pos - 1]);
+            const after_ok = pos + m.len >= content.len or !isWordCharByte(content[pos + m.len]);
+            if (before_ok and after_ok) {
+                if (best == null or pos < best.?) best = pos;
+                break;
+            }
+            search_from = pos + 1;
+        }
+    }
+    return best;
 }
 
 // --- File start/end ---

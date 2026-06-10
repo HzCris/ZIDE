@@ -20,7 +20,12 @@ pub const TokenType = enum {
     function,
     constant,
     preprocessor,
+    /// TODO/FIXME-style marker inside a comment.
+    todo,
 };
+
+/// Markers highlighted inside comments (word-boundary matched, case-sensitive).
+pub const todo_markers = [_][]const u8{ "TODO", "FIXME", "XXX", "HACK", "BUG", "NOTE" };
 
 pub const HighlightSpan = struct {
     start: u16,
@@ -166,11 +171,11 @@ pub fn tokenizeLine(
         if (lang.block_comment_end) |bce| {
             if (std.mem.indexOf(u8, line, bce)) |end_pos| {
                 const end = end_pos + bce.len;
-                addSpan(&count, spans_buf, 0, end, .comment);
+                addCommentSpans(&count, spans_buf, line, 0, end);
                 i = end;
                 state = .normal;
             } else {
-                addSpan(&count, spans_buf, 0, line.len, .comment);
+                addCommentSpans(&count, spans_buf, line, 0, line.len);
                 return .{ .count = count, .state = .in_block_comment };
             }
         } else {
@@ -197,7 +202,7 @@ pub fn tokenizeLine(
         // Line comment — consumes rest of line
         if (lang.line_comment) |lc| {
             if (prefixAt(line, i, lc)) {
-                addSpan(&count, spans_buf, i, line.len, .comment);
+                addCommentSpans(&count, spans_buf, line, i, line.len);
                 return .{ .count = count, .state = .normal };
             }
         }
@@ -210,12 +215,12 @@ pub fn tokenizeLine(
                 if (lang.block_comment_end) |bce| {
                     if (std.mem.indexOf(u8, line[i..], bce)) |end_offset| {
                         i += end_offset + bce.len;
-                        addSpan(&count, spans_buf, start, i, .comment);
+                        addCommentSpans(&count, spans_buf, line, start, i);
                         continue;
                     }
                 }
                 // Block comment extends past this line
-                addSpan(&count, spans_buf, start, line.len, .comment);
+                addCommentSpans(&count, spans_buf, line, start, line.len);
                 return .{ .count = count, .state = .in_block_comment };
             }
         }
@@ -354,6 +359,37 @@ fn addSpan(count: *usize, buf: []HighlightSpan, start: usize, end: usize, token:
         };
         count.* += 1;
     }
+}
+
+/// Emit a comment region split into .comment / .todo spans so TODO-style
+/// markers inside it stand out.
+fn addCommentSpans(count: *usize, buf: []HighlightSpan, line: []const u8, start: usize, end: usize) void {
+    var plain_from = start;
+    var i = start;
+    while (i < end) {
+        if (todoMarkerEnd(line, i, end)) |marker_end| {
+            if (i > plain_from) addSpan(count, buf, plain_from, i, .comment);
+            addSpan(count, buf, i, marker_end, .todo);
+            plain_from = marker_end;
+            i = marker_end;
+        } else {
+            i += 1;
+        }
+    }
+    if (plain_from < end) addSpan(count, buf, plain_from, end, .comment);
+}
+
+/// If a TODO-style marker starts at `pos` on a word boundary, return its end.
+fn todoMarkerEnd(line: []const u8, pos: usize, end: usize) ?usize {
+    if (pos > 0 and isIdentChar(line[pos - 1])) return null;
+    for (todo_markers) |m| {
+        if (pos + m.len > end) continue;
+        if (!std.mem.eql(u8, line[pos .. pos + m.len], m)) continue;
+        // Word boundary after the marker
+        if (pos + m.len < end and isIdentChar(line[pos + m.len])) continue;
+        return pos + m.len;
+    }
+    return null;
 }
 
 fn prefixAt(line: []const u8, pos: usize, prefix: []const u8) bool {
@@ -498,6 +534,63 @@ test "block comment state tracking" {
     const r2 = tokenizeLine("still in comment */", &c_like, .in_block_comment, &buf);
     try std.testing.expectEqual(LineState.normal, r2.state);
     try std.testing.expectEqual(TokenType.comment, buf[0].token);
+}
+
+test "TODO markers inside comments get their own spans" {
+    var buf: [64]HighlightSpan = undefined;
+    const result = tokenizeLine("// TODO: fix this", &lang_zig, .normal, &buf);
+    // "// " comment, "TODO" todo, ": fix this" comment
+    try std.testing.expectEqual(@as(usize, 3), result.count);
+    try std.testing.expectEqual(TokenType.comment, buf[0].token);
+    try std.testing.expectEqual(TokenType.todo, buf[1].token);
+    try std.testing.expectEqual(@as(u16, 3), buf[1].start);
+    try std.testing.expectEqual(@as(u16, 7), buf[1].end);
+    try std.testing.expectEqual(TokenType.comment, buf[2].token);
+}
+
+test "TODO marker needs word boundaries" {
+    var buf: [64]HighlightSpan = undefined;
+    // TODOS and myTODO must NOT match; plain comment span only
+    const r1 = tokenizeLine("// TODOS are plural", &lang_zig, .normal, &buf);
+    try std.testing.expectEqual(@as(usize, 1), r1.count);
+    try std.testing.expectEqual(TokenType.comment, buf[0].token);
+
+    const r2 = tokenizeLine("// myTODO marker", &lang_zig, .normal, &buf);
+    try std.testing.expectEqual(@as(usize, 1), r2.count);
+    try std.testing.expectEqual(TokenType.comment, buf[0].token);
+}
+
+test "FIXME in block comment continuation" {
+    const c_like = LanguageDef{
+        .name = "c",
+        .extensions = &.{"c"},
+        .keywords = &.{},
+        .types = &.{},
+        .constants = &.{},
+        .builtins = &.{},
+        .line_comment = "//",
+        .block_comment_start = "/*",
+        .block_comment_end = "*/",
+        .string_delimiters = "\"",
+        .has_char_literals = true,
+        .builtin_prefix = null,
+        .preproc_prefix = '#',
+        .arena = null,
+    };
+    var buf: [64]HighlightSpan = undefined;
+    const result = tokenizeLine("FIXME later */", &c_like, .in_block_comment, &buf);
+    try std.testing.expectEqual(TokenType.todo, buf[0].token);
+    try std.testing.expectEqual(@as(u16, 0), buf[0].start);
+    try std.testing.expectEqual(@as(u16, 5), buf[0].end);
+    try std.testing.expectEqual(LineState.normal, result.state);
+}
+
+test "TODO outside comments is not highlighted" {
+    var buf: [64]HighlightSpan = undefined;
+    const result = tokenizeLine("const TODO = 1;", &lang_zig, .normal, &buf);
+    for (buf[0..result.count]) |span| {
+        try std.testing.expect(span.token != .todo);
+    }
 }
 
 test "empty line" {

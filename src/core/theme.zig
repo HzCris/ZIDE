@@ -440,6 +440,7 @@ pub const SyntaxTheme = struct {
     punctuation: ThemeColor,
     preprocessor: ThemeColor,
     attribute: ThemeColor,
+    todo: ThemeColor,
 
     /// Returns the color for a token type, or null for plain text (use default).
     pub fn colorForToken(self: *const SyntaxTheme, token: syntax.TokenType) ?ThemeColor {
@@ -458,6 +459,7 @@ pub const SyntaxTheme = struct {
             .punctuation => self.punctuation,
             .preprocessor => self.preprocessor,
             .attribute => self.attribute,
+            .todo => self.todo,
         };
     }
 };
@@ -480,6 +482,7 @@ pub const TuiSyntaxTheme = struct {
     punctuation: TuiColor,
     preprocessor: TuiColor,
     attribute: TuiColor,
+    todo: TuiColor,
 
     /// Returns the color for a token type, or null for plain text (use default).
     pub fn colorForToken(self: *const TuiSyntaxTheme, token: syntax.TokenType) ?TuiColor {
@@ -498,6 +501,7 @@ pub const TuiSyntaxTheme = struct {
             .punctuation => self.punctuation,
             .preprocessor => self.preprocessor,
             .attribute => self.attribute,
+            .todo => self.todo,
         };
     }
 };
@@ -521,6 +525,7 @@ pub const syn_gui_dark = SyntaxTheme{
     .punctuation = .{ .r = 171, .g = 178, .b = 191 }, // #abb2bf light gray
     .preprocessor = .{ .r = 190, .g = 132, .b = 210 }, // #be84d2 light purple
     .attribute = .{ .r = 229, .g = 192, .b = 123 }, // #e5c07b gold
+    .todo = .{ .r = 229, .g = 192, .b = 123 }, // #e5c07b gold — pops against gray comments
 };
 
 /// Light syntax theme (One Light inspired).
@@ -538,6 +543,7 @@ pub const syn_gui_light = SyntaxTheme{
     .punctuation = .{ .r = 56, .g = 58, .b = 66 }, // #383a42 dark gray
     .preprocessor = .{ .r = 166, .g = 38, .b = 164 }, // #a626a4 purple
     .attribute = .{ .r = 152, .g = 104, .b = 1 }, // #986801 dark orange
+    .todo = .{ .r = 193, .g = 132, .b = 1 }, // #c18401 amber — pops against gray comments
 };
 
 /// High-contrast syntax theme.
@@ -555,6 +561,7 @@ pub const syn_gui_high_contrast = SyntaxTheme{
     .punctuation = .{ .r = 200, .g = 200, .b = 200 }, // light gray
     .preprocessor = .{ .r = 255, .g = 100, .b = 255 }, // bright magenta
     .attribute = .{ .r = 255, .g = 255, .b = 100 }, // bright yellow
+    .todo = .{ .r = 255, .g = 255, .b = 100 }, // bright yellow
 };
 
 // ---------------------------------------------------------------------------
@@ -576,6 +583,7 @@ pub const syn_tui_terminal = TuiSyntaxTheme{
     .punctuation = .default,
     .preprocessor = .{ .ansi = 5 }, // magenta
     .attribute = .{ .ansi = 3 }, // yellow
+    .todo = .{ .ansi = 11 }, // bright yellow — pops against bright-black comments
 };
 
 /// Dark TUI syntax theme — RGB colors.
@@ -593,6 +601,7 @@ pub const syn_tui_dark = TuiSyntaxTheme{
     .punctuation = .{ .rgb = .{ .r = 171, .g = 178, .b = 191 } },
     .preprocessor = .{ .rgb = .{ .r = 190, .g = 132, .b = 210 } },
     .attribute = .{ .rgb = .{ .r = 229, .g = 192, .b = 123 } },
+    .todo = .{ .rgb = .{ .r = 229, .g = 192, .b = 123 } },
 };
 
 /// Light TUI syntax theme — ANSI-256 colors.
@@ -610,6 +619,7 @@ pub const syn_tui_light = TuiSyntaxTheme{
     .punctuation = .{ .ansi = 238 }, // dark gray
     .preprocessor = .{ .ansi = 128 }, // dark magenta
     .attribute = .{ .ansi = 130 }, // dark orange
+    .todo = .{ .ansi = 136 }, // dark goldenrod
 };
 
 /// High-contrast TUI syntax theme — RGB colors.
@@ -627,6 +637,7 @@ pub const syn_tui_high_contrast = TuiSyntaxTheme{
     .punctuation = .{ .rgb = .{ .r = 200, .g = 200, .b = 200 } },
     .preprocessor = .{ .rgb = .{ .r = 255, .g = 100, .b = 255 } },
     .attribute = .{ .rgb = .{ .r = 255, .g = 255, .b = 100 } },
+    .todo = .{ .rgb = .{ .r = 255, .g = 255, .b = 100 } },
 };
 
 // ---------------------------------------------------------------------------
