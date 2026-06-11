@@ -16,6 +16,13 @@
 - [] Linting
 - [] Extension fetching (Think like how neovim pulls from github/codeberg)
 
+### File tree follow-ups (queued 2026-06-10)
+- [] Indent guide lines showing parent/child folder structure
+- [] Starting-directory setting in the Settings dialog (filetree_root is init.lua-only today — needs a text field kind)
+- [] Context-menu "Move tree to left/right side"
+- [] Single click selects, double click opens (folders still toggle on single click)
+- [] Drag & drop to move files/folders between directories
+
 ## GUI
 - [x] LSP support
 - [x] Embedded Terminal
