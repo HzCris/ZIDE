@@ -2720,6 +2720,7 @@ fn handleSaveAsKey(editor: *Editor, key: Key) void {
                 editor.status_message = "Save failed";
             };
             editor.activeDoc().detectLanguage(editor);
+            editor.noteFileSaved(true);
         }
         editor.mode = .normal;
         return;

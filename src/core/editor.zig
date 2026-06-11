@@ -406,6 +406,18 @@ pub const Editor = struct {
         }
     }
 
+    /// Call after any successful save so the file tree stays current:
+    /// git status colors always; a full rescan only when requested
+    /// (Save As creates a file the tree hasn't scanned yet). The GUI's
+    /// native-dialog save path bypasses execAction("save"), so every
+    /// save site must call this rather than relying on the action hook.
+    pub fn noteFileSaved(self: *Editor, new_file: bool) void {
+        if (self.filetree) |*ft| {
+            if (new_file) ft.refresh() catch {};
+            ft.gitRefresh();
+        }
+    }
+
     /// Re-root the file tree at the parent of the current root (tree
     /// Backspace/'u'). The new root sticks for the session via
     /// filetree_root (not persisted to init.lua).
@@ -660,7 +672,7 @@ pub const Editor = struct {
                 return true;
             };
             self.lspDidSave(doc);
-            if (self.filetree) |*ft| ft.gitRefresh();
+            self.noteFileSaved(false);
             const msg = std.fmt.bufPrint(&self.status_buf, "Saved {s}", .{doc.display_name}) catch "Saved";
             self.status_message = msg;
             return true;
@@ -835,7 +847,7 @@ pub const Editor = struct {
             }
         }
         if (saved > 0) {
-            if (self.filetree) |*ft| ft.gitRefresh();
+            self.noteFileSaved(false);
             const msg = std.fmt.bufPrint(&self.status_buf, "Auto-saved {d} file(s)", .{saved}) catch "Auto-saved";
             self.status_message = msg;
         }
