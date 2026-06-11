@@ -141,7 +141,8 @@ pub const FileTree = struct {
     }
 
     /// Scan a directory node's entries into child nodes (sorted dirs-first,
-    /// then case-insensitive). `.git` is skipped; dotfiles are shown.
+    /// then case-insensitive). Everything is shown, dotfiles included —
+    /// hiding `.git` while listing `.zig-cache` just looked inconsistent.
     fn loadChildren(self: *FileTree, idx: u32) !void {
         std.debug.assert(self.nodes.items[idx].kind == .dir);
         if (self.nodes.items[idx].loaded) return;
@@ -159,7 +160,6 @@ pub const FileTree = struct {
 
         var it = dir.iterate();
         while (try it.next(self.io)) |entry| {
-            if (std.mem.eql(u8, entry.name, ".git")) continue;
             const kind: NodeKind = if (entry.kind == .directory) .dir else .file;
             // entry.name is invalidated by the next iteration — dupe now.
             const child_rel = if (rel.len == 0)

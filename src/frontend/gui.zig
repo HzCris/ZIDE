@@ -328,6 +328,14 @@ pub fn frame(editor: *Editor) bool {
     }
     filetree_was_focused = editor.filetree_focused;
 
+    // File tree edge-drag resize (uses last frame's panel rect).
+    if (editor.filetree_visible and editor.filetree != null) {
+        if (filetree_panel_rect) |prect| handleFiletreeResize(editor, prect, filetree_panel_scale);
+    } else {
+        filetree_resizing = false;
+        filetree_panel_rect = null;
+    }
+
     // Auto-save check
     if (editor.auto_save and editor.hasUnsavedChanges()) {
         const now_ns: i128 = std.Io.Clock.now(.awake, editor.io).nanoseconds;
@@ -747,6 +755,13 @@ var filetree_release_focus: bool = false;
 /// Previous-frame filetree_focused, to catch command-driven transitions
 /// (Ctrl+B hide, etc.) as well as the tree's own Esc/Enter.
 var filetree_was_focused: bool = false;
+/// Panel content rect + scale from the last draw — the resize drag runs
+/// at the top of frame() (before any pane consumes events), so it works
+/// the same whichever side the panel docks on.
+var filetree_panel_rect: ?dvui.Rect.Physical = null;
+var filetree_panel_scale: f32 = 1;
+/// True while the user is dragging the panel's editor-facing edge.
+var filetree_resizing: bool = false;
 
 /// File tree side panel — custom row rendering in the editorPane style
 /// (no per-row widgets; we own scrolling, selection, and input). Renders
@@ -769,6 +784,8 @@ fn filetreePanel(editor: *Editor) void {
     const rs = wd.contentRectScale();
     const scale = rs.s;
     const area = rs.r;
+    filetree_panel_rect = area;
+    filetree_panel_scale = scale;
 
     const font = dvui.Font.theme(.mono);
     const line_height = font.lineHeight() * scale;
@@ -838,8 +855,67 @@ fn filetreePanel(editor: *Editor) void {
         y += line_height;
     }
 
+    // Separator line on the editor-facing edge — without it the panel
+    // blends straight into the line-number gutter.
+    const sep_w = @max(1.0, 1 * scale);
+    const sep_x = if (editor.filetree_side == .left) area.x + area.w - sep_w else area.x;
+    const sep_rect: dvui.Rect.Physical = .{ .x = sep_x, .y = area.y, .w = sep_w, .h = area.h };
+    sep_rect.fill(.{}, .{ .color = toDvui(editor.theme.gutter_separator), .fade = 1.0 });
+
     // Right-click context menu over the panel.
     filetreeContextMenu(editor, area);
+}
+
+/// Drag the panel's editor-facing edge to resize, VS Code style. The
+/// chosen width persists to init.lua on release. Runs from frame() with
+/// the previous frame's rect so it always sees events before the panes.
+fn handleFiletreeResize(editor: *Editor, prect: dvui.Rect.Physical, scale: f32) void {
+    if (!build_options.has_gui) return;
+    if (scale <= 0) return;
+    const edge_x = if (editor.filetree_side == .left) prect.x + prect.w else prect.x;
+    const grab: f32 = 4 * scale;
+
+    for (dvui.events()) |*e| {
+        if (e.handled) continue;
+        if (e.evt != .mouse) continue;
+        const me = e.evt.mouse;
+        const near_edge = me.p.x >= edge_x - grab and me.p.x <= edge_x + grab and
+            me.p.y >= prect.y and me.p.y <= prect.y + prect.h;
+
+        switch (me.action) {
+            .position => {
+                if (near_edge or filetree_resizing) dvui.cursorSet(.arrow_w_e);
+            },
+            .press => {
+                if (me.button == .left and near_edge) {
+                    e.handled = true;
+                    filetree_resizing = true;
+                }
+            },
+            .motion => {
+                if (filetree_resizing) {
+                    e.handled = true;
+                    const w_phys = if (editor.filetree_side == .left)
+                        me.p.x - prect.x
+                    else
+                        (prect.x + prect.w) - me.p.x;
+                    editor.filetree_width = std.math.clamp(w_phys / scale, 120, 600);
+                }
+            },
+            .release => {
+                if (filetree_resizing) {
+                    e.handled = true;
+                    filetree_resizing = false;
+                    // Persist the chosen width
+                    const lua_settings = @import("../core/lua_settings.zig");
+                    var buf: [32]u8 = undefined;
+                    const num = std.fmt.bufPrint(&buf, "{d}", .{@as(i64, @intFromFloat(editor.filetree_width))}) catch "";
+                    if (num.len > 0) lua_settings.writeSettingToFile("filetree_width", num) catch {};
+                }
+            },
+            else => {},
+        }
+    }
 }
 
 /// Keep the tree selection inside the visible row window.
@@ -1008,17 +1084,24 @@ fn handleFiletreeKeys(editor: *Editor, ft: *FileTree, wd: *dvui.WidgetData, visi
     }
 }
 
+/// Status message + dvui toast — for errors the user must actually see
+/// (the status bar alone was easy to miss in the first smoke test).
+fn guiNotify(editor: *Editor, comptime fmt: []const u8, args: anytype) void {
+    const msg = std.fmt.bufPrint(&editor.status_buf, fmt, args) catch return;
+    editor.status_message = msg;
+    dvui.toast(@src(), .{ .message = msg });
+}
+
 /// Open the file behind a tree node (deduped against open tabs).
 fn openFiletreeFile(editor: *Editor, ft: *FileTree, idx: u32) void {
     const abs = ft.absPathAlloc(editor.allocator, idx) catch return;
     defer editor.allocator.free(abs);
     _ = editor.openOrFocus(abs) catch |err| {
         if (err == error.BinaryFile) {
-            editor.status_message = "Cannot open: binary file";
-            return;
+            guiNotify(editor, "Not opened: binary or unsupported text encoding", .{});
+        } else {
+            guiNotify(editor, "Open failed: {s}", .{@errorName(err)});
         }
-        const msg = std.fmt.bufPrint(&editor.status_buf, "Open failed: {s}", .{@errorName(err)}) catch "Open failed";
-        editor.status_message = msg;
     };
 }
 
@@ -2777,7 +2860,11 @@ fn openFileDialog(editor: *Editor) void {
     if (path) |p| {
         defer editor.allocator.free(p);
         _ = editor.openFile(p) catch |err| {
-            editor.status_message = @errorName(err);
+            if (err == error.BinaryFile) {
+                guiNotify(editor, "Not opened: binary or unsupported text encoding", .{});
+            } else {
+                guiNotify(editor, "Open failed: {s}", .{@errorName(err)});
+            }
         };
     }
 }
