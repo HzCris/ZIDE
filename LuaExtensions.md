@@ -3,7 +3,7 @@
 ## TUI
 - [x] Syntax highlighting
 - [x] LSP support
-- [] File tree / project browser (Including a Starting Directory option)
+- [x] File tree / project browser (Ctrl+B toggle, dockable left/right via `filetree_side`, starting directory via `zide.set("filetree_root", path)`, a/r/d file ops, Shift+R refresh, reveal-current-file, git status row colors)
 - [] LLM support using OpenAI API for various cloud providers and local LLMs (And claude if allowed)
 - [] Git integration (gutter signs)
 - [] Terminal Splitting
@@ -21,7 +21,7 @@
 - [x] Embedded Terminal
 - [x] Syntax highlighting
 - [x] Block/column selection
-- [] File tree / project browser (Including a Starting Directory option)
+- [x] File tree / project browser (Ctrl+B toggle, dockable left/right, starting directory via `filetree_root`, click + keyboard browsing, right-click menu, a/r/d file ops, git status row colors)
 - [] LLM support using OpenAI API for various cloud providers and local LLMs (And claude if allowed)
 - [] Git integration (gutter signs)
 - [x] Ctrl+/ to comment highlighted text (uses register_language's line_comment/block_comment fields — upkeep lives in Lua configs)
