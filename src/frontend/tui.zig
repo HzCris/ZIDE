@@ -1573,8 +1573,16 @@ fn drawStatusBar(win: Window, editor: *Editor, width: u16) void {
         _ = writeStr(win, x, 0, " [+]", style);
     }
 
-    // Center: diagnostic message for cursor line
-    for (doc.diagnostics.items) |*diag| {
+    // Center: transient status message ("Saved", "Cannot open: ...",
+    // file-tree results) takes priority over the line diagnostic —
+    // previously these were never rendered in normal mode at all.
+    if (editor.status_message.len > 0) {
+        const max_len = width / 2;
+        const msg_len: u16 = @intCast(@min(editor.status_message.len, max_len));
+        const center_x = (width -| msg_len) / 2;
+        _ = writeStr(win, center_x, 0, editor.status_message[0..msg_len], style);
+        // Right side still drawn below; skip the diagnostic this frame
+    } else for (doc.diagnostics.items) |*diag| {
         if (diag.start_line <= pos.line and diag.end_line >= pos.line) {
             const diag_fg: Color = switch (diag.severity) {
                 .err => .{ .rgb = .{ 0xE0, 0x40, 0x40 } },
@@ -1758,8 +1766,9 @@ fn handleMouse(editor: *Editor, mouse: vaxis.Mouse) void {
     switch (mouse.button) {
         .left => {
             if (mouse.type == .press) {
-                // Click: position cursor — also un-pin scroll
+                // Click: position cursor — un-pin scroll, drop old status
                 scroll_pinned = false;
+                editor.status_message = "";
 
                 // Tab bar click: switch document in active pane
                 const tab_bar_height: i16 = if (editor.docCount() > 1) 1 else 0;
@@ -1994,6 +2003,7 @@ fn tryKeybindCommand(editor: *Editor, key: Key) bool {
 /// mode). Global ctrl/alt chords still hit the keybind map first.
 fn handleFiletreeKey(editor: *Editor, key: Key) void {
     if (key.isModifier()) return;
+    editor.status_message = "";
     if (tryKeybindCommand(editor, key)) return;
     const ft = editor.ensureFiletree() orelse {
         editor.filetree_focused = false;
@@ -2071,8 +2081,10 @@ fn handleKey(editor: *Editor, key_in: Key) void {
         key.text = null;
     }
 
-    // Any key press un-pins scroll (cursor tracking resumes)
+    // Any key press un-pins scroll (cursor tracking resumes) and drops
+    // the previous transient status message
     scroll_pinned = false;
+    editor.status_message = "";
 
     // Ctrl/Alt+key shortcuts — look up in keybind map.
     if (tryKeybindCommand(editor, key)) return;

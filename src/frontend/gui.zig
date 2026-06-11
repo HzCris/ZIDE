@@ -632,8 +632,19 @@ pub fn frame(editor: *Editor) bool {
             .color = status_text_color,
         }) catch {};
 
-        // Center: diagnostic message for cursor line
-        if (worstDiagnosticOnLine(doc, pos.line)) |diag| {
+        // Center: transient status message ("Saved", "Cannot open: ...",
+        // file-tree results) takes priority over the line diagnostic —
+        // previously these were never rendered in normal mode at all.
+        if (editor.status_message.len > 0) {
+            const pos_w = status_font.textSize(pos_str).w * sscale;
+            dvui.renderText(.{
+                .font = status_font,
+                .text = editor.status_message,
+                .rs = srs,
+                .p = .{ .x = sarea.x + pos_w + 20 * sscale, .y = sarea.y },
+                .color = status_text_color,
+            }) catch {};
+        } else if (worstDiagnosticOnLine(doc, pos.line)) |diag| {
             const diag_color = diagnosticColor(diag.severity);
             const prefix: []const u8 = switch (diag.severity) {
                 .err => "Error: ",
@@ -946,6 +957,7 @@ fn handleFiletreeMouse(editor: *Editor, ft: *FileTree, wd: *dvui.WidgetData, are
 
         switch (me.action) {
             .press => {
+                editor.status_message = "";
                 const row = filetreeRowAt(ft, rows_y, line_height, me.p.y);
                 if (me.button == .right) {
                     // Select the row under the cursor but leave the press
@@ -993,6 +1005,7 @@ fn handleFiletreeKeys(editor: *Editor, ft: *FileTree, wd: *dvui.WidgetData, visi
         switch (e.evt) {
             .key => |key| {
                 if (key.action != .down and key.action != .repeat) continue;
+                editor.status_message = "";
                 if (key.mod.control() or key.mod.alt()) continue;
                 switch (key.code) {
                     .up, .k => {
@@ -2169,6 +2182,7 @@ fn handleMouseEvents(editor: *Editor, pane_id: u8, wd: *dvui.WidgetData, area: d
                 dvui.focusWidget(wd.id, null, e.num);
             },
             .press => {
+                editor.status_message = "";
                 if (me.button == .right) {
                     // Right-click: focus the pane and move the cursor to the
                     // click point — unless it lands inside the current
@@ -2605,7 +2619,9 @@ fn handleGuiKeyEvents(editor: *Editor, wd: *dvui.WidgetData) bool {
                     continue;
 
                 // Any real key press un-pins scroll (cursor tracking resumes)
+                // and drops the previous transient status message
                 scroll_pinned = false;
+                editor.status_message = "";
 
                 // Ctrl/Alt shortcuts handled by the early event loop in frame()
                 if (key.mod.control() or key.mod.alt()) continue;
@@ -2705,6 +2721,8 @@ fn handleGuiKeyEvents(editor: *Editor, wd: *dvui.WidgetData) bool {
 
 /// Execute an action with GUI-specific overrides (native file dialogs).
 fn execGuiAction(editor: *Editor, action: []const u8) void {
+    // New action — drop the previous transient status message
+    editor.status_message = "";
     if (std.mem.eql(u8, action, "save")) {
         save(editor);
         return;
