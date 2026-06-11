@@ -696,8 +696,11 @@ fn handleFiletreeClick(editor: *Editor, band: FiletreeBand, row_abs: u16) void {
 fn openFiletreeFileTui(editor: *Editor, ft: *FileTree, idx: u32) void {
     const abs = ft.absPathAlloc(editor.allocator, idx) catch return;
     defer editor.allocator.free(abs);
-    _ = editor.openOrFocus(abs) catch {
-        editor.status_message = "Open failed";
+    _ = editor.openOrFocus(abs) catch |err| {
+        editor.status_message = if (err == error.BinaryFile)
+            "Cannot open: binary file"
+        else
+            "Open failed";
     };
 }
 
@@ -2041,6 +2044,7 @@ fn handleFiletreeKey(editor: *Editor, key: Key) void {
         },
         'a' => editor.startFiletreePrompt(.create),
         'd' => editor.startFiletreePrompt(.delete_confirm),
+        Key.backspace, 'u' => editor.filetreeRootUp(),
         'r', 'R' => {
             if (key.codepoint == 'R' or key.mods.shift) {
                 _ = editor.execCommand("filetree_refresh", null);

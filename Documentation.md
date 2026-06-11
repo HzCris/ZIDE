@@ -610,11 +610,13 @@ ZIDE includes a built-in terminal emulator that integrates with the split pane s
 A toggleable side panel for browsing and managing the project directory, backed by a frontend-agnostic core model (`src/core/filetree.zig`) — both frontends render the same flattened row list, so expansion state, selection, file operations, and prompts behave identically in the GUI and the TUI.
 
 ### Basics
-- **Ctrl+B** (`toggle_filetree`): show/hide the panel. Showing it focuses the tree (nvim-tree style); hiding it returns focus to the editor.
+- **Ctrl+B** (`toggle_filetree`) cycles: hidden → shown + focused → (from the editor) focus the tree → (from the tree) hidden. Together with Escape this gives a full keyboard round-trip between editor and tree.
 - Docks **left or right** (`filetree_side` setting, default left); width via `filetree_width` (GUI px) / `tui_filetree_width` (TUI columns).
-- Root = current directory by default, or `zide.set("filetree_root", "/path")` (Lua-only; "" resets to cwd).
+- Starts **visible** by default — to launch with it closed, uncheck "File Tree Visible" in the settings dialog (persists to init.lua) or `zide.set("filetree_visible", false)`; Ctrl+B at runtime never writes settings.
+- Root = current directory by default, or `zide.set("filetree_root", "/path")` (Lua-only; "" resets to cwd). **Backspace / u** (or `filetree_root_up`) re-roots at the parent directory to climb the hierarchy.
 - Directories sort first, names case-insensitive; children scan lazily on first expand; `.git` is hidden, dotfiles are shown.
 - Opening a file that's already open switches to its existing tab instead of duplicating it.
+- Binary files (NUL byte in the first 8 KiB — executables, images, ...) are refused with a status message instead of being loaded; this applies to every open path (tree, Ctrl+O, CLI, session restore).
 
 ### Keys (while the tree is focused)
 | Key | Action |
@@ -627,6 +629,7 @@ A toggleable side panel for browsing and managing the project directory, backed 
 | r | Rename (no-clobber; renaming updates open tabs, including files inside a renamed folder) |
 | Shift+R | Refresh from disk (expansion and selection preserved) |
 | d | Delete (y/n confirm; directories delete recursively) |
+| Backspace or u | Re-root the tree at the parent directory |
 | Escape | Return focus to the editor |
 
 Ctrl/Alt chords (Ctrl+P, Ctrl+B, ...) still work while the tree is focused.

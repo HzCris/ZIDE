@@ -145,6 +145,7 @@ pub fn registerBuiltins(registry: *CommandRegistry) !void {
     try registry.register("toggle_filetree", "Toggle the file tree side panel", cmdToggleFiletree);
     try registry.register("filetree_reveal", "Reveal the current file in the file tree", cmdFiletreeReveal);
     try registry.register("filetree_refresh", "Refresh the file tree from disk", cmdFiletreeRefresh);
+    try registry.register("filetree_root_up", "Re-root the file tree at the parent directory", cmdFiletreeRootUp);
     try registry.register("cursor_file_start", "Move to start of file", cmdCursorFileStart);
     try registry.register("cursor_file_end", "Move to end of file", cmdCursorFileEnd);
     try registry.register("cursor_file_start_select", "Select to start of file", cmdCursorFileStartSelect);
@@ -547,6 +548,10 @@ fn cmdFiletreeRefresh(editor: *Editor, _: ?[]const u8) void {
     };
     ft.gitRefresh();
     editor.status_message = "File tree refreshed";
+}
+
+fn cmdFiletreeRootUp(editor: *Editor, _: ?[]const u8) void {
+    editor.filetreeRootUp();
 }
 
 fn cmdFiletreeReveal(editor: *Editor, _: ?[]const u8) void {

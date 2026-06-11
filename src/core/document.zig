@@ -85,8 +85,19 @@ pub const Document = struct {
     }
 
     /// Open a file into this document, replacing its current content.
+    /// Refuses obviously-binary files (error.BinaryFile) — the GUI text
+    /// stack requires valid UTF-8 (dvui's textSize does `catch
+    /// unreachable` on invalid sequences, so one open .exe used to panic
+    /// every subsequent frame).
     pub fn open(self: *Document, io: std.Io, path: []const u8) !void {
         try self.buffer.loadFile(io, path);
+        // NUL byte in the first 8 KiB = binary. Restore an empty buffer
+        // so a caller that catches the error isn't left holding the bytes.
+        const probe_len = @min(self.buffer.byteLen(), 8192);
+        if (std.mem.indexOfScalar(u8, self.buffer.slice(0, probe_len), 0) != null) {
+            try self.buffer.loadText("");
+            return error.BinaryFile;
+        }
         // Store owned copy of path
         if (self.file_path) |old| {
             self.allocator.free(old);
@@ -871,6 +882,34 @@ test "document new and load text" {
     try std.testing.expectEqualStrings("world", doc.lineContent(1));
     try std.testing.expect(!doc.dirty);
     try std.testing.expectEqualStrings("untitled", doc.display_name);
+}
+
+test "document open rejects binary files" {
+    const t = std.testing;
+    var tmp = t.tmpDir(.{});
+    defer tmp.cleanup();
+    const f = try tmp.dir.createFile(t.io, "blob.bin", .{});
+    try f.writeStreamingAll(t.io, "MZ\x00\x01\x02binary\x00bytes");
+    f.close(t.io);
+    const tf = try tmp.dir.createFile(t.io, "fine.txt", .{});
+    try tf.writeStreamingAll(t.io, "plain text\n");
+    tf.close(t.io);
+
+    var tmp_path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const tmp_path = tmp_path_buf[0..try std.Io.Dir.realPathFile(tmp.dir, t.io, ".", &tmp_path_buf)];
+
+    var doc = try Document.init(t.allocator);
+    defer doc.deinit();
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+
+    const bin_path = try std.fmt.bufPrint(&path_buf, "{s}/blob.bin", .{tmp_path});
+    try std.testing.expectError(error.BinaryFile, doc.open(t.io, bin_path));
+    // Buffer restored to empty — a catching caller isn't left holding bytes
+    try std.testing.expectEqual(@as(usize, 0), doc.buffer.byteLen());
+
+    const txt_path = try std.fmt.bufPrint(&path_buf, "{s}/fine.txt", .{tmp_path});
+    try doc.open(t.io, txt_path);
+    try std.testing.expectEqualStrings("plain text", doc.lineContent(0));
 }
 
 test "document insert and dirty tracking" {

@@ -386,16 +386,43 @@ pub const Editor = struct {
         return &self.filetree.?;
     }
 
-    /// Toggle the file tree panel. Showing it also focuses it (nvim-tree
-    /// style); hiding it returns focus to the editor.
+    /// Ctrl+B cycle: hidden → shown + focused; shown but editor focused →
+    /// focus the tree; tree focused → hide (focus returns to the editor).
+    /// Gives a full keyboard round-trip together with Escape.
     pub fn toggleFiletree(self: *Editor) void {
-        if (self.filetree_visible) {
-            self.filetree_visible = false;
-            self.filetree_focused = false;
-        } else {
+        if (!self.filetree_visible) {
             self.filetree_visible = true;
             if (self.ensureFiletree() != null) self.filetree_focused = true;
+        } else if (!self.filetree_focused) {
+            if (self.ensureFiletree() != null) {
+                self.filetree_focused = true;
+                self.filetree.?.scroll_to_selected = true;
+            } else {
+                self.filetree_visible = false;
+            }
+        } else {
+            self.filetree_visible = false;
+            self.filetree_focused = false;
         }
+    }
+
+    /// Re-root the file tree at the parent of the current root (tree
+    /// Backspace/'u'). The new root sticks for the session via
+    /// filetree_root (not persisted to init.lua).
+    pub fn filetreeRootUp(self: *Editor) void {
+        const ft = self.ensureFiletree() orelse return;
+        const parent = std.fs.path.dirname(ft.root_path) orelse {
+            self.status_message = "File tree: already at the filesystem root";
+            return;
+        };
+        const new_root = self.allocator.dupe(u8, parent) catch return;
+        if (self.filetree_root) |old| self.allocator.free(old);
+        self.filetree_root = new_root;
+        if (self.filetree) |*old_ft| old_ft.deinit();
+        self.filetree = null;
+        if (self.ensureFiletree() == null) return;
+        const msg = std.fmt.bufPrint(&self.status_buf, "File tree root: {s}", .{self.filetree.?.root_path}) catch "";
+        self.status_message = msg;
     }
 
     /// Begin a file-tree prompt (mode → .filetree_prompt). For .create the

@@ -321,6 +321,13 @@ pub fn frame(editor: *Editor) bool {
     // Check if quit was requested via keybind/command
     if (!editor.running) return false;
 
+    // Keyboard focus left the file tree (Esc/Enter/Ctrl+B/...) — hand
+    // dvui focus back to the active editor pane this frame.
+    if (filetree_was_focused and !editor.filetree_focused) {
+        filetree_release_focus = true;
+    }
+    filetree_was_focused = editor.filetree_focused;
+
     // Auto-save check
     if (editor.auto_save and editor.hasUnsavedChanges()) {
         const now_ns: i128 = std.Io.Clock.now(.awake, editor.io).nanoseconds;
@@ -732,6 +739,15 @@ fn renderLayout(editor: *Editor, node_idx: u8) void {
 /// GUI scroll offset (in rows) for the file tree panel.
 var filetree_scroll: usize = 0;
 
+/// One-frame flag: keyboard focus just left the file tree, so the active
+/// editor pane must take dvui focus back — its movement/typing handlers
+/// are gated on holding dvui widget focus, which the panel grabbed on
+/// click. Without this, Escape "worked" but the editor stayed deaf.
+var filetree_release_focus: bool = false;
+/// Previous-frame filetree_focused, to catch command-driven transitions
+/// (Ctrl+B hide, etc.) as well as the tree's own Esc/Enter.
+var filetree_was_focused: bool = false;
+
 /// File tree side panel — custom row rendering in the editorPane style
 /// (no per-row widgets; we own scrolling, selection, and input). Renders
 /// the core model's flattened visible list, which the TUI draws identically.
@@ -764,7 +780,15 @@ fn filetreePanel(editor: *Editor) void {
     const rows_h = area.h - header_h;
     const visible_rows: usize = if (rows_h > line_height) @intFromFloat(@floor(rows_h / line_height)) else 1;
 
-    // Reveal/create flagged the selection for scroll-into-view.
+    // Input first — clicks/keys can expand or collapse rows, so every
+    // count and clamp below must see the post-input state (a stale
+    // row_count here was an index-out-of-bounds panic on collapse).
+    handleFiletreeMouse(editor, ft, wd, area, rows_y, line_height, visible_rows);
+    if (editor.filetree_focused and editor.mode == .normal and !editor.completion_active) {
+        handleFiletreeKeys(editor, ft, wd, visible_rows);
+    }
+
+    // Reveal/create/nav flagged the selection for scroll-into-view.
     if (ft.scroll_to_selected) {
         ft.scroll_to_selected = false;
         filetreeEnsureSelectedVisible(ft, visible_rows);
@@ -773,12 +797,6 @@ fn filetreePanel(editor: *Editor) void {
     const row_count = ft.visible.items.len;
     if (filetree_scroll > 0 and filetree_scroll + visible_rows > row_count) {
         filetree_scroll = row_count -| visible_rows;
-    }
-
-    // Input before rendering so changes draw this frame.
-    handleFiletreeMouse(editor, ft, wd, area, rows_y, line_height, visible_rows);
-    if (editor.filetree_focused and editor.mode == .normal and !editor.completion_active) {
-        handleFiletreeKeys(editor, ft, wd, visible_rows);
     }
 
     // --- Header ---
@@ -933,6 +951,7 @@ fn handleFiletreeKeys(editor: *Editor, ft: *FileTree, wd: *dvui.WidgetData, visi
                         } else {
                             openFiletreeFile(editor, ft, idx);
                             editor.filetree_focused = false;
+                            filetree_release_focus = true;
                         }
                     },
                     .left => {
@@ -964,9 +983,14 @@ fn handleFiletreeKeys(editor: *Editor, ft: *FileTree, wd: *dvui.WidgetData, visi
                         e.handle(@src(), wd);
                         editor.startFiletreePrompt(.delete_confirm);
                     },
+                    .backspace, .u => {
+                        e.handle(@src(), wd);
+                        editor.filetreeRootUp();
+                    },
                     .escape => {
                         e.handle(@src(), wd);
                         editor.filetree_focused = false;
+                        filetree_release_focus = true;
                     },
                     else => {},
                 }
@@ -989,6 +1013,10 @@ fn openFiletreeFile(editor: *Editor, ft: *FileTree, idx: u32) void {
     const abs = ft.absPathAlloc(editor.allocator, idx) catch return;
     defer editor.allocator.free(abs);
     _ = editor.openOrFocus(abs) catch |err| {
+        if (err == error.BinaryFile) {
+            editor.status_message = "Cannot open: binary file";
+            return;
+        }
         const msg = std.fmt.bufPrint(&editor.status_buf, "Open failed: {s}", .{@errorName(err)}) catch "Open failed";
         editor.status_message = msg;
     };
@@ -1014,6 +1042,10 @@ fn filetreeContextMenu(editor: *Editor, area: dvui.Rect.Physical) void {
         }
         if (dvui.menuItemLabel(@src(), "Delete             d", .{}, .{ .expand = .horizontal }) != null) {
             editor.startFiletreePrompt(.delete_confirm);
+            fw.close();
+        }
+        if (dvui.menuItemLabel(@src(), "Up One Folder      u", .{}, .{ .expand = .horizontal }) != null) {
+            editor.filetreeRootUp();
             fw.close();
         }
         if (dvui.menuItemLabel(@src(), "Refresh            R", .{}, .{ .expand = .horizontal }) != null) {
@@ -1089,6 +1121,13 @@ fn editorPane(editor: *Editor, pane_id: u8) void {
     const text_area_w_logical = @max(0.0, area.w - gutter_total_width) / scale;
     editor.text_width = if (text_area_w_logical > 0) @intFromFloat(text_area_w_logical) else 80;
     const do_wrap = editor.word_wrap;
+
+    // Take dvui focus back from the file tree panel when keyboard focus
+    // returned to the editor (movement/typing below is is_focused-gated).
+    if (is_active_pane and filetree_release_focus) {
+        filetree_release_focus = false;
+        dvui.focusWidget(wd.id, null, null);
+    }
 
     // --- Handle keyboard events (before rendering) — only for the focused
     // pane, and not while the file tree owns the keyboard. Modal prompts
