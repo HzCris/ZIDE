@@ -381,6 +381,7 @@ pub const Editor = struct {
                 self.filetree_visible = false;
                 return null;
             };
+            self.filetree.?.gitRefresh();
         }
         return &self.filetree.?;
     }
@@ -456,6 +457,7 @@ pub const Editor = struct {
                 };
                 defer self.allocator.free(created);
                 ft.refresh() catch {};
+                ft.gitRefresh();
                 _ = ft.expandToPath(created) catch null;
                 const msg = std.fmt.bufPrint(&self.status_buf, "Created {s}", .{created}) catch "Created";
                 self.status_message = msg;
@@ -472,6 +474,7 @@ pub const Editor = struct {
                 defer self.allocator.free(new_rel);
                 self.fixupDocPathsAfterRename(ft, target, new_rel);
                 ft.refresh() catch {};
+                ft.gitRefresh();
                 _ = ft.expandToPath(new_rel) catch null;
                 const msg = std.fmt.bufPrint(&self.status_buf, "Renamed to {s}", .{new_rel}) catch "Renamed";
                 self.status_message = msg;
@@ -486,6 +489,7 @@ pub const Editor = struct {
                     return;
                 };
                 ft.refresh() catch {};
+                ft.gitRefresh();
                 const msg = std.fmt.bufPrint(&self.status_buf, "Deleted {s}", .{target}) catch "Deleted";
                 self.status_message = msg;
             },
@@ -629,6 +633,7 @@ pub const Editor = struct {
                 return true;
             };
             self.lspDidSave(doc);
+            if (self.filetree) |*ft| ft.gitRefresh();
             const msg = std.fmt.bufPrint(&self.status_buf, "Saved {s}", .{doc.display_name}) catch "Saved";
             self.status_message = msg;
             return true;
@@ -803,6 +808,7 @@ pub const Editor = struct {
             }
         }
         if (saved > 0) {
+            if (self.filetree) |*ft| ft.gitRefresh();
             const msg = std.fmt.bufPrint(&self.status_buf, "Auto-saved {d} file(s)", .{saved}) catch "Auto-saved";
             self.status_message = msg;
         }

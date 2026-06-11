@@ -69,6 +69,12 @@ pub const EditorTheme = struct {
     bool_true: ThemeColor,
     bool_false: ThemeColor,
 
+    // File tree git status row colors
+    git_added: ThemeColor,
+    git_modified: ThemeColor,
+    git_deleted: ThemeColor,
+    git_untracked: ThemeColor,
+
     // Status bar
     status_bg: ThemeColor,
     status_fg: ThemeColor,
@@ -119,6 +125,12 @@ pub const TuiTheme = struct {
     tab_active_bg: TuiColor,
     tab_active_fg: TuiColor,
 
+    // File tree git status row colors
+    git_added: TuiColor,
+    git_modified: TuiColor,
+    git_deleted: TuiColor,
+    git_untracked: TuiColor,
+
     // Status bar
     status_bg: TuiColor,
     status_fg: TuiColor,
@@ -162,6 +174,11 @@ pub const gui_dark = EditorTheme{
     .bool_true = .{ .r = 100, .g = 220, .b = 100 },
     .bool_false = .{ .r = 180, .g = 80, .b = 80 },
 
+    .git_added = .{ .r = 115, .g = 191, .b = 105 },
+    .git_modified = .{ .r = 229, .g = 192, .b = 123 },
+    .git_deleted = .{ .r = 224, .g = 108, .b = 117 },
+    .git_untracked = .{ .r = 105, .g = 200, .b = 175 },
+
     .status_bg = .{ .r = 30, .g = 30, .b = 30 },
     .status_fg = .{ .r = 225, .g = 225, .b = 230 },
 };
@@ -189,6 +206,11 @@ pub const gui_light = EditorTheme{
 
     .bool_true = .{ .r = 40, .g = 160, .b = 40 },
     .bool_false = .{ .r = 200, .g = 60, .b = 60 },
+
+    .git_added = .{ .r = 30, .g = 130, .b = 30 },
+    .git_modified = .{ .r = 154, .g = 103, .b = 0 },
+    .git_deleted = .{ .r = 200, .g = 40, .b = 40 },
+    .git_untracked = .{ .r = 0, .g = 130, .b = 130 },
 
     .status_bg = .{ .r = 230, .g = 230, .b = 230 },
     .status_fg = .{ .r = 30, .g = 30, .b = 30 },
@@ -218,6 +240,11 @@ pub const gui_high_contrast = EditorTheme{
     .bool_true = .{ .r = 0, .g = 255, .b = 0 },
     .bool_false = .{ .r = 255, .g = 0, .b = 0 },
 
+    .git_added = .{ .r = 0, .g = 255, .b = 0 },
+    .git_modified = .{ .r = 255, .g = 255, .b = 0 },
+    .git_deleted = .{ .r = 255, .g = 80, .b = 80 },
+    .git_untracked = .{ .r = 0, .g = 255, .b = 255 },
+
     .status_bg = .{ .r = 0, .g = 0, .b = 40 },
     .status_fg = .{ .r = 255, .g = 255, .b = 255 },
 };
@@ -246,6 +273,11 @@ pub const tui_terminal = TuiTheme{
     .tab_fg = .{ .ansi = 15 }, // white
     .tab_active_bg = .{ .ansi = 4 }, // blue
     .tab_active_fg = .{ .ansi = 15 }, // bright white
+
+    .git_added = .{ .ansi = 2 }, // green
+    .git_modified = .{ .ansi = 3 }, // yellow
+    .git_deleted = .{ .ansi = 1 }, // red
+    .git_untracked = .{ .ansi = 6 }, // cyan
 
     .status_bg = .{ .ansi = 4 }, // blue
     .status_fg = .{ .ansi = 15 }, // bright white
@@ -281,6 +313,11 @@ pub const tui_dark = TuiTheme{
     .tab_active_bg = .{ .ansi = 24 }, // #005f87
     .tab_active_fg = .{ .rgb = .{ .r = 255, .g = 255, .b = 255 } },
 
+    .git_added = .{ .rgb = .{ .r = 115, .g = 191, .b = 105 } },
+    .git_modified = .{ .rgb = .{ .r = 229, .g = 192, .b = 123 } },
+    .git_deleted = .{ .rgb = .{ .r = 224, .g = 108, .b = 117 } },
+    .git_untracked = .{ .rgb = .{ .r = 105, .g = 200, .b = 175 } },
+
     .status_bg = .{ .ansi = 24 }, // #005f87
     .status_fg = .{ .rgb = .{ .r = 255, .g = 255, .b = 255 } },
 
@@ -315,6 +352,11 @@ pub const tui_light = TuiTheme{
     .tab_active_bg = .{ .ansi = 33 }, // #0087ff
     .tab_active_fg = .{ .ansi = 231 }, // #ffffff
 
+    .git_added = .{ .ansi = 28 }, // #008700
+    .git_modified = .{ .ansi = 130 }, // #af5f00
+    .git_deleted = .{ .ansi = 160 }, // #d70000
+    .git_untracked = .{ .ansi = 30 }, // #008787
+
     .status_bg = .{ .ansi = 33 }, // #0087ff
     .status_fg = .{ .ansi = 231 }, // #ffffff
 
@@ -348,6 +390,11 @@ pub const tui_high_contrast = TuiTheme{
     .tab_fg = .{ .rgb = .{ .r = 255, .g = 255, .b = 255 } },
     .tab_active_bg = .{ .ansi = 25 }, // #005faf
     .tab_active_fg = .{ .rgb = .{ .r = 255, .g = 255, .b = 255 } },
+
+    .git_added = .{ .rgb = .{ .r = 0, .g = 255, .b = 0 } },
+    .git_modified = .{ .rgb = .{ .r = 255, .g = 255, .b = 0 } },
+    .git_deleted = .{ .rgb = .{ .r = 255, .g = 80, .b = 80 } },
+    .git_untracked = .{ .rgb = .{ .r = 0, .g = 255, .b = 255 } },
 
     .status_bg = .{ .ansi = 17 }, // #00005f
     .status_fg = .{ .rgb = .{ .r = 255, .g = 255, .b = 255 } },

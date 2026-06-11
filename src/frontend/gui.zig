@@ -807,9 +807,16 @@ fn filetreePanel(editor: *Editor) void {
             .dir => if (node.expanded) "- " else "+ ",
             .file => "  ",
         };
+        // Git status drives the row color (dirs roll up contained changes)
+        const row_color = if (ft.statusFor(idx)) |st| toDvui(switch (st) {
+            .added => editor.theme.git_added,
+            .modified => editor.theme.git_modified,
+            .deleted => editor.theme.git_deleted,
+            .untracked => editor.theme.git_untracked,
+        }) else text_color;
         var name_buf: [300]u8 = undefined;
         const row_txt = std.fmt.bufPrint(&name_buf, "{s}{s}", .{ glyph, node.name }) catch node.name;
-        renderOverlayText(font, row_txt, x, y, rs, text_color);
+        renderOverlayText(font, row_txt, x, y, rs, row_color);
         y += line_height;
     }
 
@@ -948,8 +955,7 @@ fn handleFiletreeKeys(editor: *Editor, ft: *FileTree, wd: *dvui.WidgetData, visi
                     .r => {
                         e.handle(@src(), wd);
                         if (key.mod.shift()) {
-                            ft.refresh() catch {};
-                            editor.status_message = "File tree refreshed";
+                            _ = editor.execCommand("filetree_refresh", null);
                         } else {
                             editor.startFiletreePrompt(.rename);
                         }

@@ -545,6 +545,7 @@ fn cmdFiletreeRefresh(editor: *Editor, _: ?[]const u8) void {
         editor.status_message = msg;
         return;
     };
+    ft.gitRefresh();
     editor.status_message = "File tree refreshed";
 }
 

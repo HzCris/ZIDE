@@ -634,7 +634,15 @@ fn drawFileTree(win: Window, editor: *Editor, w: u16, h: u16) void {
     }) {
         const idx = ft.visible.items[row];
         const node = ft.nodes.items[idx];
-        const style = if (row == ft.selected) sel_style else bg_style;
+        // Git status drives the foreground; selection drives the background
+        const status_fg: ?Color = if (ft.statusFor(idx)) |st| toVaxis(switch (st) {
+            .added => theme.git_added,
+            .modified => theme.git_modified,
+            .deleted => theme.git_deleted,
+            .untracked => theme.git_untracked,
+        }) else null;
+        var style = if (row == ft.selected) sel_style else bg_style;
+        if (status_fg) |fg| style.fg = fg;
         if (row == ft.selected) {
             // Fill the whole row so the selection reads as a bar
             for (0..text_w) |ci| {
@@ -2035,8 +2043,7 @@ fn handleFiletreeKey(editor: *Editor, key: Key) void {
         'd' => editor.startFiletreePrompt(.delete_confirm),
         'r', 'R' => {
             if (key.codepoint == 'R' or key.mods.shift) {
-                ft.refresh() catch {};
-                editor.status_message = "File tree refreshed";
+                _ = editor.execCommand("filetree_refresh", null);
             } else {
                 editor.startFiletreePrompt(.rename);
             }

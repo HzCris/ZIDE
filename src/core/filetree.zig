@@ -17,6 +17,10 @@ const Allocator = std.mem.Allocator;
 /// children render at depth 1 and indentation uses `depth - 1`.
 pub const NodeKind = enum { file, dir };
 
+/// Git working-tree status for tree-row coloring. Order matters: when one
+/// path somehow gets two records, the lower (stronger) value wins.
+pub const GitStatus = enum { untracked, added, deleted, modified };
+
 pub const Node = struct {
     /// Path relative to the tree root, '/'-normalized, owned. "" = root.
     rel_path: []u8,
@@ -51,6 +55,10 @@ pub const FileTree = struct {
     selected: usize = 0,
     /// Set by reveal/create so frontends scroll the selection into view.
     scroll_to_selected: bool = false,
+    /// Git status per rel_path (owned keys). Empty when not a git repo.
+    git_map: std.StringHashMapUnmanaged(GitStatus) = .empty,
+    /// Dirs with any changed descendant (owned keys) — rendered as modified.
+    git_dirty_dirs: std.StringHashMapUnmanaged(void) = .empty,
 
     /// Open `root_path` (relative to cwd or absolute) and build the tree.
     pub fn init(allocator: Allocator, io: std.Io, root_path: []const u8) !FileTree {
@@ -102,6 +110,9 @@ pub const FileTree = struct {
         self.clearNodes();
         self.nodes.deinit(self.allocator);
         self.visible.deinit(self.allocator);
+        self.clearGitMaps();
+        self.git_map.deinit(self.allocator);
+        self.git_dirty_dirs.deinit(self.allocator);
         self.allocator.free(self.root_path);
         if (self.owns_root_dir) self.root_dir.close(self.io);
     }
@@ -412,6 +423,119 @@ pub const FileTree = struct {
         return std.fs.path.join(allocator, &.{ self.root_path, rel });
     }
 
+    // ---- Git status ----
+
+    fn clearGitMaps(self: *FileTree) void {
+        var kit = self.git_map.keyIterator();
+        while (kit.next()) |k| self.allocator.free(k.*);
+        self.git_map.clearRetainingCapacity();
+        var dit = self.git_dirty_dirs.keyIterator();
+        while (dit.next()) |k| self.allocator.free(k.*);
+        self.git_dirty_dirs.clearRetainingCapacity();
+    }
+
+    /// Re-run `git status --porcelain -z` for the tree root and rebuild the
+    /// status maps. Silently leaves them empty when git is missing or the
+    /// root isn't inside a repository. Blocking one-shot — called on load,
+    /// refresh, file ops, and save; never per frame.
+    pub fn gitRefresh(self: *FileTree) void {
+        self.clearGitMaps();
+
+        // Porcelain paths are repo-root-relative; --show-prefix tells us
+        // where our tree root sits inside the repo (with a trailing '/').
+        const prefix_res = std.process.run(self.allocator, self.io, .{
+            .argv = &.{ "git", "-C", self.root_path, "rev-parse", "--show-prefix" },
+            .stdout_limit = .limited(4096),
+            .stderr_limit = .limited(4096),
+        }) catch return;
+        defer self.allocator.free(prefix_res.stdout);
+        defer self.allocator.free(prefix_res.stderr);
+        switch (prefix_res.term) {
+            .exited => |code| if (code != 0) return,
+            else => return,
+        }
+        const prefix = std.mem.trimEnd(u8, prefix_res.stdout, "\r\n");
+
+        // Pathspec '.' limits output to our subtree; -z gives NUL-separated
+        // records with no quoting (spaces in names stay literal).
+        const status_res = std.process.run(self.allocator, self.io, .{
+            .argv = &.{ "git", "-C", self.root_path, "status", "--porcelain", "-z", "--", "." },
+            .stdout_limit = .limited(4 * 1024 * 1024),
+            .stderr_limit = .limited(4096),
+        }) catch return;
+        defer self.allocator.free(status_res.stdout);
+        defer self.allocator.free(status_res.stderr);
+        switch (status_res.term) {
+            .exited => |code| if (code != 0) return,
+            else => return,
+        }
+        self.parseGitPorcelain(prefix, status_res.stdout) catch {};
+    }
+
+    /// Parse `git status --porcelain -z` output into the status maps.
+    /// Records are `XY <path>\0`; rename/copy records carry a second
+    /// NUL-terminated origin path that must be consumed or the parser
+    /// desyncs. `prefix` (repo-relative root, trailing '/') is stripped.
+    pub fn parseGitPorcelain(self: *FileTree, prefix: []const u8, bytes: []const u8) !void {
+        var it = std.mem.splitScalar(u8, bytes, 0);
+        while (it.next()) |rec| {
+            if (rec.len < 4) continue; // "XY p" minimum
+            const x = rec[0];
+            const y = rec[1];
+            if (rec[2] != ' ') continue;
+            var path = rec[3..];
+            if (x == 'R' or x == 'C' or y == 'R' or y == 'C') {
+                _ = it.next(); // origin path of a rename/copy — ignored
+            }
+            if (prefix.len > 0) {
+                if (path.len <= prefix.len or !std.mem.startsWith(u8, path, prefix)) continue;
+                path = path[prefix.len..];
+            }
+            // Untracked directories arrive with a trailing slash
+            path = std.mem.trimEnd(u8, path, "/");
+            if (path.len == 0) continue;
+            try self.putGitStatus(path, statusFromXY(x, y));
+        }
+    }
+
+    fn putGitStatus(self: *FileTree, rel: []const u8, status: GitStatus) !void {
+        if (self.git_map.getPtr(rel)) |existing| {
+            if (@intFromEnum(status) < @intFromEnum(existing.*)) existing.* = status;
+        } else {
+            const key = try self.allocator.dupe(u8, rel);
+            errdefer self.allocator.free(key);
+            try self.git_map.put(self.allocator, key, status);
+        }
+        // Roll the change up into every ancestor directory
+        var p = rel;
+        while (std.mem.lastIndexOfScalar(u8, p, '/')) |sep| {
+            p = p[0..sep];
+            if (self.git_dirty_dirs.contains(p)) break;
+            const dkey = try self.allocator.dupe(u8, p);
+            errdefer self.allocator.free(dkey);
+            try self.git_dirty_dirs.put(self.allocator, dkey, {});
+        }
+    }
+
+    /// Git status for a node's row color: direct entry first, then the
+    /// dirty-ancestor rollup for dirs, then untracked inherited from the
+    /// nearest mapped ancestor (children of an untracked dir aren't listed
+    /// individually by git).
+    pub fn statusFor(self: *const FileTree, idx: u32) ?GitStatus {
+        const node = self.nodes.items[idx];
+        if (node.rel_path.len == 0) return null;
+        if (self.git_map.get(node.rel_path)) |s| return s;
+        if (node.kind == .dir and self.git_dirty_dirs.contains(node.rel_path)) return .modified;
+        var p = node.rel_path;
+        while (std.mem.lastIndexOfScalar(u8, p, '/')) |sep| {
+            p = p[0..sep];
+            if (self.git_map.get(p)) |s| {
+                return if (s == .untracked) .untracked else null;
+            }
+        }
+        return null;
+    }
+
     /// Path of `abs` relative to the tree root ('/'-normalized, owned by
     /// `allocator`), or null if `abs` is outside the root.
     pub fn relFromAbs(self: *const FileTree, allocator: Allocator, abs: []const u8) !?[]u8 {
@@ -426,6 +550,16 @@ pub const FileTree = struct {
         return out;
     }
 };
+
+/// Map porcelain X/Y status codes to a row color category. Untracked and
+/// added win over modified; D in either column means deleted; everything
+/// else (M, T, R, C, conflict combos) renders as modified.
+fn statusFromXY(x: u8, y: u8) GitStatus {
+    if (x == '?' or y == '?') return .untracked;
+    if (x == 'A' or y == 'A') return .added;
+    if (x == 'D' or y == 'D') return .deleted;
+    return .modified;
+}
 
 /// Replace '\' with '/' in place.
 pub fn normalizeSeps(p: []u8) void {
@@ -645,6 +779,74 @@ test "filetree: moveSelection clamps and rowOf finds parent" {
     try t.expectEqual(@as(usize, 1), ft.selected);
     ft.moveSelection(-1);
     try t.expectEqual(@as(usize, 0), ft.selected);
+}
+
+test "filetree: porcelain parser basics + ancestor rollup" {
+    var tmp = t.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var ft = try testTree(&tmp);
+    defer ft.deinit();
+
+    try ft.parseGitPorcelain("", "?? new.txt\x00 M src/main.zig\x00A  staged.zig\x00 D gone.txt\x00");
+    try t.expectEqual(GitStatus.untracked, ft.git_map.get("new.txt").?);
+    try t.expectEqual(GitStatus.modified, ft.git_map.get("src/main.zig").?);
+    try t.expectEqual(GitStatus.added, ft.git_map.get("staged.zig").?);
+    try t.expectEqual(GitStatus.deleted, ft.git_map.get("gone.txt").?);
+    try t.expect(ft.git_dirty_dirs.contains("src"));
+    try t.expect(!ft.git_dirty_dirs.contains("new.txt"));
+}
+
+test "filetree: porcelain rename records don't desync the parser" {
+    var tmp = t.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var ft = try testTree(&tmp);
+    defer ft.deinit();
+
+    // R record carries a second NUL field (the origin path); the entry
+    // after it must still parse.
+    try ft.parseGitPorcelain("", "R  new-name.txt\x00old-name.txt\x00?? after.txt\x00");
+    try t.expectEqual(GitStatus.modified, ft.git_map.get("new-name.txt").?);
+    try t.expectEqual(@as(?GitStatus, null), ft.git_map.get("old-name.txt"));
+    try t.expectEqual(GitStatus.untracked, ft.git_map.get("after.txt").?);
+}
+
+test "filetree: porcelain prefix strip, untracked dirs, spaces" {
+    var tmp = t.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var ft = try testTree(&tmp);
+    defer ft.deinit();
+
+    try ft.parseGitPorcelain("app/", "?? app/inner.txt\x00?? outside.txt\x00?? app/newdir/\x00 M app/has space.txt\x00");
+    try t.expectEqual(GitStatus.untracked, ft.git_map.get("inner.txt").?);
+    try t.expectEqual(@as(?GitStatus, null), ft.git_map.get("outside.txt"));
+    try t.expectEqual(GitStatus.untracked, ft.git_map.get("newdir").?);
+    try t.expectEqual(GitStatus.modified, ft.git_map.get("has space.txt").?);
+}
+
+test "filetree: statusFor rollup and untracked inheritance" {
+    var tmp = t.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(t.io, "src");
+    try touch(t.io, tmp.dir, "src/main.zig");
+    try tmp.dir.createDirPath(t.io, "newdir");
+    try touch(t.io, tmp.dir, "newdir/child.txt");
+    try touch(t.io, tmp.dir, "clean.txt");
+
+    var ft = try testTree(&tmp);
+    defer ft.deinit();
+    try ft.parseGitPorcelain("", " M src/main.zig\x00?? newdir/\x00");
+
+    // Dir containing a change rolls up as modified
+    try t.expectEqual(GitStatus.modified, ft.statusFor(ft.findByPath("src").?).?);
+    // The changed file itself
+    _ = try ft.expandToPath("src/main.zig");
+    try t.expectEqual(GitStatus.modified, ft.statusFor(ft.findByPath("src/main.zig").?).?);
+    // Untracked dir + a child inheriting untracked from its ancestor
+    try t.expectEqual(GitStatus.untracked, ft.statusFor(ft.findByPath("newdir").?).?);
+    _ = try ft.expandToPath("newdir/child.txt");
+    try t.expectEqual(GitStatus.untracked, ft.statusFor(ft.findByPath("newdir/child.txt").?).?);
+    // Clean file has no status
+    try t.expectEqual(@as(?GitStatus, null), ft.statusFor(ft.findByPath("clean.txt").?));
 }
 
 test "filetree: path helpers" {
