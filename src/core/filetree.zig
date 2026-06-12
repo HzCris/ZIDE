@@ -405,6 +405,35 @@ pub const FileTree = struct {
         return new_rel;
     }
 
+    /// Move node `idx` into directory `dest_dir_idx`, keeping its name.
+    /// Rejects non-dir targets, the entry itself, its current parent
+    /// (no-op), and any destination inside the moved entry; refuses to
+    /// clobber (error.PathAlreadyExists, consistent with rename).
+    /// Returns the new rel_path, owned by `allocator`.
+    pub fn moveEntry(self: *FileTree, allocator: Allocator, idx: u32, dest_dir_idx: u32) ![]u8 {
+        if (idx == 0) return error.InvalidMove;
+        const node = self.nodes.items[idx];
+        const dest = self.nodes.items[dest_dir_idx];
+        if (dest.kind != .dir) return error.InvalidMove;
+        if (dest_dir_idx == idx) return error.InvalidMove;
+        if (dest_dir_idx == node.parent) return error.InvalidMove; // already there
+        // Destination inside the moved entry — '/'-boundary check so
+        // "src2" doesn't false-match a "src" prefix.
+        if (node.kind == .dir and dest.rel_path.len > node.rel_path.len and
+            std.mem.startsWith(u8, dest.rel_path, node.rel_path) and
+            dest.rel_path[node.rel_path.len] == '/')
+        {
+            return error.InvalidMove;
+        }
+        const new_rel = if (dest.rel_path.len == 0)
+            try allocator.dupe(u8, node.name)
+        else
+            try std.mem.concat(allocator, u8, &.{ dest.rel_path, "/", node.name });
+        errdefer allocator.free(new_rel);
+        try std.Io.Dir.renamePreserve(self.root_dir, node.rel_path, self.root_dir, new_rel, self.io);
+        return new_rel;
+    }
+
     /// Delete node `idx` from disk (directories recursively).
     pub fn deleteEntry(self: *FileTree, idx: u32) !void {
         if (idx == 0) return error.InvalidName;
@@ -762,6 +791,56 @@ test "filetree: deleteEntry file and recursive dir" {
     try ft.refresh();
     try t.expectEqual(@as(usize, 0), ft.visible.items.len);
     try t.expectEqual(@as(?u32, null), ft.selectedNodeIdx());
+}
+
+test "filetree: moveEntry file and dir into subdir" {
+    var tmp = t.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    try touch(t.io, tmp.dir, "a.txt");
+    try tmp.dir.createDirPath(t.io, "sub");
+    try tmp.dir.createDirPath(t.io, "other");
+
+    var ft = try testTree(&tmp);
+    defer ft.deinit();
+
+    const moved = try ft.moveEntry(t.allocator, ft.findByPath("a.txt").?, ft.findByPath("sub").?);
+    defer t.allocator.free(moved);
+    try t.expectEqualStrings("sub/a.txt", moved);
+    try tmp.dir.access(t.io, "sub/a.txt", .{});
+    try t.expectError(error.FileNotFound, tmp.dir.access(t.io, "a.txt", .{}));
+
+    const moved_dir = try ft.moveEntry(t.allocator, ft.findByPath("other").?, ft.findByPath("sub").?);
+    defer t.allocator.free(moved_dir);
+    try t.expectEqualStrings("sub/other", moved_dir);
+    try tmp.dir.access(t.io, "sub/other", .{});
+}
+
+test "filetree: moveEntry rejects bad targets and collisions" {
+    var tmp = t.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(t.io, "parent/child");
+    try touch(t.io, tmp.dir, "f.txt");
+    try touch(t.io, tmp.dir, "parent/f.txt");
+
+    var ft = try testTree(&tmp);
+    defer ft.deinit();
+    _ = try ft.expandToPath("parent/child");
+
+    const parent_idx = ft.findByPath("parent").?;
+    const child_idx = ft.findByPath("parent/child").?;
+    const f_idx = ft.findByPath("f.txt").?;
+
+    // Dir into its own subtree
+    try t.expectError(error.InvalidMove, ft.moveEntry(t.allocator, parent_idx, child_idx));
+    // Into itself
+    try t.expectError(error.InvalidMove, ft.moveEntry(t.allocator, parent_idx, parent_idx));
+    // Into its current parent (root) — no-op rejected
+    try t.expectError(error.InvalidMove, ft.moveEntry(t.allocator, f_idx, 0));
+    // Onto a file
+    try t.expectError(error.InvalidMove, ft.moveEntry(t.allocator, f_idx, ft.findByPath("parent/f.txt").?));
+    // Name collision in the destination — not clobbered
+    try t.expectError(error.PathAlreadyExists, ft.moveEntry(t.allocator, f_idx, parent_idx));
+    try tmp.dir.access(t.io, "f.txt", .{});
 }
 
 test "filetree: moveSelection clamps and rowOf finds parent" {

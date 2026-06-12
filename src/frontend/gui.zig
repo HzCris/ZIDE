@@ -782,6 +782,15 @@ var filetree_resizing: bool = false;
 const filetree_double_click_ms: i128 = 400;
 var filetree_last_click_ns: i128 = 0;
 var filetree_last_click_row: usize = std.math.maxInt(usize);
+/// Drag & drop move state: a press on a row name arms it, motion past
+/// ~5px engages, release over a folder (or the header/empty space =
+/// root) moves the entry there.
+const FiletreeDndTarget = union(enum) { none, root, row: usize };
+var filetree_dnd_armed: bool = false;
+var filetree_dnd_active: bool = false;
+var filetree_dnd_press: dvui.Point.Physical = .{};
+var filetree_dnd_src_row: usize = 0;
+var filetree_dnd_target: FiletreeDndTarget = .none;
 
 /// File tree side panel — custom row rendering in the editorPane style
 /// (no per-row widgets; we own scrolling, selection, and input). Renders
@@ -841,6 +850,12 @@ fn filetreePanel(editor: *Editor) void {
     const header_fg = toDvui(editor.theme.overlay_fg);
     const dim = toDvui(editor.theme.overlay_dim);
     fillBar(area, 0, header_h, toDvui(editor.theme.gutter_bg));
+    if (filetree_dnd_active) {
+        switch (filetree_dnd_target) {
+            .root => fillBar(area, 0, header_h, toDvui(editor.theme.overlay_selection)),
+            else => {},
+        }
+    }
     const root_name = std.fs.path.basename(ft.root_path);
     const header_txt = if (root_name.len > 0) root_name else ft.root_path;
     renderOverlayText(font, header_txt, area.x + 6 * scale, area.y + 2 * scale, rs, if (editor.filetree_focused) header_fg else dim);
@@ -857,6 +872,12 @@ fn filetreePanel(editor: *Editor) void {
         const node = ft.nodes.items[idx];
         if (row == ft.selected) {
             fillBar(area, y - area.y, line_height, sel_bg);
+        }
+        if (filetree_dnd_active) {
+            switch (filetree_dnd_target) {
+                .row => |tr| if (tr == row) fillBar(area, y - area.y, line_height, toDvui(editor.theme.overlay_selection)),
+                else => {},
+            }
         }
         const depth_f: f32 = @floatFromInt(node.depth -| 1);
         const x = area.x + 6 * scale + depth_f * indent_w;
@@ -957,6 +978,16 @@ fn filetreeEnsureSelectedVisible(ft: *FileTree, visible_rows: usize) void {
     }
 }
 
+/// Resolve the drop target under the cursor while drag-moving: a row,
+/// the root (header or empty space below the rows), or none outside.
+fn filetreeDropTarget(ft: *const FileTree, area: dvui.Rect.Physical, rows_y: f32, line_height: f32, p: dvui.Point.Physical) FiletreeDndTarget {
+    if (p.x < area.x or p.x > area.x + area.w or
+        p.y < area.y or p.y > area.y + area.h) return .none;
+    if (p.y < rows_y) return .root; // header
+    if (filetreeRowAt(ft, rows_y, line_height, p.y)) |r| return .{ .row = r };
+    return .root; // empty space below the rows
+}
+
 /// Visible row index under a physical y position, or null.
 fn filetreeRowAt(ft: *const FileTree, rows_y: f32, line_height: f32, my: f32) ?usize {
     if (my < rows_y or line_height <= 0) return null;
@@ -971,6 +1002,64 @@ fn handleFiletreeMouse(editor: *Editor, ft: *FileTree, wd: *dvui.WidgetData, are
         if (e.handled) continue;
         if (e.evt != .mouse) continue;
         const me = e.evt.mouse;
+
+        // In-flight drag-move: track motion/release even outside the panel
+        if (filetree_dnd_armed or filetree_dnd_active) {
+            if (me.action == .motion) {
+                if (!filetree_dnd_active) {
+                    const dx = me.p.x - filetree_dnd_press.x;
+                    const dy = me.p.y - filetree_dnd_press.y;
+                    if (dx * dx + dy * dy > 25) { // ~5px threshold
+                        filetree_dnd_active = true;
+                        filetree_last_click_ns = 0; // a drag is not a click
+                    }
+                }
+                if (filetree_dnd_active) {
+                    e.handle(@src(), wd);
+                    filetree_dnd_target = filetreeDropTarget(ft, area, rows_y, line_height, me.p);
+                    dvui.cursorSet(.arrow_all);
+                    if (filetree_dnd_src_row < ft.visible.items.len) {
+                        const src_name = ft.nodes.items[ft.visible.items[filetree_dnd_src_row]].name;
+                        const tgt_name: []const u8 = switch (filetree_dnd_target) {
+                            .none => "(no target)",
+                            .root => std.fs.path.basename(ft.root_path),
+                            .row => |tr| ft.nodes.items[ft.visible.items[tr]].name,
+                        };
+                        const msg = std.fmt.bufPrint(&editor.status_buf, "Move {s} -> {s}", .{ src_name, tgt_name }) catch "";
+                        editor.status_message = msg;
+                    }
+                }
+                continue;
+            }
+            if (me.action == .release) {
+                defer {
+                    filetree_dnd_armed = false;
+                    filetree_dnd_active = false;
+                    filetree_dnd_target = .none;
+                }
+                if (filetree_dnd_active) {
+                    e.handle(@src(), wd);
+                    editor.status_message = "";
+                    if (filetree_dnd_src_row < ft.visible.items.len) {
+                        const src_idx = ft.visible.items[filetree_dnd_src_row];
+                        const dest_idx: ?u32 = switch (filetree_dnd_target) {
+                            .none => null,
+                            .root => 0,
+                            .row => |tr| blk: {
+                                if (tr >= ft.visible.items.len) break :blk null;
+                                const tnode = ft.visible.items[tr];
+                                break :blk if (ft.nodes.items[tnode].kind == .dir) tnode else ft.nodes.items[tnode].parent;
+                            },
+                        };
+                        if (dest_idx) |di| {
+                            editor.filetreeMoveTo(ft.nodes.items[src_idx].rel_path, di);
+                        }
+                    }
+                }
+                continue;
+            }
+        }
+
         if (me.p.x < area.x or me.p.x > area.x + area.w or
             me.p.y < area.y or me.p.y > area.y + area.h) continue;
 
@@ -1019,6 +1108,14 @@ fn handleFiletreeMouse(editor: *Editor, ft: *FileTree, wd: *dvui.WidgetData, are
                         filetree_last_click_ns = now_ns;
                         filetree_last_click_row = r;
                     }
+                    // Arm drag & drop from any name press (the glyph press
+                    // already mutated the tree, so its row may be stale)
+                    if (!in_glyph) {
+                        filetree_dnd_armed = true;
+                        filetree_dnd_active = false;
+                        filetree_dnd_press = me.p;
+                        filetree_dnd_src_row = r;
+                    }
                 }
             },
             .wheel_y => |delta| {
@@ -1046,7 +1143,8 @@ fn handleFiletreeKeys(editor: *Editor, ft: *FileTree, wd: *dvui.WidgetData, visi
         switch (e.evt) {
             .key => |key| {
                 if (key.action != .down and key.action != .repeat) continue;
-                editor.status_message = "";
+                // Keep the "press p" hint visible while a move is pending
+                if (editor.filetree_move_src == null) editor.status_message = "";
                 if (key.mod.control() or key.mod.alt()) continue;
                 switch (key.code) {
                     .up, .k => {
@@ -1113,14 +1211,29 @@ fn handleFiletreeKeys(editor: *Editor, ft: *FileTree, wd: *dvui.WidgetData, visi
                         e.handle(@src(), wd);
                         editor.startFiletreePrompt(.delete_confirm);
                     },
+                    .x => {
+                        e.handle(@src(), wd);
+                        editor.startFiletreeMove();
+                    },
+                    .p => {
+                        e.handle(@src(), wd);
+                        editor.applyFiletreeMove();
+                    },
                     .backspace, .u => {
                         e.handle(@src(), wd);
                         editor.filetreeRootUp();
                     },
                     .escape => {
                         e.handle(@src(), wd);
-                        editor.filetree_focused = false;
-                        filetree_release_focus = true;
+                        // A pending move mark cancels first; second Esc
+                        // leaves the tree
+                        if (editor.filetree_move_src != null) {
+                            editor.cancelFiletreeMove();
+                            editor.status_message = "Move cancelled";
+                        } else {
+                            editor.filetree_focused = false;
+                            filetree_release_focus = true;
+                        }
                     },
                     else => {},
                 }

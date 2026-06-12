@@ -631,7 +631,8 @@ A toggleable side panel for browsing and managing the project directory, backed 
 | Shift+R | Refresh from disk (expansion and selection preserved) |
 | d | Delete (y/n confirm; directories delete recursively) |
 | Backspace or u | Re-root the tree at the parent directory |
-| Escape | Return focus to the editor |
+| x then p | Move: x marks the selected entry, p drops it into the selected folder (or a selected file's folder); no-clobber, open tabs follow |
+| Escape | Cancel a pending x move first; otherwise return focus to the editor |
 
 Ctrl/Alt chords (Ctrl+P, Ctrl+B, ...) still work while the tree is focused.
 
@@ -639,6 +640,7 @@ Ctrl/Alt chords (Ctrl+P, Ctrl+B, ...) still work while the tree is focused.
 - Single click: selects the row only — except on a folder's `+`/`-` glyph, which toggles immediately
 - Double click (400ms, same row): expands/collapses a folder or opens a file — a stray single click never opens or collapses anything
 - Wheel over the panel: scrolls the tree independently of the editor
+- Drag & drop (GUI): drag a row ~5px to start a move — the drop target highlights (a folder, a file's folder, or the header/empty space = root) with a live "Move X -> Y" status; release performs it. Dropping into the same place or into the moved folder itself is rejected. No drag ghost or edge auto-scroll yet
 - Drag the panel's editor-facing edge (GUI, ⇄ cursor): resize the panel — the width persists to init.lua on release; a separator line marks the edge
 - Right-click (GUI): context menu (New / Rename / Delete / Up One Folder / Move Tree to Left-Right / Refresh / Reveal Current File); the side choice persists to init.lua
 

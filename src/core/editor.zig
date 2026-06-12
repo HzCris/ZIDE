@@ -180,6 +180,9 @@ pub const Editor = struct {
     filetree_prompt_kind: FiletreePromptKind = .create,
     /// Rel-path of the prompt's target node (owned; survives refreshes).
     filetree_prompt_target: ?[]u8 = null,
+    /// Rel-path marked for a move via 'x' (owned); 'p' pastes it into the
+    /// selected folder.
+    filetree_move_src: ?[]u8 = null,
 
     pub const EditorCompletionItem = struct {
         label: []const u8,
@@ -284,6 +287,7 @@ pub const Editor = struct {
         if (self.filetree) |*ft| ft.deinit();
         if (self.filetree_root) |r| self.allocator.free(r);
         if (self.filetree_prompt_target) |tgt| self.allocator.free(tgt);
+        if (self.filetree_move_src) |src| self.allocator.free(src);
     }
 
     /// Get the currently active document (from the focused pane).
@@ -404,6 +408,73 @@ pub const Editor = struct {
             self.filetree_visible = false;
             self.filetree_focused = false;
         }
+    }
+
+    /// Mark the selected entry for a move (tree 'x'). 'p' pastes it into
+    /// the selected folder; Escape cancels.
+    pub fn startFiletreeMove(self: *Editor) void {
+        const ft = self.ensureFiletree() orelse return;
+        const sel = ft.selectedNodeIdx() orelse {
+            self.status_message = "File tree: nothing selected";
+            return;
+        };
+        if (sel == 0) return;
+        const src = self.allocator.dupe(u8, ft.nodes.items[sel].rel_path) catch return;
+        if (self.filetree_move_src) |old| self.allocator.free(old);
+        self.filetree_move_src = src;
+        const msg = std.fmt.bufPrint(&self.status_buf, "Move: {s} — select the target folder, press p", .{ft.nodes.items[sel].name}) catch "Move: press p on the target folder";
+        self.status_message = msg;
+    }
+
+    /// Drop a pending 'x' move mark.
+    pub fn cancelFiletreeMove(self: *Editor) void {
+        if (self.filetree_move_src) |old| self.allocator.free(old);
+        self.filetree_move_src = null;
+    }
+
+    /// Apply a pending 'x' move (tree 'p'): target = the selected folder,
+    /// or the parent of a selected file.
+    pub fn applyFiletreeMove(self: *Editor) void {
+        const ft = self.ensureFiletree() orelse return;
+        const src = self.filetree_move_src orelse {
+            self.status_message = "File tree: nothing marked — press x on an entry first";
+            return;
+        };
+        const sel = ft.selectedNodeIdx() orelse 0;
+        const dest_idx = if (ft.nodes.items[sel].kind == .dir) sel else ft.nodes.items[sel].parent;
+        self.filetreeMoveTo(src, dest_idx);
+    }
+
+    /// Move `src_rel` into the directory node `dest_idx` — shared by the
+    /// x/p keys (both frontends) and GUI drag & drop. `src_rel` may alias
+    /// `filetree_move_src` or a node's rel_path: it is only read before
+    /// the tree refresh, and the mark is freed last.
+    pub fn filetreeMoveTo(self: *Editor, src_rel: []const u8, dest_idx: u32) void {
+        const ft = self.ensureFiletree() orelse return;
+        const src_idx = ft.findByPath(src_rel) orelse {
+            self.status_message = "Move failed: entry no longer exists";
+            self.cancelFiletreeMove();
+            return;
+        };
+        const new_rel = ft.moveEntry(self.allocator, src_idx, dest_idx) catch |err| {
+            self.status_message = switch (err) {
+                error.InvalidMove => "Move: invalid target (same place, or inside the moved entry)",
+                error.PathAlreadyExists => "Move failed: that name already exists in the target",
+                else => blk: {
+                    const msg = std.fmt.bufPrint(&self.status_buf, "Move failed: {s}", .{@errorName(err)}) catch "Move failed";
+                    break :blk msg;
+                },
+            };
+            return; // keep the mark — the user can pick another target
+        };
+        defer self.allocator.free(new_rel);
+        self.fixupDocPathsAfterRename(ft, src_rel, new_rel);
+        ft.refresh() catch {};
+        ft.gitRefresh();
+        _ = ft.expandToPath(new_rel) catch null;
+        const msg = std.fmt.bufPrint(&self.status_buf, "Moved to {s}", .{new_rel}) catch "Moved";
+        self.status_message = msg;
+        self.cancelFiletreeMove();
     }
 
     /// Call after any successful save so the file tree stays current:

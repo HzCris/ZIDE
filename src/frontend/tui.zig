@@ -2046,14 +2046,23 @@ fn tryKeybindCommand(editor: *Editor, key: Key) bool {
 /// mode). Global ctrl/alt chords still hit the keybind map first.
 fn handleFiletreeKey(editor: *Editor, key: Key) void {
     if (key.isModifier()) return;
-    editor.status_message = "";
+    // Keep the "press p" hint visible while a move is pending
+    if (editor.filetree_move_src == null) editor.status_message = "";
     if (tryKeybindCommand(editor, key)) return;
     const ft = editor.ensureFiletree() orelse {
         editor.filetree_focused = false;
         return;
     };
     switch (key.codepoint) {
-        Key.escape => editor.filetree_focused = false,
+        Key.escape => {
+            // A pending move mark cancels first; second Esc leaves the tree
+            if (editor.filetree_move_src != null) {
+                editor.cancelFiletreeMove();
+                editor.status_message = "Move cancelled";
+            } else {
+                editor.filetree_focused = false;
+            }
+        },
         Key.up, 'k' => {
             ft.moveSelection(-1);
             ft.scroll_to_selected = true;
@@ -2097,6 +2106,8 @@ fn handleFiletreeKey(editor: *Editor, key: Key) void {
         },
         'a' => editor.startFiletreePrompt(.create),
         'd' => editor.startFiletreePrompt(.delete_confirm),
+        'x' => editor.startFiletreeMove(),
+        'p' => editor.applyFiletreeMove(),
         Key.backspace, 'u' => editor.filetreeRootUp(),
         'r', 'R' => {
             if (key.codepoint == 'R' or key.mods.shift) {
