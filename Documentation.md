@@ -399,6 +399,32 @@ end)
 | `zide.exec(name)` → bool | Run any action or command by name — the same names keybinds use (`"save"`, `"undo"`, `"toggle_filetree"`, other Lua commands, …). Returns whether the name was recognized. |
 | `zide.status(msg)` | Show a transient message in the status bar (both frontends). |
 
+**Buffer API** — all calls act on the active document; lines and columns are
+**1-based**. Mutations go through the editor's normal document operations, so
+undo (Ctrl+Z) and LSP sync behave exactly as if typed.
+
+| Call | Description |
+|------|-------------|
+| `zide.line_count()` → int | Number of lines. |
+| `zide.get_line(n)` → string\|nil | Line `n` without its newline; nil out of range. |
+| `zide.get_text()` → string | The whole buffer. |
+| `zide.cursor()` → line, col | Primary cursor position (two return values). |
+| `zide.set_cursor(line, col)` | Move the primary cursor (clamped to valid positions); drops secondary cursors and selection. |
+| `zide.file_path()` → string\|nil | The document's path on disk (nil = untitled). |
+| `zide.language()` → string\|nil | Detected language name (e.g. `"Zig"`). |
+| `zide.selection()` → string\|nil | Selected text of the primary cursor. |
+| `zide.insert(text)` | Insert at the primary cursor; an active selection is replaced (one undo step) — this doubles as "replace selection". |
+| `zide.set_line(n, text)` | Replace line `n`'s content (one undo step); out-of-range is ignored. |
+
+```lua
+-- Example: a "duplicate line upper-cased" command
+zide.command("dup_line_upper", "Duplicate line in caps", function()
+    local line = zide.cursor()
+    local text = zide.get_line(line)
+    if text then zide.set_line(line, text .. "\n" .. text:upper()) end
+end)
+```
+
 The `reload_extensions` command (palette) drops all Lua-registered commands
 and event handlers and re-runs every `extensions/*.lua` — edit-extension,
 reload, retry without restarting ZIDE. (Lua globals your scripts set persist

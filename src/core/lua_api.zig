@@ -38,6 +38,28 @@ pub fn registerInto(lua: *Lua, editor: *Editor) void {
     lua.setField(-2, "exec");
     lua.pushFunction(&luaStatus);
     lua.setField(-2, "status");
+
+    // Buffer API (active document)
+    lua.pushFunction(&luaLineCount);
+    lua.setField(-2, "line_count");
+    lua.pushFunction(&luaGetLine);
+    lua.setField(-2, "get_line");
+    lua.pushFunction(&luaGetText);
+    lua.setField(-2, "get_text");
+    lua.pushFunction(&luaCursor);
+    lua.setField(-2, "cursor");
+    lua.pushFunction(&luaSetCursor);
+    lua.setField(-2, "set_cursor");
+    lua.pushFunction(&luaFilePath);
+    lua.setField(-2, "file_path");
+    lua.pushFunction(&luaLanguage);
+    lua.setField(-2, "language");
+    lua.pushFunction(&luaSelection);
+    lua.setField(-2, "selection");
+    lua.pushFunction(&luaInsert);
+    lua.setField(-2, "insert");
+    lua.pushFunction(&luaSetLine);
+    lua.setField(-2, "set_line");
 }
 
 // ---------------------------------------------------------------------------
@@ -236,6 +258,170 @@ fn luaStatus(state: ?*zlua.LuaState) callconv(.c) c_int {
 }
 
 // ---------------------------------------------------------------------------
+// Buffer API — all calls act on the active document. Lines and columns
+// are 1-based on the Lua side. Mutations go through Document ops only,
+// so undo history and LSP sync stay correct.
+// ---------------------------------------------------------------------------
+
+/// zide.line_count() -> integer
+fn luaLineCount(state: ?*zlua.LuaState) callconv(.c) c_int {
+    var lua: *Lua = @ptrCast(@alignCast(state orelse return 0));
+    const editor = lua_settings.getEditor(state) orelse return 0;
+    lua.pushInteger(@intCast(editor.activeDoc().lineCount()));
+    return 1;
+}
+
+/// zide.get_line(n) -> string | nil — line content without the newline.
+fn luaGetLine(state: ?*zlua.LuaState) callconv(.c) c_int {
+    var lua: *Lua = @ptrCast(@alignCast(state orelse return 0));
+    const editor = lua_settings.getEditor(state) orelse return 0;
+    const doc = editor.activeDoc();
+    const n = lua.toInteger(1) catch {
+        lua.pushNil();
+        return 1;
+    };
+    if (n < 1 or @as(usize, @intCast(n)) > doc.lineCount()) {
+        lua.pushNil();
+        return 1;
+    }
+    _ = lua.pushString(doc.lineContent(@intCast(n - 1)));
+    return 1;
+}
+
+/// zide.get_text() -> string — the whole buffer.
+fn luaGetText(state: ?*zlua.LuaState) callconv(.c) c_int {
+    var lua: *Lua = @ptrCast(@alignCast(state orelse return 0));
+    const editor = lua_settings.getEditor(state) orelse return 0;
+    const doc = editor.activeDoc();
+    // slice() may return the buffer's shared scratch; pushString copies
+    // into the Lua heap immediately, so that's fine.
+    _ = lua.pushString(doc.buffer.slice(0, doc.buffer.byteLen()));
+    return 1;
+}
+
+/// zide.cursor() -> line, col (primary cursor, both 1-based).
+fn luaCursor(state: ?*zlua.LuaState) callconv(.c) c_int {
+    var lua: *Lua = @ptrCast(@alignCast(state orelse return 0));
+    const editor = lua_settings.getEditor(state) orelse return 0;
+    const pos = editor.activeDoc().cursorPos();
+    lua.pushInteger(@intCast(pos.line + 1));
+    lua.pushInteger(@intCast(pos.col + 1));
+    return 2;
+}
+
+/// zide.set_cursor(line, col) — move the primary cursor (clamped); drops
+/// secondary cursors and any selection.
+fn luaSetCursor(state: ?*zlua.LuaState) callconv(.c) c_int {
+    var lua: *Lua = @ptrCast(@alignCast(state orelse return 0));
+    const editor = lua_settings.getEditor(state) orelse return 0;
+    const doc = editor.activeDoc();
+    const line_arg = lua.toInteger(1) catch return 0;
+    const col_arg = lua.toInteger(2) catch 1;
+
+    const line: usize = @intCast(std.math.clamp(line_arg, 1, @as(i64, @intCast(doc.lineCount()))) - 1);
+    const line_len = doc.lineContent(line).len;
+    const col: usize = @intCast(std.math.clamp(col_arg - 1, 0, @as(i64, @intCast(line_len))));
+
+    doc.cursors.clearSecondary();
+    const c = doc.cursors.primary();
+    c.clearSelection();
+    c.offset = doc.buffer.posToOffset(line, col);
+    c.preferred_col = col;
+    return 0;
+}
+
+/// zide.file_path() -> string | nil
+fn luaFilePath(state: ?*zlua.LuaState) callconv(.c) c_int {
+    var lua: *Lua = @ptrCast(@alignCast(state orelse return 0));
+    const editor = lua_settings.getEditor(state) orelse return 0;
+    if (editor.activeDoc().file_path) |p| {
+        _ = lua.pushString(p);
+    } else {
+        lua.pushNil();
+    }
+    return 1;
+}
+
+/// zide.language() -> string | nil — detected language name.
+fn luaLanguage(state: ?*zlua.LuaState) callconv(.c) c_int {
+    var lua: *Lua = @ptrCast(@alignCast(state orelse return 0));
+    const editor = lua_settings.getEditor(state) orelse return 0;
+    if (editor.activeDoc().language) |lang| {
+        _ = lua.pushString(lang.name);
+    } else {
+        lua.pushNil();
+    }
+    return 1;
+}
+
+/// zide.selection() -> string | nil — primary cursor's selected text.
+fn luaSelection(state: ?*zlua.LuaState) callconv(.c) c_int {
+    var lua: *Lua = @ptrCast(@alignCast(state orelse return 0));
+    const editor = lua_settings.getEditor(state) orelse return 0;
+    if (editor.activeDoc().selectedText()) |text| {
+        _ = lua.pushString(text);
+    } else {
+        lua.pushNil();
+    }
+    return 1;
+}
+
+/// zide.insert(text) — insert at the primary cursor; an active selection
+/// is replaced (single undo step). This is also the "replace selection".
+fn luaInsert(state: ?*zlua.LuaState) callconv(.c) c_int {
+    var lua: *Lua = @ptrCast(@alignCast(state orelse return 0));
+    const editor = lua_settings.getEditor(state) orelse return 0;
+    const text_z = lua.toString(1) catch {
+        std.log.warn("zide.insert: text (string) required", .{});
+        return 0;
+    };
+    editor.activeDoc().insertAtCursor(text_z) catch |err| {
+        std.log.warn("zide.insert failed: {s}", .{@errorName(err)});
+    };
+    return 0;
+}
+
+/// zide.set_line(n, text) — replace line n's content (one undo step).
+/// Out-of-range lines are ignored.
+fn luaSetLine(state: ?*zlua.LuaState) callconv(.c) c_int {
+    var lua: *Lua = @ptrCast(@alignCast(state orelse return 0));
+    const editor = lua_settings.getEditor(state) orelse return 0;
+    const doc = editor.activeDoc();
+    const n = lua.toInteger(1) catch return 0;
+    const text_z = lua.toString(2) catch {
+        std.log.warn("zide.set_line: text (string) required", .{});
+        return 0;
+    };
+    if (n < 1 or @as(usize, @intCast(n)) > doc.lineCount()) {
+        std.log.warn("zide.set_line: line {d} out of range", .{n});
+        return 0;
+    }
+    const line: usize = @intCast(n - 1);
+    const start = doc.buffer.posToOffset(line, 0);
+    const old_len = doc.lineContent(line).len;
+
+    doc.cursors.clearSecondary();
+    const c = doc.cursors.primary();
+    doc.history.beginGroup();
+    defer doc.history.endGroup();
+    if (old_len > 0) {
+        c.anchor = start;
+        c.offset = start + old_len;
+        doc.deleteSelection() catch |err| {
+            std.log.warn("zide.set_line failed: {s}", .{@errorName(err)});
+            return 0;
+        };
+    } else {
+        c.clearSelection();
+        c.offset = start;
+    }
+    doc.insertAtCursor(text_z) catch |err| {
+        std.log.warn("zide.set_line failed: {s}", .{@errorName(err)});
+    };
+    return 0;
+}
+
+// ---------------------------------------------------------------------------
 // Tests — drive the real API through a real Lua state.
 // NOTE: declare the Lua state BEFORE the editor in every test so the
 // LIFO defers run editor.deinit (which unrefs) while the state is alive.
@@ -280,6 +466,9 @@ test "zide.command re-registration replaces the previous callback" {
 }
 
 test "Lua command may shadow a built-in" {
+    // The override warn is expected — keep it out of the runner's stderr.
+    testing.log_level = .err;
+    defer testing.log_level = .warn;
     var lua = try Lua.init(testing.allocator);
     defer lua.deinit();
     lua.openLibs();
@@ -293,6 +482,9 @@ test "Lua command may shadow a built-in" {
 }
 
 test "broken Lua command reports an error instead of crashing" {
+    // The reported Lua error warn is expected — keep stderr clean.
+    testing.log_level = .err;
+    defer testing.log_level = .warn;
     var lua = try Lua.init(testing.allocator);
     defer lua.deinit();
     lua.openLibs();
@@ -349,6 +541,9 @@ test "zide.on('open') fires when a file opens" {
 }
 
 test "zide.on rejects unknown event names" {
+    // The unknown-event warn is expected — keep stderr clean.
+    testing.log_level = .err;
+    defer testing.log_level = .warn;
     var lua = try Lua.init(testing.allocator);
     defer lua.deinit();
     lua.openLibs();
@@ -372,6 +567,105 @@ test "zide.exec runs built-in commands from Lua" {
     try editor.activeDoc().loadText("ab");
     try lua.doString("zide.exec('cursor_right')");
     try testing.expectEqual(@as(usize, 1), editor.activeDoc().cursors.primary().offset);
+}
+
+test "buffer API: reads, cursor round-trip, clamping" {
+    var lua = try Lua.init(testing.allocator);
+    defer lua.deinit();
+    lua.openLibs();
+    var editor = try Editor.init(testing.allocator, testing.io);
+    defer editor.deinit();
+    lua_settings.registerApi(lua, &editor);
+
+    try editor.activeDoc().loadText("alpha\nbeta");
+    try lua.doString(
+        \\assert(zide.line_count() == 2)
+        \\assert(zide.get_line(1) == 'alpha')
+        \\assert(zide.get_line(2) == 'beta')
+        \\assert(zide.get_line(3) == nil)
+        \\assert(zide.get_text() == 'alpha\nbeta')
+        \\assert(zide.file_path() == nil)
+        \\zide.set_cursor(2, 3)
+        \\local l, c = zide.cursor()
+        \\assert(l == 2 and c == 3)
+        \\zide.set_cursor(99, 99) -- clamps to end of last line
+        \\l, c = zide.cursor()
+        \\assert(l == 2 and c == 5)
+    );
+}
+
+test "buffer API: insert replaces an active selection in one undo step" {
+    var lua = try Lua.init(testing.allocator);
+    defer lua.deinit();
+    lua.openLibs();
+    var editor = try Editor.init(testing.allocator, testing.io);
+    defer editor.deinit();
+    lua_settings.registerApi(lua, &editor);
+
+    const doc = editor.activeDoc();
+    try doc.loadText("hello world");
+    // Select "hello" from the Zig side
+    const c = doc.cursors.primary();
+    c.anchor = 0;
+    c.offset = 5;
+    try lua.doString(
+        \\assert(zide.selection() == 'hello')
+        \\zide.insert('goodbye')
+    );
+    try testing.expectEqualStrings("goodbye world", doc.buffer.slice(0, doc.buffer.byteLen()));
+    _ = try doc.undoAction();
+    try testing.expectEqualStrings("hello world", doc.buffer.slice(0, doc.buffer.byteLen()));
+    try lua.doString("assert(zide.selection() == nil)");
+}
+
+test "buffer API: set_line swap via a Lua command, undo restores" {
+    // The out-of-range warn at the end is expected — keep stderr clean.
+    testing.log_level = .err;
+    defer testing.log_level = .warn;
+    var lua = try Lua.init(testing.allocator);
+    defer lua.deinit();
+    lua.openLibs();
+    var editor = try Editor.init(testing.allocator, testing.io);
+    defer editor.deinit();
+    lua_settings.registerApi(lua, &editor);
+
+    const doc = editor.activeDoc();
+    try doc.loadText("bb\na\n");
+    try lua.doString(
+        \\zide.command('swap12', 'Swap first two lines', function()
+        \\  local l1, l2 = zide.get_line(1), zide.get_line(2)
+        \\  zide.set_line(1, l2)
+        \\  zide.set_line(2, l1)
+        \\end)
+    );
+    try testing.expect(editor.execCommand("swap12", null));
+    try testing.expectEqualStrings("a\nbb\n", doc.buffer.slice(0, doc.buffer.byteLen()));
+    // Two set_line calls = two undo groups
+    _ = try doc.undoAction();
+    _ = try doc.undoAction();
+    try testing.expectEqualStrings("bb\na\n", doc.buffer.slice(0, doc.buffer.byteLen()));
+    // Out-of-range set_line is a no-op
+    try lua.doString("zide.set_line(99, 'nope')");
+    try testing.expectEqualStrings("bb\na\n", doc.buffer.slice(0, doc.buffer.byteLen()));
+}
+
+test "buffer API: set_line on an empty line and language()" {
+    var lua = try Lua.init(testing.allocator);
+    defer lua.deinit();
+    lua.openLibs();
+    var editor = try Editor.init(testing.allocator, testing.io);
+    defer editor.deinit();
+    lua_settings.registerApi(lua, &editor);
+
+    const doc = editor.activeDoc();
+    try doc.loadText("a\n\nc");
+    try lua.doString("zide.set_line(2, 'b')");
+    try testing.expectEqualStrings("a\nb\nc", doc.buffer.slice(0, doc.buffer.byteLen()));
+
+    try lua.doString("assert(zide.language() == nil)");
+    doc.language = editor.languages.items[0]; // built-in Zig
+    try lua.doString("zide.status(zide.language() or 'none')");
+    try testing.expectEqualStrings(editor.languages.items[0].name, editor.status_message);
 }
 
 test "reload_extensions drops Lua commands and handlers" {
