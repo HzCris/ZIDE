@@ -661,6 +661,15 @@ fn drawFileTree(win: Window, editor: *Editor, w: u16, h: u16) void {
         }
         const depth: usize = node.depth -| 1;
         const indent: u16 = @intCast(@min(depth * 2, text_w / 2));
+        // Indent guides: │ per ancestor level (same clamp as the indent)
+        const guide_style: Style = .{ .fg = toVaxis(theme.gutter_separator), .bg = style.bg };
+        var lvl: u16 = 0;
+        while (lvl * 2 < indent) : (lvl += 1) {
+            win.writeCell(text_x + lvl * 2, screen_row, .{
+                .char = .{ .grapheme = "\u{2502}", .width = 1 }, // │
+                .style = guide_style,
+            });
+        }
         var x: u16 = text_x + indent;
         const glyph: []const u8 = switch (node.kind) {
             .dir => if (node.expanded) "- " else "+ ",

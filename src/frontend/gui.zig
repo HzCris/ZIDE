@@ -845,6 +845,7 @@ fn filetreePanel(editor: *Editor) void {
     // --- Rows ---
     const text_color = toDvui(editor.theme.text);
     const sel_bg = toDvui(editor.theme.selection);
+    const guide_color = toDvui(editor.theme.gutter_separator);
     const indent_w = 12 * scale;
     var row = filetree_scroll;
     var y = rows_y;
@@ -856,6 +857,14 @@ fn filetreePanel(editor: *Editor) void {
         }
         const depth_f: f32 = @floatFromInt(node.depth -| 1);
         const x = area.x + 6 * scale + depth_f * indent_w;
+        // Indent guides: one vertical line per ancestor level, under that
+        // level's glyph column, so deep nesting stays readable.
+        var lvl: usize = 0;
+        while (lvl < node.depth -| 1) : (lvl += 1) {
+            const gx = area.x + 6 * scale + @as(f32, @floatFromInt(lvl)) * indent_w + 3 * scale;
+            const guide: dvui.Rect.Physical = .{ .x = gx, .y = y, .w = @max(1.0, 1 * scale), .h = line_height };
+            guide.fill(.{}, .{ .color = guide_color, .fade = 1.0 });
+        }
         const glyph: []const u8 = switch (node.kind) {
             .dir => if (node.expanded) "- " else "+ ",
             .file => "  ",

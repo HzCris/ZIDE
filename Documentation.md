@@ -615,6 +615,7 @@ A toggleable side panel for browsing and managing the project directory, backed 
 - Starts **visible** by default — to launch with it closed, uncheck "File Tree Visible" in the settings dialog (persists to init.lua) or `zide.set("filetree_visible", false)`; Ctrl+B at runtime never writes settings.
 - Root = current directory by default, or `zide.set("filetree_root", "/path")` (Lua-only; "" resets to cwd). **Backspace / u** (or `filetree_root_up`) re-roots at the parent directory to climb the hierarchy.
 - Directories sort first, names case-insensitive; children scan lazily on first expand; everything is listed, dotfiles and `.git` included.
+- Indent guide lines mark each ancestor level (thin rules in the GUI, `│` columns in the TUI) so deep nesting stays readable.
 - Opening a file that's already open switches to its existing tab instead of duplicating it.
 - Binary files (NUL byte in the first 8 KiB — executables, images, ...) are refused instead of being loaded; this applies to every open path (tree, Ctrl+O, CLI, session restore). The GUI shows a toast ("Not opened: binary or unsupported text encoding") plus the status-bar message; the TUI uses the status bar.
 
