@@ -133,7 +133,7 @@ Windows terminals commonly intercept Alt combos (Windows Terminal binds Alt+arro
 **Configuration:**
 - Config folder hierarchy: `~/.config/zide/` with `themes/` and `extensions/` subfolders
 - Lua settings file (`~/.config/zide/init.lua`)
-  - `zide.set(key, value)` — tab_width, use_tabs, word_wrap, auto_close_brackets, page_size, auto_save, auto_save_interval_ms, click_clears_cursors, max_undo_history, session_persistence, filetree_visible, filetree_side ("left"/"right"), filetree_width (GUI px), tui_filetree_width (columns), filetree_root (starting directory, "" = cwd)
+  - `zide.set(key, value)` — tab_width, use_tabs, word_wrap, auto_close_brackets, page_size, auto_save, auto_save_interval_ms, click_clears_cursors, max_undo_history, session_persistence, filetree_visible, filetree_side ("left"/"right"), filetree_width (GUI px), tui_filetree_width (columns), filetree_root (starting directory, "" = cwd), lsp_enabled (off = no language server, takes effect next launch), syntax_highlighting (off = plain-text look), filetree_git_colors (off = no git status colors/subprocesses)
   - `zide.set("mono_font_path", "/path/to/font.ttf")` — use a custom monospace font (e.g. a Nerd Font for box-drawing and powerline glyphs in the embedded terminal)
   - `zide.set("mono_font_size", 14)` — override the default monospace font size
   - `zide.set("tui_theme", name)` — switch TUI theme ("terminal", "dark", "light", "high_contrast")
@@ -765,7 +765,7 @@ Ctrl/Alt chords (Ctrl+P, Ctrl+B, ...) still work while the tree is focused.
 Tree rows are colored from `git status --porcelain` (a one-shot `git` shell-out — no libgit2): **untracked** and **added** files green/teal, **modified** amber, and any directory containing changes rolls up as modified; children of an untracked folder inherit untracked. Refreshed on panel load, manual refresh (Shift+R / `filetree_refresh`), after create/rename/delete, and after saves (including auto-save). Outside a git repo (or without git installed) rows simply stay uncolored. Colors are theme fields overridable via `zide.set("color_git_added" | "color_git_modified" | "color_git_deleted" | "color_git_untracked", "#hex")` and the `tui_color_git_*` equivalents.
 
 ### Settings
-Settings dialog (GUI) or `zide.set` in init.lua: `filetree_visible` (bool, default true), `filetree_side` ("left"/"right"), `filetree_width` (120–600 px), `tui_filetree_width` (16–80 cols), `filetree_root` (path text field in the dialog — Enter applies and persists).
+Settings dialog (GUI) or `zide.set` in init.lua: `filetree_visible` (bool, default true), `filetree_side` ("left"/"right"), `filetree_width` (120–600 px), `tui_filetree_width` (16–80 cols), `filetree_root` (path text field in the dialog — Enter applies and persists), `filetree_git_colors` (bool, default true — off stops the git status coloring and its `git status` subprocess calls entirely).
 
 ## Performance
 - **Gap buffer** text storage — inserts/deletes at cursor are O(1) amortized instead of O(n) memmove

@@ -1348,7 +1348,8 @@ fn drawContent(win: Window, doc: *Document, editor: *Editor, width: u16, height:
         // Tokenize line for syntax highlighting
         var span_buf: [syntax.MAX_SPANS]syntax.HighlightSpan = undefined;
         var span_count: usize = 0;
-        if (doc.language) |lang| {
+        // syntax_highlighting=false: skip tokenizing → plain text render
+        if (if (editor.syntax_highlighting) doc.language else null) |lang| {
             const state = doc.ensureLineState(line_idx);
             const result = syntax.tokenizeLine(line, lang, state, &span_buf);
             span_count = result.count;

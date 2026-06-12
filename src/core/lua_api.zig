@@ -1218,6 +1218,30 @@ test "reload_extensions clears lint diagnostics" {
     try testing.expectEqual(@as(usize, 0), doc.lint_diagnostics.items.len);
 }
 
+test "off-switch settings round-trip through zide.set/get" {
+    var lua = try Lua.init(testing.allocator);
+    defer lua.deinit();
+    lua.openLibs();
+    var editor = try Editor.init(testing.allocator, testing.io);
+    defer editor.deinit();
+    lua_settings.registerApi(lua, &editor);
+
+    try lua.doString(
+        \\assert(zide.get('lsp_enabled') == true)
+        \\assert(zide.get('syntax_highlighting') == true)
+        \\assert(zide.get('filetree_git_colors') == true)
+        \\zide.set('lsp_enabled', false)
+        \\zide.set('syntax_highlighting', false)
+        \\zide.set('filetree_git_colors', false)
+        \\assert(zide.get('lsp_enabled') == false)
+        \\assert(zide.get('syntax_highlighting') == false)
+        \\assert(zide.get('filetree_git_colors') == false)
+    );
+    try testing.expect(!editor.lsp_enabled);
+    try testing.expect(!editor.syntax_highlighting);
+    try testing.expect(!editor.filetree_git_colors);
+}
+
 test "reload_extensions drops Lua commands and handlers" {
     var lua = try Lua.init(testing.allocator);
     defer lua.deinit();

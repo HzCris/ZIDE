@@ -269,19 +269,23 @@ fn runGui(allocator: std.mem.Allocator, io: std.Io, lua: *zlua.Lua, cli_files: [
     lua_settings.loadExtensions(lua);
     lua_settings.loadLangSyntaxThemes(lua);
 
-    // Start LSP client (zls from PATH unless init.lua registered a command)
+    // Start LSP client (zls from PATH unless init.lua registered a command;
+    // lsp_enabled=false skips the server entirely — editor.lsp stays null
+    // and every LSP call site already tolerates that)
     var lsp_client = LspClient.init(allocator, io);
     defer lsp_client.deinit();
-    const lsp_cmd = editor.lspServerCommand();
-    lsp_client.start(lsp_cmd) catch |err| {
-        std.log.warn("Failed to start LSP server '{s}': {}", .{ lsp_cmd, err });
-        // Surface it in the status bar — the log file is easy to miss.
-        editor.status_message = if (err == error.FileNotFound)
-            "LSP server not found — completions disabled (see zide.log)"
-        else
-            "LSP server failed to start — completions disabled (see zide.log)";
-    };
-    editor.lsp = &lsp_client;
+    if (editor.lsp_enabled) {
+        const lsp_cmd = editor.lspServerCommand();
+        lsp_client.start(lsp_cmd) catch |err| {
+            std.log.warn("Failed to start LSP server '{s}': {}", .{ lsp_cmd, err });
+            // Surface it in the status bar — the log file is easy to miss.
+            editor.status_message = if (err == error.FileNotFound)
+                "LSP server not found — completions disabled (see zide.log)"
+            else
+                "LSP server failed to start — completions disabled (see zide.log)";
+        };
+        editor.lsp = &lsp_client;
+    }
 
     // Open CLI files, or show welcome text
     if (cli_files.len > 0) {
@@ -394,19 +398,22 @@ fn runTui(allocator: std.mem.Allocator, io: std.Io, lua: *zlua.Lua, cli_files: [
     lua_settings.loadExtensions(lua);
     lua_settings.loadLangSyntaxThemes(lua);
 
-    // Start LSP client (zls from PATH unless init.lua registered a command)
+    // Start LSP client (zls from PATH unless init.lua registered a command;
+    // lsp_enabled=false skips the server entirely)
     var lsp_client = LspClient.init(allocator, io);
     defer lsp_client.deinit();
-    const lsp_cmd = editor.lspServerCommand();
-    lsp_client.start(lsp_cmd) catch |err| {
-        std.log.warn("Failed to start LSP server '{s}': {}", .{ lsp_cmd, err });
-        // Surface it in the status bar — the log file is easy to miss.
-        editor.status_message = if (err == error.FileNotFound)
-            "LSP server not found — completions disabled (see zide.log)"
-        else
-            "LSP server failed to start — completions disabled (see zide.log)";
-    };
-    editor.lsp = &lsp_client;
+    if (editor.lsp_enabled) {
+        const lsp_cmd = editor.lspServerCommand();
+        lsp_client.start(lsp_cmd) catch |err| {
+            std.log.warn("Failed to start LSP server '{s}': {}", .{ lsp_cmd, err });
+            // Surface it in the status bar — the log file is easy to miss.
+            editor.status_message = if (err == error.FileNotFound)
+                "LSP server not found — completions disabled (see zide.log)"
+            else
+                "LSP server failed to start — completions disabled (see zide.log)";
+        };
+        editor.lsp = &lsp_client;
+    }
 
     // Open CLI files, or show welcome text
     if (cli_files.len > 0) {

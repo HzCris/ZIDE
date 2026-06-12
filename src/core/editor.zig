@@ -84,6 +84,13 @@ pub const Editor = struct {
     click_clears_cursors: bool = true,
     /// Save open files + cursors on quit and restore them on a bare launch.
     session_persistence: bool = false,
+    /// Start the LSP client at launch (off = no language server process;
+    /// takes effect at the next launch).
+    lsp_enabled: bool = true,
+    /// Render syntax colors (off = plain-text editor look, instant).
+    syntax_highlighting: bool = true,
+    /// Color file tree rows by git status (off = no git subprocesses).
+    filetree_git_colors: bool = true,
     /// Maximum undo history size per document (0 = unlimited).
     max_undo_history: usize = 100,
     /// Command palette selection index (for Tab cycling).
@@ -418,6 +425,7 @@ pub const Editor = struct {
                 self.filetree_visible = false;
                 return null;
             };
+            self.filetree.?.git_enabled = self.filetree_git_colors;
             self.filetree.?.gitRefresh();
         }
         return &self.filetree.?;

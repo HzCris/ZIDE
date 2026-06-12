@@ -434,6 +434,17 @@ fn luaSet(state: ?*zlua.LuaState) callconv(.c) c_int {
         editor.click_clears_cursors = lua.toBoolean(2);
     } else if (std.mem.eql(u8, key_str, "session_persistence")) {
         editor.session_persistence = lua.toBoolean(2);
+    } else if (std.mem.eql(u8, key_str, "lsp_enabled")) {
+        // Read before the LSP starts; runtime changes take effect next launch.
+        editor.lsp_enabled = lua.toBoolean(2);
+    } else if (std.mem.eql(u8, key_str, "syntax_highlighting")) {
+        editor.syntax_highlighting = lua.toBoolean(2);
+    } else if (std.mem.eql(u8, key_str, "filetree_git_colors")) {
+        editor.filetree_git_colors = lua.toBoolean(2);
+        if (editor.filetree) |*ft| {
+            ft.git_enabled = editor.filetree_git_colors;
+            ft.gitRefresh();
+        }
     } else if (std.mem.eql(u8, key_str, "filetree_visible")) {
         editor.filetree_visible = lua.toBoolean(2);
     } else if (std.mem.eql(u8, key_str, "filetree_side")) {
@@ -639,6 +650,15 @@ fn luaGet(state: ?*zlua.LuaState) callconv(.c) c_int {
         return 1;
     } else if (std.mem.eql(u8, key_str, "session_persistence")) {
         lua.pushBoolean(editor.session_persistence);
+        return 1;
+    } else if (std.mem.eql(u8, key_str, "lsp_enabled")) {
+        lua.pushBoolean(editor.lsp_enabled);
+        return 1;
+    } else if (std.mem.eql(u8, key_str, "syntax_highlighting")) {
+        lua.pushBoolean(editor.syntax_highlighting);
+        return 1;
+    } else if (std.mem.eql(u8, key_str, "filetree_git_colors")) {
+        lua.pushBoolean(editor.filetree_git_colors);
         return 1;
     } else if (std.mem.eql(u8, key_str, "filetree_visible")) {
         lua.pushBoolean(editor.filetree_visible);

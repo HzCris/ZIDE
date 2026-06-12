@@ -62,6 +62,9 @@ pub const FileTree = struct {
     git_map: std.StringHashMapUnmanaged(GitStatus) = .empty,
     /// Dirs with any changed descendant (owned keys) — rendered as modified.
     git_dirty_dirs: std.StringHashMapUnmanaged(void) = .empty,
+    /// Row coloring by git status (editor mirrors `filetree_git_colors`
+    /// onto this; off = gitRefresh never shells out).
+    git_enabled: bool = true,
 
     /// Open `root_path` (relative to cwd or absolute) and build the tree.
     pub fn init(allocator: Allocator, io: std.Io, root_path: []const u8) !FileTree {
@@ -492,8 +495,11 @@ pub const FileTree = struct {
     /// status maps. Silently leaves them empty when git is missing or the
     /// root isn't inside a repository. Blocking one-shot — called on load,
     /// refresh, file ops, and save; never per frame.
+    /// No-op (beyond clearing) when `git_enabled` is off — statusFor then
+    /// returns null for everything and rows render uncolored.
     pub fn gitRefresh(self: *FileTree) void {
         self.clearGitMaps();
+        if (!self.git_enabled) return;
 
         // Porcelain paths are repo-root-relative; --show-prefix tells us
         // where our tree root sits inside the repo (with a trailing '/').

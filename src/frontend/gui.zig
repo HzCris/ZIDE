@@ -1637,7 +1637,8 @@ fn editorPane(editor: *Editor, pane_id: u8) void {
         var exp_starts: [syntax.MAX_SPANS]usize = undefined;
         var exp_ends: [syntax.MAX_SPANS]usize = undefined;
         const lang_name: ?[]const u8 = if (doc.language) |l| l.name else null;
-        if (doc.language) |lang| {
+        // syntax_highlighting=false: skip tokenizing → plain text render
+        if (if (editor.syntax_highlighting) doc.language else null) |lang| {
             const state = doc.ensureLineState(line_idx);
             const result = syntax.tokenizeLine(orig_line, lang, state, &span_buf);
             span_count = result.count;
@@ -3755,6 +3756,9 @@ const settings_defs = [_]SettingDef{
     .{ .key = "page_size", .label = "Page Size", .kind = .number, .desc = "Lines to scroll on Page Up/Down (5-200)", .min = 5, .max = 200 },
     .{ .key = "click_clears_cursors", .label = "Click Clears Cursors", .kind = .boolean, .desc = "Left-click clears secondary cursors" },
     .{ .key = "session_persistence", .label = "Session Persistence", .kind = .boolean, .desc = "Reopen last session's files when launched bare" },
+    .{ .key = "lsp_enabled", .label = "LSP Support", .kind = .boolean, .desc = "Start the language server at launch (takes effect next launch)" },
+    .{ .key = "syntax_highlighting", .label = "Syntax Highlighting", .kind = .boolean, .desc = "Color code by language — off = plain text editor" },
+    .{ .key = "filetree_git_colors", .label = "File Tree Git Colors", .kind = .boolean, .desc = "Color file tree rows by git status" },
     .{ .key = "max_undo_history", .label = "Undo History Limit", .kind = .number, .desc = "Max undo operations per document, 0 = unlimited (0-100000)", .min = 0, .max = 100000 },
     .{ .key = "theme", .label = "Theme", .kind = .enum_choice, .desc = "Editor color theme", .choices = &.{ "dark", "light", "high_contrast" } },
     .{ .key = "filetree_visible", .label = "File Tree Visible", .kind = .boolean, .desc = "Show the file tree side panel (Ctrl+B)" },
@@ -3938,6 +3942,9 @@ fn getSettingBool(editor: *const Editor, key: []const u8) bool {
     if (std.mem.eql(u8, key, "auto_save")) return editor.auto_save;
     if (std.mem.eql(u8, key, "click_clears_cursors")) return editor.click_clears_cursors;
     if (std.mem.eql(u8, key, "session_persistence")) return editor.session_persistence;
+    if (std.mem.eql(u8, key, "lsp_enabled")) return editor.lsp_enabled;
+    if (std.mem.eql(u8, key, "syntax_highlighting")) return editor.syntax_highlighting;
+    if (std.mem.eql(u8, key, "filetree_git_colors")) return editor.filetree_git_colors;
     if (std.mem.eql(u8, key, "filetree_visible")) return editor.filetree_visible;
     return false;
 }
@@ -3949,6 +3956,15 @@ fn applySettingBool(editor: *Editor, key: []const u8, val: bool) void {
     if (std.mem.eql(u8, key, "auto_save")) editor.auto_save = val;
     if (std.mem.eql(u8, key, "click_clears_cursors")) editor.click_clears_cursors = val;
     if (std.mem.eql(u8, key, "session_persistence")) editor.session_persistence = val;
+    if (std.mem.eql(u8, key, "lsp_enabled")) editor.lsp_enabled = val; // next launch
+    if (std.mem.eql(u8, key, "syntax_highlighting")) editor.syntax_highlighting = val;
+    if (std.mem.eql(u8, key, "filetree_git_colors")) {
+        editor.filetree_git_colors = val;
+        if (editor.filetree) |*ft| {
+            ft.git_enabled = val;
+            ft.gitRefresh();
+        }
+    }
     if (std.mem.eql(u8, key, "filetree_visible")) {
         editor.filetree_visible = val;
         if (!val) editor.filetree_focused = false;
