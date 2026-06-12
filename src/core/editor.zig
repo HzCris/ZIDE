@@ -140,6 +140,12 @@ pub const Editor = struct {
     lua_event_refs: lua_api.EventRefs = lua_api.EventRefs.initFill(.empty),
     /// Recursion guard for event firing (e.g. a save handler that saves).
     lua_event_depth: u8 = 0,
+    /// Shared state for zide.spawn worker threads (created on first use;
+    /// refcounted teardown lets detached workers outlive the editor).
+    lua_spawn: ?*lua_api.SpawnState = null,
+    /// Wake callback fired when a spawn result lands (TUI sets this like
+    /// terminal_wake_fn; the GUI polls every frame and leaves it null).
+    lua_wake_fn: ?*const fn () void = null,
 
     /// Language served by `lsp`. Documents in any other language are not
     /// synced to the server — zls would otherwise receive (and squiggle)
@@ -774,6 +780,12 @@ pub const Editor = struct {
             self.active_doc_idx = idx;
             self.paneShowDoc(idx);
         }
+    }
+
+    /// Deliver finished zide.spawn results to their Lua callbacks.
+    /// Called by both frontends' main loops.
+    pub fn pumpLuaJobs(self: *Editor) void {
+        lua_api.pumpLuaJobs(self);
     }
 
     /// Execute a command by name.

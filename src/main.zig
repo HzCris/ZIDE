@@ -360,6 +360,9 @@ fn runGui(allocator: std.mem.Allocator, io: std.Io, lua: *zlua.Lua, cli_files: [
         if (editor.lsp) |l| l.pollMessages(&editor);
         editor.syncLspDocuments();
 
+        // Deliver finished zide.spawn results to their Lua callbacks
+        editor.pumpLuaJobs();
+
         if (!gui.frame(&editor)) break :main_loop;
 
         // New dvui (0.16 snapshot): win.end(.{}) manages the backend by

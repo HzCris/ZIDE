@@ -425,6 +425,26 @@ zide.command("dup_line_upper", "Duplicate line in caps", function()
 end)
 ```
 
+**Running external tools** — both calls produce a result table
+`{ code = exit_code, stdout = "...", stderr = "...", error = "ErrName" }`
+(`code` is absent if the tool didn't exit normally; `error` is set when the
+run itself failed — tool not found, timeout, …). Output is capped at 4 MiB
+stdout / 256 KiB stderr.
+
+| Call | Description |
+|------|-------------|
+| `zide.run(argv [, timeout_ms])` → table\|nil, err | Run a tool and **block until it exits** (the UI freezes meanwhile — fast tools only). `argv` is a list, e.g. `{"git", "status"}`. On timeout the child is killed and `nil, "Timeout"` returns. |
+| `zide.spawn(argv, fn(result))` | Run on a background thread; the callback fires on the editor loop when the tool finishes. Use this for linters, builds, anything slow. |
+
+```lua
+-- Example: branch name in the status bar on every save
+zide.on("save", function()
+    zide.spawn({"git", "rev-parse", "--abbrev-ref", "HEAD"}, function(r)
+        if r.code == 0 then zide.status("saved on " .. r.stdout:gsub("%s+$", "")) end
+    end)
+end)
+```
+
 The `reload_extensions` command (palette) drops all Lua-registered commands
 and event handlers and re-runs every `extensions/*.lua` — edit-extension,
 reload, retry without restarting ZIDE. (Lua globals your scripts set persist

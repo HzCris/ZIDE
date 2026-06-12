@@ -60,6 +60,12 @@ pub fn registerInto(lua: *Lua, editor: *Editor) void {
     lua.setField(-2, "insert");
     lua.pushFunction(&luaSetLine);
     lua.setField(-2, "set_line");
+
+    // Process running
+    lua.pushFunction(&luaRun);
+    lua.setField(-2, "run");
+    lua.pushFunction(&luaSpawn);
+    lua.setField(-2, "spawn");
 }
 
 // ---------------------------------------------------------------------------
@@ -139,6 +145,19 @@ pub fn deinitLua(editor: *Editor) void {
     cleanupLuaRefs(editor);
     inline for (comptime std.meta.tags(LuaEvent)) |ev| {
         editor.lua_event_refs.getPtr(ev).deinit(editor.allocator);
+    }
+    // Detach from spawn workers: queued results are dropped (their Lua
+    // refs die with the state); in-flight workers free the state when the
+    // last one finishes.
+    if (editor.lua_spawn) |state| {
+        state.mutex.lockUncancelable(editor.io);
+        state.alive = false;
+        for (state.jobs.items) |job| freeJob(state.allocator, job);
+        state.jobs.clearRetainingCapacity();
+        const workers_in_flight = state.active != 0;
+        state.mutex.unlock(editor.io);
+        if (!workers_in_flight) state.destroy();
+        editor.lua_spawn = null;
     }
 }
 
@@ -422,6 +441,267 @@ fn luaSetLine(state: ?*zlua.LuaState) callconv(.c) c_int {
 }
 
 // ---------------------------------------------------------------------------
+// Process running — zide.run (synchronous) and zide.spawn (worker thread).
+// Workers never touch the Lua state: results travel through a mutex'd
+// queue and the main loop's pumpLuaJobs delivers them to the callbacks.
+// ---------------------------------------------------------------------------
+
+const spawn_stdout_limit = 4 * 1024 * 1024;
+const spawn_stderr_limit = 256 * 1024;
+
+/// A finished zide.spawn job traveling from a worker to the main thread.
+pub const LuaJob = struct {
+    /// Lua registry ref of the callback (released by the deliverer).
+    ref: i32,
+    /// Exit code, or null when the tool didn't exit normally.
+    code: ?i64,
+    stdout: []u8,
+    stderr: []u8,
+    /// Static error name when the run itself failed (spawn error, timeout,
+    /// signal, …).
+    err_name: ?[]const u8,
+};
+
+/// Shared between the editor and detached worker threads. Heap-allocated;
+/// freed by whichever side lets go last (`alive` flag + `active` count).
+pub const SpawnState = struct {
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    mutex: std.Io.Mutex = .init,
+    /// Editor still consuming results (cleared in deinitLua).
+    alive: bool = true,
+    /// Worker threads in flight.
+    active: usize = 0,
+    jobs: std.ArrayList(LuaJob) = .empty,
+    wake_fn: ?*const fn () void = null,
+
+    fn destroy(self: *SpawnState) void {
+        const a = self.allocator;
+        self.jobs.deinit(a);
+        a.destroy(self);
+    }
+};
+
+fn freeJob(allocator: std.mem.Allocator, job: LuaJob) void {
+    allocator.free(job.stdout);
+    allocator.free(job.stderr);
+}
+
+fn freeArgv(allocator: std.mem.Allocator, argv: []const []const u8) void {
+    for (argv) |arg| allocator.free(arg);
+    allocator.free(argv);
+}
+
+/// Read a positional table of strings at `index` into owned slices.
+fn readArgvAlloc(lua: *Lua, allocator: std.mem.Allocator, index: i32) ?[]const []const u8 {
+    if (lua.typeOf(index) != .table) return null;
+    const len = lua.lenRaw(index);
+    if (len == 0) return null;
+    var list = std.ArrayList([]const u8).initCapacity(allocator, len) catch return null;
+    // Error paths free elements + deinit the list — list.items can't be
+    // handed to free() directly (capacity may exceed len; see allNames).
+    var i: usize = 1;
+    while (i <= len) : (i += 1) {
+        _ = lua.getIndexRaw(index, @intCast(i));
+        defer lua.pop(1);
+        const ok: ?[]const u8 = blk: {
+            const s = lua.toString(-1) catch break :blk null;
+            break :blk allocator.dupe(u8, s) catch null;
+        };
+        const duped = ok orelse {
+            for (list.items) |it| allocator.free(it);
+            list.deinit(allocator);
+            return null;
+        };
+        list.appendAssumeCapacity(duped);
+    }
+    return list.toOwnedSlice(allocator) catch {
+        for (list.items) |it| allocator.free(it);
+        list.deinit(allocator);
+        return null;
+    };
+}
+
+fn ensureSpawnState(editor: *Editor) ?*SpawnState {
+    if (editor.lua_spawn) |s| return s;
+    const s = editor.allocator.create(SpawnState) catch return null;
+    s.* = .{
+        .allocator = editor.allocator,
+        .io = editor.io,
+        .wake_fn = editor.lua_wake_fn,
+    };
+    editor.lua_spawn = s;
+    return s;
+}
+
+/// Point spawn-result wakes at the frontend's loop (TUI). Also updates an
+/// already-created SpawnState.
+pub fn setLuaWake(editor: *Editor, wake: ?*const fn () void) void {
+    editor.lua_wake_fn = wake;
+    if (editor.lua_spawn) |s| {
+        s.mutex.lockUncancelable(editor.io);
+        s.wake_fn = wake;
+        s.mutex.unlock(editor.io);
+    }
+}
+
+/// Worker thread body: run the tool, hand the result to the queue. When
+/// the editor is already gone, free everything (last worker frees state).
+fn spawnWorker(state: *SpawnState, argv: []const []const u8, ref: i32) void {
+    defer freeArgv(state.allocator, argv);
+
+    var job: LuaJob = .{ .ref = ref, .code = null, .stdout = &.{}, .stderr = &.{}, .err_name = null };
+    if (std.process.run(state.allocator, state.io, .{
+        .argv = argv,
+        .stdout_limit = .limited(spawn_stdout_limit),
+        .stderr_limit = .limited(spawn_stderr_limit),
+    })) |res| {
+        job.stdout = res.stdout;
+        job.stderr = res.stderr;
+        switch (res.term) {
+            .exited => |c| job.code = c,
+            else => job.err_name = "AbnormalExit",
+        }
+    } else |err| {
+        job.err_name = @errorName(err);
+    }
+
+    state.mutex.lockUncancelable(state.io);
+    state.active -= 1;
+    if (state.alive) {
+        state.jobs.append(state.allocator, job) catch {
+            state.mutex.unlock(state.io);
+            freeJob(state.allocator, job);
+            return; // ref stays in the registry until cleanup — OOM path
+        };
+        const wake = state.wake_fn;
+        state.mutex.unlock(state.io);
+        if (wake) |w| w();
+        return;
+    }
+    const last = state.active == 0;
+    state.mutex.unlock(state.io);
+    // Editor is gone: nobody will deliver this. The ref died (or will die)
+    // with the Lua state; only the payload needs freeing.
+    freeJob(state.allocator, job);
+    if (last) state.destroy();
+}
+
+/// Deliver finished spawn results to their Lua callbacks (main thread).
+pub fn pumpLuaJobs(editor: *Editor) void {
+    const state = editor.lua_spawn orelse return;
+    while (true) {
+        state.mutex.lockUncancelable(editor.io);
+        const job: ?LuaJob = if (state.jobs.items.len > 0) state.jobs.orderedRemove(0) else null;
+        state.mutex.unlock(editor.io);
+        deliverJobToLua(editor, job orelse break);
+    }
+}
+
+fn deliverJobToLua(editor: *Editor, job: LuaJob) void {
+    defer freeJob(editor.allocator, job);
+    const lua = editor.lua orelse return;
+    defer lua.unref(zlua.registry_index, job.ref);
+    _ = lua.getIndexRaw(zlua.registry_index, @intCast(job.ref));
+    pushRunResult(lua, job.code, job.stdout, job.stderr, job.err_name);
+    lua.protectedCall(.{ .args = 1 }) catch reportLuaError(editor, lua, "spawn callback");
+}
+
+/// Push the { code, stdout, stderr, error } result table.
+fn pushRunResult(lua: *Lua, code: ?i64, stdout_text: []const u8, stderr_text: []const u8, err_name: ?[]const u8) void {
+    lua.newTable();
+    if (code) |c| {
+        lua.pushInteger(c);
+        lua.setField(-2, "code");
+    }
+    _ = lua.pushString(stdout_text);
+    lua.setField(-2, "stdout");
+    _ = lua.pushString(stderr_text);
+    lua.setField(-2, "stderr");
+    if (err_name) |e| {
+        _ = lua.pushString(e);
+        lua.setField(-2, "error");
+    }
+}
+
+/// zide.run(argv [, timeout_ms]) -> table | nil, err — run a tool and
+/// block until it exits (UI freezes meanwhile: fast tools only; use
+/// zide.spawn for anything slow). On timeout the child is killed.
+fn luaRun(state: ?*zlua.LuaState) callconv(.c) c_int {
+    var lua: *Lua = @ptrCast(@alignCast(state orelse return 0));
+    const editor = lua_settings.getEditor(state) orelse return 0;
+
+    const argv = readArgvAlloc(lua, editor.allocator, 1) orelse {
+        lua.pushNil();
+        _ = lua.pushString("zide.run: argv table of strings required");
+        return 2;
+    };
+    defer freeArgv(editor.allocator, argv);
+
+    const timeout_ms: ?i64 = if (lua.typeOf(2) == .number) (lua.toInteger(2) catch null) else null;
+
+    const res = std.process.run(editor.allocator, editor.io, .{
+        .argv = argv,
+        .stdout_limit = .limited(spawn_stdout_limit),
+        .stderr_limit = .limited(spawn_stderr_limit),
+        .timeout = if (timeout_ms) |ms| .{ .duration = .{ .raw = .fromMilliseconds(ms), .clock = .awake } } else .none,
+    }) catch |err| {
+        lua.pushNil();
+        _ = lua.pushString(@errorName(err));
+        return 2;
+    };
+    defer editor.allocator.free(res.stdout);
+    defer editor.allocator.free(res.stderr);
+    const code: ?i64 = switch (res.term) {
+        .exited => |c| c,
+        else => null,
+    };
+    pushRunResult(lua, code, res.stdout, res.stderr, if (code == null) "AbnormalExit" else null);
+    return 1;
+}
+
+/// zide.spawn(argv, fn(result)) — run a tool on a worker thread; the
+/// callback fires later on the main loop with { code, stdout, stderr,
+/// error }.
+fn luaSpawn(state_arg: ?*zlua.LuaState) callconv(.c) c_int {
+    var lua: *Lua = @ptrCast(@alignCast(state_arg orelse return 0));
+    const editor = lua_settings.getEditor(state_arg) orelse return 0;
+
+    const argv = readArgvAlloc(lua, editor.allocator, 1) orelse {
+        std.log.warn("zide.spawn: argv table of strings required", .{});
+        return 0;
+    };
+    if (!lua.isFunction(2)) {
+        freeArgv(editor.allocator, argv);
+        std.log.warn("zide.spawn: second argument must be a function", .{});
+        return 0;
+    }
+    const spawn_state = ensureSpawnState(editor) orelse {
+        freeArgv(editor.allocator, argv);
+        return 0;
+    };
+
+    lua.pushValue(2);
+    const ref = lua.ref(zlua.registry_index);
+
+    spawn_state.mutex.lockUncancelable(editor.io);
+    spawn_state.active += 1;
+    spawn_state.mutex.unlock(editor.io);
+
+    const thread = std.Thread.spawn(.{}, spawnWorker, .{ spawn_state, argv, ref }) catch {
+        spawn_state.mutex.lockUncancelable(editor.io);
+        spawn_state.active -= 1;
+        spawn_state.mutex.unlock(editor.io);
+        lua.unref(zlua.registry_index, ref);
+        freeArgv(editor.allocator, argv);
+        std.log.warn("zide.spawn: failed to start worker thread", .{});
+        return 0;
+    };
+    thread.detach();
+    return 0;
+}
+
+// ---------------------------------------------------------------------------
 // Tests — drive the real API through a real Lua state.
 // NOTE: declare the Lua state BEFORE the editor in every test so the
 // LIFO defers run editor.deinit (which unrefs) while the state is alive.
@@ -666,6 +946,77 @@ test "buffer API: set_line on an empty line and language()" {
     doc.language = editor.languages.items[0]; // built-in Zig
     try lua.doString("zide.status(zide.language() or 'none')");
     try testing.expectEqualStrings(editor.languages.items[0].name, editor.status_message);
+}
+
+test "zide.run executes a tool and returns code/stdout" {
+    if (@import("builtin").os.tag != .windows) return error.SkipZigTest;
+    var lua = try Lua.init(testing.allocator);
+    defer lua.deinit();
+    lua.openLibs();
+    var editor = try Editor.init(testing.allocator, testing.io);
+    defer editor.deinit();
+    lua_settings.registerApi(lua, &editor);
+
+    try lua.doString(
+        \\local r = zide.run({'cmd', '/c', 'echo lua-run-works'})
+        \\assert(r ~= nil)
+        \\assert(r.code == 0)
+        \\assert(r.stdout:find('lua%-run%-works') ~= nil)
+        \\assert(r.error == nil)
+    );
+}
+
+test "zide.run reports a missing tool as nil, err" {
+    var lua = try Lua.init(testing.allocator);
+    defer lua.deinit();
+    lua.openLibs();
+    var editor = try Editor.init(testing.allocator, testing.io);
+    defer editor.deinit();
+    lua_settings.registerApi(lua, &editor);
+
+    try lua.doString(
+        \\local r, err = zide.run({'zide-definitely-not-a-real-tool'})
+        \\assert(r == nil)
+        \\assert(type(err) == 'string')
+    );
+}
+
+test "zide.spawn delivers the result through pumpLuaJobs" {
+    if (@import("builtin").os.tag != .windows) return error.SkipZigTest;
+    var lua = try Lua.init(testing.allocator);
+    defer lua.deinit();
+    lua.openLibs();
+    var editor = try Editor.init(testing.allocator, testing.io);
+    defer editor.deinit();
+    lua_settings.registerApi(lua, &editor);
+
+    try lua.doString(
+        \\zide.spawn({'cmd', '/c', 'echo spawned-ok'}, function(r)
+        \\  if r.code == 0 and r.stdout:find('spawned%-ok') then
+        \\    zide.status('spawn delivered')
+        \\  else
+        \\    zide.status('spawn wrong: ' .. (r.error or tostring(r.code)))
+        \\  end
+        \\end)
+    );
+
+    // Pump until the worker delivers (10s deadline).
+    const start_ns = std.Io.Clock.now(.awake, testing.io).nanoseconds;
+    while (std.Io.Clock.now(.awake, testing.io).nanoseconds - start_ns < 10 * std.time.ns_per_s) {
+        editor.pumpLuaJobs();
+        if (editor.status_message.len != 0) break;
+    }
+    try testing.expectEqualStrings("spawn delivered", editor.status_message);
+
+    // Let the worker fully retire before deinit so the leak checker sees
+    // the SpawnState freed on the editor side.
+    while (std.Io.Clock.now(.awake, testing.io).nanoseconds - start_ns < 10 * std.time.ns_per_s) {
+        const state = editor.lua_spawn orelse break;
+        state.mutex.lockUncancelable(testing.io);
+        const in_flight = state.active;
+        state.mutex.unlock(testing.io);
+        if (in_flight == 0) break;
+    }
 }
 
 test "reload_extensions drops Lua commands and handlers" {

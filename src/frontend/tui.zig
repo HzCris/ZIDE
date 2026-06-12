@@ -150,6 +150,7 @@ const Event = union(enum) {
     focus_out,
     lsp_data,
     terminal_data,
+    lua_job_data,
 };
 
 /// Module-level loop pointer for reader-thread wake callbacks (LSP +
@@ -172,6 +173,14 @@ fn lspWakeFn() void {
 fn terminalWakeFn() void {
     if (global_loop) |loop_ptr| {
         loop_ptr.postEvent(.terminal_data) catch {};
+    }
+}
+
+/// Wake function called from zide.spawn worker threads when a result is
+/// queued — unblocks nextEvent so pumpLuaJobs runs promptly.
+fn luaJobWakeFn() void {
+    if (global_loop) |loop_ptr| {
+        loop_ptr.postEvent(.lua_job_data) catch {};
     }
 }
 
@@ -215,6 +224,7 @@ pub fn run(allocator: std.mem.Allocator, editor: *Editor) !void {
         lsp_client.tui_wake_fn = &lspWakeFn;
     }
     editor.terminal_wake_fn = &terminalWakeFn;
+    @import("../core/lua_api.zig").setLuaWake(editor, &luaJobWakeFn);
 
     // Enter alternate screen
     try vx.enterAltScreen(tty.writer());
@@ -265,6 +275,9 @@ pub fn run(allocator: std.mem.Allocator, editor: *Editor) !void {
         // Poll LSP messages and sync documents
         if (editor.lsp) |lsp_client| lsp_client.pollMessages(editor);
         editor.syncLspDocuments();
+
+        // Deliver finished zide.spawn results to their Lua callbacks
+        editor.pumpLuaJobs();
 
         // Auto-save check
         if (editor.auto_save and editor.hasUnsavedChanges()) {
