@@ -4,6 +4,7 @@ const Editor = @import("editor.zig").Editor;
 const theme_mod = @import("theme.zig");
 const ThemeColor = theme_mod.ThemeColor;
 const syntax = @import("syntax.zig");
+const lua_api = @import("lua_api.zig");
 
 const Lua = zlua.Lua;
 
@@ -47,6 +48,9 @@ pub fn registerApi(lua: *Lua, editor: *Editor) void {
     // zide.register_lsp
     lua.pushFunction(&luaRegisterLsp);
     lua.setField(-2, "register_lsp");
+
+    // Extension runtime API (zide.command / on / exec / status, …)
+    lua_api.registerInto(lua, editor);
 
     // Set as global
     lua.setGlobal("zide");
@@ -378,7 +382,7 @@ fn currentLangOverride(lua: *Lua, editor: *Editor) ?*Editor.LangSyntaxOverride {
     return &editor.lang_syntax_overrides.items[editor.lang_syntax_overrides.items.len - 1];
 }
 
-fn getEditor(state: ?*zlua.LuaState) ?*Editor {
+pub fn getEditor(state: ?*zlua.LuaState) ?*Editor {
     var lua: *Lua = @ptrCast(@alignCast(state orelse return null));
     _ = lua.getField(zlua.registry_index, EDITOR_KEY);
     const editor = lua.toUserdata(Editor, -1) catch {

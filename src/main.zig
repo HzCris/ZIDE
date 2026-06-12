@@ -286,12 +286,10 @@ fn runGui(allocator: std.mem.Allocator, io: std.Io, lua: *zlua.Lua, cli_files: [
     // Open CLI files, or show welcome text
     if (cli_files.len > 0) {
         // Replace the default empty document with the first file
-        editor.activeDoc().open(io, cli_files[0]) catch |err| {
+        // (openIntoActive: language detect + LSP notify + extension event)
+        editor.openIntoActive(cli_files[0]) catch |err| {
             std.log.err("Failed to open {s}: {}", .{ cli_files[0], err });
         };
-        editor.activeDoc().detectLanguage(&editor);
-        // Notify LSP about the first file
-        editor.lspNotifyOpen(editor.activeDoc());
         // Open additional files as new tabs
         for (cli_files[1..]) |path| {
             _ = editor.openFile(path) catch |err| {
@@ -409,12 +407,10 @@ fn runTui(allocator: std.mem.Allocator, io: std.Io, lua: *zlua.Lua, cli_files: [
 
     // Open CLI files, or show welcome text
     if (cli_files.len > 0) {
-        editor.activeDoc().open(io, cli_files[0]) catch |err| {
+        // openIntoActive: language detect + LSP notify + extension event
+        editor.openIntoActive(cli_files[0]) catch |err| {
             std.log.err("Failed to open {s}: {}", .{ cli_files[0], err });
         };
-        editor.activeDoc().detectLanguage(&editor);
-        // Notify LSP about the first file
-        editor.lspNotifyOpen(editor.activeDoc());
         for (cli_files[1..]) |path| {
             _ = editor.openFile(path) catch |err| {
                 std.log.err("Failed to open {s}: {}", .{ path, err });

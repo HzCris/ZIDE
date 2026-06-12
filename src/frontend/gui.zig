@@ -3098,7 +3098,7 @@ fn save(editor: *Editor) void {
             editor.status_message = @errorName(err);
             return;
         };
-        editor.noteFileSaved(false);
+        editor.noteFileSaved(false, doc);
         editor.status_message = "Saved";
     } else {
         saveAs(editor);
@@ -3120,7 +3120,7 @@ fn saveAs(editor: *Editor) void {
             return;
         };
         editor.activeDoc().detectLanguage(editor);
-        editor.noteFileSaved(true);
+        editor.noteFileSaved(true, editor.activeDoc());
         editor.status_message = "Saved";
     }
 }

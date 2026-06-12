@@ -977,6 +977,15 @@ test "filetree: checkExternalChanges spots out-of-band file creation" {
 
     try t.expect(!ft.checkExternalChanges());
     try touch(t.io, tmp.dir, "outside.txt"); // created behind the tree's back
+    // Windows file times tick coarsely (~0.5–16ms): a fast run can create
+    // the file in the same tick the scan stamped, leaving the dir mtime
+    // unchanged. Churn the directory until the mtime visibly moves —
+    // bounded, and exactly the self-healing the 1.5s production poll has.
+    var attempts: usize = 0;
+    while (!ft.checkExternalChanges() and attempts < 10_000) : (attempts += 1) {
+        tmp.dir.deleteFile(t.io, "outside.txt") catch {};
+        try touch(t.io, tmp.dir, "outside.txt");
+    }
     try t.expect(ft.checkExternalChanges());
     try ft.refresh();
     try t.expect(!ft.checkExternalChanges());

@@ -2,6 +2,7 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 const theme_mod = @import("theme.zig");
 const lua_settings = @import("lua_settings.zig");
+const lua_api = @import("lua_api.zig");
 const syntax = @import("syntax.zig");
 const filetree_mod = @import("filetree.zig");
 
@@ -18,7 +19,15 @@ pub const Command = struct {
     name: []const u8,
     description: []const u8,
     execute: CommandFn,
+    /// Lua registry ref of the callback when this command was registered
+    /// from Lua via zide.command — dispatch routes through lua_api instead
+    /// of `execute`, and name/description are owned by the registry.
+    lua_ref: ?i32 = null,
 };
+
+/// Placeholder for Lua-backed commands; never invoked (execute() routes
+/// lua_ref entries through lua_api before reaching the fn pointer).
+fn cmdLuaStub(_: *Editor, _: ?[]const u8) void {}
 
 /// Registry of named commands. All editor actions go through this.
 pub const CommandRegistry = struct {
@@ -57,8 +66,59 @@ pub const CommandRegistry = struct {
     /// Execute a command by name. Returns false if command not found.
     pub fn execute(self: *const CommandRegistry, editor: *Editor, name: []const u8, args: ?[]const u8) bool {
         const cmd = self.commands.getPtr(name) orelse return false;
+        if (cmd.lua_ref) |r| {
+            lua_api.callLuaCommand(editor, r, args);
+            return true;
+        }
         cmd.execute(editor, args);
         return true;
+    }
+
+    /// Register a Lua-backed command. Takes ownership of `name` and
+    /// `description` (allocated with this registry's allocator) on
+    /// success; on error the caller still owns them. Returns the previous
+    /// Lua ref when replacing a Lua command — the caller must unref it.
+    /// Replacing a built-in is allowed (Lite XL style) and logged.
+    pub fn registerLua(self: *CommandRegistry, name: []const u8, description: []const u8, lua_ref: i32) !?i32 {
+        var prev_ref: ?i32 = null;
+        if (self.commands.fetchRemove(name)) |kv| {
+            if (kv.value.lua_ref) |r| {
+                prev_ref = r;
+                self.allocator.free(kv.value.name);
+                self.allocator.free(kv.value.description);
+            } else {
+                std.log.warn("zide.command: '{s}' overrides a built-in command", .{name});
+            }
+        }
+        try self.commands.put(self.allocator, name, .{
+            .name = name,
+            .description = description,
+            .execute = cmdLuaStub,
+            .lua_ref = lua_ref,
+        });
+        self.invalidateCache();
+        return prev_ref;
+    }
+
+    /// Remove all Lua-backed commands, freeing their owned strings.
+    /// Appends their registry refs to `refs_out`; the caller unrefs them
+    /// (the registry has no Lua state of its own).
+    pub fn removeLuaCommands(self: *CommandRegistry, refs_out: *std.ArrayList(i32)) void {
+        var keys: std.ArrayList([]const u8) = .empty;
+        defer keys.deinit(self.allocator);
+        var it = self.commands.iterator();
+        while (it.next()) |entry| {
+            if (entry.value_ptr.lua_ref != null) {
+                keys.append(self.allocator, entry.key_ptr.*) catch return;
+            }
+        }
+        for (keys.items) |key| {
+            const kv = self.commands.fetchRemove(key) orelse continue;
+            if (kv.value.lua_ref) |r| refs_out.append(self.allocator, r) catch {};
+            self.allocator.free(kv.value.name);
+            self.allocator.free(kv.value.description);
+        }
+        if (keys.items.len > 0) self.invalidateCache();
     }
 
     /// Get a sorted list of all command names (for command palette).
@@ -141,6 +201,7 @@ pub fn registerBuiltins(registry: *CommandRegistry) !void {
     try registry.register("dedent", "Dedent (remove leading whitespace)", cmdDedent);
     try registry.register("toggle_comment", "Toggle comment on selected lines", cmdToggleComment);
     try registry.register("next_todo", "Jump to next TODO/FIXME/XXX/HACK/BUG/NOTE marker", cmdNextTodo);
+    try registry.register("reload_extensions", "Reload Lua extensions (re-runs extensions/*.lua)", cmdReloadExtensions);
     // File tree commands
     try registry.register("toggle_filetree", "Toggle the file tree side panel", cmdToggleFiletree);
     try registry.register("filetree_reveal", "Reveal the current file in the file tree", cmdFiletreeReveal);
@@ -531,6 +592,12 @@ fn cmdToggleComment(editor: *Editor, _: ?[]const u8) void {
     } else {
         editor.status_message = "Comment toggle: language has no comment syntax";
     }
+}
+
+// --- Extensions ---
+
+fn cmdReloadExtensions(editor: *Editor, _: ?[]const u8) void {
+    lua_api.reloadExtensions(editor);
 }
 
 // --- File tree ---

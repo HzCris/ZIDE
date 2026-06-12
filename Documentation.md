@@ -369,12 +369,47 @@ zide.register_language({
 | `builtin_prefix` | string | no | Single character prefix for builtins (e.g., `"@"` for Zig) |
 | `preproc_prefix` | string | no | Single character prefix for preprocessor (e.g., `"#"` for C) |
 
+#### Extension Runtime API
+
+Extensions are not limited to language definitions — any `.lua` file in
+`~/.config/zide/extensions/` can register commands and react to editor
+events. Every callback runs in a protected call: a broken extension shows
+`Extension error: …` in the status bar (details in the log) and the editor
+keeps running.
+
+```lua
+-- A command: appears in the command palette (Ctrl+P) and is bindable.
+zide.command("insert_date", "Insert today's date", function()
+    zide.status("It is " .. os.date("%Y-%m-%d"))
+end)
+
+-- Bind it like any built-in (init.lua or here):
+zide.bind("ctrl+shift+d", "insert_date")
+
+-- React to editor events. The handler gets the file path (nil = untitled).
+zide.on("save", function(path)
+    zide.status("Saved: " .. (path or "untitled"))
+end)
+```
+
+| Call | Description |
+|------|-------------|
+| `zide.command(name, desc, fn)` | Register a command — listed in the palette, runnable via `zide.bind`/`zide.exec`. Re-registering a name replaces it; shadowing a built-in is allowed (logged). `fn` receives the optional args string (usually nil). |
+| `zide.on(event, fn)` | Hook an event. Events: `"open"` (file opened into a tab), `"save"` (file written — fires per document on auto-save too). `fn(path)` gets the file path or nil. |
+| `zide.exec(name)` → bool | Run any action or command by name — the same names keybinds use (`"save"`, `"undo"`, `"toggle_filetree"`, other Lua commands, …). Returns whether the name was recognized. |
+| `zide.status(msg)` | Show a transient message in the status bar (both frontends). |
+
+The `reload_extensions` command (palette) drops all Lua-registered commands
+and event handlers and re-runs every `extensions/*.lua` — edit-extension,
+reload, retry without restarting ZIDE. (Lua globals your scripts set persist
+across reloads; top-level state is re-initialized by your script itself.)
+
 #### Extension Directory
 
 ```
 ~/.config/zide/
 ├── init.lua                          # Main settings
-├── extensions/                       # Language extensions
+├── extensions/                       # Language + runtime extensions
 │   ├── python.lua
 │   ├── c.lua
 │   └── ...

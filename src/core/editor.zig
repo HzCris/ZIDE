@@ -17,6 +17,8 @@ const TuiSyntaxTheme = theme_mod.TuiSyntaxTheme;
 const syntax = @import("syntax.zig");
 pub const lsp_mod = @import("lsp.zig");
 pub const filetree_mod = @import("filetree.zig");
+pub const lua_api = @import("lua_api.zig");
+const zlua = @import("zlua");
 
 /// The central editor state. NOT a global singleton — passed explicitly.
 /// Owns open documents, the command registry, and global editor settings.
@@ -129,6 +131,15 @@ pub const Editor = struct {
 
     /// LSP client (null if not started).
     lsp: ?*lsp_mod.LspClient = null,
+
+    /// Lua state for extension callbacks (set by lua_settings.registerApi;
+    /// null in tests that don't create one). Owned by main.zig and must
+    /// outlive the editor — Editor.deinit releases refs into it.
+    lua: ?*zlua.Lua = null,
+    /// Lua registry refs of event handlers per event (zide.on).
+    lua_event_refs: lua_api.EventRefs = lua_api.EventRefs.initFill(.empty),
+    /// Recursion guard for event firing (e.g. a save handler that saves).
+    lua_event_depth: u8 = 0,
 
     /// Language served by `lsp`. Documents in any other language are not
     /// synced to the server — zls would otherwise receive (and squiggle)
@@ -250,6 +261,9 @@ pub const Editor = struct {
     }
 
     pub fn deinit(self: *Editor) void {
+        // Release Lua refs first: touches the command registry and needs
+        // the (caller-owned, still-alive) Lua state.
+        lua_api.deinitLua(self);
         for (self.documents.items) |*doc| {
             doc.deinit();
         }
@@ -357,7 +371,20 @@ pub const Editor = struct {
         const active = self.activeDoc();
         active.detectLanguage(self);
         self.lspNotifyOpen(active);
+        lua_api.fireEvent(self, .open, active.file_path);
         return active;
+    }
+
+    /// Open `path` into the current (startup-empty) document — the CLI
+    /// first-file / session-restore path that bypasses openFile. Keeps
+    /// the post-open bookkeeping (language detection, LSP notify,
+    /// extension event) in one place so bypass sites can't drift.
+    pub fn openIntoActive(self: *Editor, path: []const u8) !void {
+        const doc = self.activeDoc();
+        try doc.open(self.io, path);
+        doc.detectLanguage(self);
+        self.lspNotifyOpen(doc);
+        lua_api.fireEvent(self, .open, doc.file_path);
     }
 
     /// Open `path`, or switch to the tab that already has it open
@@ -477,16 +504,19 @@ pub const Editor = struct {
         self.cancelFiletreeMove();
     }
 
-    /// Call after any successful save so the file tree stays current:
-    /// git status colors always; a full rescan only when requested
-    /// (Save As creates a file the tree hasn't scanned yet). The GUI's
-    /// native-dialog save path bypasses execAction("save"), so every
-    /// save site must call this rather than relying on the action hook.
-    pub fn noteFileSaved(self: *Editor, new_file: bool) void {
+    /// Call after any successful save so the file tree stays current
+    /// (git colors always; full rescan when Save As created a new file)
+    /// and extensions hear about it. The GUI's native-dialog save path
+    /// bypasses execAction("save"), so every save site must call this
+    /// rather than relying on the action hook. `saved` is the document
+    /// that was written — pass null only for bulk saves that fire the
+    /// extension event per document themselves (autoSaveAll).
+    pub fn noteFileSaved(self: *Editor, new_file: bool, saved: ?*const Document) void {
         if (self.filetree) |*ft| {
             if (new_file) ft.refresh() catch {};
             ft.gitRefresh();
         }
+        if (saved) |d| lua_api.fireEvent(self, .save, d.file_path);
     }
 
     /// Change the file tree root (settings dialog, root-up). Empty/blank
@@ -776,7 +806,7 @@ pub const Editor = struct {
                 return true;
             };
             self.lspDidSave(doc);
-            self.noteFileSaved(false);
+            self.noteFileSaved(false, doc);
             const msg = std.fmt.bufPrint(&self.status_buf, "Saved {s}", .{doc.display_name}) catch "Saved";
             self.status_message = msg;
             return true;
@@ -948,10 +978,13 @@ pub const Editor = struct {
             if (doc.dirty and doc.file_path != null) {
                 doc.save(self.io) catch continue;
                 saved += 1;
+                // Per-document extension event; the file tree note below
+                // runs once for the whole batch (it shells out to git).
+                lua_api.fireEvent(self, .save, doc.file_path);
             }
         }
         if (saved > 0) {
-            self.noteFileSaved(false);
+            self.noteFileSaved(false, null);
             const msg = std.fmt.bufPrint(&self.status_buf, "Auto-saved {d} file(s)", .{saved}) catch "Auto-saved";
             self.status_message = msg;
         }
@@ -1040,10 +1073,8 @@ pub const Editor = struct {
                 var doc: *Document = undefined;
                 if (opened == 0) {
                     // Replace the initial empty document, like a CLI file open.
+                    self.openIntoActive(file_path) catch continue;
                     doc = self.activeDoc();
-                    doc.open(self.io, file_path) catch continue;
-                    doc.detectLanguage(self);
-                    self.lspNotifyOpen(doc);
                 } else {
                     doc = self.openFile(file_path) catch continue;
                 }
