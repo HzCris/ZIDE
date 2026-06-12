@@ -456,6 +456,17 @@ like LSP diagnostics (and kept separately, so LSP updates never wipe them):
 Lint diagnostics are cleared by `reload_extensions` (a removed linter's
 stale squiggles don't survive).
 
+#### The Shipped Example: example-lint-zig.lua
+
+On first launch ZIDE creates `~/.config/zide/extensions/example-lint-zig.lua`
+— a complete on-save linter for Zig (`zig ast-check`), **fully commented out**
+so nothing runs subprocesses without your consent. Uncomment its body, run
+`reload_extensions` from the palette, then save a `.zig` file containing a
+mistake: the findings land in the gutter and status bar exactly like LSP
+diagnostics, in both frontends. It's the recommended copy-paste starting
+point for wiring up any other linter or tool: hook `"save"`, run the tool
+with `zide.spawn`, parse its output, call `zide.set_diagnostics`.
+
 The `reload_extensions` command (palette) drops all Lua-registered commands
 and event handlers and re-runs every `extensions/*.lua` — edit-extension,
 reload, retry without restarting ZIDE. (Lua globals your scripts set persist

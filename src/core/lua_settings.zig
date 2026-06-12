@@ -870,13 +870,16 @@ fn readTableChar(lua: *Lua, field: [:0]const u8) ?u8 {
 // Extension and syntax theme loading
 // ---------------------------------------------------------------------------
 
-/// Load extension files from ~/.config/zide/extensions/*.lua.
-/// Each file should call zide.register_language({...}) to add language support.
+/// Load extension files from ~/.config/zide/extensions/*.lua — language
+/// definitions (zide.register_language) and runtime extensions
+/// (zide.command / zide.on / …) alike.
 pub fn loadExtensions(lua: *Lua) void {
     const dir = getConfigDir() orelse return;
     const io = global_io orelse return;
     var ext_buf: [512]u8 = undefined;
     const ext_path = std.fmt.bufPrint(&ext_buf, "{s}/extensions", .{dir}) catch return;
+    std.Io.Dir.cwd().createDirPath(io, ext_path) catch {};
+    createLintExampleTemplate();
 
     var iter_dir = std.Io.Dir.cwd().openDir(io, ext_path, .{ .iterate = true }) catch return;
     defer iter_dir.close(io);
@@ -898,6 +901,62 @@ pub fn loadExtensions(lua: *Lua) void {
             std.log.info("Loaded extension: {s}", .{entry.name});
         }
     }
+}
+
+/// Create extensions/example-lint-zig.lua (fully commented out) if it
+/// doesn't exist — a complete, working save-hook linter demonstrating the
+/// extension runtime API end to end. Inert until the user uncomments it.
+fn createLintExampleTemplate() void {
+    const dir = getConfigDir() orelse return;
+    const io = global_io orelse return;
+    var path_buf: [512]u8 = undefined;
+    const path = std.fmt.bufPrint(&path_buf, "{s}/extensions/example-lint-zig.lua", .{dir}) catch return;
+    if (path.len >= path_buf.len) return;
+    path_buf[path.len] = 0;
+    const z_path: [:0]const u8 = path_buf[0..path.len :0];
+    if (std.Io.Dir.cwd().access(io, z_path, .{})) |_| return else |_| {}
+    const f = std.Io.Dir.cwd().createFile(io, z_path, .{}) catch return;
+    defer f.close(io);
+    f.writeStreamingAll(io,
+        \\-- ZIDE example extension: lint Zig files on save with `zig ast-check`.
+        \\--
+        \\-- To enable: uncomment everything below this header (and set `cmd` to a
+        \\-- full zig path if zig isn't on PATH), then run the `reload_extensions`
+        \\-- command from the palette (Ctrl+P) — no restart needed.
+        \\--
+        \\-- It's a plain extension file: copy it to build linters for other tools.
+        \\-- The recipe is always the same — hook "save", run the tool with
+        \\-- zide.spawn (background thread, UI never blocks), parse its output,
+        \\-- hand the findings to zide.set_diagnostics. They render like LSP
+        \\-- diagnostics: gutter marker, underline, message in the status bar.
+        \\
+        \\-- local cmd = "zig"
+        \\--
+        \\-- zide.on("save", function(path)
+        \\--   if path == nil or not path:match("%.zig$") then return end
+        \\--   zide.spawn({ cmd, "ast-check", path }, function(r)
+        \\--     if r.error then
+        \\--       zide.status("lint-zig: " .. r.error)
+        \\--       return
+        \\--     end
+        \\--     -- ast-check reports on stderr: file:line:col: error: message
+        \\--     local diags = {}
+        \\--     for line, col, kind, msg in r.stderr:gmatch("[^\r\n]-:(%d+):(%d+): (%w+): ([^\r\n]+)") do
+        \\--       diags[#diags + 1] = {
+        \\--         line = tonumber(line),
+        \\--         col = tonumber(col),
+        \\--         severity = (kind == "error") and "error" or "warning",
+        \\--         message = msg,
+        \\--       }
+        \\--     end
+        \\--     zide.set_diagnostics(path, diags) -- empty table clears old findings
+        \\--     if #diags > 0 then
+        \\--       zide.status(string.format("zig ast-check: %d problem(s)", #diags))
+        \\--     end
+        \\--   end)
+        \\-- end)
+        \\
+    ) catch {};
 }
 
 /// Load the global syntax theme from ~/.config/zide/themes/syntax-theme.lua.

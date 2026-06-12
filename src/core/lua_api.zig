@@ -1173,6 +1173,35 @@ test "zide.set_diagnostics fills, replaces, merges, and clears" {
     try testing.expectEqual(@as(usize, 0), doc.lint_diagnostics.items.len);
 }
 
+test "lint-zig template pattern parses ast-check output (drive-letter paths)" {
+    var lua = try Lua.init(testing.allocator);
+    defer lua.deinit();
+    lua.openLibs();
+    var editor = try Editor.init(testing.allocator, testing.io);
+    defer editor.deinit();
+    lua_settings.registerApi(lua, &editor);
+
+    const doc = editor.activeDoc();
+    try doc.setFilePath("C:/fake/lint.zig");
+    // The exact gmatch pattern shipped in example-lint-zig.lua — keep in sync.
+    try lua.doString(
+        \\local stderr = "C:\\fake\\lint.zig:12:5: error: expected ';' after statement\nC:\\fake\\lint.zig:3:1: note: while parsing this\n"
+        \\local diags = {}
+        \\for line, col, kind, msg in stderr:gmatch("[^\r\n]-:(%d+):(%d+): (%w+): ([^\r\n]+)") do
+        \\  diags[#diags + 1] = { line = tonumber(line), col = tonumber(col),
+        \\    severity = (kind == "error") and "error" or "warning", message = msg }
+        \\end
+        \\zide.set_diagnostics("C:/fake/lint.zig", diags)
+    );
+    try testing.expectEqual(@as(usize, 2), doc.lint_diagnostics.items.len);
+    const d0 = doc.lint_diagnostics.items[0];
+    try testing.expectEqual(@as(u32, 11), d0.start_line);
+    try testing.expectEqual(@as(u32, 4), d0.start_col);
+    try testing.expectEqual(lsp_mod.DiagnosticSeverity.err, d0.severity);
+    try testing.expectEqualStrings("expected ';' after statement", d0.message);
+    try testing.expectEqual(lsp_mod.DiagnosticSeverity.warning, doc.lint_diagnostics.items[1].severity);
+}
+
 test "reload_extensions clears lint diagnostics" {
     var lua = try Lua.init(testing.allocator);
     defer lua.deinit();
