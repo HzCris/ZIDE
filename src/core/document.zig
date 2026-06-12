@@ -45,6 +45,10 @@ pub const Document = struct {
     lsp_opened: bool = false,
     /// LSP diagnostics from the language server.
     diagnostics: std.ArrayList(lsp.Diagnostic),
+    /// Lint diagnostics from Lua extensions (zide.set_diagnostics) — a
+    /// separate list because LSP publishes clear+replace `diagnostics`
+    /// wholesale. Replaced per set_diagnostics call.
+    lint_diagnostics: std.ArrayList(lsp.Diagnostic),
 
     /// Detected language for syntax highlighting (null = plain text).
     language: ?*const syntax.LanguageDef = null,
@@ -61,6 +65,7 @@ pub const Document = struct {
             .history = UndoHistory.init(allocator),
             .allocator = allocator,
             .diagnostics = .empty,
+            .lint_diagnostics = .empty,
             .line_states = .empty,
         };
     }
@@ -74,6 +79,8 @@ pub const Document = struct {
             d.deinit(self.allocator);
         }
         self.diagnostics.deinit(self.allocator);
+        self.clearLintDiagnostics();
+        self.lint_diagnostics.deinit(self.allocator);
         if (self.file_path) |p| {
             self.allocator.free(p);
         }
@@ -82,6 +89,41 @@ pub const Document = struct {
         if (self.display_name.ptr != default_display_name.ptr) {
             self.allocator.free(self.display_name);
         }
+    }
+
+    /// Drop all extension lint diagnostics (frees their messages).
+    pub fn clearLintDiagnostics(self: *Document) void {
+        for (self.lint_diagnostics.items) |*d| {
+            d.deinit(self.allocator);
+        }
+        self.lint_diagnostics.clearRetainingCapacity();
+    }
+
+    /// Iterate LSP and lint diagnostics as one sequence — every consumer
+    /// (gutter markers, underlines, status bar) goes through this so
+    /// extension diagnostics render exactly like LSP ones.
+    pub const DiagnosticIterator = struct {
+        doc: *const Document,
+        idx: usize = 0,
+
+        pub fn next(self: *DiagnosticIterator) ?*const lsp.Diagnostic {
+            const lsp_items = self.doc.diagnostics.items;
+            if (self.idx < lsp_items.len) {
+                defer self.idx += 1;
+                return &lsp_items[self.idx];
+            }
+            const lint_items = self.doc.lint_diagnostics.items;
+            const li = self.idx - lsp_items.len;
+            if (li < lint_items.len) {
+                defer self.idx += 1;
+                return &lint_items[li];
+            }
+            return null;
+        }
+    };
+
+    pub fn diagIter(self: *const Document) DiagnosticIterator {
+        return .{ .doc = self };
     }
 
     /// Open a file into this document, replacing its current content.

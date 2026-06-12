@@ -11,6 +11,8 @@ const zlua = @import("zlua");
 const Editor = @import("editor.zig").Editor;
 const Document = @import("document.zig").Document;
 const lua_settings = @import("lua_settings.zig");
+const lsp_mod = @import("lsp.zig");
+const filetree_mod = @import("filetree.zig");
 
 const Lua = zlua.Lua;
 
@@ -66,6 +68,10 @@ pub fn registerInto(lua: *Lua, editor: *Editor) void {
     lua.setField(-2, "run");
     lua.pushFunction(&luaSpawn);
     lua.setField(-2, "spawn");
+
+    // Diagnostics
+    lua.pushFunction(&luaSetDiagnostics);
+    lua.setField(-2, "set_diagnostics");
 }
 
 // ---------------------------------------------------------------------------
@@ -137,6 +143,8 @@ pub fn cleanupLuaRefs(editor: *Editor) void {
         }
         list.clearRetainingCapacity();
     }
+    // A removed lint extension's stale squiggles shouldn't survive reload.
+    for (editor.documents.items) |*doc| doc.clearLintDiagnostics();
 }
 
 /// Full teardown for Editor.deinit (also frees the ref lists). Must run
@@ -702,6 +710,91 @@ fn luaSpawn(state_arg: ?*zlua.LuaState) callconv(.c) c_int {
 }
 
 // ---------------------------------------------------------------------------
+// Diagnostics — zide.set_diagnostics(path, list) fills the document's
+// lint_diagnostics, which render exactly like LSP diagnostics (gutter
+// marker, underline, status bar) via Document.diagIter.
+// ---------------------------------------------------------------------------
+
+/// Integer field of the diagnostic table at the top of the stack.
+fn diagFieldInt(lua: *Lua, field: [:0]const u8) ?i64 {
+    _ = lua.getField(-1, field);
+    defer lua.pop(1);
+    if (lua.typeOf(-1) != .number) return null;
+    return lua.toInteger(-1) catch null;
+}
+
+/// String field of the diagnostic table at the top of the stack.
+fn diagFieldString(lua: *Lua, field: [:0]const u8) ?[:0]const u8 {
+    _ = lua.getField(-1, field);
+    defer lua.pop(1);
+    if (lua.typeOf(-1) != .string) return null;
+    return lua.toString(-1) catch null;
+}
+
+fn severityFromName(name: []const u8) lsp_mod.DiagnosticSeverity {
+    if (std.mem.eql(u8, name, "warning")) return .warning;
+    if (std.mem.eql(u8, name, "info")) return .information;
+    if (std.mem.eql(u8, name, "hint")) return .hint;
+    return .err; // "error" and anything else — linters mostly report errors
+}
+
+/// zide.set_diagnostics(path, {{line, col, end_col, severity, message}, …})
+/// Replaces the extension diagnostics of the open document at `path`
+/// (1-based positions; severity: "error"/"warning"/"info"/"hint", default
+/// "error"). Pass an empty table to clear. Paths that aren't open are
+/// ignored. Positions go stale as the user edits — same as LSP, the next
+/// lint run replaces them.
+fn luaSetDiagnostics(state: ?*zlua.LuaState) callconv(.c) c_int {
+    var lua: *Lua = @ptrCast(@alignCast(state orelse return 0));
+    const editor = lua_settings.getEditor(state) orelse return 0;
+
+    const path_z = lua.toString(1) catch {
+        std.log.warn("zide.set_diagnostics: path (string) required", .{});
+        return 0;
+    };
+    if (lua.typeOf(2) != .table) {
+        std.log.warn("zide.set_diagnostics: second argument must be a table", .{});
+        return 0;
+    }
+    const doc: *Document = blk: {
+        for (editor.documents.items) |*d| {
+            const dp = d.file_path orelse continue;
+            if (filetree_mod.normPathEql(dp, path_z)) break :blk d;
+        }
+        return 0; // not open — nothing to annotate
+    };
+
+    doc.clearLintDiagnostics();
+    const len = lua.lenRaw(2);
+    var i: usize = 1;
+    while (i <= len) : (i += 1) {
+        _ = lua.getIndexRaw(2, @intCast(i));
+        defer lua.pop(1);
+        if (lua.typeOf(-1) != .table) continue;
+
+        const line = diagFieldInt(lua, "line") orelse continue;
+        if (line < 1) continue;
+        const col = @max(diagFieldInt(lua, "col") orelse 1, 1);
+        const end_col = @max(diagFieldInt(lua, "end_col") orelse (col + 1), col);
+        const severity = severityFromName(diagFieldString(lua, "severity") orelse "error");
+        const message = diagFieldString(lua, "message") orelse "";
+
+        const owned_msg = doc.allocator.dupe(u8, message) catch continue;
+        doc.lint_diagnostics.append(doc.allocator, .{
+            .start_line = @intCast(line - 1),
+            .start_col = @intCast(col - 1),
+            .end_line = @intCast(line - 1),
+            .end_col = @intCast(end_col - 1),
+            .severity = severity,
+            .message = owned_msg,
+        }) catch {
+            doc.allocator.free(owned_msg);
+        };
+    }
+    return 0;
+}
+
+// ---------------------------------------------------------------------------
 // Tests — drive the real API through a real Lua state.
 // NOTE: declare the Lua state BEFORE the editor in every test so the
 // LIFO defers run editor.deinit (which unrefs) while the state is alive.
@@ -1017,6 +1110,83 @@ test "zide.spawn delivers the result through pumpLuaJobs" {
         state.mutex.unlock(testing.io);
         if (in_flight == 0) break;
     }
+}
+
+test "zide.set_diagnostics fills, replaces, merges, and clears" {
+    var lua = try Lua.init(testing.allocator);
+    defer lua.deinit();
+    lua.openLibs();
+    var editor = try Editor.init(testing.allocator, testing.io);
+    defer editor.deinit();
+    lua_settings.registerApi(lua, &editor);
+
+    const doc = editor.activeDoc();
+    try doc.loadText("line one\nline two\n");
+    try doc.setFilePath("C:/fake/lint_target.zig");
+
+    try lua.doString(
+        \\zide.set_diagnostics('C:/fake/lint_target.zig', {
+        \\  { line = 1, col = 2, end_col = 5, severity = 'error', message = 'bad thing' },
+        \\  { line = 2, severity = 'warning', message = 'meh thing' },
+        \\})
+    );
+    try testing.expectEqual(@as(usize, 2), doc.lint_diagnostics.items.len);
+    const d0 = doc.lint_diagnostics.items[0];
+    try testing.expectEqual(@as(u32, 0), d0.start_line);
+    try testing.expectEqual(@as(u32, 1), d0.start_col);
+    try testing.expectEqual(@as(u32, 4), d0.end_col);
+    try testing.expectEqual(lsp_mod.DiagnosticSeverity.err, d0.severity);
+    try testing.expectEqualStrings("bad thing", d0.message);
+    try testing.expectEqual(lsp_mod.DiagnosticSeverity.warning, doc.lint_diagnostics.items[1].severity);
+
+    // diagIter merges LSP + lint lists
+    try doc.diagnostics.append(doc.allocator, .{
+        .start_line = 0,
+        .start_col = 0,
+        .end_line = 0,
+        .end_col = 1,
+        .severity = .information,
+        .message = try doc.allocator.dupe(u8, "from lsp"),
+    });
+    var it = doc.diagIter();
+    var seen: usize = 0;
+    while (it.next()) |_| seen += 1;
+    try testing.expectEqual(@as(usize, 3), seen);
+
+    // Separator-normalized path matching (backslashes vs forward slashes)
+    try lua.doString(
+        \\zide.set_diagnostics('C:\\fake\\lint_target.zig', {
+        \\  { line = 1, message = 'replaced' },
+        \\})
+    );
+    try testing.expectEqual(@as(usize, 1), doc.lint_diagnostics.items.len);
+    try testing.expectEqualStrings("replaced", doc.lint_diagnostics.items[0].message);
+    // LSP list untouched by the lint replace
+    try testing.expectEqual(@as(usize, 1), doc.diagnostics.items.len);
+
+    // Unknown path is ignored
+    try lua.doString("zide.set_diagnostics('C:/other/file.zig', { { line = 1, message = 'x' } })");
+    try testing.expectEqual(@as(usize, 1), doc.lint_diagnostics.items.len);
+
+    // Empty table clears
+    try lua.doString("zide.set_diagnostics('C:/fake/lint_target.zig', {})");
+    try testing.expectEqual(@as(usize, 0), doc.lint_diagnostics.items.len);
+}
+
+test "reload_extensions clears lint diagnostics" {
+    var lua = try Lua.init(testing.allocator);
+    defer lua.deinit();
+    lua.openLibs();
+    var editor = try Editor.init(testing.allocator, testing.io);
+    defer editor.deinit();
+    lua_settings.registerApi(lua, &editor);
+
+    const doc = editor.activeDoc();
+    try doc.setFilePath("C:/fake/reload_lint.zig");
+    try lua.doString("zide.set_diagnostics('C:/fake/reload_lint.zig', { { line = 1, message = 'stale' } })");
+    try testing.expectEqual(@as(usize, 1), doc.lint_diagnostics.items.len);
+    try testing.expect(editor.execCommand("reload_extensions", null));
+    try testing.expectEqual(@as(usize, 0), doc.lint_diagnostics.items.len);
 }
 
 test "reload_extensions drops Lua commands and handlers" {

@@ -30,7 +30,8 @@ fn diagnosticColor(severity: lsp.DiagnosticSeverity) dvui.Color {
 /// Get the worst severity diagnostic on a given line (lowest enum = worst).
 fn worstDiagnosticOnLine(doc: *Document, line: usize) ?*const lsp.Diagnostic {
     var worst: ?*const lsp.Diagnostic = null;
-    for (doc.diagnostics.items) |*d| {
+    var diag_it = doc.diagIter();
+    while (diag_it.next()) |d| {
         if (d.start_line <= line and d.end_line >= line) {
             if (worst) |w| {
                 if (@intFromEnum(d.severity) < @intFromEnum(w.severity)) {
@@ -1793,7 +1794,8 @@ fn editorPane(editor: *Editor, pane_id: u8) void {
                 }
 
                 // Diagnostic underlines
-                for (doc.diagnostics.items) |*diag| {
+                var diag_it = doc.diagIter();
+                while (diag_it.next()) |diag| {
                     if (diag.start_line == line_idx) {
                         // Compute underline range within this row
                         const ul_start = if (diag.start_col > row_start) diag.start_col - @as(u32, @intCast(row_start)) else 0;

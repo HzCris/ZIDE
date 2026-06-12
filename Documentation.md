@@ -445,6 +445,17 @@ zide.on("save", function()
 end)
 ```
 
+**Diagnostics** — extensions can put their own findings in the gutter,
+underline the text, and show messages in the status bar, rendered exactly
+like LSP diagnostics (and kept separately, so LSP updates never wipe them):
+
+| Call | Description |
+|------|-------------|
+| `zide.set_diagnostics(path, list)` | Replace the extension diagnostics of the **open** document at `path` (separator/case-insensitive match; non-open paths ignored). Pass `{}` to clear. Each entry: `{ line = N, col = N, end_col = N, severity = "error"\|"warning"\|"info"\|"hint", message = "…" }` — 1-based positions; only `line` is required (severity defaults to `"error"`). Positions go stale as the user edits, exactly like LSP — the next run replaces them. |
+
+Lint diagnostics are cleared by `reload_extensions` (a removed linter's
+stale squiggles don't survive).
+
 The `reload_extensions` command (palette) drops all Lua-registered commands
 and event handlers and re-runs every `extensions/*.lua` — edit-extension,
 reload, retry without restarting ZIDE. (Lua globals your scripts set persist

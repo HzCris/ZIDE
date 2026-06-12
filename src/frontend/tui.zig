@@ -1380,7 +1380,8 @@ fn drawContent(win: Window, doc: *Document, editor: *Editor, width: u16, height:
 
             // Gutter separator (or diagnostic marker)
             if (wrap_row == 0) {
-                const has_diag = for (doc.diagnostics.items) |*d| {
+                var diag_it = doc.diagIter();
+                const has_diag = while (diag_it.next()) |d| {
                     if (d.start_line <= line_idx and d.end_line >= line_idx) break d;
                 } else null;
                 if (has_diag) |diag| {
@@ -1535,7 +1536,8 @@ fn drawContent(win: Window, doc: *Document, editor: *Editor, width: u16, height:
             }
 
             // Apply diagnostic underlines to rendered text cells
-            for (doc.diagnostics.items) |*diag| {
+            var ul_diag_it = doc.diagIter();
+            while (ul_diag_it.next()) |diag| {
                 if (diag.start_line == line_idx and wrap_row == 0) {
                     const visible_start_offset: usize = if (do_wrap) row_start else doc.scroll_left;
                     const ul_start = if (diag.start_col >= visible_start_offset) diag.start_col - @as(u32, @intCast(visible_start_offset)) else 0;
@@ -1672,20 +1674,23 @@ fn drawStatusBar(win: Window, editor: *Editor, width: u16) void {
         const center_x = (width -| msg_len) / 2;
         _ = writeStr(win, center_x, 0, editor.status_message[0..msg_len], style);
         // Right side still drawn below; skip the diagnostic this frame
-    } else for (doc.diagnostics.items) |*diag| {
-        if (diag.start_line <= pos.line and diag.end_line >= pos.line) {
-            const diag_fg: Color = switch (diag.severity) {
-                .err => .{ .rgb = .{ 0xE0, 0x40, 0x40 } },
-                .warning => .{ .rgb = .{ 0xE0, 0xC0, 0x40 } },
-                .information => .{ .rgb = .{ 0x40, 0xA0, 0xE0 } },
-                .hint => .{ .rgb = .{ 0x80, 0x80, 0xA0 } },
-            };
-            const diag_style: Style = .{ .fg = diag_fg, .bg = style.bg };
-            const max_len = width / 2;
-            const msg_len: u16 = @intCast(@min(diag.message.len, max_len));
-            const center_x = (width -| msg_len) / 2;
-            _ = writeStr(win, center_x, 0, diag.message[0..msg_len], diag_style);
-            break;
+    } else {
+        var diag_it = doc.diagIter();
+        while (diag_it.next()) |diag| {
+            if (diag.start_line <= pos.line and diag.end_line >= pos.line) {
+                const diag_fg: Color = switch (diag.severity) {
+                    .err => .{ .rgb = .{ 0xE0, 0x40, 0x40 } },
+                    .warning => .{ .rgb = .{ 0xE0, 0xC0, 0x40 } },
+                    .information => .{ .rgb = .{ 0x40, 0xA0, 0xE0 } },
+                    .hint => .{ .rgb = .{ 0x80, 0x80, 0xA0 } },
+                };
+                const diag_style: Style = .{ .fg = diag_fg, .bg = style.bg };
+                const max_len = width / 2;
+                const msg_len: u16 = @intCast(@min(diag.message.len, max_len));
+                const center_x = (width -| msg_len) / 2;
+                _ = writeStr(win, center_x, 0, diag.message[0..msg_len], diag_style);
+                break;
+            }
         }
     }
 
