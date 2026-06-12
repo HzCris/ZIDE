@@ -531,6 +531,9 @@ pub fn frame(editor: *Editor) bool {
     // the panes' raw event loops only see what the dialog left unhandled.
     if (editor.mode == .settings) {
         settingsDialog(editor);
+    } else {
+        // Re-arm the text-setting pre-fill for the next dialog open
+        settings_text_prefill = true;
     }
 
     // --- Tab bar (if multiple documents) ---
@@ -3581,7 +3584,7 @@ fn handleConfirmQuitKeyGui(editor: *Editor, key: dvui.Event.Key) void {
 const SettingDef = struct {
     key: []const u8,
     label: []const u8,
-    kind: enum { boolean, number, enum_choice },
+    kind: enum { boolean, number, enum_choice, text },
     desc: []const u8,
     choices: []const []const u8 = &.{},
     min: i64 = 0,
@@ -3605,7 +3608,14 @@ const settings_defs = [_]SettingDef{
     .{ .key = "filetree_side", .label = "File Tree Side", .kind = .enum_choice, .desc = "Dock the file tree on the left or right", .choices = &.{ "left", "right" } },
     .{ .key = "filetree_width", .label = "File Tree Width (GUI)", .kind = .number, .desc = "Panel width in pixels (120-600)", .min = 120, .max = 600 },
     .{ .key = "tui_filetree_width", .label = "File Tree Width (TUI)", .kind = .number, .desc = "Panel width in columns (16-80)", .min = 16, .max = 80 },
+    .{ .key = "filetree_root", .label = "File Tree Root", .kind = .text, .desc = "Starting directory — empty = current dir (Enter applies)" },
 };
+
+/// Backing buffer for the dialog's single .text setting (filetree_root).
+/// TextEntryWidget .buffer mode re-derives its length from the first NUL
+/// every frame, so pre-filling = copy + zero-fill on dialog open.
+var settings_text_buf: [512]u8 = undefined;
+var settings_text_prefill: bool = true;
 
 /// Modal settings dialog built from native DVUI widgets (floating window
 /// with header, checkboxes, numeric entries, and a theme dropdown). Shown
@@ -3727,6 +3737,43 @@ fn settingsDialog(editor: *Editor) void {
                     }
                 }
             },
+            .text => {
+                if (settings_text_prefill) {
+                    settings_text_prefill = false;
+                    const cur = getSettingText(editor, def.key);
+                    const n = @min(cur.len, settings_text_buf.len - 1);
+                    @memcpy(settings_text_buf[0..n], cur[0..n]);
+                    @memset(settings_text_buf[n..], 0);
+                }
+                const te = dvui.textEntry(@src(), .{ .text = .{ .buffer = &settings_text_buf } }, .{
+                    .id_extra = i,
+                    .gravity_x = 1.0,
+                    .gravity_y = 0.5,
+                    .min_size_content = dvui.Font.theme(.body).sizeM(18, 1),
+                });
+                const entered = te.enter_pressed;
+                const entry_text = te.textGet();
+                te.deinit();
+                if (entered) {
+                    applySettingText(editor, def.key, entry_text);
+                }
+            },
+        }
+    }
+}
+
+fn getSettingText(editor: *const Editor, key: []const u8) []const u8 {
+    if (std.mem.eql(u8, key, "filetree_root")) return editor.filetree_root orelse "";
+    return "";
+}
+
+fn applySettingText(editor: *Editor, key: []const u8, val: []const u8) void {
+    if (std.mem.eql(u8, key, "filetree_root")) {
+        if (editor.setFiletreeRoot(val)) {
+            const lua_settings = @import("../core/lua_settings.zig");
+            var buf: [600]u8 = undefined;
+            const quoted = std.fmt.bufPrint(&buf, "\"{s}\"", .{std.mem.trim(u8, val, " \t")}) catch return;
+            lua_settings.writeSettingToFile(key, quoted) catch {};
         }
     }
 }

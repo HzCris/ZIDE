@@ -613,7 +613,7 @@ A toggleable side panel for browsing and managing the project directory, backed 
 - **Ctrl+B** (`toggle_filetree`) cycles: hidden → shown + focused → (from the editor) focus the tree → (from the tree) hidden. Together with Escape this gives a full keyboard round-trip between editor and tree.
 - Docks **left or right** (`filetree_side` setting, default left); width via `filetree_width` (GUI px) / `tui_filetree_width` (TUI columns).
 - Starts **visible** by default — to launch with it closed, uncheck "File Tree Visible" in the settings dialog (persists to init.lua) or `zide.set("filetree_visible", false)`; Ctrl+B at runtime never writes settings.
-- Root = current directory by default, or `zide.set("filetree_root", "/path")` (Lua-only; "" resets to cwd). **Backspace / u** (or `filetree_root_up`) re-roots at the parent directory to climb the hierarchy.
+- Root = current directory by default. Change it in the Settings dialog ("File Tree Root" — type a path, Enter applies; a bad path keeps the previous root and shows why) or `zide.set("filetree_root", "/path")`; "" resets to cwd. **Backspace / u** (or `filetree_root_up`) re-roots at the parent directory to climb the hierarchy.
 - Directories sort first, names case-insensitive; children scan lazily on first expand; everything is listed, dotfiles and `.git` included.
 - Indent guide lines mark each ancestor level (thin rules in the GUI, `│` columns in the TUI) so deep nesting stays readable.
 - Opening a file that's already open switches to its existing tab instead of duplicating it.
@@ -658,7 +658,7 @@ Ctrl/Alt chords (Ctrl+P, Ctrl+B, ...) still work while the tree is focused.
 Tree rows are colored from `git status --porcelain` (a one-shot `git` shell-out — no libgit2): **untracked** and **added** files green/teal, **modified** amber, and any directory containing changes rolls up as modified; children of an untracked folder inherit untracked. Refreshed on panel load, manual refresh (Shift+R / `filetree_refresh`), after create/rename/delete, and after saves (including auto-save). Outside a git repo (or without git installed) rows simply stay uncolored. Colors are theme fields overridable via `zide.set("color_git_added" | "color_git_modified" | "color_git_deleted" | "color_git_untracked", "#hex")` and the `tui_color_git_*` equivalents.
 
 ### Settings
-Settings dialog (GUI) or `zide.set` in init.lua: `filetree_visible` (bool, default true), `filetree_side` ("left"/"right"), `filetree_width` (120–600 px), `tui_filetree_width` (16–80 cols), `filetree_root` (string, Lua-only).
+Settings dialog (GUI) or `zide.set` in init.lua: `filetree_visible` (bool, default true), `filetree_side` ("left"/"right"), `filetree_width` (120–600 px), `tui_filetree_width` (16–80 cols), `filetree_root` (path text field in the dialog — Enter applies and persists).
 
 ## Performance
 - **Gap buffer** text storage — inserts/deletes at cursor are O(1) amortized instead of O(n) memmove

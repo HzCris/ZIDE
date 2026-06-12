@@ -418,6 +418,42 @@ pub const Editor = struct {
         }
     }
 
+    /// Change the file tree root (settings dialog, root-up). Empty/blank
+    /// path resets to the current directory. On failure the previous root
+    /// is restored and the tree brought back — a typo in the dialog must
+    /// not nuke the panel. Does NOT persist to init.lua; callers decide.
+    pub fn setFiletreeRoot(self: *Editor, path: []const u8) bool {
+        const trimmed = std.mem.trim(u8, path, " \t");
+        const new_root: ?[]const u8 = if (trimmed.len == 0)
+            null
+        else
+            self.allocator.dupe(u8, trimmed) catch return false;
+
+        const old_root = self.filetree_root;
+        self.filetree_root = new_root;
+        if (self.filetree) |*ft| ft.deinit();
+        self.filetree = null;
+        self.filetree_visible = true;
+        if (self.ensureFiletree() != null) {
+            if (old_root) |o| self.allocator.free(o);
+            const msg = std.fmt.bufPrint(&self.status_buf, "File tree root: {s}", .{self.filetree.?.root_path}) catch "";
+            self.status_message = msg;
+            return true;
+        }
+        // Failed — keep the failure message visible across the restore
+        // (the restore's ensure would otherwise overwrite status_buf).
+        var fail_buf: [128]u8 = undefined;
+        const fail_len = @min(self.status_message.len, fail_buf.len);
+        @memcpy(fail_buf[0..fail_len], self.status_message[0..fail_len]);
+        if (self.filetree_root) |bad| self.allocator.free(bad);
+        self.filetree_root = old_root;
+        self.filetree_visible = true;
+        _ = self.ensureFiletree();
+        @memcpy(self.status_buf[0..fail_len], fail_buf[0..fail_len]);
+        self.status_message = self.status_buf[0..fail_len];
+        return false;
+    }
+
     /// Re-root the file tree at the parent of the current root (tree
     /// Backspace/'u'). The new root sticks for the session via
     /// filetree_root (not persisted to init.lua).
@@ -427,14 +463,11 @@ pub const Editor = struct {
             self.status_message = "File tree: already at the filesystem root";
             return;
         };
-        const new_root = self.allocator.dupe(u8, parent) catch return;
-        if (self.filetree_root) |old| self.allocator.free(old);
-        self.filetree_root = new_root;
-        if (self.filetree) |*old_ft| old_ft.deinit();
-        self.filetree = null;
-        if (self.ensureFiletree() == null) return;
-        const msg = std.fmt.bufPrint(&self.status_buf, "File tree root: {s}", .{self.filetree.?.root_path}) catch "";
-        self.status_message = msg;
+        // Copy out — setFiletreeRoot deinits the tree `parent` points into
+        var buf: [std.fs.max_path_bytes]u8 = undefined;
+        const n = @min(parent.len, buf.len);
+        @memcpy(buf[0..n], parent[0..n]);
+        _ = self.setFiletreeRoot(buf[0..n]);
     }
 
     /// Begin a file-tree prompt (mode → .filetree_prompt). For .create the
