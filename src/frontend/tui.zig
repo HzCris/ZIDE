@@ -6,7 +6,8 @@ const TuiColor = @import("../core/theme.zig").TuiColor;
 const syntax = @import("../core/syntax.zig");
 const lsp = @import("../core/lsp.zig");
 const terminal_mod = @import("../core/terminal.zig");
-const FileTree = @import("../core/filetree.zig").FileTree;
+const filetree_mod = @import("../core/filetree.zig");
+const FileTree = filetree_mod.FileTree;
 
 const Key = vaxis.Key;
 const Cell = vaxis.Cell;
@@ -275,6 +276,21 @@ pub fn run(allocator: std.mem.Allocator, editor: *Editor) !void {
             }
         }
 
+        // File tree: pick up files created/removed outside ZIDE — cheap
+        // dir-mtime probe at most every ~1.5s, full rescan only on change.
+        if (editor.filetree_visible) {
+            if (editor.filetree) |*ft| {
+                const poll_now: i128 = std.Io.Clock.now(.awake, editor.io).nanoseconds;
+                if (poll_now - filetree_poll_ns > 1500 * std.time.ns_per_ms) {
+                    filetree_poll_ns = poll_now;
+                    if (ft.checkExternalChanges()) {
+                        ft.refresh() catch {};
+                        ft.gitRefresh();
+                    }
+                }
+            }
+        }
+
         // Update page_size based on terminal height
         const win = vx.window();
         const width = win.width;
@@ -510,6 +526,9 @@ var filetree_band: ?FiletreeBand = null;
 const filetree_double_click_ms: i128 = 400;
 var filetree_last_click_ns: i128 = 0;
 var filetree_last_click_row: usize = std.math.maxInt(usize);
+/// Last external-change mtime probe (run-loop poll; the TUI loop is
+/// event-driven, so the check fires when input arrives).
+var filetree_poll_ns: i128 = 0;
 
 /// Draw the full editor screen.
 fn drawEditor(win: Window, editor: *Editor, width: u16, height: u16) void {
@@ -606,15 +625,22 @@ fn drawFileTree(win: Window, editor: *Editor, w: u16, h: u16) void {
     const text_x: u16 = if (editor.filetree_side == .left) 0 else 1;
     const text_w: u16 = w - 1;
 
-    // Header: root directory name (highlighted while the tree has focus).
+    // Header: clickable ^ up-button + root path, truncated from the left
+    // so the tail (the part you care about) stays readable.
     const header_style: Style = .{
         .fg = toVaxis(if (editor.filetree_focused) theme.overlay_accent else theme.gutter_text),
         .bg = toVaxis(theme.text_bg),
         .bold = editor.filetree_focused,
     };
-    const root_name = std.fs.path.basename(ft.root_path);
-    const header_txt = if (root_name.len > 0) root_name else ft.root_path;
-    _ = writeStr(win, text_x, 0, truncToWidth(header_txt, text_w), header_style);
+    var hx = writeStr(win, text_x, 0, "^ ", header_style);
+    const path_cols: usize = text_w -| 2;
+    const tail = filetree_mod.pathTail(ft.root_path, path_cols);
+    if (tail.len == ft.root_path.len) {
+        _ = writeStr(win, hx, 0, tail, header_style);
+    } else {
+        hx = writeStr(win, hx, 0, "...", header_style);
+        _ = writeStr(win, hx, 0, filetree_mod.pathTail(ft.root_path, path_cols -| 3), header_style);
+    }
 
     // Keep the selection in view (reveal/create/keyboard nav set the flag),
     // then clamp the scroll when rows disappeared (collapse/refresh).
@@ -697,7 +723,15 @@ fn mouseOverFiletree(mouse: vaxis.Mouse) bool {
 fn handleFiletreeClick(editor: *Editor, band: FiletreeBand, col_abs: u16, row_abs: u16) void {
     const ft = editor.ensureFiletree() orelse return;
     editor.filetree_focused = true;
-    if (row_abs <= band.y) return; // header row
+    if (row_abs <= band.y) {
+        // Header: the ^ button re-roots at the parent folder
+        const hdr_text_x: u16 = if (editor.filetree_side == .left) 0 else 1;
+        const hdr_col = col_abs -| band.x;
+        if (hdr_col >= hdr_text_x and hdr_col < hdr_text_x + 2) {
+            editor.filetreeRootUp();
+        }
+        return;
+    }
     const rel: usize = row_abs - band.y - 1;
     const r = editor.tui_filetree_scroll + rel;
     if (r >= ft.visible.items.len) return;

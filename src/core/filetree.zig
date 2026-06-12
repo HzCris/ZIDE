@@ -37,6 +37,9 @@ pub const Node = struct {
     expanded: bool = false,
     /// Whether children have been scanned (dirs load lazily on expand).
     loaded: bool = false,
+    /// Directory mtime at scan time (dirs only) — compared by
+    /// checkExternalChanges to spot files created outside ZIDE.
+    scanned_mtime_ns: i96 = 0,
 };
 
 pub const FileTree = struct {
@@ -179,6 +182,28 @@ pub const FileTree = struct {
         }
         self.sortChildren(idx);
         self.nodes.items[idx].loaded = true;
+        self.nodes.items[idx].scanned_mtime_ns = self.dirMtimeNs(rel) orelse 0;
+    }
+
+    fn dirMtimeNs(self: *const FileTree, rel: []const u8) ?i96 {
+        const sub = if (rel.len == 0) "." else rel;
+        const st = self.root_dir.statFile(self.io, sub, .{}) catch return null;
+        return st.mtime.nanoseconds;
+    }
+
+    /// Cheap external-change probe: a directory's mtime changes when its
+    /// direct children are added/removed/renamed, so comparing the visible
+    /// (loaded, expanded) dirs against the mtime stamped at scan time
+    /// catches files created outside ZIDE — a few stats, no git spawn.
+    /// Frontends poll this on a timer and only refresh when it fires.
+    pub fn checkExternalChanges(self: *const FileTree) bool {
+        for (self.nodes.items) |n| {
+            if (n.kind != .dir or !n.loaded) continue;
+            if (n.rel_path.len != 0 and !n.expanded) continue;
+            const now_mtime = self.dirMtimeNs(n.rel_path) orelse return true; // vanished
+            if (now_mtime != n.scanned_mtime_ns) return true;
+        }
+        return false;
     }
 
     fn sortChildren(self: *FileTree, idx: u32) void {
@@ -590,6 +615,20 @@ fn statusFromXY(x: u8, y: u8) GitStatus {
     return .modified;
 }
 
+/// Tail of `path` spanning at most `max_cols` codepoints — for showing
+/// long paths truncated from the left (the tail is the readable part).
+pub fn pathTail(path: []const u8, max_cols: usize) []const u8 {
+    var cols: usize = 0;
+    var start: usize = path.len;
+    while (start > 0 and cols < max_cols) {
+        var j = start - 1;
+        while (j > 0 and (path[j] & 0xC0) == 0x80) j -= 1; // utf-8 continuations
+        start = j;
+        cols += 1;
+    }
+    return path[start..];
+}
+
 /// Replace '\' with '/' in place.
 pub fn normalizeSeps(p: []u8) void {
     for (p) |*c| {
@@ -926,6 +965,28 @@ test "filetree: statusFor rollup and untracked inheritance" {
     try t.expectEqual(GitStatus.untracked, ft.statusFor(ft.findByPath("newdir/child.txt").?).?);
     // Clean file has no status
     try t.expectEqual(@as(?GitStatus, null), ft.statusFor(ft.findByPath("clean.txt").?));
+}
+
+test "filetree: checkExternalChanges spots out-of-band file creation" {
+    var tmp = t.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    try touch(t.io, tmp.dir, "a.txt");
+
+    var ft = try testTree(&tmp);
+    defer ft.deinit();
+
+    try t.expect(!ft.checkExternalChanges());
+    try touch(t.io, tmp.dir, "outside.txt"); // created behind the tree's back
+    try t.expect(ft.checkExternalChanges());
+    try ft.refresh();
+    try t.expect(!ft.checkExternalChanges());
+    try t.expect(ft.findByPath("outside.txt") != null);
+}
+
+test "filetree: pathTail left-truncation" {
+    try t.expectEqualStrings("C:\\code\\zide", pathTail("C:\\code\\zide", 50));
+    try t.expectEqualStrings("ide", pathTail("C:\\code\\zide", 3));
+    try t.expectEqualStrings("", pathTail("abc", 0));
 }
 
 test "filetree: path helpers" {

@@ -336,6 +336,22 @@ pub fn frame(editor: *Editor) bool {
         filetree_panel_rect = null;
     }
 
+    // Pick up files created/removed outside ZIDE: cheap dir-mtime probe
+    // every ~1.5s; the full rescan + git refresh runs only when it fires.
+    // Paused while a drag-move is in flight (row indices must stay stable).
+    if (editor.filetree_visible and !filetree_dnd_armed and !filetree_dnd_active) {
+        if (editor.filetree) |*ft| {
+            const poll_now: i128 = std.Io.Clock.now(.awake, editor.io).nanoseconds;
+            if (poll_now - filetree_poll_ns > 1500 * std.time.ns_per_ms) {
+                filetree_poll_ns = poll_now;
+                if (ft.checkExternalChanges()) {
+                    ft.refresh() catch {};
+                    ft.gitRefresh();
+                }
+            }
+        }
+    }
+
     // Auto-save check
     if (editor.auto_save and editor.hasUnsavedChanges()) {
         const now_ns: i128 = std.Io.Clock.now(.awake, editor.io).nanoseconds;
@@ -791,6 +807,8 @@ var filetree_dnd_active: bool = false;
 var filetree_dnd_press: dvui.Point.Physical = .{};
 var filetree_dnd_src_row: usize = 0;
 var filetree_dnd_target: FiletreeDndTarget = .none;
+/// Last external-change mtime probe (see the poll in frame()).
+var filetree_poll_ns: i128 = 0;
 
 /// File tree side panel — custom row rendering in the editorPane style
 /// (no per-row widgets; we own scrolling, selection, and input). Renders
@@ -846,7 +864,8 @@ fn filetreePanel(editor: *Editor) void {
         filetree_scroll = row_count -| visible_rows;
     }
 
-    // --- Header ---
+    // --- Header: clickable ^ up-button + root path, truncated from the
+    // left so the tail (the part you care about) stays readable ---
     const header_fg = toDvui(editor.theme.overlay_fg);
     const dim = toDvui(editor.theme.overlay_dim);
     fillBar(area, 0, header_h, toDvui(editor.theme.gutter_bg));
@@ -856,9 +875,21 @@ fn filetreePanel(editor: *Editor) void {
             else => {},
         }
     }
-    const root_name = std.fs.path.basename(ft.root_path);
-    const header_txt = if (root_name.len > 0) root_name else ft.root_path;
-    renderOverlayText(font, header_txt, area.x + 6 * scale, area.y + 2 * scale, rs, if (editor.filetree_focused) header_fg else dim);
+    const hdr_color = if (editor.filetree_focused) header_fg else dim;
+    renderOverlayText(font, "^", area.x + 6 * scale, area.y + 2 * scale, rs, hdr_color);
+    const char_w = font.textSize("M").w * scale;
+    const path_x = area.x + 6 * scale + glyph_w;
+    const avail_px = (area.x + area.w) - path_x - 4 * scale;
+    const budget: usize = if (char_w > 0 and avail_px > char_w) @intFromFloat(@floor(avail_px / char_w)) else 0;
+    const tail = filetree_mod.pathTail(ft.root_path, budget);
+    if (tail.len == ft.root_path.len) {
+        renderOverlayText(font, tail, path_x, area.y + 2 * scale, rs, hdr_color);
+    } else {
+        var hdr_buf: [600]u8 = undefined;
+        const short = filetree_mod.pathTail(ft.root_path, budget -| 3);
+        const txt = std.fmt.bufPrint(&hdr_buf, "...{s}", .{short}) catch short;
+        renderOverlayText(font, txt, path_x, area.y + 2 * scale, rs, hdr_color);
+    }
 
     // --- Rows ---
     const text_color = toDvui(editor.theme.text);
@@ -1078,6 +1109,13 @@ fn handleFiletreeMouse(editor: *Editor, ft: *FileTree, wd: *dvui.WidgetData, are
                 dvui.focusWidget(wd.id, null, e.num);
                 editor.filetree_focused = true;
                 if (editor.mode != .normal) continue;
+                if (me.p.y < rows_y) {
+                    // Header: the ^ button re-roots at the parent folder
+                    if (me.p.x <= area.x + 6 * scale + glyph_w) {
+                        editor.filetreeRootUp();
+                    }
+                    continue;
+                }
                 if (row) |r| {
                     ft.selected = r;
                     const idx = ft.visible.items[r];

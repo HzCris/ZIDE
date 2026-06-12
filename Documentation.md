@@ -614,6 +614,8 @@ A toggleable side panel for browsing and managing the project directory, backed 
 - Docks **left or right** (`filetree_side` setting, default left); width via `filetree_width` (GUI px) / `tui_filetree_width` (TUI columns).
 - Starts **visible** by default — to launch with it closed, uncheck "File Tree Visible" in the settings dialog (persists to init.lua) or `zide.set("filetree_visible", false)`; Ctrl+B at runtime never writes settings.
 - Root = current directory by default. Change it in the Settings dialog ("File Tree Root" — type a path, Enter applies; a bad path keeps the previous root and shows why) or `zide.set("filetree_root", "/path")`; "" resets to cwd. **Backspace / u** (or `filetree_root_up`) re-roots at the parent directory to climb the hierarchy.
+- The panel header shows a clickable **`^` up-button** plus the full root path, truncated from the left (`...\Zig\ZIDE`) so the tail stays readable — click the `^` to go up one folder.
+- Files created, deleted, or renamed **outside ZIDE** (Explorer, a terminal) appear automatically: a cheap directory-mtime probe runs every ~1.5s and triggers the full rescan + git recolor only when something actually changed. (The TUI checks when input arrives, since its loop sleeps between events.)
 - Directories sort first, names case-insensitive; children scan lazily on first expand; everything is listed, dotfiles and `.git` included.
 - Indent guide lines mark each ancestor level (thin rules in the GUI, `│` columns in the TUI) so deep nesting stays readable.
 - Opening a file that's already open switches to its existing tab instead of duplicating it.
@@ -637,7 +639,7 @@ A toggleable side panel for browsing and managing the project directory, backed 
 Ctrl/Alt chords (Ctrl+P, Ctrl+B, ...) still work while the tree is focused.
 
 ### Mouse
-- Single click: selects the row only — except on a folder's `+`/`-` glyph, which toggles immediately
+- Single click: selects the row only — except on a folder's `+`/`-` glyph, which toggles immediately; clicking the header's `^` goes up one folder
 - Double click (400ms, same row): expands/collapses a folder or opens a file — a stray single click never opens or collapses anything
 - Wheel over the panel: scrolls the tree independently of the editor
 - Drag & drop (GUI): drag a row ~5px to start a move — the drop target highlights (a folder, a file's folder, or the header/empty space = root) with a live "Move X -> Y" status; release performs it. Dropping into the same place or into the moved folder itself is rejected. No drag ghost or edge auto-scroll yet
