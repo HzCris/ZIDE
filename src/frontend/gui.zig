@@ -773,6 +773,12 @@ var filetree_panel_rect: ?dvui.Rect.Physical = null;
 var filetree_panel_scale: f32 = 1;
 /// True while the user is dragging the panel's editor-facing edge.
 var filetree_resizing: bool = false;
+/// Double-click state for tree rows: single click on a row NAME only
+/// selects; a second click on the same row within the threshold toggles
+/// a folder or opens a file. (The +/- glyph stays single-click.)
+const filetree_double_click_ms: i128 = 400;
+var filetree_last_click_ns: i128 = 0;
+var filetree_last_click_row: usize = std.math.maxInt(usize);
 
 /// File tree side panel — custom row rendering in the editorPane style
 /// (no per-row widgets; we own scrolling, selection, and input). Renders
@@ -811,7 +817,8 @@ fn filetreePanel(editor: *Editor) void {
     // Input first — clicks/keys can expand or collapse rows, so every
     // count and clamp below must see the post-input state (a stale
     // row_count here was an index-out-of-bounds panic on collapse).
-    handleFiletreeMouse(editor, ft, wd, area, rows_y, line_height, visible_rows);
+    const glyph_w = font.textSize("+ ").w * scale;
+    handleFiletreeMouse(editor, ft, wd, area, rows_y, line_height, visible_rows, scale, glyph_w);
     if (editor.filetree_focused and editor.mode == .normal and !editor.completion_active) {
         handleFiletreeKeys(editor, ft, wd, visible_rows);
     }
@@ -947,7 +954,7 @@ fn filetreeRowAt(ft: *const FileTree, rows_y: f32, line_height: f32, my: f32) ?u
     return row;
 }
 
-fn handleFiletreeMouse(editor: *Editor, ft: *FileTree, wd: *dvui.WidgetData, area: dvui.Rect.Physical, rows_y: f32, line_height: f32, visible_rows: usize) void {
+fn handleFiletreeMouse(editor: *Editor, ft: *FileTree, wd: *dvui.WidgetData, area: dvui.Rect.Physical, rows_y: f32, line_height: f32, visible_rows: usize, scale: f32, glyph_w: f32) void {
     for (dvui.events()) |*e| {
         if (e.handled) continue;
         if (e.evt != .mouse) continue;
@@ -973,10 +980,32 @@ fn handleFiletreeMouse(editor: *Editor, ft: *FileTree, wd: *dvui.WidgetData, are
                 if (row) |r| {
                     ft.selected = r;
                     const idx = ft.visible.items[r];
-                    if (ft.nodes.items[idx].kind == .dir) {
+                    const node = ft.nodes.items[idx];
+
+                    const now_ns: i128 = std.Io.Clock.now(.awake, editor.io).nanoseconds;
+                    const is_double = r == filetree_last_click_row and
+                        now_ns - filetree_last_click_ns < filetree_double_click_ms * std.time.ns_per_ms;
+
+                    // Single click on the +/- glyph toggles a folder; row
+                    // names need a double click (toggle dir / open file) so
+                    // a stray click never opens or collapses anything.
+                    const depth_f: f32 = @floatFromInt(node.depth -| 1);
+                    const gx = area.x + 6 * scale + depth_f * 12 * scale;
+                    const in_glyph = node.kind == .dir and me.p.x >= gx and me.p.x < gx + glyph_w;
+
+                    if (in_glyph) {
                         ft.toggle(idx) catch {};
+                        filetree_last_click_ns = 0; // action fired — no chain
+                    } else if (is_double) {
+                        if (node.kind == .dir) {
+                            ft.toggle(idx) catch {};
+                        } else {
+                            openFiletreeFile(editor, ft, idx);
+                        }
+                        filetree_last_click_ns = 0;
                     } else {
-                        openFiletreeFile(editor, ft, idx);
+                        filetree_last_click_ns = now_ns;
+                        filetree_last_click_row = r;
                     }
                 }
             },
@@ -1142,6 +1171,17 @@ fn filetreeContextMenu(editor: *Editor, area: dvui.Rect.Physical) void {
         }
         if (dvui.menuItemLabel(@src(), "Up One Folder      u", .{}, .{ .expand = .horizontal }) != null) {
             editor.filetreeRootUp();
+            fw.close();
+        }
+        const side_label: []const u8 = if (editor.filetree_side == .left)
+            "Move Tree to Right"
+        else
+            "Move Tree to Left";
+        if (dvui.menuItemLabel(@src(), side_label, .{}, .{ .expand = .horizontal }) != null) {
+            editor.filetree_side = if (editor.filetree_side == .left) .right else .left;
+            const lua_settings = @import("../core/lua_settings.zig");
+            const quoted: []const u8 = if (editor.filetree_side == .right) "\"right\"" else "\"left\"";
+            lua_settings.writeSettingToFile("filetree_side", quoted) catch {};
             fw.close();
         }
         if (dvui.menuItemLabel(@src(), "Refresh            R", .{}, .{ .expand = .horizontal }) != null) {

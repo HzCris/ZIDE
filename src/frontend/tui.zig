@@ -504,6 +504,13 @@ fn resolvePaneAt(editor: *Editor, col: i16, row: i16) ?struct { pane_id: u8, loc
 const FiletreeBand = struct { x: u16, y: u16, w: u16, h: u16 };
 var filetree_band: ?FiletreeBand = null;
 
+/// Double-click state for tree rows: single click on a row NAME only
+/// selects; a second click on the same row within the threshold toggles
+/// a folder or opens a file. (The +/- glyph stays single-click.)
+const filetree_double_click_ms: i128 = 400;
+var filetree_last_click_ns: i128 = 0;
+var filetree_last_click_row: usize = std.math.maxInt(usize);
+
 /// Draw the full editor screen.
 fn drawEditor(win: Window, editor: *Editor, width: u16, height: u16) void {
     pane_rect_count = 0;
@@ -674,9 +681,11 @@ fn mouseOverFiletree(mouse: vaxis.Mouse) bool {
         mr >= band.y and mr < @as(i32, band.y) + band.h;
 }
 
-/// Left click inside the file tree band: focus the tree, select the row,
-/// toggle directories, open files.
-fn handleFiletreeClick(editor: *Editor, band: FiletreeBand, row_abs: u16) void {
+/// Left click inside the file tree band: focus the tree and select the
+/// row. A single click on the +/- glyph toggles a folder; row names need
+/// a double click (toggle dir / open file) so a stray click never opens
+/// or collapses anything.
+fn handleFiletreeClick(editor: *Editor, band: FiletreeBand, col_abs: u16, row_abs: u16) void {
     const ft = editor.ensureFiletree() orelse return;
     editor.filetree_focused = true;
     if (row_abs <= band.y) return; // header row
@@ -685,10 +694,35 @@ fn handleFiletreeClick(editor: *Editor, band: FiletreeBand, row_abs: u16) void {
     if (r >= ft.visible.items.len) return;
     ft.selected = r;
     const idx = ft.visible.items[r];
-    if (ft.nodes.items[idx].kind == .dir) {
+    const node = ft.nodes.items[idx];
+
+    const now_ns: i128 = std.Io.Clock.now(.awake, editor.io).nanoseconds;
+    const is_double = r == filetree_last_click_row and
+        now_ns - filetree_last_click_ns < filetree_double_click_ms * std.time.ns_per_ms;
+
+    // Glyph zone — must reuse drawFileTree's indent clamp or deep rows
+    // would mis-target.
+    const text_x: u16 = if (editor.filetree_side == .left) 0 else 1;
+    const text_w: u16 = band.w - 1;
+    const depth: usize = node.depth -| 1;
+    const indent: u16 = @intCast(@min(depth * 2, text_w / 2));
+    const local_col = col_abs -| band.x;
+    const in_glyph = node.kind == .dir and
+        local_col >= text_x + indent and local_col < text_x + indent + 2;
+
+    if (in_glyph) {
         ft.toggle(idx) catch {};
+        filetree_last_click_ns = 0; // action fired — no chain
+    } else if (is_double) {
+        if (node.kind == .dir) {
+            ft.toggle(idx) catch {};
+        } else {
+            openFiletreeFileTui(editor, ft, idx);
+        }
+        filetree_last_click_ns = 0;
     } else {
-        openFiletreeFileTui(editor, ft, idx);
+        filetree_last_click_ns = now_ns;
+        filetree_last_click_row = r;
     }
 }
 
@@ -1782,7 +1816,7 @@ fn handleMouse(editor: *Editor, mouse: vaxis.Mouse) void {
                 // File tree band: clicks focus/select/toggle/open in the tree
                 if (filetree_band) |band| {
                     if (mouseOverFiletree(mouse)) {
-                        handleFiletreeClick(editor, band, @intCast(mouse.row));
+                        handleFiletreeClick(editor, band, @intCast(mouse.col), @intCast(mouse.row));
                         return;
                     }
                 }

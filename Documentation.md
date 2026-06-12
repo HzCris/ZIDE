@@ -635,10 +635,11 @@ A toggleable side panel for browsing and managing the project directory, backed 
 Ctrl/Alt chords (Ctrl+P, Ctrl+B, ...) still work while the tree is focused.
 
 ### Mouse
-- Click: select; toggles a directory, opens a file (both frontends)
+- Single click: selects the row only — except on a folder's `+`/`-` glyph, which toggles immediately
+- Double click (400ms, same row): expands/collapses a folder or opens a file — a stray single click never opens or collapses anything
 - Wheel over the panel: scrolls the tree independently of the editor
 - Drag the panel's editor-facing edge (GUI, ⇄ cursor): resize the panel — the width persists to init.lua on release; a separator line marks the edge
-- Right-click (GUI): context menu (New / Rename / Delete / Up One Folder / Refresh / Reveal Current File)
+- Right-click (GUI): context menu (New / Rename / Delete / Up One Folder / Move Tree to Left-Right / Refresh / Reveal Current File); the side choice persists to init.lua
 
 ### TUI specifics
 - Rendered as a column band with a `│` separator; the terminal cursor hides while the tree is focused (the selection bar takes its place) and the panel header brightens
