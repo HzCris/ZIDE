@@ -1,0 +1,13 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256">
+  <defs>
+    <clipPath id="rim"><rect width="256" height="256" rx="58"></rect></clipPath>
+    <clipPath id="tui"><polygon points="0,0 256,0 0,256"></polygon></clipPath>
+    <clipPath id="gui"><polygon points="256,0 256,256 0,256"></polygon></clipPath>
+  </defs>
+  <g clip-path="url(#rim)">
+    <polygon points="0,0 256,0 0,256" fill="#121316"></polygon>
+    <polygon points="256,0 256,256 0,256" fill="#f0efeb"></polygon>
+    <g clip-path="url(#tui)"><polygon points="48,48 208,48 208,88 115,168 208,168 208,208 48,208 48,168 141,88 48,88" fill="#2fd573"></polygon></g>
+    <g clip-path="url(#gui)"><polygon points="48,48 208,48 208,88 115,168 208,168 208,208 48,208 48,168 141,88 48,88" fill="#169a52"></polygon></g>
+  </g>
+</svg>
