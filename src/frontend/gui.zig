@@ -11,6 +11,7 @@ const lsp = @import("../core/lsp.zig");
 const terminal_mod = @import("../core/terminal.zig");
 const filetree_mod = @import("../core/filetree.zig");
 const FileTree = filetree_mod.FileTree;
+const fileicons = @import("../core/fileicons.zig");
 
 /// Convert a ThemeColor to a dvui.Color.
 fn toDvui(c: ThemeColor) dvui.Color {
@@ -292,6 +293,24 @@ pub fn frame(editor: *Editor) bool {
                     key.code == .left_alt or key.code == .right_alt or
                     key.code == .left_command or key.code == .right_command) continue;
 
+                // Tree-focused Ctrl+C/X/V operate on files, not on the
+                // document behind the panel.
+                if (editor.filetree_focused and key.mod.control() and
+                    !key.mod.alt() and !key.mod.shift())
+                {
+                    const tree_op: ?[]const u8 = switch (key.code) {
+                        .c => "filetree_copy",
+                        .x => "filetree_cut",
+                        .v => "filetree_paste",
+                        else => null,
+                    };
+                    if (tree_op) |op| {
+                        e.handled = true;
+                        _ = editor.execCommand(op, null);
+                        continue;
+                    }
+                }
+
                 var kbuf: [64]u8 = undefined;
                 const key_str = dvuiKeyToStr(key, &kbuf);
                 if (key_str.len > 0) {
@@ -336,6 +355,9 @@ pub fn frame(editor: *Editor) bool {
         filetree_resizing = false;
         filetree_panel_rect = null;
     }
+
+    // OS file drops staged by the SDL backend between frames.
+    processFileDrops(editor);
 
     // Pick up files created/removed outside ZIDE: cheap dir-mtime probe
     // every ~1.5s; the full rescan + git refresh runs only when it fires.
@@ -551,6 +573,12 @@ pub fn frame(editor: *Editor) bool {
     } else {
         // Re-arm the text-setting pre-fill for the next dialog open
         settings_text_prefill = true;
+    }
+
+    // Delete confirmation dialog (clickable) — same declared-before-panes
+    // rule as the settings dialog so its buttons win the event race.
+    if (editor.mode == .filetree_prompt and editor.filetree_prompt_kind == .delete_confirm) {
+        filetreeDeleteDialog(editor);
     }
 
     // --- Tab bar (if multiple documents) ---
@@ -808,8 +836,121 @@ var filetree_dnd_active: bool = false;
 var filetree_dnd_press: dvui.Point.Physical = .{};
 var filetree_dnd_src_row: usize = 0;
 var filetree_dnd_target: FiletreeDndTarget = .none;
+/// Selection snapshot taken when the drag arms — the drag carries this
+/// cargo even if the live selection changes (or a background refresh
+/// clears the multi set) before the drop lands.
+var filetree_dnd_paths: ?[][]u8 = null;
+
+fn filetreeDndFreePaths(editor: *Editor) void {
+    if (filetree_dnd_paths) |paths| {
+        for (paths) |p| editor.allocator.free(p);
+        editor.allocator.free(paths);
+        filetree_dnd_paths = null;
+    }
+}
+
+/// Arm a row drag and snapshot what it will move.
+fn filetreeDndArm(editor: *Editor, ft: *FileTree, p: dvui.Point.Physical, r: usize) void {
+    filetree_dnd_armed = true;
+    filetree_dnd_active = false;
+    filetree_dnd_press = p;
+    filetree_dnd_src_row = r;
+    filetreeDndFreePaths(editor);
+    filetree_dnd_paths = ft.selectionRelPaths(editor.allocator) catch null;
+}
 /// Last external-change mtime probe (see the poll in frame()).
 var filetree_poll_ns: i128 = 0;
+/// Row under the mouse cursor (hover highlight); null when the pointer
+/// is outside the panel or a drag is in flight.
+var filetree_hover_row: ?usize = null;
+/// Scrollbar state: thumb drag with the grab offset inside the thumb,
+/// plus hover over the scrollbar band for the wider/brighter thumb.
+var filetree_sb_drag: bool = false;
+var filetree_sb_grab_dy: f32 = 0;
+var filetree_sb_hover: bool = false;
+/// `/` search state: incremental case-insensitive substring jump over
+/// the visible rows (letters are taken by the j/k/a/r/d/x/p bindings,
+/// so type-ahead needs the vim-style `/` prefix).
+var filetree_search_active: bool = false;
+var filetree_search_buf: [64]u8 = undefined;
+var filetree_search_len: usize = 0;
+var filetree_search_miss: bool = false;
+/// Header icon-button hover: 0 = none, 1 = new file, 2 = collapse all.
+var filetree_hdr_hover: u8 = 0;
+/// Hash of the file path last auto-revealed (0 = none) — auto-reveal
+/// fires once per active-document change, not per frame.
+var filetree_autoreveal_last: u64 = 0;
+/// Row band geometry from the last panel frame — lets OS-drop targeting
+/// map a drop point to a row without re-deriving the layout.
+var filetree_rows_geom: ?struct { rows_y: f32, line_height: f32 } = null;
+
+/// OS drag & drop staging, filled by the SDL backend patch through
+/// onSdlDropFile and consumed once per frame. Fixed slots — a drop of
+/// more than 16 items imports the first 16.
+const DropSlot = struct { path: [1024]u8 = undefined, len: usize = 0, x: f32 = 0, y: f32 = 0 };
+var drop_slots: [16]DropSlot = @splat(.{});
+var drop_count: usize = 0;
+
+/// Registered as the SDL backend's drop_file_fn (main.zig, GUI startup).
+/// Runs synchronously during event pumping — stash and return.
+pub fn onSdlDropFile(path: []const u8, x: f32, y: f32) void {
+    if (drop_count >= drop_slots.len) return;
+    if (path.len == 0 or path.len > drop_slots[0].path.len) return;
+    const s = &drop_slots[drop_count];
+    @memcpy(s.path[0..path.len], path);
+    s.len = path.len;
+    s.x = x;
+    s.y = y;
+    drop_count += 1;
+}
+
+/// Consume staged OS file drops: dropped on the tree panel = import into
+/// the folder under the cursor; dropped on the editor = open the file
+/// (or re-root the tree when a folder was dropped).
+fn processFileDrops(editor: *Editor) void {
+    if (!build_options.has_gui) return;
+    if (drop_count == 0) return;
+    defer drop_count = 0;
+    const scale = filetree_panel_scale;
+    for (drop_slots[0..drop_count]) |*s| {
+        const path = s.path[0..s.len];
+        var handled = false;
+        if (editor.filetree_visible) {
+            if (filetree_panel_rect) |pr| {
+                const px = s.x * scale;
+                const py = s.y * scale;
+                if (px >= pr.x and px <= pr.x + pr.w and py >= pr.y and py <= pr.y + pr.h) {
+                    if (editor.filetree) |*ft| {
+                        const dest_idx: u32 = blk: {
+                            const g = filetree_rows_geom orelse break :blk 0;
+                            const row = filetreeRowAt(ft, g.rows_y, g.line_height, py) orelse break :blk 0;
+                            const node_idx = ft.visible.items[row];
+                            break :blk if (ft.nodes.items[node_idx].kind == .dir) node_idx else ft.nodes.items[node_idx].parent;
+                        };
+                        editor.filetreeImportAbs(path, dest_idx);
+                        handled = true;
+                    }
+                }
+            }
+        }
+        if (!handled) {
+            // Dropped on the editor: folders become the tree root, files
+            // open as tabs (with the usual binary-file guard).
+            if (std.Io.Dir.openDirAbsolute(editor.io, path, .{})) |d| {
+                d.close(editor.io);
+                _ = editor.setFiletreeRoot(path);
+            } else |_| {
+                _ = editor.openOrFocus(path) catch |err| {
+                    if (err == error.BinaryFile) {
+                        guiNotify(editor, "Not opened: binary or unsupported text encoding", .{});
+                    } else {
+                        guiNotify(editor, "Open failed: {s}", .{@errorName(err)});
+                    }
+                };
+            }
+        }
+    }
+}
 
 /// File tree side panel — custom row rendering in the editorPane style
 /// (no per-row widgets; we own scrolling, selection, and input). Renders
@@ -817,6 +958,23 @@ var filetree_poll_ns: i128 = 0;
 fn filetreePanel(editor: *Editor) void {
     if (!build_options.has_gui) return;
     const ft = if (editor.filetree) |*f| f else return;
+
+    // Auto-reveal: when the active document changes (tab click, Ctrl+Tab,
+    // open), select it in the tree — without stealing keyboard focus.
+    if (editor.filetree_auto_reveal) {
+        const doc = editor.activeDoc();
+        if (doc.file_path) |p| {
+            const h = std.hash.Fnv1a_64.hash(p);
+            if (h != filetree_autoreveal_last) {
+                filetree_autoreveal_last = h;
+                _ = editor.filetreeRevealPath(p);
+            }
+        } else {
+            filetree_autoreveal_last = 0;
+        }
+    }
+    // The `/` search only lives while the tree owns the keyboard.
+    if (!editor.filetree_focused) filetree_search_active = false;
 
     const panel_w = std.math.clamp(editor.filetree_width, 120, 600);
     var pbox = dvui.box(@src(), .{ .dir = .vertical }, .{
@@ -835,21 +993,26 @@ fn filetreePanel(editor: *Editor) void {
     filetree_panel_rect = area;
     filetree_panel_scale = scale;
 
-    const font = dvui.Font.theme(.mono);
+    const font = dvui.Font.theme(.body);
     const line_height = font.lineHeight() * scale;
     if (line_height <= 0 or area.h <= 0 or area.w <= 0) return;
 
-    // Header row (root directory name), tree rows below.
-    const header_h = line_height + 4 * scale;
-    const rows_y = area.y + header_h;
-    const rows_h = area.h - header_h;
-    const visible_rows: usize = if (rows_h > line_height) @intFromFloat(@floor(rows_h / line_height)) else 1;
+    // Column geometry shared by the painter and the mouse handler.
+    const m = filetreeMetrics(area, scale, line_height);
+    const header_h = m.rows_y - area.y;
+    const visible_rows = m.visible_rows;
+
+    // SDL only delivers .text events while someone declares a text-input
+    // region, and the editor pane only does that for itself — without
+    // this, `/` search never receives its query characters.
+    if (editor.filetree_focused and editor.mode == .normal) {
+        dvui.wantTextInput(area.toNatural());
+    }
 
     // Input first — clicks/keys can expand or collapse rows, so every
     // count and clamp below must see the post-input state (a stale
     // row_count here was an index-out-of-bounds panic on collapse).
-    const glyph_w = font.textSize("+ ").w * scale;
-    handleFiletreeMouse(editor, ft, wd, area, rows_y, line_height, visible_rows, scale, glyph_w);
+    handleFiletreeMouse(editor, ft, wd, m);
     if (editor.filetree_focused and editor.mode == .normal and !editor.completion_active) {
         handleFiletreeKeys(editor, ft, wd, visible_rows);
     }
@@ -865,11 +1028,39 @@ fn filetreePanel(editor: *Editor) void {
         filetree_scroll = row_count -| visible_rows;
     }
 
+    // Inline create/rename entry target (delete confirm is a dialog).
+    // Rename draws over the entry's own row; create inserts a pseudo-row
+    // right below its parent directory.
+    var inline_rename_row: ?usize = null;
+    var inline_rename_icon: fileicons.FileIcon = .{ .kind = .generic, .color = null };
+    var inline_create_slot: ?usize = null;
+    var inline_depth: u16 = 1;
+    if (filetreeInlineTarget(editor, ft)) |it| {
+        inline_rename_row = it.rename_row;
+        inline_create_slot = it.create_slot;
+        inline_depth = it.depth;
+        inline_rename_icon = it.icon;
+        // Keep the entry on-screen while typing.
+        if (it.create_slot orelse it.rename_row) |slot| {
+            if (slot < filetree_scroll) {
+                filetree_scroll = slot;
+            } else if (visible_rows > 0 and slot >= filetree_scroll + visible_rows) {
+                filetree_scroll = slot - visible_rows + 1;
+            }
+        }
+    }
+    // Frame geometry for OS-drop targeting (consumed by processFileDrops).
+    filetree_rows_geom = .{ .rows_y = m.rows_y, .line_height = line_height };
+
     // --- Header: clickable ^ up-button + root path, truncated from the
     // left so the tail (the part you care about) stays readable ---
     const header_fg = toDvui(editor.theme.overlay_fg);
     const dim = toDvui(editor.theme.overlay_dim);
     fillBar(area, 0, header_h, toDvui(editor.theme.gutter_bg));
+    // Root is the operation target (empty-space click) — mark the header.
+    if (ft.root_selected) {
+        fillBar(area, 0, header_h, toDvui(editor.theme.selection).opacity(0.35));
+    }
     if (filetree_dnd_active) {
         switch (filetree_dnd_target) {
             .root => fillBar(area, 0, header_h, toDvui(editor.theme.overlay_selection)),
@@ -877,33 +1068,93 @@ fn filetreePanel(editor: *Editor) void {
         }
     }
     const hdr_color = if (editor.filetree_focused) header_fg else dim;
-    renderOverlayText(font, "^", area.x + 6 * scale, area.y + 2 * scale, rs, hdr_color);
+    const up_sz = @min(header_h - 4 * scale, 13 * scale);
+    renderIconTinted("ft_up", dvui.entypo.level_up, .{
+        .x = area.x + 6 * scale,
+        .y = area.y + (header_h - up_sz) / 2,
+        .w = up_sz,
+        .h = up_sz,
+    }, scale, hdr_color);
+    // Right-aligned header buttons: new file, collapse all.
+    const btn_y = area.y + (header_h - m.hdr_btn_sz) / 2;
+    const b1_color = if (filetree_hdr_hover == 1) header_fg else dim;
+    const b2_color = if (filetree_hdr_hover == 2) header_fg else dim;
+    renderIconTinted("ft_new", dvui.entypo.plus, .{
+        .x = m.hdr_btn1_x,
+        .y = btn_y,
+        .w = m.hdr_btn_sz,
+        .h = m.hdr_btn_sz,
+    }, scale, b1_color);
+    renderIconTinted("ft_collapse", dvui.entypo.squared_minus, .{
+        .x = m.hdr_btn2_x,
+        .y = btn_y,
+        .w = m.hdr_btn_sz,
+        .h = m.hdr_btn_sz,
+    }, scale, b2_color);
+
     const char_w = font.textSize("M").w * scale;
-    const path_x = area.x + 6 * scale + glyph_w;
-    const avail_px = (area.x + area.w) - path_x - 4 * scale;
-    const budget: usize = if (char_w > 0 and avail_px > char_w) @intFromFloat(@floor(avail_px / char_w)) else 0;
-    const tail = filetree_mod.pathTail(ft.root_path, budget);
-    if (tail.len == ft.root_path.len) {
-        renderOverlayText(font, tail, path_x, area.y + 2 * scale, rs, hdr_color);
+    const path_x = area.x + m.up_btn_w;
+    const avail_px = m.hdr_btn1_x - path_x - 6 * scale;
+    if (filetree_search_active) {
+        // `/` search replaces the path while typing; warn color on no match.
+        var sbuf: [96]u8 = undefined;
+        const stxt = std.fmt.bufPrint(&sbuf, "/{s}_", .{filetree_search_buf[0..filetree_search_len]}) catch "/_";
+        const scolor = if (filetree_search_miss) toDvui(editor.theme.overlay_warn) else hdr_color;
+        const prev_clip = dvui.clip(.{ .x = path_x, .y = area.y, .w = @max(0, avail_px), .h = header_h });
+        renderOverlayText(font, stxt, path_x, area.y + 2 * scale, rs, scolor);
+        dvui.clipSet(prev_clip);
     } else {
-        var hdr_buf: [600]u8 = undefined;
-        const short = filetree_mod.pathTail(ft.root_path, budget -| 3);
-        const txt = std.fmt.bufPrint(&hdr_buf, "...{s}", .{short}) catch short;
-        renderOverlayText(font, txt, path_x, area.y + 2 * scale, rs, hdr_color);
+        const budget: usize = if (char_w > 0 and avail_px > char_w) @intFromFloat(@floor(avail_px / char_w)) else 0;
+        const tail = filetree_mod.pathTail(ft.root_path, budget);
+        if (tail.len == ft.root_path.len) {
+            renderOverlayText(font, tail, path_x, area.y + 2 * scale, rs, hdr_color);
+        } else {
+            var hdr_buf: [600]u8 = undefined;
+            const short = filetree_mod.pathTail(ft.root_path, budget -| 3);
+            const txt = std.fmt.bufPrint(&hdr_buf, "...{s}", .{short}) catch short;
+            renderOverlayText(font, txt, path_x, area.y + 2 * scale, rs, hdr_color);
+        }
     }
 
     // --- Rows ---
     const text_color = toDvui(editor.theme.text);
     const sel_bg = toDvui(editor.theme.selection);
     const guide_color = toDvui(editor.theme.gutter_separator);
-    const indent_w = 12 * scale;
     var row = filetree_scroll;
-    var y = rows_y;
+    var y = m.rows_y;
     while (row < row_count and y + line_height <= area.y + area.h + 0.5) : (row += 1) {
         const idx = ft.visible.items[row];
         const node = ft.nodes.items[idx];
+        // Inline create entry: a pseudo-row that pushes later rows down.
+        if (inline_create_slot) |slot| {
+            if (slot == row) {
+                filetreeDrawInlineEntry(editor, m, rs, font, y, inline_depth, null);
+                y += line_height;
+                if (y + line_height > area.y + area.h + 0.5) break;
+            }
+        }
+        // Inline rename: the entry's own row becomes the input box.
+        if (inline_rename_row) |rr| {
+            if (rr == row) {
+                filetreeDrawInlineEntry(editor, m, rs, font, y, inline_depth, inline_rename_icon);
+                y += line_height;
+                continue;
+            }
+        }
+        if (!filetree_dnd_active) {
+            if (filetree_hover_row) |hr| {
+                if (hr == row and row != ft.selected) {
+                    fillBar(area, y - area.y, line_height, sel_bg.opacity(0.3));
+                }
+            }
+        }
+        if (row != ft.selected and ft.isMultiSelected(idx)) {
+            fillBar(area, y - area.y, line_height, sel_bg.opacity(0.55));
+        }
         if (row == ft.selected) {
-            fillBar(area, y - area.y, line_height, sel_bg);
+            // Dimmed bar when the tree doesn't own the keyboard.
+            const bar = if (editor.filetree_focused) sel_bg else sel_bg.opacity(0.45);
+            fillBar(area, y - area.y, line_height, bar);
         }
         if (filetree_dnd_active) {
             switch (filetree_dnd_target) {
@@ -911,31 +1162,86 @@ fn filetreePanel(editor: *Editor) void {
                 else => {},
             }
         }
-        const depth_f: f32 = @floatFromInt(node.depth -| 1);
-        const x = area.x + 6 * scale + depth_f * indent_w;
-        // Indent guides: one vertical line per ancestor level, under that
-        // level's glyph column, so deep nesting stays readable.
+        const x = m.rowX(node.depth);
+        // Indent guides: one vertical line per ancestor level, centered
+        // under that level's chevron column, so deep nesting stays readable.
         var lvl: usize = 0;
         while (lvl < node.depth -| 1) : (lvl += 1) {
-            const gx = area.x + 6 * scale + @as(f32, @floatFromInt(lvl)) * indent_w + 3 * scale;
+            const gx = area.x + m.pad_l + @as(f32, @floatFromInt(lvl)) * m.indent_w + m.chevron_w / 2;
             const guide: dvui.Rect.Physical = .{ .x = gx, .y = y, .w = @max(1.0, 1 * scale), .h = line_height };
             guide.fill(.{}, .{ .color = guide_color, .fade = 1.0 });
         }
-        const glyph: []const u8 = switch (node.kind) {
-            .dir => if (node.expanded) "- " else "+ ",
-            .file => "  ",
-        };
-        // Git status drives the row color (dirs roll up contained changes)
-        const row_color = if (ft.statusFor(idx)) |st| toDvui(switch (st) {
+        const icon_y = y + (line_height - m.icon_size) / 2;
+        if (node.kind == .dir) {
+            const chev: []const u8 = if (node.expanded) dvui.entypo.chevron_small_down else dvui.entypo.chevron_small_right;
+            const chev_name: []const u8 = if (node.expanded) "ft_chev_open" else "ft_chev";
+            renderIconTinted(chev_name, chev, .{
+                .x = x + (m.chevron_w - m.icon_size) / 2,
+                .y = icon_y,
+                .w = m.icon_size,
+                .h = m.icon_size,
+            }, scale, dim);
+        }
+        // Entries sitting in the cut clipboard render dimmed.
+        const in_cut = editor.filetree_clip_cut and editor.filetreeClipContains(node.rel_path);
+        // Type icon: fixed accent colors; unknown types use dimmed text.
+        const fi = fileicons.iconFor(node.name, node.kind == .dir);
+        const glyph = filetreeIconTvg(fi.kind);
+        var tint: dvui.Color = if (fi.color) |c|
+            .{ .r = c.r, .g = c.g, .b = c.b, .a = 255 }
+        else
+            text_color.opacity(0.75);
+        if (in_cut) tint = tint.opacity(0.45);
+        renderIconTinted(glyph.name, glyph.tvg, .{
+            .x = x + m.chevron_w,
+            .y = icon_y,
+            .w = m.icon_size,
+            .h = m.icon_size,
+        }, scale, tint);
+        // Git status drives the name color (dirs roll up contained changes)
+        const status = ft.statusFor(idx);
+        var row_color = if (status) |st| toDvui(switch (st) {
             .added => editor.theme.git_added,
             .modified => editor.theme.git_modified,
             .deleted => editor.theme.git_deleted,
             .untracked => editor.theme.git_untracked,
         }) else text_color;
-        var name_buf: [300]u8 = undefined;
-        const row_txt = std.fmt.bufPrint(&name_buf, "{s}{s}", .{ glyph, node.name }) catch node.name;
-        renderOverlayText(font, row_txt, x, y, rs, row_color);
+        if (in_cut) row_color = row_color.opacity(0.45);
+        // Badge column: status letter for files, a dot for dirty dirs.
+        var badge_left = m.badge_right;
+        if (status) |st| {
+            const badge: []const u8 = if (node.kind == .dir) "\u{2022}" else switch (st) {
+                .added => "A",
+                .modified => "M",
+                .deleted => "D",
+                .untracked => "U",
+            };
+            const bw = font.textSize(badge).w * scale;
+            badge_left = m.badge_right - bw;
+            renderOverlayText(font, badge, badge_left, y, rs, row_color);
+        }
+        // Name, clipped so long names never run under the badge or bar.
+        const name_x = x + m.chevron_w + m.icon_w;
+        const clip_w = @max(0, badge_left - 4 * scale - area.x);
+        const prev_clip = dvui.clip(.{ .x = area.x, .y = y, .w = clip_w, .h = line_height });
+        renderOverlayText(font, node.name, name_x, y, rs, row_color);
+        dvui.clipSet(prev_clip);
         y += line_height;
+    }
+
+    // Inline create entry appended past the last row (or in an empty tree).
+    if (inline_create_slot) |slot| {
+        if (slot >= row_count and row >= row_count and y + line_height <= area.y + area.h + 0.5) {
+            filetreeDrawInlineEntry(editor, m, rs, font, y, inline_depth, null);
+        }
+    }
+
+    // --- Scrollbar: slim pill over the right edge of the rows ---
+    if (filetreeSbThumb(ft, m)) |thumb| {
+        const active = filetree_sb_drag or filetree_sb_hover;
+        const sb_color = if (active) header_fg.opacity(0.6) else dim.opacity(0.45);
+        const rad = thumb.w / 2;
+        thumb.fill(.{ .x = rad, .y = rad, .w = rad, .h = rad }, .{ .color = sb_color, .fade = 1.0 });
     }
 
     // Separator line on the editor-facing edge — without it the panel
@@ -962,6 +1268,9 @@ fn handleFiletreeResize(editor: *Editor, prect: dvui.Rect.Physical, scale: f32) 
         if (e.handled) continue;
         if (e.evt != .mouse) continue;
         const me = e.evt.mouse;
+        // Same subwindow rule as handleFiletreeMouse: a press on a
+        // floating window overlapping the edge band must not grab it.
+        if (me.floating_win != dvui.subwindowCurrentId()) continue;
         const near_edge = me.p.x >= edge_x - grab and me.p.x <= edge_x + grab and
             me.p.y >= prect.y and me.p.y <= prect.y + prect.h;
 
@@ -1029,11 +1338,258 @@ fn filetreeRowAt(ft: *const FileTree, rows_y: f32, line_height: f32, my: f32) ?u
     return row;
 }
 
-fn handleFiletreeMouse(editor: *Editor, ft: *FileTree, wd: *dvui.WidgetData, area: dvui.Rect.Physical, rows_y: f32, line_height: f32, visible_rows: usize, scale: f32, glyph_w: f32) void {
+/// Per-frame file tree layout metrics (physical px) — one place for the
+/// column geometry so the painter and the mouse handler can't drift.
+const FiletreeMetrics = struct {
+    area: dvui.Rect.Physical,
+    scale: f32,
+    line_height: f32,
+    rows_y: f32,
+    rows_h: f32,
+    visible_rows: usize,
+    /// Left padding before depth-1 content.
+    pad_l: f32,
+    /// Horizontal shift per depth level.
+    indent_w: f32,
+    /// Expander column, reserved on every row so icons align.
+    chevron_w: f32,
+    /// Square edge of chevron/type icons.
+    icon_size: f32,
+    /// Icon column width incl. the gap before the name.
+    icon_w: f32,
+    /// Header up-button click zone, measured from area.x.
+    up_btn_w: f32,
+    /// Header icon buttons (new file, collapse all), right-aligned.
+    hdr_btn_sz: f32,
+    hdr_btn1_x: f32,
+    hdr_btn2_x: f32,
+    /// Scrollbar band (left edge + width) over the rows' right edge.
+    sb_x: f32,
+    sb_w: f32,
+    /// Right x where git badges end.
+    badge_right: f32,
+
+    /// Left x of a row's chevron column at `depth`.
+    fn rowX(m: FiletreeMetrics, depth: u16) f32 {
+        return m.area.x + m.pad_l + @as(f32, @floatFromInt(depth -| 1)) * m.indent_w;
+    }
+};
+
+fn filetreeMetrics(area: dvui.Rect.Physical, scale: f32, line_height: f32) FiletreeMetrics {
+    const header_h = line_height + 4 * scale;
+    const rows_h = area.h - header_h;
+    const icon_size = @round(line_height * 0.72);
+    const sb_w = 6 * scale;
+    const sb_x = area.x + area.w - sb_w - 1 * scale;
+    const hdr_btn_sz = @min(header_h - 4 * scale, 14 * scale);
+    const hdr_btn2_x = area.x + area.w - sb_w - hdr_btn_sz - 4 * scale;
+    return .{
+        .hdr_btn_sz = hdr_btn_sz,
+        .hdr_btn1_x = hdr_btn2_x - hdr_btn_sz - 6 * scale,
+        .hdr_btn2_x = hdr_btn2_x,
+        .area = area,
+        .scale = scale,
+        .line_height = line_height,
+        .rows_y = area.y + header_h,
+        .rows_h = rows_h,
+        .visible_rows = if (rows_h > line_height) @intFromFloat(@floor(rows_h / line_height)) else 1,
+        .pad_l = 6 * scale,
+        .indent_w = 12 * scale,
+        .chevron_w = 14 * scale,
+        .icon_size = icon_size,
+        .icon_w = icon_size + 5 * scale,
+        .up_btn_w = 22 * scale,
+        .sb_x = sb_x,
+        .sb_w = sb_w,
+        .badge_right = sb_x - 2 * scale,
+    };
+}
+
+/// Scrollbar thumb rect, or null when every row fits.
+fn filetreeSbThumb(ft: *const FileTree, m: FiletreeMetrics) ?dvui.Rect.Physical {
+    const count = ft.visible.items.len;
+    if (count <= m.visible_rows or m.rows_h <= 0) return null;
+    const count_f: f32 = @floatFromInt(count);
+    const vis_f: f32 = @floatFromInt(m.visible_rows);
+    const thumb_h = @min(m.rows_h, @max(20 * m.scale, m.rows_h * vis_f / count_f));
+    const denom: f32 = @floatFromInt(count - m.visible_rows);
+    const frac = @min(1.0, @as(f32, @floatFromInt(filetree_scroll)) / denom);
+    return .{
+        .x = m.sb_x + 1 * m.scale,
+        .y = m.rows_y + (m.rows_h - thumb_h) * frac,
+        .w = m.sb_w - 2 * m.scale,
+        .h = thumb_h,
+    };
+}
+
+/// TinyVG glyph for a file-icon kind (entypo set bundled with dvui). The
+/// name only keys error logs and the no-tvg fallback, not the cache.
+fn filetreeIconTvg(kind: fileicons.IconKind) struct { name: []const u8, tvg: []const u8 } {
+    return switch (kind) {
+        .folder => .{ .name = "ft_folder", .tvg = dvui.entypo.folder },
+        .code => .{ .name = "ft_code", .tvg = dvui.entypo.code },
+        .text => .{ .name = "ft_text", .tvg = dvui.entypo.text_document },
+        .book => .{ .name = "ft_book", .tvg = dvui.entypo.open_book },
+        .license => .{ .name = "ft_license", .tvg = dvui.entypo.shield },
+        .config => .{ .name = "ft_config", .tvg = dvui.entypo.cog },
+        .data => .{ .name = "ft_data", .tvg = dvui.entypo.database },
+        .image => .{ .name = "ft_image", .tvg = dvui.entypo.image },
+        .audio => .{ .name = "ft_audio", .tvg = dvui.entypo.music },
+        .video => .{ .name = "ft_video", .tvg = dvui.entypo.video },
+        .archive => .{ .name = "ft_archive", .tvg = dvui.entypo.box },
+        .binary => .{ .name = "ft_binary", .tvg = dvui.entypo.layers },
+        .executable => .{ .name = "ft_exec", .tvg = dvui.entypo.flash },
+        .git => .{ .name = "ft_git", .tvg = dvui.entypo.flow_branch },
+        .lock => .{ .name = "ft_lock", .tvg = dvui.entypo.lock },
+        .font_file => .{ .name = "ft_font", .tvg = dvui.entypo.text },
+        .generic => .{ .name = "ft_file", .tvg = dvui.entypo.document },
+    };
+}
+
+/// Paint a tinted TinyVG icon into a physical rect. dvui caches the
+/// rasterized texture per (glyph, height, tint).
+fn renderIconTinted(name: []const u8, tvg_bytes: []const u8, rect: dvui.Rect.Physical, scale: f32, color: dvui.Color) void {
+    dvui.renderIcon(name, tvg_bytes, .{ .r = rect, .s = scale }, .{}, .{
+        .fill_color = color,
+        .stroke_color = color,
+    }) catch {};
+}
+
+/// Jump the selection to the next visible row whose name contains the
+/// `/` search query (case-insensitive), scanning forward from the current
+/// selection and wrapping. Sets the miss flag for header feedback.
+fn filetreeSearchJump(ft: *FileTree, visible_rows: usize) void {
+    const q = filetree_search_buf[0..filetree_search_len];
+    filetree_search_miss = false;
+    if (q.len == 0) return;
+    const n = ft.visible.items.len;
+    if (n == 0) {
+        filetree_search_miss = true;
+        return;
+    }
+    const start = @min(ft.selected, n - 1);
+    var i: usize = 0;
+    while (i < n) : (i += 1) {
+        const r = (start + i) % n;
+        const name = ft.nodes.items[ft.visible.items[r]].name;
+        if (std.ascii.indexOfIgnoreCase(name, q) != null) {
+            ft.clearMulti();
+            ft.root_selected = false;
+            ft.selected = r;
+            filetreeEnsureSelectedVisible(ft, visible_rows);
+            return;
+        }
+    }
+    filetree_search_miss = true;
+}
+
+/// Paint the inline create/rename entry row (mode == .filetree_prompt).
+/// The prompt state machine — keys, text input, apply/cancel — is the
+/// shared one; this is purely the in-panel rendering of `open_buf`.
+/// `base_icon` fixes the icon (rename keeps the entry's own); null means
+/// live-classify the typed name, flipping to a folder on a trailing '/'.
+fn filetreeDrawInlineEntry(editor: *Editor, m: FiletreeMetrics, rs: dvui.RectScale, font: dvui.Font, y: f32, depth: u16, base_icon: ?fileicons.FileIcon) void {
+    const scale = m.scale;
+    const area = m.area;
+    const input = editor.open_buf[0..editor.open_buf_len];
+    fillBar(area, y - area.y, m.line_height, toDvui(editor.theme.overlay_bg));
+    const fi = base_icon orelse blk: {
+        const is_dir = input.len > 0 and (input[input.len - 1] == '/' or input[input.len - 1] == '\\');
+        break :blk fileicons.iconFor(if (is_dir) "" else input, is_dir);
+    };
+    const glyph = filetreeIconTvg(fi.kind);
+    const text_color = toDvui(editor.theme.text);
+    const tint: dvui.Color = if (fi.color) |c|
+        .{ .r = c.r, .g = c.g, .b = c.b, .a = 255 }
+    else
+        text_color.opacity(0.75);
+    const x = m.rowX(depth);
+    const icon_y = y + (m.line_height - m.icon_size) / 2;
+    renderIconTinted(glyph.name, glyph.tvg, .{
+        .x = x + m.chevron_w,
+        .y = icon_y,
+        .w = m.icon_size,
+        .h = m.icon_size,
+    }, scale, tint);
+    // Input box: text and caret over an underline.
+    const name_x = x + m.chevron_w + m.icon_w;
+    const box_w = @max(0, m.badge_right - name_x);
+    const fg = toDvui(editor.theme.overlay_fg);
+    const line_w = @max(1.0, 1 * scale);
+    const underline: dvui.Rect.Physical = .{ .x = name_x, .y = y + m.line_height - line_w, .w = box_w, .h = line_w };
+    underline.fill(.{}, .{ .color = fg, .fade = 1.0 });
+    const prev_clip = dvui.clip(.{ .x = name_x, .y = y, .w = box_w, .h = m.line_height });
+    renderOverlayText(font, input, name_x, y, rs, text_color);
+    dvui.clipSet(prev_clip);
+    const tw = font.textSize(input).w * scale;
+    const caret: dvui.Rect.Physical = .{
+        .x = @min(name_x + tw + 1 * scale, m.badge_right - line_w),
+        .y = y + 2 * scale,
+        .w = line_w,
+        .h = m.line_height - 4 * scale,
+    };
+    caret.fill(.{}, .{ .color = fg, .fade = 1.0 });
+}
+
+fn handleFiletreeMouse(editor: *Editor, ft: *FileTree, wd: *dvui.WidgetData, m: FiletreeMetrics) void {
+    const area = m.area;
+    const rows_y = m.rows_y;
+    const line_height = m.line_height;
+    const visible_rows = m.visible_rows;
     for (dvui.events()) |*e| {
         if (e.handled) continue;
         if (e.evt != .mouse) continue;
         const me = e.evt.mouse;
+
+        // Events over an open floating window (context menu, dialogs)
+        // belong to it — dvui tags each mouse event with the topmost
+        // subwindow under the pointer. Without this check the raw rect
+        // tests below stole the context menu's clicks, so its items
+        // never fired.
+        if (me.floating_win != dvui.subwindowCurrentId()) continue;
+
+        // Click-away: while an inline create/rename is open, any press
+        // that isn't on the entry row cancels it (like Escape). The
+        // press is consumed — a dismiss click shouldn't also select.
+        if (me.action == .press and editor.mode == .filetree_prompt and
+            editor.filetree_prompt_kind != .delete_confirm)
+        {
+            const on_entry = blk: {
+                const it = filetreeInlineTarget(editor, ft) orelse break :blk false;
+                const entry_row = it.rename_row orelse (it.create_slot orelse break :blk false);
+                const rel_row: i64 = @as(i64, @intCast(entry_row)) - @as(i64, @intCast(filetree_scroll));
+                const ey = rows_y + @as(f32, @floatFromInt(rel_row)) * line_height;
+                break :blk me.p.x >= area.x and me.p.x <= area.x + area.w and
+                    me.p.y >= ey and me.p.y < ey + line_height;
+            };
+            if (!on_entry) {
+                e.handle(@src(), wd);
+                editor.cancelFiletreePrompt();
+            }
+            continue;
+        }
+
+        // In-flight scrollbar-thumb drag: track motion/release even
+        // outside the panel, like the drag-move below.
+        if (filetree_sb_drag) {
+            if (me.action == .motion) {
+                e.handle(@src(), wd);
+                if (filetreeSbThumb(ft, m)) |thumb| {
+                    const usable = m.rows_h - thumb.h;
+                    if (usable > 0) {
+                        const frac = std.math.clamp((me.p.y - rows_y - filetree_sb_grab_dy) / usable, 0, 1);
+                        const denom: f32 = @floatFromInt(ft.visible.items.len - visible_rows);
+                        filetree_scroll = @intFromFloat(@round(frac * denom));
+                    }
+                }
+                continue;
+            }
+            if (me.action == .release) {
+                e.handle(@src(), wd);
+                filetree_sb_drag = false;
+                continue;
+            }
+        }
 
         // In-flight drag-move: track motion/release even outside the panel
         if (filetree_dnd_armed or filetree_dnd_active) {
@@ -1051,13 +1607,18 @@ fn handleFiletreeMouse(editor: *Editor, ft: *FileTree, wd: *dvui.WidgetData, are
                     filetree_dnd_target = filetreeDropTarget(ft, area, rows_y, line_height, me.p);
                     dvui.cursorSet(.arrow_all);
                     if (filetree_dnd_src_row < ft.visible.items.len) {
-                        const src_name = ft.nodes.items[ft.visible.items[filetree_dnd_src_row]].name;
+                        const src_idx = ft.visible.items[filetree_dnd_src_row];
+                        const src_name = ft.nodes.items[src_idx].name;
                         const tgt_name: []const u8 = switch (filetree_dnd_target) {
                             .none => "(no target)",
                             .root => std.fs.path.basename(ft.root_path),
                             .row => |tr| ft.nodes.items[ft.visible.items[tr]].name,
                         };
-                        const msg = std.fmt.bufPrint(&editor.status_buf, "Move {s} -> {s}", .{ src_name, tgt_name }) catch "";
+                        const drag_n: usize = if (filetree_dnd_paths) |p| p.len else 1;
+                        const msg = if (drag_n > 1)
+                            std.fmt.bufPrint(&editor.status_buf, "Move {d} items -> {s}", .{ drag_n, tgt_name }) catch ""
+                        else
+                            std.fmt.bufPrint(&editor.status_buf, "Move {s} -> {s}", .{ src_name, tgt_name }) catch "";
                         editor.status_message = msg;
                     }
                 }
@@ -1068,6 +1629,7 @@ fn handleFiletreeMouse(editor: *Editor, ft: *FileTree, wd: *dvui.WidgetData, are
                     filetree_dnd_armed = false;
                     filetree_dnd_active = false;
                     filetree_dnd_target = .none;
+                    filetreeDndFreePaths(editor);
                 }
                 if (filetree_dnd_active) {
                     e.handle(@src(), wd);
@@ -1084,7 +1646,17 @@ fn handleFiletreeMouse(editor: *Editor, ft: *FileTree, wd: *dvui.WidgetData, are
                             },
                         };
                         if (dest_idx) |di| {
-                            editor.filetreeMoveTo(ft.nodes.items[src_idx].rel_path, di);
+                            // The press-time snapshot is what moves — the
+                            // live set may have changed since the drag armed.
+                            if (filetree_dnd_paths) |paths| {
+                                if (paths.len > 1) {
+                                    editor.filetreeMoveManyTo(paths, di);
+                                } else if (paths.len == 1) {
+                                    editor.filetreeMoveTo(paths[0], di);
+                                }
+                            } else {
+                                editor.filetreeMoveTo(ft.nodes.items[src_idx].rel_path, di);
+                            }
                         }
                     }
                 }
@@ -1092,17 +1664,43 @@ fn handleFiletreeMouse(editor: *Editor, ft: *FileTree, wd: *dvui.WidgetData, are
             }
         }
 
-        if (me.p.x < area.x or me.p.x > area.x + area.w or
-            me.p.y < area.y or me.p.y > area.y + area.h) continue;
+        const inside = me.p.x >= area.x and me.p.x <= area.x + area.w and
+            me.p.y >= area.y and me.p.y <= area.y + area.h;
+        if (me.action == .position) {
+            // Hover feedback (row highlight + scrollbar brightening);
+            // cleared whenever the pointer leaves the panel.
+            filetree_sb_hover = inside and me.p.x >= m.sb_x and me.p.y >= rows_y;
+            filetree_hover_row = if (inside and !filetree_sb_hover)
+                filetreeRowAt(ft, rows_y, line_height, me.p.y)
+            else
+                null;
+            filetree_hdr_hover = 0;
+            if (inside and me.p.y < rows_y) {
+                if (me.p.x >= m.hdr_btn1_x and me.p.x < m.hdr_btn1_x + m.hdr_btn_sz) {
+                    filetree_hdr_hover = 1;
+                } else if (me.p.x >= m.hdr_btn2_x and me.p.x < m.hdr_btn2_x + m.hdr_btn_sz) {
+                    filetree_hdr_hover = 2;
+                }
+            }
+            if (inside) dvui.cursorSet(.arrow);
+            continue;
+        }
+        if (!inside) continue;
 
         switch (me.action) {
             .press => {
                 editor.status_message = "";
+                filetree_search_active = false;
                 const row = filetreeRowAt(ft, rows_y, line_height, me.p.y);
                 if (me.button == .right) {
-                    // Select the row under the cursor but leave the press
+                    // Select the row under the cursor (keeping any multi
+                    // selection that includes it) but leave the press
                     // unhandled — the panel's ContextWidget consumes it.
-                    if (row) |r| ft.selected = r;
+                    if (row) |r| {
+                        if (!ft.isMultiSelected(ft.visible.items[r])) ft.clearMulti();
+                        ft.root_selected = false;
+                        ft.selected = r;
+                    }
                     editor.filetree_focused = true;
                     continue;
                 }
@@ -1110,14 +1708,63 @@ fn handleFiletreeMouse(editor: *Editor, ft: *FileTree, wd: *dvui.WidgetData, are
                 dvui.focusWidget(wd.id, null, e.num);
                 editor.filetree_focused = true;
                 if (editor.mode != .normal) continue;
+                // Scrollbar band: drag the thumb, or page toward the click.
+                if (me.p.y >= rows_y and me.p.x >= m.sb_x) {
+                    if (filetreeSbThumb(ft, m)) |thumb| {
+                        if (me.p.y >= thumb.y and me.p.y < thumb.y + thumb.h) {
+                            filetree_sb_drag = true;
+                            filetree_sb_grab_dy = me.p.y - thumb.y;
+                        } else if (me.p.y < thumb.y) {
+                            filetree_scroll = filetree_scroll -| visible_rows;
+                        } else {
+                            const max_top = ft.visible.items.len -| visible_rows;
+                            filetree_scroll = @min(filetree_scroll + visible_rows, max_top);
+                        }
+                    }
+                    continue;
+                }
                 if (me.p.y < rows_y) {
-                    // Header: the ^ button re-roots at the parent folder
-                    if (me.p.x <= area.x + 6 * scale + glyph_w) {
+                    // Header: icon buttons on the right, up-button on the left
+                    if (me.p.x >= m.hdr_btn1_x and me.p.x < m.hdr_btn1_x + m.hdr_btn_sz) {
+                        editor.startFiletreePrompt(.create);
+                    } else if (me.p.x >= m.hdr_btn2_x and me.p.x < m.hdr_btn2_x + m.hdr_btn_sz) {
+                        _ = editor.execCommand("filetree_collapse_all", null);
+                    } else if (me.p.x <= area.x + m.up_btn_w) {
                         editor.filetreeRootUp();
                     }
                     continue;
                 }
+                if (row == null) {
+                    // Empty space below the rows: target the root for
+                    // create/paste/move (it has no row of its own).
+                    ft.clearMulti();
+                    ft.root_selected = true;
+                    filetree_last_click_ns = 0;
+                    continue;
+                }
                 if (row) |r| {
+                    // Multi-select: Ctrl toggles, Shift ranges — both skip
+                    // the double-click machinery but still arm a drag of
+                    // the resulting selection (VS Code gesture).
+                    if (me.mod.control() and !me.mod.shift()) {
+                        ft.toggleMultiAt(r) catch {};
+                        filetree_last_click_ns = 0;
+                        const still_selected = ft.isMultiSelected(ft.visible.items[r]) or
+                            (ft.multi.count() == 0 and ft.selected == r);
+                        if (still_selected) filetreeDndArm(editor, ft, me.p, r);
+                        continue;
+                    }
+                    if (me.mod.shift()) {
+                        ft.selectRangeTo(r) catch {};
+                        filetree_last_click_ns = 0;
+                        filetreeDndArm(editor, ft, me.p, r);
+                        continue;
+                    }
+                    // Plain click inside a multi selection keeps it (so
+                    // the group can be dragged); outside it, back to a
+                    // single selection.
+                    if (!ft.isMultiSelected(ft.visible.items[r])) ft.clearMulti();
+                    ft.root_selected = false;
                     ft.selected = r;
                     const idx = ft.visible.items[r];
                     const node = ft.nodes.items[idx];
@@ -1126,14 +1773,13 @@ fn handleFiletreeMouse(editor: *Editor, ft: *FileTree, wd: *dvui.WidgetData, are
                     const is_double = r == filetree_last_click_row and
                         now_ns - filetree_last_click_ns < filetree_double_click_ms * std.time.ns_per_ms;
 
-                    // Single click on the +/- glyph toggles a folder; row
+                    // Single click on the chevron toggles a folder; row
                     // names need a double click (toggle dir / open file) so
                     // a stray click never opens or collapses anything.
-                    const depth_f: f32 = @floatFromInt(node.depth -| 1);
-                    const gx = area.x + 6 * scale + depth_f * 12 * scale;
-                    const in_glyph = node.kind == .dir and me.p.x >= gx and me.p.x < gx + glyph_w;
+                    const rx = m.rowX(node.depth);
+                    const in_chevron = node.kind == .dir and me.p.x >= rx and me.p.x < rx + m.chevron_w;
 
-                    if (in_glyph) {
+                    if (in_chevron) {
                         ft.toggle(idx) catch {};
                         filetree_last_click_ns = 0; // action fired — no chain
                     } else if (is_double) {
@@ -1147,13 +1793,10 @@ fn handleFiletreeMouse(editor: *Editor, ft: *FileTree, wd: *dvui.WidgetData, are
                         filetree_last_click_ns = now_ns;
                         filetree_last_click_row = r;
                     }
-                    // Arm drag & drop from any name press (the glyph press
+                    // Arm drag & drop from any name press (the chevron press
                     // already mutated the tree, so its row may be stale)
-                    if (!in_glyph) {
-                        filetree_dnd_armed = true;
-                        filetree_dnd_active = false;
-                        filetree_dnd_press = me.p;
-                        filetree_dnd_src_row = r;
+                    if (!in_chevron) {
+                        filetreeDndArm(editor, ft, me.p, r);
                     }
                 }
             },
@@ -1165,9 +1808,8 @@ fn handleFiletreeMouse(editor: *Editor, ft: *FileTree, wd: *dvui.WidgetData, are
                 const max_top: i64 = @intCast(ft.visible.items.len -| visible_rows);
                 const new_top = @as(i64, @intCast(filetree_scroll)) + scroll_rows;
                 filetree_scroll = @intCast(@max(0, @min(new_top, max_top)));
-            },
-            .position => {
-                dvui.cursorSet(.arrow);
+                // Rows moved under the cursor — recompute the hover row.
+                filetree_hover_row = filetreeRowAt(ft, rows_y, line_height, me.p.y);
             },
             else => {},
         }
@@ -1185,24 +1827,60 @@ fn handleFiletreeKeys(editor: *Editor, ft: *FileTree, wd: *dvui.WidgetData, visi
                 // Keep the "press p" hint visible while a move is pending
                 if (editor.filetree_move_src == null) editor.status_message = "";
                 if (key.mod.control() or key.mod.alt()) continue;
+                if (filetree_search_active) {
+                    switch (key.code) {
+                        .escape, .enter => {
+                            e.handle(@src(), wd);
+                            filetree_search_active = false;
+                            continue;
+                        },
+                        .backspace => {
+                            e.handle(@src(), wd);
+                            if (filetree_search_len > 0) filetree_search_len -= 1;
+                            filetreeSearchJump(ft, visible_rows);
+                            continue;
+                        },
+                        // Arrows and friends leave search mode, then
+                        // navigate normally via the switch below.
+                        .up, .down, .left, .right, .home, .end => filetree_search_active = false,
+                        // Letters arrive via the text event — swallow the
+                        // raw keys so j/k/a/r/d/x/p don't fire mid-query.
+                        else => {
+                            e.handle(@src(), wd);
+                            continue;
+                        },
+                    }
+                }
                 switch (key.code) {
                     .up, .k => {
                         e.handle(@src(), wd);
-                        ft.moveSelection(-1);
+                        if (key.mod.shift() and key.code == .up) {
+                            ft.selectRangeTo(ft.selected -| 1) catch {};
+                        } else {
+                            ft.clearMulti();
+                            ft.moveSelection(-1);
+                        }
                         filetreeEnsureSelectedVisible(ft, visible_rows);
                     },
                     .down, .j => {
                         e.handle(@src(), wd);
-                        ft.moveSelection(1);
+                        if (key.mod.shift() and key.code == .down) {
+                            ft.selectRangeTo(ft.selected + 1) catch {};
+                        } else {
+                            ft.clearMulti();
+                            ft.moveSelection(1);
+                        }
                         filetreeEnsureSelectedVisible(ft, visible_rows);
                     },
                     .home => {
                         e.handle(@src(), wd);
+                        ft.clearMulti();
                         ft.selected = 0;
                         filetreeEnsureSelectedVisible(ft, visible_rows);
                     },
                     .end => {
                         e.handle(@src(), wd);
+                        ft.clearMulti();
                         ft.selected = ft.visible.items.len -| 1;
                         filetreeEnsureSelectedVisible(ft, visible_rows);
                     },
@@ -1264,11 +1942,13 @@ fn handleFiletreeKeys(editor: *Editor, ft: *FileTree, wd: *dvui.WidgetData, visi
                     },
                     .escape => {
                         e.handle(@src(), wd);
-                        // A pending move mark cancels first; second Esc
-                        // leaves the tree
+                        // A pending move mark cancels first, then a multi
+                        // selection; only then does focus leave the tree.
                         if (editor.filetree_move_src != null) {
                             editor.cancelFiletreeMove();
                             editor.status_message = "Move cancelled";
+                        } else if (ft.multi.count() > 0) {
+                            ft.clearMulti();
                         } else {
                             editor.filetree_focused = false;
                             filetree_release_focus = true;
@@ -1278,10 +1958,27 @@ fn handleFiletreeKeys(editor: *Editor, ft: *FileTree, wd: *dvui.WidgetData, visi
                 }
             },
             .text => |te| {
-                // Swallow stray text while the tree owns the keyboard so
-                // letters never insert into the document behind it.
+                // While the tree owns the keyboard, text either drives the
+                // `/` search or is swallowed so letters never insert into
+                // the document behind the panel.
                 switch (te.action) {
-                    .value => e.handle(@src(), wd),
+                    .value => |val| {
+                        e.handle(@src(), wd);
+                        if (filetree_search_active) {
+                            for (val.txt) |ch| {
+                                if (ch < 32 or ch >= 127) continue;
+                                if (filetree_search_len < filetree_search_buf.len) {
+                                    filetree_search_buf[filetree_search_len] = ch;
+                                    filetree_search_len += 1;
+                                }
+                            }
+                            filetreeSearchJump(ft, visible_rows);
+                        } else if (val.txt.len == 1 and val.txt[0] == '/') {
+                            filetree_search_active = true;
+                            filetree_search_len = 0;
+                            filetree_search_miss = false;
+                        }
+                    },
                     else => {},
                 }
             },
@@ -1311,6 +2008,92 @@ fn openFiletreeFile(editor: *Editor, ft: *FileTree, idx: u32) void {
     };
 }
 
+/// Clickable delete confirmation (mode == .filetree_prompt with kind ==
+/// .delete_confirm). Declared from frame() before the panes, like the
+/// settings dialog, so its buttons see events first. The y/n/Enter/Esc
+/// keys keep working through the modal key path.
+fn filetreeDeleteDialog(editor: *Editor) void {
+    if (!build_options.has_gui) return;
+    var float = dvui.floatingWindow(@src(), .{ .modal = true }, .{ .min_size_content = .{ .w = 340 } });
+    defer float.deinit();
+    float.dragAreaSet(dvui.windowHeader("Delete", "", null));
+
+    var vbox = dvui.box(@src(), .{ .dir = .vertical }, .{ .expand = .both, .padding = dvui.Rect.all(8) });
+    defer vbox.deinit();
+
+    const count = if (editor.filetree) |*ft| ft.selectionCount() else 1;
+    var buf: [600]u8 = undefined;
+    const what = if (count > 1)
+        std.fmt.bufPrint(&buf, "Delete {d} selected items?", .{count}) catch "Delete the selection?"
+    else
+        std.fmt.bufPrint(&buf, "Delete {s}?", .{editor.filetree_prompt_target orelse ""}) catch "Delete?";
+    dvui.labelNoFmt(@src(), what, .{}, .{});
+    dvui.labelNoFmt(@src(), "Folders delete recursively. (y/n works too)", .{}, .{
+        .color_text = toDvui(editor.theme.overlay_hint),
+    });
+
+    var hbox = dvui.box(@src(), .{ .dir = .horizontal }, .{
+        .gravity_x = 1.0,
+        .padding = .{ .x = 0, .y = 8, .w = 0, .h = 0 },
+    });
+    defer hbox.deinit();
+    if (dvui.button(@src(), "Cancel", .{}, .{})) {
+        editor.cancelFiletreePrompt();
+        dvui.focusSubwindow(null, null);
+    }
+    if (dvui.button(@src(), "Delete", .{}, .{})) {
+        editor.applyFiletreePrompt();
+        dvui.focusSubwindow(null, null);
+    }
+}
+
+const FiletreeInlineTarget = struct {
+    rename_row: ?usize,
+    create_slot: ?usize,
+    depth: u16,
+    icon: fileicons.FileIcon,
+};
+
+/// Resolve where the inline create/rename entry lives this frame — used
+/// by both the painter and the click-away hit test. Null when no
+/// create/rename prompt is active.
+fn filetreeInlineTarget(editor: *Editor, ft: *FileTree) ?FiletreeInlineTarget {
+    if (editor.mode != .filetree_prompt) return null;
+    if (editor.filetree_prompt_kind == .delete_confirm) return null;
+    const target = editor.filetree_prompt_target orelse return null;
+    var out: FiletreeInlineTarget = .{
+        .rename_row = null,
+        .create_slot = null,
+        .depth = 1,
+        .icon = .{ .kind = .generic, .color = null },
+    };
+    switch (editor.filetree_prompt_kind) {
+        .rename => {
+            const tidx = ft.findByPath(target) orelse return null;
+            const trow = ft.rowOf(tidx) orelse return null;
+            out.rename_row = trow;
+            const tnode = ft.nodes.items[tidx];
+            out.depth = tnode.depth;
+            out.icon = fileicons.iconFor(tnode.name, tnode.kind == .dir);
+        },
+        .create => {
+            const pidx = ft.findByPath(target) orelse 0;
+            if (pidx != 0) {
+                if (ft.rowOf(pidx)) |prow| {
+                    out.create_slot = prow + 1;
+                    out.depth = ft.nodes.items[pidx].depth + 1;
+                } else {
+                    out.create_slot = 0; // parent collapsed out of view
+                }
+            } else {
+                out.create_slot = 0;
+            }
+        },
+        .delete_confirm => unreachable,
+    }
+    return out;
+}
+
 /// Right-click context menu for the file tree panel. The right press has
 /// already selected the row (handleFiletreeMouse leaves it unhandled).
 fn filetreeContextMenu(editor: *Editor, area: dvui.Rect.Physical) void {
@@ -1331,6 +2114,18 @@ fn filetreeContextMenu(editor: *Editor, area: dvui.Rect.Physical) void {
         }
         if (dvui.menuItemLabel(@src(), "Delete             d", .{}, .{ .expand = .horizontal }) != null) {
             editor.startFiletreePrompt(.delete_confirm);
+            fw.close();
+        }
+        if (dvui.menuItemLabel(@src(), "Copy Path", .{}, .{ .expand = .horizontal }) != null) {
+            _ = editor.execCommand("filetree_copy_path", null);
+            fw.close();
+        }
+        if (dvui.menuItemLabel(@src(), "Copy Relative Path", .{}, .{ .expand = .horizontal }) != null) {
+            _ = editor.execCommand("filetree_copy_relative_path", null);
+            fw.close();
+        }
+        if (dvui.menuItemLabel(@src(), "Reveal in Explorer", .{}, .{ .expand = .horizontal }) != null) {
+            _ = editor.execCommand("filetree_reveal_explorer", null);
             fw.close();
         }
         if (dvui.menuItemLabel(@src(), "Up One Folder      u", .{}, .{ .expand = .horizontal }) != null) {
@@ -3759,6 +4554,7 @@ const settings_defs = [_]SettingDef{
     .{ .key = "lsp_enabled", .label = "LSP Support", .kind = .boolean, .desc = "Start the language server at launch (takes effect next launch)" },
     .{ .key = "syntax_highlighting", .label = "Syntax Highlighting", .kind = .boolean, .desc = "Color code by language — off = plain text editor" },
     .{ .key = "filetree_git_colors", .label = "File Tree Git Colors", .kind = .boolean, .desc = "Color file tree rows by git status" },
+    .{ .key = "filetree_auto_reveal", .label = "File Tree Auto Reveal", .kind = .boolean, .desc = "Select the active file in the tree when switching tabs" },
     .{ .key = "max_undo_history", .label = "Undo History Limit", .kind = .number, .desc = "Max undo operations per document, 0 = unlimited (0-100000)", .min = 0, .max = 100000 },
     .{ .key = "theme", .label = "Theme", .kind = .enum_choice, .desc = "Editor color theme", .choices = &.{ "dark", "light", "high_contrast" } },
     .{ .key = "filetree_visible", .label = "File Tree Visible", .kind = .boolean, .desc = "Show the file tree side panel (Ctrl+B)" },
@@ -3945,6 +4741,7 @@ fn getSettingBool(editor: *const Editor, key: []const u8) bool {
     if (std.mem.eql(u8, key, "lsp_enabled")) return editor.lsp_enabled;
     if (std.mem.eql(u8, key, "syntax_highlighting")) return editor.syntax_highlighting;
     if (std.mem.eql(u8, key, "filetree_git_colors")) return editor.filetree_git_colors;
+    if (std.mem.eql(u8, key, "filetree_auto_reveal")) return editor.filetree_auto_reveal;
     if (std.mem.eql(u8, key, "filetree_visible")) return editor.filetree_visible;
     return false;
 }
@@ -3965,6 +4762,7 @@ fn applySettingBool(editor: *Editor, key: []const u8, val: bool) void {
             ft.gitRefresh();
         }
     }
+    if (std.mem.eql(u8, key, "filetree_auto_reveal")) editor.filetree_auto_reveal = val;
     if (std.mem.eql(u8, key, "filetree_visible")) {
         editor.filetree_visible = val;
         if (!val) editor.filetree_focused = false;
@@ -4441,15 +5239,20 @@ fn drawModalOverlay(editor: *Editor, render_area: dvui.Rect.Physical, render_rs:
 
     switch (editor.mode) {
         .filetree_prompt => {
-            const h = lh + pad * 2;
-            fillBar(render_area, 0, h, bg);
-            var buf: [600]u8 = undefined;
-            const txt = switch (editor.filetree_prompt_kind) {
-                .create => std.fmt.bufPrint(&buf, "New (end with / for folder): {s}_", .{editor.open_buf[0..editor.open_buf_len]}) catch "New: ",
-                .rename => std.fmt.bufPrint(&buf, "Rename: {s}_", .{editor.open_buf[0..editor.open_buf_len]}) catch "Rename: ",
-                .delete_confirm => std.fmt.bufPrint(&buf, "Delete {s}? [Y]es [N]o", .{editor.filetree_prompt_target orelse ""}) catch "Delete? [Y]es [N]o",
-            };
-            renderOverlayText(font, txt, render_area.x + pad, render_area.y + pad, render_rs, fg);
+            // Create/rename draw inline in the tree panel (with this bar
+            // as the fallback when the panel is hidden mid-prompt);
+            // delete confirm is a clickable dialog (filetreeDeleteDialog).
+            if (editor.filetree_prompt_kind != .delete_confirm and !editor.filetree_visible) {
+                const h = lh + pad * 2;
+                fillBar(render_area, 0, h, bg);
+                var buf: [600]u8 = undefined;
+                const txt = switch (editor.filetree_prompt_kind) {
+                    .create => std.fmt.bufPrint(&buf, "New (end with / for folder): {s}_", .{editor.open_buf[0..editor.open_buf_len]}) catch "New: ",
+                    .rename => std.fmt.bufPrint(&buf, "Rename: {s}_", .{editor.open_buf[0..editor.open_buf_len]}) catch "Rename: ",
+                    .delete_confirm => unreachable,
+                };
+                renderOverlayText(font, txt, render_area.x + pad, render_area.y + pad, render_rs, fg);
+            }
         },
         .goto_line => {
             const h = lh + pad * 2;

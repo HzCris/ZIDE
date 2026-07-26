@@ -65,6 +65,18 @@ pub const FileTree = struct {
     /// Row coloring by git status (editor mirrors `filetree_git_colors`
     /// onto this; off = gitRefresh never shells out).
     git_enabled: bool = true,
+    /// Multi-select: node indices of the selected set. When non-empty it
+    /// IS the effective selection (and includes the primary); empty means
+    /// the primary `selected` row alone. Node indices die on refresh —
+    /// cleared there (clearNodes).
+    multi: std.AutoHashMapUnmanaged(u32, void) = .empty,
+    /// Range-selection anchor as a node index (resolved to a row lazily,
+    /// so expand/collapse between shifts can't invalidate it).
+    sel_anchor_node: ?u32 = null,
+    /// The root itself is the operation target (create/paste/move dest).
+    /// Set by clicking the empty space below the rows — the root has no
+    /// row of its own to select. Cleared by any row selection.
+    root_selected: bool = false,
 
     /// Open `root_path` (relative to cwd or absolute) and build the tree.
     pub fn init(allocator: Allocator, io: std.Io, root_path: []const u8) !FileTree {
@@ -116,6 +128,7 @@ pub const FileTree = struct {
         self.clearNodes();
         self.nodes.deinit(self.allocator);
         self.visible.deinit(self.allocator);
+        self.multi.deinit(self.allocator);
         self.clearGitMaps();
         self.git_map.deinit(self.allocator);
         self.git_dirty_dirs.deinit(self.allocator);
@@ -130,6 +143,8 @@ pub const FileTree = struct {
         }
         self.nodes.clearRetainingCapacity();
         self.visible.clearRetainingCapacity();
+        self.multi.clearRetainingCapacity();
+        self.sel_anchor_node = null;
     }
 
     fn initRoot(self: *FileTree) !void {
@@ -261,9 +276,134 @@ pub const FileTree = struct {
 
     pub fn moveSelection(self: *FileTree, delta: isize) void {
         if (self.visible.items.len == 0) return;
+        self.root_selected = false;
         const cur: isize = @intCast(@min(self.selected, self.visible.items.len - 1));
         const max: isize = @intCast(self.visible.items.len - 1);
         self.selected = @intCast(@max(0, @min(cur + delta, max)));
+    }
+
+    /// Directory node that receives create/paste/move-target operations:
+    /// the explicit root target (empty-space click), the selected dir,
+    /// or a selected file's parent.
+    pub fn opTargetDir(self: *const FileTree) u32 {
+        if (self.root_selected) return 0;
+        const sel = self.selectedNodeIdx() orelse return 0;
+        const node = self.nodes.items[sel];
+        return if (node.kind == .dir) sel else node.parent;
+    }
+
+    /// Drop any multi-selection (plain click/nav semantics).
+    pub fn clearMulti(self: *FileTree) void {
+        self.multi.clearRetainingCapacity();
+        self.sel_anchor_node = null;
+    }
+
+    pub fn isMultiSelected(self: *const FileTree, idx: u32) bool {
+        return self.multi.contains(idx);
+    }
+
+    /// Number of effectively selected entries (the multi set, else the
+    /// primary selection alone).
+    pub fn selectionCount(self: *const FileTree) usize {
+        if (self.multi.count() > 0) return self.multi.count();
+        return if (self.selectedNodeIdx() != null) 1 else 0;
+    }
+
+    /// Ctrl+click: toggle `row`'s membership in the multi set. Seeds the
+    /// set with the current primary so the first toggle accumulates, and
+    /// collapses back to a plain selection at or below one member.
+    pub fn toggleMultiAt(self: *FileTree, row: usize) !void {
+        if (row >= self.visible.items.len) return;
+        self.root_selected = false;
+        if (self.multi.count() == 0) {
+            if (self.selectedNodeIdx()) |prim| try self.multi.put(self.allocator, prim, {});
+        }
+        const idx = self.visible.items[row];
+        if (self.multi.contains(idx)) {
+            _ = self.multi.remove(idx);
+        } else {
+            try self.multi.put(self.allocator, idx, {});
+            self.selected = row;
+        }
+        if (self.selectedNodeIdx()) |prim| self.sel_anchor_node = prim;
+        if (self.multi.count() <= 1) {
+            if (self.multi.count() == 1) {
+                var it = self.multi.keyIterator();
+                if (self.rowOf(it.next().?.*)) |only_row| self.selected = only_row;
+            }
+            self.clearMulti();
+        }
+    }
+
+    /// Shift+click / Shift+arrows: replace the multi set with the visible
+    /// range between the anchor (the last plain/ctrl selection) and `row`.
+    pub fn selectRangeTo(self: *FileTree, row: usize) !void {
+        if (self.visible.items.len == 0) return;
+        self.root_selected = false;
+        const r = @min(row, self.visible.items.len - 1);
+        const fallback = @min(self.selected, self.visible.items.len - 1);
+        const anchor_row = blk: {
+            const an = self.sel_anchor_node orelse break :blk fallback;
+            break :blk self.rowOf(an) orelse fallback;
+        };
+        if (self.sel_anchor_node == null) self.sel_anchor_node = self.visible.items[anchor_row];
+        self.multi.clearRetainingCapacity();
+        const lo = @min(anchor_row, r);
+        const hi = @max(anchor_row, r);
+        var i = lo;
+        while (i <= hi) : (i += 1) {
+            try self.multi.put(self.allocator, self.visible.items[i], {});
+        }
+        self.selected = r;
+        // A single-row range is a plain selection (the anchor survives
+        // for the next shift).
+        if (self.multi.count() <= 1) self.multi.clearRetainingCapacity();
+    }
+
+    /// Rel paths of the effective selection, minus entries whose ancestor
+    /// is also selected — a bulk delete/move on the ancestor already
+    /// covers them (and the child op would then fail). Sorted; caller
+    /// owns the slice and its strings.
+    pub fn selectionRelPaths(self: *const FileTree, allocator: Allocator) ![][]u8 {
+        var list: std.ArrayList([]u8) = .empty;
+        errdefer {
+            for (list.items) |p| allocator.free(p);
+            list.deinit(allocator);
+        }
+        if (self.multi.count() > 0) {
+            var it = self.multi.keyIterator();
+            while (it.next()) |k| {
+                const rp = self.nodes.items[k.*].rel_path;
+                if (rp.len == 0) continue;
+                try list.append(allocator, try allocator.dupe(u8, rp));
+            }
+        } else if (self.selectedNodeIdx()) |idx| {
+            if (idx != 0) try list.append(allocator, try allocator.dupe(u8, self.nodes.items[idx].rel_path));
+        }
+        var i: usize = 0;
+        while (i < list.items.len) {
+            var covered = false;
+            for (list.items) |q| {
+                const p = list.items[i];
+                if (q.ptr == p.ptr) continue;
+                if (p.len > q.len and std.mem.startsWith(u8, p, q) and p[q.len] == '/') {
+                    covered = true;
+                    break;
+                }
+            }
+            if (covered) {
+                allocator.free(list.items[i]);
+                _ = list.swapRemove(i);
+            } else {
+                i += 1;
+            }
+        }
+        std.mem.sort([]u8, list.items, {}, struct {
+            fn lt(_: void, a: []u8, b: []u8) bool {
+                return std.mem.lessThan(u8, a, b);
+            }
+        }.lt);
+        return try list.toOwnedSlice(allocator);
     }
 
     fn expandNoRebuild(self: *FileTree, idx: u32) !void {
@@ -290,6 +430,17 @@ pub const FileTree = struct {
         } else {
             try self.expand(idx);
         }
+    }
+
+    /// Collapse every directory (the root stays expanded so top-level
+    /// entries remain visible) and reset the selection to the first row.
+    pub fn collapseAll(self: *FileTree) !void {
+        for (self.nodes.items[1..]) |*n| {
+            if (n.kind == .dir) n.expanded = false;
+        }
+        try self.rebuildVisible();
+        self.selected = 0;
+        self.scroll_to_selected = true;
     }
 
     /// Find a loaded node by '/'-normalized rel path (no lazy loading).
@@ -338,6 +489,7 @@ pub const FileTree = struct {
         if (self.rowOf(cur)) |row| {
             self.selected = row;
             self.scroll_to_selected = true;
+            self.root_selected = false;
         }
         return cur;
     }
@@ -440,25 +592,35 @@ pub const FileTree = struct {
     /// Returns the new rel_path, owned by `allocator`.
     pub fn moveEntry(self: *FileTree, allocator: Allocator, idx: u32, dest_dir_idx: u32) ![]u8 {
         if (idx == 0) return error.InvalidMove;
-        const node = self.nodes.items[idx];
+        if (dest_dir_idx == idx) return error.InvalidMove;
+        return self.moveRelTo(allocator, self.nodes.items[idx].rel_path, dest_dir_idx);
+    }
+
+    /// Path-based move core — also used by file-clipboard paste, whose
+    /// sources may no longer be loaded in the tree (collapsed away).
+    pub fn moveRelTo(self: *FileTree, allocator: Allocator, src_rel: []const u8, dest_dir_idx: u32) ![]u8 {
+        if (src_rel.len == 0) return error.InvalidMove;
         const dest = self.nodes.items[dest_dir_idx];
         if (dest.kind != .dir) return error.InvalidMove;
-        if (dest_dir_idx == idx) return error.InvalidMove;
-        if (dest_dir_idx == node.parent) return error.InvalidMove; // already there
+        if (std.mem.eql(u8, dest.rel_path, src_rel)) return error.InvalidMove; // into itself
+        const base = std.fs.path.basenamePosix(src_rel);
+        const parent_len = src_rel.len - base.len;
+        const src_parent = if (parent_len == 0) "" else src_rel[0 .. parent_len - 1];
+        if (std.mem.eql(u8, src_parent, dest.rel_path)) return error.InvalidMove; // already there
         // Destination inside the moved entry — '/'-boundary check so
         // "src2" doesn't false-match a "src" prefix.
-        if (node.kind == .dir and dest.rel_path.len > node.rel_path.len and
-            std.mem.startsWith(u8, dest.rel_path, node.rel_path) and
-            dest.rel_path[node.rel_path.len] == '/')
+        if (dest.rel_path.len > src_rel.len and
+            std.mem.startsWith(u8, dest.rel_path, src_rel) and
+            dest.rel_path[src_rel.len] == '/')
         {
             return error.InvalidMove;
         }
         const new_rel = if (dest.rel_path.len == 0)
-            try allocator.dupe(u8, node.name)
+            try allocator.dupe(u8, base)
         else
-            try std.mem.concat(allocator, u8, &.{ dest.rel_path, "/", node.name });
+            try std.mem.concat(allocator, u8, &.{ dest.rel_path, "/", base });
         errdefer allocator.free(new_rel);
-        try std.Io.Dir.renamePreserve(self.root_dir, node.rel_path, self.root_dir, new_rel, self.io);
+        try std.Io.Dir.renamePreserve(self.root_dir, src_rel, self.root_dir, new_rel, self.io);
         return new_rel;
     }
 
@@ -472,12 +634,98 @@ pub const FileTree = struct {
         }
     }
 
-    /// Absolute path of a node (root_path joined with rel_path). Owned by
-    /// `allocator`.
+    /// Recursive copy driver: copy `src_path` (a path relative to
+    /// `src_dir`) to `dest_rel` under the tree root. Symlinks are
+    /// skipped — following them could walk outside the source.
+    fn copyIntoRoot(self: *FileTree, src_dir: std.Io.Dir, src_path: []const u8, dest_rel: []const u8) !void {
+        const st = try src_dir.statFile(self.io, src_path, .{});
+        if (st.kind == .directory) {
+            try self.root_dir.createDirPath(self.io, dest_rel);
+            var sub = try src_dir.openDir(self.io, src_path, .{ .iterate = true });
+            defer sub.close(self.io);
+            var it = sub.iterate();
+            while (try it.next(self.io)) |entry| {
+                if (entry.kind == .sym_link) continue;
+                // entry.name is invalidated by the next iteration — dupe
+                // before recursing.
+                const child_name = try self.allocator.dupe(u8, entry.name);
+                defer self.allocator.free(child_name);
+                const child_dest = try std.mem.concat(self.allocator, u8, &.{ dest_rel, "/", child_name });
+                defer self.allocator.free(child_dest);
+                try self.copyIntoRoot(sub, child_name, child_dest);
+            }
+        } else {
+            try std.Io.Dir.copyFile(src_dir, src_path, self.root_dir, dest_rel, self.io, .{});
+        }
+    }
+
+    /// Recursively copy `src_rel` into directory node `dest_dir_idx`,
+    /// keeping its basename. No-clobber (error.PathAlreadyExists) —
+    /// which also covers pasting into the source's own parent. Returns
+    /// the new rel_path, owned by `allocator`.
+    pub fn copyEntryTo(self: *FileTree, allocator: Allocator, src_rel: []const u8, dest_dir_idx: u32) ![]u8 {
+        if (src_rel.len == 0) return error.InvalidCopy;
+        const dest = self.nodes.items[dest_dir_idx];
+        if (dest.kind != .dir) return error.InvalidCopy;
+        // Copying a dir into its own subtree would recurse forever.
+        if (std.mem.eql(u8, dest.rel_path, src_rel) or
+            (dest.rel_path.len > src_rel.len and
+                std.mem.startsWith(u8, dest.rel_path, src_rel) and
+                dest.rel_path[src_rel.len] == '/'))
+        {
+            return error.InvalidCopy;
+        }
+        const base = std.fs.path.basenamePosix(src_rel);
+        const new_rel = if (dest.rel_path.len == 0)
+            try allocator.dupe(u8, base)
+        else
+            try std.mem.concat(allocator, u8, &.{ dest.rel_path, "/", base });
+        errdefer allocator.free(new_rel);
+        if (self.root_dir.access(self.io, new_rel, .{})) |_| {
+            return error.PathAlreadyExists;
+        } else |_| {}
+        try self.copyIntoRoot(self.root_dir, src_rel, new_rel);
+        return new_rel;
+    }
+
+    /// Copy an absolute path from outside the tree (OS drag & drop) into
+    /// directory node `dest_dir_idx`, keeping its basename. No-clobber.
+    /// Returns the new rel_path, owned by `allocator`.
+    pub fn importAbsPath(self: *FileTree, allocator: Allocator, abs: []const u8, dest_dir_idx: u32) ![]u8 {
+        const dest = self.nodes.items[dest_dir_idx];
+        if (dest.kind != .dir) return error.InvalidCopy;
+        const base = std.fs.path.basename(abs);
+        if (base.len == 0) return error.InvalidCopy;
+        const parent = std.fs.path.dirname(abs) orelse return error.InvalidCopy;
+        const new_rel = if (dest.rel_path.len == 0)
+            try allocator.dupe(u8, base)
+        else
+            try std.mem.concat(allocator, u8, &.{ dest.rel_path, "/", base });
+        errdefer allocator.free(new_rel);
+        normalizeSeps(new_rel);
+        if (self.root_dir.access(self.io, new_rel, .{})) |_| {
+            return error.PathAlreadyExists;
+        } else |_| {}
+        var pdir = try std.Io.Dir.openDirAbsolute(self.io, parent, .{});
+        defer pdir.close(self.io);
+        try self.copyIntoRoot(pdir, base, new_rel);
+        return new_rel;
+    }
+
+    /// Absolute path of a node (root_path joined with rel_path), in
+    /// native separators — rel_path is '/'-normalized internally, but
+    /// user-facing consumers (clipboard, Explorer) want backslashes on
+    /// Windows. Owned by `allocator`.
     pub fn absPathAlloc(self: *const FileTree, allocator: Allocator, idx: u32) ![]u8 {
         const rel = self.nodes.items[idx].rel_path;
         if (rel.len == 0) return allocator.dupe(u8, self.root_path);
-        return std.fs.path.join(allocator, &.{ self.root_path, rel });
+        const joined = try std.fs.path.join(allocator, &.{ self.root_path, rel });
+        if (builtin.os.tag == .windows) {
+            for (joined) |*c| {
+                if (c.* == '/') c.* = '\\';
+            }
+        }
+        return joined;
     }
 
     // ---- Git status ----
@@ -730,6 +978,26 @@ test "filetree: expandToPath selects and flags scroll" {
     try t.expect(ft.scroll_to_selected);
     // Missing path: ancestors stay expanded, returns null
     try t.expectEqual(@as(?u32, null), try ft.expandToPath("a/b/missing.txt"));
+}
+
+test "filetree: collapseAll folds everything but the root" {
+    var tmp = t.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(t.io, "a/b");
+    try touch(t.io, tmp.dir, "a/b/c.txt");
+    try touch(t.io, tmp.dir, "top.txt");
+
+    var ft = try testTree(&tmp);
+    defer ft.deinit();
+
+    _ = try ft.expandToPath("a/b/c.txt");
+    try t.expectEqual(@as(usize, 4), ft.visible.items.len); // a, b, c.txt, top.txt
+
+    try ft.collapseAll();
+    try t.expectEqual(@as(usize, 2), ft.visible.items.len); // a, top.txt
+    try t.expectEqual(@as(usize, 0), ft.selected);
+    try t.expect(ft.scroll_to_selected);
+    try t.expect(!ft.nodes.items[ft.findByPath("a").?].expanded);
 }
 
 test "filetree: refresh preserves expansion and selection, drops vanished" {
@@ -996,6 +1264,193 @@ test "filetree: checkExternalChanges spots out-of-band file creation" {
     try ft.refresh();
     try t.expect(!ft.checkExternalChanges());
     try t.expect(ft.findByPath("outside.txt") != null);
+}
+
+test "filetree: opTargetDir resolves root/dir/file-parent" {
+    var tmp = t.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(t.io, "sub");
+    try touch(t.io, tmp.dir, "sub/inner.txt");
+    try touch(t.io, tmp.dir, "top.txt");
+
+    var ft = try testTree(&tmp);
+    defer ft.deinit();
+
+    // Selected dir -> itself
+    ft.selected = ft.rowOf(ft.findByPath("sub").?).?;
+    try t.expectEqual(ft.findByPath("sub").?, ft.opTargetDir());
+    // Selected file -> its parent
+    _ = try ft.expandToPath("sub/inner.txt");
+    try t.expectEqual(ft.findByPath("sub").?, ft.opTargetDir());
+    // Explicit root target wins; row selection clears it
+    ft.root_selected = true;
+    try t.expectEqual(@as(u32, 0), ft.opTargetDir());
+    ft.moveSelection(1);
+    try t.expect(!ft.root_selected);
+}
+
+test "filetree: multi toggle seeds, accumulates, and collapses" {
+    var tmp = t.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    try touch(t.io, tmp.dir, "a.txt");
+    try touch(t.io, tmp.dir, "b.txt");
+    try touch(t.io, tmp.dir, "c.txt");
+
+    var ft = try testTree(&tmp);
+    defer ft.deinit();
+
+    ft.selected = 0; // a.txt
+    try ft.toggleMultiAt(2); // ctrl+click c.txt: set = {a, c}
+    try t.expectEqual(@as(usize, 2), ft.selectionCount());
+    try t.expectEqual(@as(usize, 2), ft.selected);
+    try t.expect(ft.isMultiSelected(ft.visible.items[0]));
+    try t.expect(ft.isMultiSelected(ft.visible.items[2]));
+
+    try ft.toggleMultiAt(2); // toggle c off: collapses to plain a.txt
+    try t.expectEqual(@as(usize, 1), ft.selectionCount());
+    try t.expectEqual(@as(usize, 0), ft.selected);
+    try t.expectEqual(@as(usize, 0), ft.multi.count());
+}
+
+test "filetree: shift range replaces and follows the anchor" {
+    var tmp = t.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    try touch(t.io, tmp.dir, "a.txt");
+    try touch(t.io, tmp.dir, "b.txt");
+    try touch(t.io, tmp.dir, "c.txt");
+    try touch(t.io, tmp.dir, "d.txt");
+
+    var ft = try testTree(&tmp);
+    defer ft.deinit();
+
+    ft.selected = 1; // b.txt as anchor
+    try ft.selectRangeTo(3); // b..d
+    try t.expectEqual(@as(usize, 3), ft.selectionCount());
+    try t.expectEqual(@as(usize, 3), ft.selected);
+    try ft.selectRangeTo(0); // same anchor, other direction: a..b
+    try t.expectEqual(@as(usize, 2), ft.selectionCount());
+    try t.expect(ft.isMultiSelected(ft.visible.items[0]));
+    try t.expect(ft.isMultiSelected(ft.visible.items[1]));
+    try t.expect(!ft.isMultiSelected(ft.visible.items[3]));
+    ft.clearMulti();
+    try t.expectEqual(@as(usize, 1), ft.selectionCount());
+}
+
+test "filetree: selectionRelPaths drops covered descendants" {
+    var tmp = t.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(t.io, "sub");
+    try touch(t.io, tmp.dir, "sub/inner.txt");
+    try touch(t.io, tmp.dir, "top.txt");
+
+    var ft = try testTree(&tmp);
+    defer ft.deinit();
+    _ = try ft.expandToPath("sub/inner.txt");
+
+    const sub_row = ft.rowOf(ft.findByPath("sub").?).?;
+    const inner_row = ft.rowOf(ft.findByPath("sub/inner.txt").?).?;
+    const top_row = ft.rowOf(ft.findByPath("top.txt").?).?;
+    ft.selected = sub_row;
+    try ft.toggleMultiAt(inner_row);
+    try ft.toggleMultiAt(top_row);
+
+    const paths = try ft.selectionRelPaths(t.allocator);
+    defer {
+        for (paths) |p| t.allocator.free(p);
+        t.allocator.free(paths);
+    }
+    // sub/inner.txt is covered by sub
+    try t.expectEqual(@as(usize, 2), paths.len);
+    try t.expectEqualStrings("sub", paths[0]);
+    try t.expectEqualStrings("top.txt", paths[1]);
+}
+
+test "filetree: copyEntryTo file and recursive dir, no-clobber" {
+    var tmp = t.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    try touch(t.io, tmp.dir, "a.txt");
+    try tmp.dir.createDirPath(t.io, "src/nested");
+    try touch(t.io, tmp.dir, "src/f.txt");
+    try touch(t.io, tmp.dir, "src/nested/deep.txt");
+    try tmp.dir.createDirPath(t.io, "dest");
+
+    var ft = try testTree(&tmp);
+    defer ft.deinit();
+    const dest_idx = ft.findByPath("dest").?;
+
+    const c1 = try ft.copyEntryTo(t.allocator, "a.txt", dest_idx);
+    defer t.allocator.free(c1);
+    try t.expectEqualStrings("dest/a.txt", c1);
+    try tmp.dir.access(t.io, "dest/a.txt", .{});
+    try tmp.dir.access(t.io, "a.txt", .{}); // source stays
+
+    const c2 = try ft.copyEntryTo(t.allocator, "src", dest_idx);
+    defer t.allocator.free(c2);
+    try tmp.dir.access(t.io, "dest/src/f.txt", .{});
+    try tmp.dir.access(t.io, "dest/src/nested/deep.txt", .{});
+
+    // No-clobber, and no copying into your own subtree
+    try t.expectError(error.PathAlreadyExists, ft.copyEntryTo(t.allocator, "a.txt", dest_idx));
+    try ft.refresh();
+    _ = try ft.expandToPath("src/nested");
+    try t.expectError(error.InvalidCopy, ft.copyEntryTo(t.allocator, "src", ft.findByPath("src/nested").?));
+}
+
+test "filetree: moveRelTo works for unloaded (collapsed) sources" {
+    var tmp = t.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(t.io, "sub");
+    try touch(t.io, tmp.dir, "sub/deep.txt");
+    try tmp.dir.createDirPath(t.io, "dest");
+
+    var ft = try testTree(&tmp);
+    defer ft.deinit();
+    // Never expanded: sub/deep.txt has no node, but the path move works.
+    try t.expectEqual(@as(?u32, null), ft.findByPath("sub/deep.txt"));
+    const moved = try ft.moveRelTo(t.allocator, "sub/deep.txt", ft.findByPath("dest").?);
+    defer t.allocator.free(moved);
+    try t.expectEqualStrings("dest/deep.txt", moved);
+    try tmp.dir.access(t.io, "dest/deep.txt", .{});
+    try t.expectError(error.FileNotFound, tmp.dir.access(t.io, "sub/deep.txt", .{}));
+}
+
+test "filetree: importAbsPath copies from outside the root" {
+    var tmp = t.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var outside = t.tmpDir(.{ .iterate = true });
+    defer outside.cleanup();
+    try touch(t.io, outside.dir, "alien.txt");
+    const outside_abs = try std.Io.Dir.realPathFileAlloc(outside.dir, t.io, "alien.txt", t.allocator);
+    defer t.allocator.free(outside_abs);
+
+    var ft = try testTree(&tmp);
+    defer ft.deinit();
+
+    const imported = try ft.importAbsPath(t.allocator, outside_abs, 0);
+    defer t.allocator.free(imported);
+    try t.expectEqualStrings("alien.txt", imported);
+    try tmp.dir.access(t.io, "alien.txt", .{});
+    try outside.dir.access(t.io, "alien.txt", .{}); // source untouched
+    // Second import collides
+    try t.expectError(error.PathAlreadyExists, ft.importAbsPath(t.allocator, outside_abs, 0));
+}
+
+test "filetree: absPathAlloc uses native separators" {
+    var tmp = t.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(t.io, "sub");
+    try touch(t.io, tmp.dir, "sub/deep.txt");
+
+    var ft = try testTree(&tmp);
+    defer ft.deinit();
+    _ = try ft.expandToPath("sub/deep.txt");
+
+    const abs = try ft.absPathAlloc(t.allocator, ft.findByPath("sub/deep.txt").?);
+    defer t.allocator.free(abs);
+    if (builtin.os.tag == .windows) {
+        try t.expectEqual(@as(?usize, null), std.mem.indexOfScalar(u8, abs, '/'));
+    }
+    try t.expect(std.mem.endsWith(u8, abs, if (builtin.os.tag == .windows) "sub\\deep.txt" else "sub/deep.txt"));
 }
 
 test "filetree: pathTail left-truncation" {

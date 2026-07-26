@@ -308,6 +308,10 @@ fn runGui(allocator: std.mem.Allocator, io: std.Io, lua: *zlua.Lua, cli_files: [
         }
     }
 
+    // OS file drops (Explorer drag-in) flow through the vendored
+    // backend's ZIDE patch into the GUI's staging buffer.
+    SDLBackend.drop_file_fn = &gui.onSdlDropFile;
+
     // Init SDL backend (creates OS window)
     var backend = try SDLBackend.initWindow(.{
         .io = io,
@@ -476,6 +480,7 @@ comptime {
     _ = @import("core/keybind.zig");
     _ = @import("core/syntax.zig");
     _ = @import("core/theme.zig");
+    _ = @import("core/fileicons.zig");
     _ = @import("core/lsp.zig");
     _ = @import("core/ansi.zig");
     _ = @import("core/terminal.zig");

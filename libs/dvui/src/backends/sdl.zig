@@ -15,6 +15,10 @@ pub const kind: dvui.enums.Backend = if (sdl3) .sdl3 else .sdl2;
 pub const SDLBackend = @This();
 pub const Context = *SDLBackend;
 
+/// ZIDE patch: surface OS file drops to the app — dvui has no drop
+/// event type. Coordinates are SDL window points (0,0 under SDL2).
+pub var drop_file_fn: ?*const fn (path: []const u8, x: f32, y: f32) void = null;
+
 const log = std.log.scoped(.SDLBackend);
 
 // Global io instance assigned to `dvui.io`
@@ -1428,6 +1432,15 @@ pub fn addEvent(self: *SDLBackend, win: *dvui.Window, event: c.SDL_Event) !bool 
         if (sdl3) c.SDL_EVENT_DROP_FILE else c.SDL_DROPFILE => {
             if (self.log_events) {
                 log.debug("SDL event drop file: {s}\n", .{if (sdl3) event.drop.data else event.drop.file});
+            }
+            // ZIDE patch: dvui has no drop event type — hand the path to
+            // the app synchronously (SDL frees the string after dispatch).
+            if (drop_file_fn) |f| {
+                if (sdl3) {
+                    if (event.drop.data != null) f(std.mem.span(event.drop.data), event.drop.x, event.drop.y);
+                } else {
+                    if (event.drop.file != null) f(std.mem.span(event.drop.file), 0, 0);
+                }
             }
             return false;
         },

@@ -1,4 +1,5 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const Allocator = std.mem.Allocator;
 const theme_mod = @import("theme.zig");
 const lua_settings = @import("lua_settings.zig");
@@ -207,6 +208,13 @@ pub fn registerBuiltins(registry: *CommandRegistry) !void {
     try registry.register("filetree_reveal", "Reveal the current file in the file tree", cmdFiletreeReveal);
     try registry.register("filetree_refresh", "Refresh the file tree from disk", cmdFiletreeRefresh);
     try registry.register("filetree_root_up", "Re-root the file tree at the parent directory", cmdFiletreeRootUp);
+    try registry.register("filetree_collapse_all", "Collapse all file tree folders", cmdFiletreeCollapseAll);
+    try registry.register("filetree_copy_path", "Copy the selected file tree entry's absolute path", cmdFiletreeCopyPath);
+    try registry.register("filetree_copy_relative_path", "Copy the selected file tree entry's root-relative path", cmdFiletreeCopyRelPath);
+    try registry.register("filetree_reveal_explorer", "Show the selected file tree entry in the system file manager", cmdFiletreeRevealExplorer);
+    try registry.register("filetree_copy", "Copy the selected file tree entries to the file clipboard", cmdFiletreeClipCopy);
+    try registry.register("filetree_cut", "Cut the selected file tree entries to the file clipboard", cmdFiletreeClipCut);
+    try registry.register("filetree_paste", "Paste the file clipboard into the selected folder", cmdFiletreeClipPaste);
     try registry.register("cursor_file_start", "Move to start of file", cmdCursorFileStart);
     try registry.register("cursor_file_end", "Move to end of file", cmdCursorFileEnd);
     try registry.register("cursor_file_start_select", "Select to start of file", cmdCursorFileStartSelect);
@@ -622,33 +630,154 @@ fn cmdFiletreeRootUp(editor: *Editor, _: ?[]const u8) void {
 }
 
 fn cmdFiletreeReveal(editor: *Editor, _: ?[]const u8) void {
-    const ft = editor.ensureFiletree() orelse return;
+    _ = editor.ensureFiletree() orelse return;
     const doc = editor.activeDoc();
     const path = doc.file_path orelse {
         editor.status_message = "Reveal: current tab has no file on disk";
         return;
     };
-    // Absolute paths map through the root; relative ones (CLI-opened) are
-    // tried as-is since the default root is the same cwd.
-    var rel_owned: ?[]u8 = ft.relFromAbs(editor.allocator, path) catch null;
-    if (rel_owned == null and !std.fs.path.isAbsolute(path)) {
-        const r = editor.allocator.dupe(u8, path) catch return;
-        filetree_mod.normalizeSeps(r);
-        rel_owned = r;
-    }
-    const rel = rel_owned orelse {
-        editor.status_message = "Reveal: file is outside the tree root";
-        return;
-    };
-    defer editor.allocator.free(rel);
     editor.filetree_visible = true;
-    const found = ft.expandToPath(rel) catch null;
-    if (found != null) {
+    if (editor.filetreeRevealPath(path)) {
         editor.filetree_focused = true;
     } else {
         editor.status_message = "Reveal: file not found under the tree root";
     }
 }
+
+fn cmdFiletreeCollapseAll(editor: *Editor, _: ?[]const u8) void {
+    const ft = editor.ensureFiletree() orelse return;
+    ft.collapseAll() catch {};
+}
+
+/// Selected tree entry as an owned absolute path, or null (with a status
+/// message) when there's no tree or nothing selected.
+fn filetreeSelectedAbs(editor: *Editor) ?[]u8 {
+    const ft = editor.ensureFiletree() orelse return null;
+    const idx = ft.selectedNodeIdx() orelse {
+        editor.status_message = "File tree: nothing selected";
+        return null;
+    };
+    return ft.absPathAlloc(editor.allocator, idx) catch null;
+}
+
+/// Newline-joined clipboard text for the selection: absolute paths, or
+/// root-relative in native separators. Sets a status message.
+fn filetreeCopyPathsToClipboard(editor: *Editor, absolute: bool) void {
+    const ft = editor.ensureFiletree() orelse return;
+    const paths = ft.selectionRelPaths(editor.allocator) catch return;
+    defer {
+        for (paths) |p| editor.allocator.free(p);
+        editor.allocator.free(paths);
+    }
+    if (paths.len == 0) {
+        editor.status_message = "File tree: nothing selected";
+        return;
+    }
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(editor.allocator);
+    for (paths, 0..) |p, i| {
+        if (i > 0) out.append(editor.allocator, '\n') catch return;
+        if (absolute) {
+            const idx = ft.findByPath(p) orelse continue;
+            const abs = ft.absPathAlloc(editor.allocator, idx) catch return;
+            defer editor.allocator.free(abs);
+            out.appendSlice(editor.allocator, abs) catch return;
+        } else {
+            const start = out.items.len;
+            out.appendSlice(editor.allocator, p) catch return;
+            if (builtin.os.tag == .windows) {
+                for (out.items[start..]) |*c| {
+                    if (c.* == '/') c.* = '\\';
+                }
+            }
+        }
+    }
+    editor.setClipboard(out.items);
+    const msg = if (paths.len == 1)
+        std.fmt.bufPrint(&editor.status_buf, "Copied {s}", .{out.items}) catch "Copied path"
+    else
+        std.fmt.bufPrint(&editor.status_buf, "Copied {d} paths", .{paths.len}) catch "Copied paths";
+    editor.status_message = msg;
+}
+
+fn cmdFiletreeCopyPath(editor: *Editor, _: ?[]const u8) void {
+    filetreeCopyPathsToClipboard(editor, true);
+}
+
+fn cmdFiletreeCopyRelPath(editor: *Editor, _: ?[]const u8) void {
+    filetreeCopyPathsToClipboard(editor, false);
+}
+
+fn cmdFiletreeClipCopy(editor: *Editor, _: ?[]const u8) void {
+    editor.filetreeClipCapture(false);
+}
+
+fn cmdFiletreeClipCut(editor: *Editor, _: ?[]const u8) void {
+    editor.filetreeClipCapture(true);
+}
+
+fn cmdFiletreeClipPaste(editor: *Editor, _: ?[]const u8) void {
+    editor.filetreePaste();
+}
+
+/// Open the OS file manager with the selected entry highlighted.
+///
+/// Windows goes through ShellExecuteW because explorer's `/select,`
+/// switch needs the exact parameter string `/select,"C:\path"` —
+/// argv-based spawning would quote the whole argument (or none of it),
+/// which explorer answers by opening "This PC" instead.
+fn cmdFiletreeRevealExplorer(editor: *Editor, _: ?[]const u8) void {
+    const abs = filetreeSelectedAbs(editor) orelse return;
+    defer editor.allocator.free(abs);
+    if (builtin.os.tag == .windows) {
+        const params = std.fmt.allocPrint(editor.allocator, "/select,\"{s}\"", .{abs}) catch return;
+        defer editor.allocator.free(params);
+        const params_w = std.unicode.utf8ToUtf16LeAllocZ(editor.allocator, params) catch return;
+        defer editor.allocator.free(params_w);
+        const file_w = std.unicode.utf8ToUtf16LeAllocZ(editor.allocator, "explorer.exe") catch return;
+        defer editor.allocator.free(file_w);
+        // Returns an HINSTANCE-shaped value > 32 on success.
+        const rc = ShellExecuteW(null, null, file_w.ptr, params_w.ptr, null, 1);
+        if (@intFromPtr(rc) > 32) {
+            editor.status_message = "Opened in Explorer";
+        } else {
+            editor.status_message = "Could not open Explorer";
+        }
+        return;
+    }
+    var argv_buf: [3][]const u8 = undefined;
+    const argv: []const []const u8 = switch (builtin.os.tag) {
+        .macos => blk: {
+            argv_buf = .{ "open", "-R", abs };
+            break :blk argv_buf[0..3];
+        },
+        else => blk: {
+            argv_buf[0] = "xdg-open";
+            argv_buf[1] = std.fs.path.dirname(abs) orelse abs;
+            break :blk argv_buf[0..2];
+        },
+    };
+    const res = std.process.run(editor.allocator, editor.io, .{
+        .argv = argv,
+        .stdout_limit = .limited(256),
+        .stderr_limit = .limited(256),
+    }) catch {
+        editor.status_message = "Could not open the system file manager";
+        return;
+    };
+    editor.allocator.free(res.stdout);
+    editor.allocator.free(res.stderr);
+    editor.status_message = "Opened in file manager";
+}
+
+extern "shell32" fn ShellExecuteW(
+    hwnd: ?*anyopaque,
+    lpOperation: ?[*:0]const u16,
+    lpFile: [*:0]const u16,
+    lpParameters: ?[*:0]const u16,
+    lpDirectory: ?[*:0]const u16,
+    nShowCmd: i32,
+) callconv(.winapi) ?*anyopaque;
 
 // --- TODO navigation ---
 

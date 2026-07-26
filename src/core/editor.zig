@@ -91,6 +91,9 @@ pub const Editor = struct {
     syntax_highlighting: bool = true,
     /// Color file tree rows by git status (off = no git subprocesses).
     filetree_git_colors: bool = true,
+    /// Select the active file in the tree whenever the active document
+    /// changes (tab switch, open) — VS Code's auto-reveal. GUI-driven.
+    filetree_auto_reveal: bool = true,
     /// Maximum undo history size per document (0 = unlimited).
     max_undo_history: usize = 100,
     /// Command palette selection index (for Tab cycling).
@@ -207,6 +210,13 @@ pub const Editor = struct {
     /// Rel-path marked for a move via 'x' (owned); 'p' pastes it into the
     /// selected folder.
     filetree_move_src: ?[]u8 = null,
+    /// All marked sources for a bulk 'x' move (includes the first; the
+    /// single `filetree_move_src` stays as the pending flag + display).
+    filetree_move_srcs: std.ArrayList([]u8) = .empty,
+    /// File clipboard (tree Ctrl+C/X/V): root-relative paths + whether
+    /// paste moves (cut) or copies. Cleared when the root changes.
+    filetree_clip_paths: std.ArrayList([]u8) = .empty,
+    filetree_clip_cut: bool = false,
 
     pub const EditorCompletionItem = struct {
         label: []const u8,
@@ -315,6 +325,10 @@ pub const Editor = struct {
         if (self.filetree_root) |r| self.allocator.free(r);
         if (self.filetree_prompt_target) |tgt| self.allocator.free(tgt);
         if (self.filetree_move_src) |src| self.allocator.free(src);
+        for (self.filetree_move_srcs.items) |p| self.allocator.free(p);
+        self.filetree_move_srcs.deinit(self.allocator);
+        for (self.filetree_clip_paths.items) |p| self.allocator.free(p);
+        self.filetree_clip_paths.deinit(self.allocator);
     }
 
     /// Get the currently active document (from the focused pane).
@@ -455,15 +469,30 @@ pub const Editor = struct {
     /// the selected folder; Escape cancels.
     pub fn startFiletreeMove(self: *Editor) void {
         const ft = self.ensureFiletree() orelse return;
-        const sel = ft.selectedNodeIdx() orelse {
+        const paths = ft.selectionRelPaths(self.allocator) catch return;
+        if (paths.len == 0) {
+            self.allocator.free(paths);
             self.status_message = "File tree: nothing selected";
             return;
+        }
+        self.cancelFiletreeMove();
+        self.filetree_move_src = self.allocator.dupe(u8, paths[0]) catch {
+            for (paths) |p| self.allocator.free(p);
+            self.allocator.free(paths);
+            return;
         };
-        if (sel == 0) return;
-        const src = self.allocator.dupe(u8, ft.nodes.items[sel].rel_path) catch return;
-        if (self.filetree_move_src) |old| self.allocator.free(old);
-        self.filetree_move_src = src;
-        const msg = std.fmt.bufPrint(&self.status_buf, "Move: {s} — select the target folder, press p", .{ft.nodes.items[sel].name}) catch "Move: press p on the target folder";
+        self.filetree_move_srcs.appendSlice(self.allocator, paths) catch {
+            for (paths) |p| self.allocator.free(p);
+            self.allocator.free(paths);
+            self.cancelFiletreeMove();
+            return;
+        };
+        self.allocator.free(paths); // container only — the strings moved into the list
+        const n = self.filetree_move_srcs.items.len;
+        const msg = if (n > 1)
+            std.fmt.bufPrint(&self.status_buf, "Move: {d} items — select the target folder, press p", .{n}) catch "Move: press p on the target folder"
+        else
+            std.fmt.bufPrint(&self.status_buf, "Move: {s} — select the target folder, press p", .{std.fs.path.basenamePosix(self.filetree_move_src.?)}) catch "Move: press p on the target folder";
         self.status_message = msg;
     }
 
@@ -471,6 +500,8 @@ pub const Editor = struct {
     pub fn cancelFiletreeMove(self: *Editor) void {
         if (self.filetree_move_src) |old| self.allocator.free(old);
         self.filetree_move_src = null;
+        for (self.filetree_move_srcs.items) |p| self.allocator.free(p);
+        self.filetree_move_srcs.clearRetainingCapacity();
     }
 
     /// Apply a pending 'x' move (tree 'p'): target = the selected folder,
@@ -481,9 +512,37 @@ pub const Editor = struct {
             self.status_message = "File tree: nothing marked — press x on an entry first";
             return;
         };
-        const sel = ft.selectedNodeIdx() orelse 0;
-        const dest_idx = if (ft.nodes.items[sel].kind == .dir) sel else ft.nodes.items[sel].parent;
-        self.filetreeMoveTo(src, dest_idx);
+        const dest_idx = ft.opTargetDir();
+        if (self.filetree_move_srcs.items.len > 1) {
+            self.filetreeMoveManyTo(self.filetree_move_srcs.items, dest_idx);
+            self.cancelFiletreeMove();
+        } else {
+            self.filetreeMoveTo(src, dest_idx);
+        }
+    }
+
+    /// Bulk form of filetreeMoveTo: move every path in `srcs` into
+    /// `dest_idx`, refreshing once at the end. Individual failures are
+    /// counted rather than aborting the batch.
+    pub fn filetreeMoveManyTo(self: *Editor, srcs: []const []u8, dest_idx: u32) void {
+        const ft = self.ensureFiletree() orelse return;
+        var ok: usize = 0;
+        var failed: usize = 0;
+        var skip: SkipNote = .{};
+        for (srcs) |src| {
+            const new_rel = ft.moveRelTo(self.allocator, src, dest_idx) catch |err| {
+                failed += 1;
+                skip.record(src, err);
+                continue;
+            };
+            self.fixupDocPathsAfterRename(ft, src, new_rel);
+            self.allocator.free(new_rel);
+            ok += 1;
+        }
+        ft.clearMulti();
+        ft.refresh() catch {};
+        ft.gitRefresh();
+        self.fileOpBulkStatus("Moved", ok, failed, &skip);
     }
 
     /// Move `src_rel` into the directory node `dest_idx` — shared by the
@@ -518,6 +577,105 @@ pub const Editor = struct {
         self.cancelFiletreeMove();
     }
 
+    /// Fill the file clipboard from the current tree selection.
+    pub fn filetreeClipCapture(self: *Editor, cut: bool) void {
+        const ft = self.ensureFiletree() orelse return;
+        const paths = ft.selectionRelPaths(self.allocator) catch return;
+        if (paths.len == 0) {
+            self.allocator.free(paths);
+            self.status_message = "File tree: nothing selected";
+            return;
+        }
+        self.filetreeClipClear();
+        self.filetree_clip_paths.appendSlice(self.allocator, paths) catch {
+            for (paths) |p| self.allocator.free(p);
+            self.allocator.free(paths);
+            return;
+        };
+        self.allocator.free(paths); // container only — strings moved into the list
+        self.filetree_clip_cut = cut;
+        const n = self.filetree_clip_paths.items.len;
+        const verb: []const u8 = if (cut) "Cut" else "Copied";
+        const plural: []const u8 = if (n == 1) "" else "s";
+        const msg = std.fmt.bufPrint(&self.status_buf, "{s} {d} item{s} — Ctrl+V on a folder pastes", .{ verb, n, plural }) catch "";
+        self.status_message = msg;
+    }
+
+    pub fn filetreeClipClear(self: *Editor) void {
+        for (self.filetree_clip_paths.items) |p| self.allocator.free(p);
+        self.filetree_clip_paths.clearRetainingCapacity();
+        self.filetree_clip_cut = false;
+    }
+
+    /// Whether `rel` is in the cut set (the GUI dims those rows).
+    pub fn filetreeClipContains(self: *const Editor, rel: []const u8) bool {
+        for (self.filetree_clip_paths.items) |p| {
+            if (std.mem.eql(u8, p, rel)) return true;
+        }
+        return false;
+    }
+
+    /// Paste the file clipboard into the selected folder (or a selected
+    /// file's parent): cut moves, copy copies recursively. No-clobber per
+    /// entry; failures are counted and the batch continues.
+    pub fn filetreePaste(self: *Editor) void {
+        const ft = self.ensureFiletree() orelse return;
+        if (self.filetree_clip_paths.items.len == 0) {
+            self.status_message = "File clipboard is empty — Ctrl+C/X in the tree first";
+            return;
+        }
+        const dest_idx = ft.opTargetDir();
+        var ok: usize = 0;
+        var failed: usize = 0;
+        var skip: SkipNote = .{};
+        var last_new: ?[]u8 = null;
+        defer if (last_new) |p| self.allocator.free(p);
+        for (self.filetree_clip_paths.items) |src| {
+            const new_rel = blk: {
+                if (self.filetree_clip_cut) {
+                    break :blk ft.moveRelTo(self.allocator, src, dest_idx) catch |err| {
+                        failed += 1;
+                        skip.record(src, err);
+                        continue;
+                    };
+                }
+                break :blk ft.copyEntryTo(self.allocator, src, dest_idx) catch |err| {
+                    failed += 1;
+                    skip.record(src, err);
+                    continue;
+                };
+            };
+            if (self.filetree_clip_cut) self.fixupDocPathsAfterRename(ft, src, new_rel);
+            if (last_new) |p| self.allocator.free(p);
+            last_new = new_rel;
+            ok += 1;
+        }
+        const was_cut = self.filetree_clip_cut;
+        if (was_cut) self.filetreeClipClear();
+        ft.clearMulti();
+        ft.refresh() catch {};
+        ft.gitRefresh();
+        if (last_new) |p| _ = ft.expandToPath(p) catch null;
+        self.fileOpBulkStatus(if (was_cut) "Moved" else "Pasted", ok, failed, &skip);
+    }
+
+    /// OS drag & drop import: copy `abs` into directory node `dest_idx`,
+    /// refresh, and reveal the result.
+    pub fn filetreeImportAbs(self: *Editor, abs: []const u8, dest_idx: u32) void {
+        const ft = self.ensureFiletree() orelse return;
+        const new_rel = ft.importAbsPath(self.allocator, abs, dest_idx) catch |err| {
+            const msg = std.fmt.bufPrint(&self.status_buf, "Import failed — {s}: {s}", .{ std.fs.path.basename(abs), fileOpSkipReason(err) }) catch "Import failed";
+            self.status_message = msg;
+            return;
+        };
+        defer self.allocator.free(new_rel);
+        ft.refresh() catch {};
+        ft.gitRefresh();
+        _ = ft.expandToPath(new_rel) catch null;
+        const msg = std.fmt.bufPrint(&self.status_buf, "Imported {s}", .{new_rel}) catch "Imported";
+        self.status_message = msg;
+    }
+
     /// Call after any successful save so the file tree stays current
     /// (git colors always; full rescan when Save As created a new file)
     /// and extensions hear about it. The GUI's native-dialog save path
@@ -538,6 +696,9 @@ pub const Editor = struct {
     /// is restored and the tree brought back — a typo in the dialog must
     /// not nuke the panel. Does NOT persist to init.lua; callers decide.
     pub fn setFiletreeRoot(self: *Editor, path: []const u8) bool {
+        // Root-relative state can't survive a root swap.
+        self.filetreeClipClear();
+        self.cancelFiletreeMove();
         const trimmed = std.mem.trim(u8, path, " \t");
         const new_root: ?[]const u8 = if (trimmed.len == 0)
             null
@@ -585,6 +746,23 @@ pub const Editor = struct {
         _ = self.setFiletreeRoot(buf[0..n]);
     }
 
+    /// Expand the tree to `path` (absolute, or relative to the tree root)
+    /// and select it — no focus or visibility change. Returns false when
+    /// the path is outside the root or doesn't exist in it.
+    pub fn filetreeRevealPath(self: *Editor, path: []const u8) bool {
+        const ft = if (self.filetree) |*f| f else return false;
+        var rel_owned: ?[]u8 = ft.relFromAbs(self.allocator, path) catch null;
+        if (rel_owned == null and !std.fs.path.isAbsolute(path)) {
+            // CLI-opened relative paths: try as-is, the default root is cwd.
+            const r = self.allocator.dupe(u8, path) catch return false;
+            filetree_mod.normalizeSeps(r);
+            rel_owned = r;
+        }
+        const rel = rel_owned orelse return false;
+        defer self.allocator.free(rel);
+        return (ft.expandToPath(rel) catch null) != null;
+    }
+
     /// Begin a file-tree prompt (mode → .filetree_prompt). For .create the
     /// target is the selected directory (or the parent of a selected file);
     /// rename/delete require a non-root selection.
@@ -593,8 +771,7 @@ pub const Editor = struct {
         var target_idx: u32 = 0;
         switch (kind) {
             .create => {
-                const sel = ft.selectedNodeIdx() orelse 0;
-                target_idx = if (ft.nodes.items[sel].kind == .dir) sel else ft.nodes.items[sel].parent;
+                target_idx = ft.opTargetDir();
             },
             .rename, .delete_confirm => {
                 const sel = ft.selectedNodeIdx() orelse {
@@ -667,6 +844,36 @@ pub const Editor = struct {
                 self.status_message = msg;
             },
             .delete_confirm => {
+                if (ft.multi.count() > 0) {
+                    // Bulk delete of the multi-selection (ancestors cover
+                    // their selected descendants via selectionRelPaths).
+                    const paths = ft.selectionRelPaths(self.allocator) catch return;
+                    defer {
+                        for (paths) |p| self.allocator.free(p);
+                        self.allocator.free(paths);
+                    }
+                    var ok: usize = 0;
+                    var failed: usize = 0;
+                    var skip: SkipNote = .{};
+                    for (paths) |p| {
+                        const idx = ft.findByPath(p) orelse {
+                            failed += 1;
+                            skip.record(p, error.FileNotFound);
+                            continue;
+                        };
+                        ft.deleteEntry(idx) catch |err| {
+                            failed += 1;
+                            skip.record(p, err);
+                            continue;
+                        };
+                        ok += 1;
+                    }
+                    ft.clearMulti();
+                    ft.refresh() catch {};
+                    ft.gitRefresh();
+                    self.fileOpBulkStatus("Deleted", ok, failed, &skip);
+                    return;
+                }
                 const idx = ft.findByPath(target) orelse {
                     self.status_message = "Delete failed: entry no longer exists";
                     return;
@@ -685,6 +892,48 @@ pub const Editor = struct {
 
     fn filetreeOpError(self: *Editor, op: []const u8, err: anyerror) void {
         const msg = std.fmt.bufPrint(&self.status_buf, "{s} failed: {s}", .{ op, @errorName(err) }) catch "File operation failed";
+        self.status_message = msg;
+    }
+
+    /// Human-readable reason for a skipped bulk file operation.
+    fn fileOpSkipReason(err: anyerror) []const u8 {
+        return switch (err) {
+            error.PathAlreadyExists => "name already exists in the target",
+            error.InvalidMove, error.InvalidCopy => "invalid target (same place, or inside the entry)",
+            error.FileNotFound => "entry no longer exists",
+            error.AccessDenied => "access denied",
+            else => @errorName(err),
+        };
+    }
+
+    /// Tracks the last skip in a bulk loop so the status line can say
+    /// WHICH entry was skipped and WHY, not just a count.
+    const SkipNote = struct {
+        name_buf: [128]u8 = undefined,
+        name_len: usize = 0,
+        reason: []const u8 = "",
+
+        fn record(self: *SkipNote, src_rel: []const u8, err: anyerror) void {
+            const base = std.fs.path.basenamePosix(src_rel);
+            self.name_len = @min(base.len, self.name_buf.len);
+            @memcpy(self.name_buf[0..self.name_len], base[0..self.name_len]);
+            self.reason = fileOpSkipReason(err);
+        }
+
+        fn name(self: *const SkipNote) []const u8 {
+            return self.name_buf[0..self.name_len];
+        }
+    };
+
+    /// Compose the "{Verb} N item(s)" status with skip details appended.
+    fn fileOpBulkStatus(self: *Editor, verb: []const u8, ok: usize, failed: usize, skip: *const SkipNote) void {
+        const plural: []const u8 = if (ok == 1) "" else "s";
+        const msg = if (failed == 0)
+            std.fmt.bufPrint(&self.status_buf, "{s} {d} item{s}", .{ verb, ok, plural }) catch verb
+        else if (failed == 1)
+            std.fmt.bufPrint(&self.status_buf, "{s} {d} item{s} — skipped {s}: {s}", .{ verb, ok, plural, skip.name(), skip.reason }) catch verb
+        else
+            std.fmt.bufPrint(&self.status_buf, "{s} {d} item{s} — {d} skipped (last {s}: {s})", .{ verb, ok, plural, failed, skip.name(), skip.reason }) catch verb;
         self.status_message = msg;
     }
 
