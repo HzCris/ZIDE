@@ -214,6 +214,65 @@ fn lowerInto(buf: []u8, s: []const u8) ?[]const u8 {
     return buf[0..s.len];
 }
 
+// ---- Runtime overrides (zide.set_icon) ----
+
+pub const Override = struct { kind: IconKind, color: ?Rgb };
+
+/// Keys are owned lowercase strings: an exact basename ("makefile",
+/// "src") or an extension ("zig"). The editor owns one of these; both
+/// frontends consult it through iconForWithOverrides.
+pub const OverrideMap = std.StringHashMapUnmanaged(Override);
+
+/// `iconFor` with the Lua override layer on top: exact basename match
+/// first (works for directories too), then extension, then built-ins.
+pub fn iconForWithOverrides(map: *const OverrideMap, name: []const u8, is_dir: bool) FileIcon {
+    if (map.count() > 0) {
+        var buf: [64]u8 = undefined;
+        if (lowerInto(&buf, name)) |lname| {
+            if (map.get(lname)) |ov| return .{ .kind = ov.kind, .color = ov.color };
+        }
+        if (!is_dir) {
+            const ext = extOf(name);
+            if (ext.len > 0) {
+                if (lowerInto(&buf, ext)) |lext| {
+                    if (map.get(lext)) |ov| return .{ .kind = ov.kind, .color = ov.color };
+                }
+            }
+        }
+    }
+    return iconFor(name, is_dir);
+}
+
+/// Parse a kind name ("code", "image", ...) — the Lua-facing spelling
+/// is exactly the enum tag.
+pub fn kindFromName(s: []const u8) ?IconKind {
+    return std.meta.stringToEnum(IconKind, s);
+}
+
+/// Nerdfont glyph per kind for the TUI (requires a Nerd Font terminal
+/// font — gated behind the tui_filetree_icons setting).
+pub fn nerdGlyph(kind: IconKind) []const u8 {
+    return switch (kind) {
+        .folder => "\u{f07b}",
+        .code => "\u{f121}",
+        .text => "\u{f15c}",
+        .book => "\u{f02d}",
+        .license => "\u{f132}",
+        .config => "\u{f013}",
+        .data => "\u{f1c0}",
+        .image => "\u{f1c5}",
+        .audio => "\u{f001}",
+        .video => "\u{f008}",
+        .archive => "\u{f1c6}",
+        .binary => "\u{f471}",
+        .executable => "\u{f0e7}",
+        .git => "\u{f1d3}",
+        .lock => "\u{f023}",
+        .font_file => "\u{f031}",
+        .generic => "\u{f15b}",
+    };
+}
+
 // ---- Tests ----
 
 const t = std.testing;
@@ -250,4 +309,29 @@ test "fileicons: extOf edge cases" {
     try t.expectEqualStrings("gz", extOf("file.tar.gz"));
     try t.expectEqualStrings("", extOf(".gitignore"));
     try t.expectEqualStrings("", extOf("noext"));
+}
+
+test "fileicons: kindFromName parses enum tags" {
+    try t.expectEqual(IconKind.code, kindFromName("code").?);
+    try t.expectEqual(IconKind.font_file, kindFromName("font_file").?);
+    try t.expectEqual(@as(?IconKind, null), kindFromName("no_such_kind"));
+}
+
+test "fileicons: overrides beat built-ins, basename beats extension" {
+    var map: OverrideMap = .empty;
+    defer map.deinit(t.allocator);
+    const red: Rgb = .{ .r = 0xFF, .g = 0, .b = 0 };
+    try map.put(t.allocator, "zig", .{ .kind = .image, .color = red });
+    try map.put(t.allocator, "build.zig", .{ .kind = .lock, .color = null });
+    try map.put(t.allocator, "src", .{ .kind = .git, .color = null });
+
+    // Extension override (case-insensitive input)
+    try t.expectEqual(IconKind.image, iconForWithOverrides(&map, "MAIN.ZIG", false).kind);
+    try t.expectEqual(@as(u8, 0xFF), iconForWithOverrides(&map, "main.zig", false).color.?.r);
+    // Exact basename beats the extension entry
+    try t.expectEqual(IconKind.lock, iconForWithOverrides(&map, "build.zig", false).kind);
+    // Directory overrides by name
+    try t.expectEqual(IconKind.git, iconForWithOverrides(&map, "src", true).kind);
+    // Unmatched falls through to built-ins
+    try t.expectEqual(IconKind.text, iconForWithOverrides(&map, "notes.md", false).kind);
 }

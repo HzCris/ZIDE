@@ -4,6 +4,7 @@ const Document = @import("document.zig").Document;
 const CommandRegistry = @import("commands.zig").CommandRegistry;
 const registerBuiltins = @import("commands.zig").registerBuiltins;
 const SystemClipboard = @import("clipboard.zig").SystemClipboard;
+const fileicons = @import("fileicons.zig");
 const KeybindMap = @import("keybind.zig").KeybindMap;
 const Layout = @import("layout.zig").Layout;
 const PaneContent = @import("layout.zig").PaneContent;
@@ -94,6 +95,12 @@ pub const Editor = struct {
     /// Select the active file in the tree whenever the active document
     /// changes (tab switch, open) — VS Code's auto-reveal. GUI-driven.
     filetree_auto_reveal: bool = true,
+    /// Nerdfont file icons in the TUI tree rows (off by default — the
+    /// terminal font must be a patched Nerd Font for the glyphs to show).
+    tui_filetree_icons: bool = false,
+    /// Icon overrides from `zide.set_icon` (lowercase basename/ext keys,
+    /// owned) — consulted by both frontends before the built-in tables.
+    icon_overrides: fileicons.OverrideMap = .empty,
     /// Maximum undo history size per document (0 = unlimited).
     max_undo_history: usize = 100,
     /// Command palette selection index (for Tab cycling).
@@ -329,6 +336,9 @@ pub const Editor = struct {
         self.filetree_move_srcs.deinit(self.allocator);
         for (self.filetree_clip_paths.items) |p| self.allocator.free(p);
         self.filetree_clip_paths.deinit(self.allocator);
+        var ov_it = self.icon_overrides.keyIterator();
+        while (ov_it.next()) |k| self.allocator.free(k.*);
+        self.icon_overrides.deinit(self.allocator);
     }
 
     /// Get the currently active document (from the focused pane).
@@ -575,6 +585,24 @@ pub const Editor = struct {
         const msg = std.fmt.bufPrint(&self.status_buf, "Moved to {s}", .{new_rel}) catch "Moved";
         self.status_message = msg;
         self.cancelFiletreeMove();
+    }
+
+    /// Register (or replace) an icon override from `zide.set_icon`.
+    /// `key` is an extension ("zig") or exact basename ("Makefile",
+    /// "src"), matched case-insensitively.
+    pub fn setIconOverride(self: *Editor, key: []const u8, kind: fileicons.IconKind, color: ?fileicons.Rgb) !void {
+        if (key.len == 0 or key.len > 64) return error.InvalidName;
+        const lower = try self.allocator.alloc(u8, key.len);
+        errdefer self.allocator.free(lower);
+        for (key, 0..) |c, i| lower[i] = std.ascii.toLower(c);
+        const gop = try self.icon_overrides.getOrPut(self.allocator, lower);
+        if (gop.found_existing) self.allocator.free(lower);
+        gop.value_ptr.* = .{ .kind = kind, .color = color };
+    }
+
+    /// Icon for a tree entry: Lua overrides layered over the built-ins.
+    pub fn filetreeIconFor(self: *const Editor, name: []const u8, is_dir: bool) fileicons.FileIcon {
+        return fileicons.iconForWithOverrides(&self.icon_overrides, name, is_dir);
     }
 
     /// Fill the file clipboard from the current tree selection.

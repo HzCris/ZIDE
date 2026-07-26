@@ -1184,8 +1184,9 @@ fn filetreePanel(editor: *Editor) void {
         }
         // Entries sitting in the cut clipboard render dimmed.
         const in_cut = editor.filetree_clip_cut and editor.filetreeClipContains(node.rel_path);
-        // Type icon: fixed accent colors; unknown types use dimmed text.
-        const fi = fileicons.iconFor(node.name, node.kind == .dir);
+        // Type icon: fixed accent colors (plus zide.set_icon overrides);
+        // unknown types use dimmed text.
+        const fi = editor.filetreeIconFor(node.name, node.kind == .dir);
         const glyph = filetreeIconTvg(fi.kind);
         var tint: dvui.Color = if (fi.color) |c|
             .{ .r = c.r, .g = c.g, .b = c.b, .a = 255 }
@@ -1495,7 +1496,7 @@ fn filetreeDrawInlineEntry(editor: *Editor, m: FiletreeMetrics, rs: dvui.RectSca
     fillBar(area, y - area.y, m.line_height, toDvui(editor.theme.overlay_bg));
     const fi = base_icon orelse blk: {
         const is_dir = input.len > 0 and (input[input.len - 1] == '/' or input[input.len - 1] == '\\');
-        break :blk fileicons.iconFor(if (is_dir) "" else input, is_dir);
+        break :blk editor.filetreeIconFor(if (is_dir) "" else input, is_dir);
     };
     const glyph = filetreeIconTvg(fi.kind);
     const text_color = toDvui(editor.theme.text);
@@ -2074,7 +2075,7 @@ fn filetreeInlineTarget(editor: *Editor, ft: *FileTree) ?FiletreeInlineTarget {
             out.rename_row = trow;
             const tnode = ft.nodes.items[tidx];
             out.depth = tnode.depth;
-            out.icon = fileicons.iconFor(tnode.name, tnode.kind == .dir);
+            out.icon = editor.filetreeIconFor(tnode.name, tnode.kind == .dir);
         },
         .create => {
             const pidx = ft.findByPath(target) orelse 0;
@@ -4561,6 +4562,7 @@ const settings_defs = [_]SettingDef{
     .{ .key = "filetree_side", .label = "File Tree Side", .kind = .enum_choice, .desc = "Dock the file tree on the left or right", .choices = &.{ "left", "right" } },
     .{ .key = "filetree_width", .label = "File Tree Width (GUI)", .kind = .number, .desc = "Panel width in pixels (120-600)", .min = 120, .max = 600 },
     .{ .key = "tui_filetree_width", .label = "File Tree Width (TUI)", .kind = .number, .desc = "Panel width in columns (16-80)", .min = 16, .max = 80 },
+    .{ .key = "tui_filetree_icons", .label = "File Tree Icons (TUI)", .kind = .boolean, .desc = "Nerdfont file icons in the TUI tree (terminal font must be a Nerd Font)" },
     .{ .key = "filetree_root", .label = "File Tree Root", .kind = .text, .desc = "Starting directory — empty = current dir (Enter applies)" },
 };
 
@@ -4743,6 +4745,7 @@ fn getSettingBool(editor: *const Editor, key: []const u8) bool {
     if (std.mem.eql(u8, key, "filetree_git_colors")) return editor.filetree_git_colors;
     if (std.mem.eql(u8, key, "filetree_auto_reveal")) return editor.filetree_auto_reveal;
     if (std.mem.eql(u8, key, "filetree_visible")) return editor.filetree_visible;
+    if (std.mem.eql(u8, key, "tui_filetree_icons")) return editor.tui_filetree_icons;
     return false;
 }
 
@@ -4763,6 +4766,7 @@ fn applySettingBool(editor: *Editor, key: []const u8, val: bool) void {
         }
     }
     if (std.mem.eql(u8, key, "filetree_auto_reveal")) editor.filetree_auto_reveal = val;
+    if (std.mem.eql(u8, key, "tui_filetree_icons")) editor.tui_filetree_icons = val;
     if (std.mem.eql(u8, key, "filetree_visible")) {
         editor.filetree_visible = val;
         if (!val) editor.filetree_focused = false;

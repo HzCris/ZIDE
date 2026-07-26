@@ -7,6 +7,7 @@ const syntax = @import("../core/syntax.zig");
 const lsp = @import("../core/lsp.zig");
 const terminal_mod = @import("../core/terminal.zig");
 const filetree_mod = @import("../core/filetree.zig");
+const fileicons = @import("../core/fileicons.zig");
 const FileTree = filetree_mod.FileTree;
 
 const Key = vaxis.Key;
@@ -377,7 +378,11 @@ pub fn run(allocator: std.mem.Allocator, editor: *Editor) !void {
                     .delete_confirm => {
                         var buf: [160]u8 = undefined;
                         const target = editor.filetree_prompt_target orelse "";
-                        const title = std.fmt.bufPrint(&buf, "Delete {s}? [Y]es [N]o: ", .{target}) catch "Delete? [Y]es [N]o: ";
+                        const del_count = if (editor.filetree) |*t| t.selectionCount() else 1;
+                        const title = if (del_count > 1)
+                            std.fmt.bufPrint(&buf, "Delete {d} selected items? [Y]es [N]o: ", .{del_count}) catch "Delete? [Y]es [N]o: "
+                        else
+                            std.fmt.bufPrint(&buf, "Delete {s}? [Y]es [N]o: ", .{target}) catch "Delete? [Y]es [N]o: ";
                         drawOverlay(win, editor, title, "", width, height);
                     },
                 }
@@ -687,9 +692,11 @@ fn drawFileTree(win: Window, editor: *Editor, w: u16, h: u16) void {
             .deleted => theme.git_deleted,
             .untracked => theme.git_untracked,
         }) else null;
+        const is_multi = row != ft.selected and ft.isMultiSelected(idx);
         var style = if (row == ft.selected) sel_style else bg_style;
+        if (is_multi) style.bg = toVaxis(theme.overlay_selection_bg);
         if (status_fg) |fg| style.fg = fg;
-        if (row == ft.selected) {
+        if (row == ft.selected or is_multi) {
             // Fill the whole row so the selection reads as a bar
             for (0..text_w) |ci| {
                 win.writeCell(@intCast(text_x + ci), screen_row, .{
@@ -710,11 +717,27 @@ fn drawFileTree(win: Window, editor: *Editor, w: u16, h: u16) void {
             });
         }
         var x: u16 = text_x + indent;
-        const glyph: []const u8 = switch (node.kind) {
-            .dir => if (node.expanded) "- " else "+ ",
-            .file => "  ",
-        };
-        x = writeStr(win, x, screen_row, glyph, style);
+        if (editor.tui_filetree_icons) {
+            // Nerdfont mode: chevron column + accent-colored type glyph.
+            const chev: []const u8 = switch (node.kind) {
+                .dir => if (node.expanded) "\u{25be} " else "\u{25b8} ", // ▾ ▸
+                .file => "  ",
+            };
+            x = writeStr(win, x, screen_row, chev, style);
+            const fi = editor.filetreeIconFor(node.name, node.kind == .dir);
+            var icon_style = style;
+            if (row != ft.selected) {
+                if (fi.color) |c| icon_style.fg = .{ .rgb = .{ c.r, c.g, c.b } };
+            }
+            x = writeStr(win, x, screen_row, fileicons.nerdGlyph(fi.kind), icon_style);
+            x = writeStr(win, x, screen_row, " ", style);
+        } else {
+            const glyph: []const u8 = switch (node.kind) {
+                .dir => if (node.expanded) "- " else "+ ",
+                .file => "  ",
+            };
+            x = writeStr(win, x, screen_row, glyph, style);
+        }
         const name_cols: usize = if (x < text_x + text_w) text_x + text_w - x else 0;
         _ = writeStr(win, x, screen_row, truncToWidth(node.name, name_cols), style);
     }
@@ -2108,27 +2131,42 @@ fn handleFiletreeKey(editor: *Editor, key: Key) void {
     };
     switch (key.codepoint) {
         Key.escape => {
-            // A pending move mark cancels first; second Esc leaves the tree
+            // A pending move mark cancels first, then a multi selection;
+            // only then does focus leave the tree.
             if (editor.filetree_move_src != null) {
                 editor.cancelFiletreeMove();
                 editor.status_message = "Move cancelled";
+            } else if (ft.multi.count() > 0) {
+                ft.clearMulti();
             } else {
                 editor.filetree_focused = false;
             }
         },
         Key.up, 'k' => {
-            ft.moveSelection(-1);
+            if (key.mods.shift and key.codepoint == Key.up) {
+                ft.selectRangeTo(ft.selected -| 1) catch {};
+            } else {
+                ft.clearMulti();
+                ft.moveSelection(-1);
+            }
             ft.scroll_to_selected = true;
         },
         Key.down, 'j' => {
-            ft.moveSelection(1);
+            if (key.mods.shift and key.codepoint == Key.down) {
+                ft.selectRangeTo(ft.selected + 1) catch {};
+            } else {
+                ft.clearMulti();
+                ft.moveSelection(1);
+            }
             ft.scroll_to_selected = true;
         },
         Key.home => {
+            ft.clearMulti();
             ft.selected = 0;
             ft.scroll_to_selected = true;
         },
         Key.end => {
+            ft.clearMulti();
             ft.selected = ft.visible.items.len -| 1;
             ft.scroll_to_selected = true;
         },

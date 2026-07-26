@@ -456,6 +456,12 @@ like LSP diagnostics (and kept separately, so LSP updates never wipe them):
 Lint diagnostics are cleared by `reload_extensions` (a removed linter's
 stale squiggles don't survive).
 
+### File Tree Icons
+
+| Call | Description |
+|------|-------------|
+| `zide.set_icon(key, kind [, color])` | Override a file tree icon. `key` is an extension (`"zig"`) or an exact basename (`"Makefile"`, `"src"` — works for folders), matched case-insensitively; basename beats extension. `kind` is one of: `folder`, `code`, `text`, `book`, `license`, `config`, `data`, `image`, `audio`, `video`, `archive`, `binary`, `executable`, `git`, `lock`, `font_file`, `generic` (picks the glyph in both frontends). `color` is `"#rrggbb"`; omit it to use the theme's text color. Overrides replace on re-registration, so `reload_extensions` picks up edits. |
+
 #### The Shipped Example: example-lint-zig.lua
 
 On first launch ZIDE creates `~/.config/zide/extensions/example-lint-zig.lua`
@@ -721,13 +727,14 @@ A toggleable side panel for browsing and managing the project directory, backed 
 - Files created, deleted, or renamed **outside ZIDE** (Explorer, a terminal) appear automatically: a cheap directory-mtime probe runs every ~1.5s and triggers the full rescan + git recolor only when something actually changed. (The TUI checks when input arrives, since its loop sleeps between events.)
 - Directories sort first, names case-insensitive; children scan lazily on first expand; everything is listed, dotfiles and `.git` included.
 - Indent guide lines mark each ancestor level (thin rules in the GUI, `│` columns in the TUI) so deep nesting stays readable.
-- **GUI rows render VS Code-style**: chevron expanders on folders, per-type file icons in fixed accent colors (Zig orange, Lua blue, Markdown blue, images purple, executables green, folders steel blue, unknown types a dimmed generic document), the UI font instead of mono, a hover highlight under the pointer, and a selection bar that dims while the tree doesn't own the keyboard. Classification lives in `src/core/fileicons.zig` (frontend-agnostic, so the TUI can map the same kinds to nerdfont glyphs later); special basenames beat extensions (README → open book, LICENSE → shield, `.gitignore` → git branch, Makefile/Dockerfile/dotfiles → config gear); glyphs are dvui's bundled entypo TinyVG set, rasterized and cached per size/tint.
+- **GUI rows render VS Code-style**: chevron expanders on folders, per-type file icons in fixed accent colors (Zig orange, Lua blue, Markdown blue, images purple, executables green, folders steel blue, unknown types a dimmed generic document), the UI font instead of mono, a hover highlight under the pointer, and a selection bar that dims while the tree doesn't own the keyboard. Classification lives in `src/core/fileicons.zig` (frontend-agnostic — the TUI maps the same kinds to nerdfont glyphs); special basenames beat extensions (README → open book, LICENSE → shield, `.gitignore` → git branch, Makefile/Dockerfile/dotfiles → config gear); glyphs are dvui's bundled entypo TinyVG set, rasterized and cached per size/tint. Extensions can override any assignment with `zide.set_icon` (see Extension Runtime API).
+- **TUI icons** (opt-in): the `toggle_tui_icons` palette command (Ctrl+P — works live in the TUI and persists), `zide.set("tui_filetree_icons", true)`, or the GUI Settings dialog swaps the `+`/`-` glyphs for ▸/▾ chevrons plus nerdfont type glyphs in truecolor accents — the terminal font must be a patched Nerd Font or the glyphs render as boxes. Off (the default) keeps the classic look.
 - **GUI scrollbar**: a slim pill appears over the rows' right edge when they overflow — drag it, or click the empty track above/below to page; the wheel still scrolls. (TUI rows are unchanged: `+`/`-` glyphs, terminal colors.)
 - **GUI create/rename are inline**: `a`/`r` (or the menu) open an input box in the tree itself — rename replaces the entry's row (keeping its icon), create appears as a new row under the target folder whose icon flips to a folder the moment the input ends with `/`. Enter applies, Escape cancels, same validation as before. Delete keeps its y/n confirm bar, and the TUI keeps its status-line prompts.
 - **Auto-reveal** (GUI): switching tabs (or opening a file any way) expands and selects that file in the tree without stealing keyboard focus — VS Code behavior, on by default; off via the Settings dialog or `zide.set("filetree_auto_reveal", false)`.
 - **`/` search** (GUI): with the tree focused, press `/` and type — the selection jumps live to the next visible row whose name contains the query (case-insensitive, wraps past the end). The header shows `/query` while typing, in the warn color when nothing matches. Enter keeps the selection, Escape backs out, arrows exit search and navigate. (`/` is needed because plain letters are the j/k/a/r/d/x/p bindings.)
 - **GUI header buttons** (right side): new file (+) starts an inline create under the selected folder; collapse-all (⊟) folds every directory back to the top level.
-- **Multi-select** (GUI): Ctrl+click toggles rows in and out of the selection, Shift+click (or Shift+Up/Down) selects a visible range from the last plain selection, plain clicks/nav collapse back to one row (Escape also clears it, after cancelling a pending move). Delete, x/p moves, drag & drop, and copy-path all operate on the whole selection — dragging any selected row moves the group (including dragging straight out of the Ctrl/Shift+click itself; the drag carries the selection as it was when the press started), and a selected folder covers its selected children automatically.
+- **Multi-select**: Ctrl+click (GUI) toggles rows in and out of the selection, Shift+click (GUI) or Shift+Up/Down (both frontends) selects a visible range from the last plain selection, plain clicks/nav collapse back to one row (Escape also clears it, after cancelling a pending move). Delete, x/p moves, drag & drop, and copy-path all operate on the whole selection — dragging any selected row moves the group (including dragging straight out of the Ctrl/Shift+click itself; the drag carries the selection as it was when the press started), and a selected folder covers its selected children automatically.
 - **The root is targetable** (GUI): click the empty space below the rows and the header highlights — create (`a`/+), paste, and x/p moves then land at the top level instead of inside a subfolder. Any row click clears it. (Drag & drop always had this: dropping on the header or empty space moves to the root.)
 - **File clipboard** (GUI keys, commands in both frontends): with the tree focused, **Ctrl+C / Ctrl+X / Ctrl+V** copy, cut, and paste the selected entries as files — paste targets the selected folder (or a file's parent). Copy duplicates recursively, cut moves; both are no-clobber per entry and cut rows render dimmed until pasted. The clipboard is ZIDE-internal (not the OS file clipboard) and clears when the tree root changes.
 - **Drag in from Explorer** (GUI): drop files or folders from the OS onto the tree to copy them into the folder under the cursor; drop a file onto the editor area to open it, or a folder to re-root the tree there.
@@ -748,7 +755,7 @@ A toggleable side panel for browsing and managing the project directory, backed 
 | d | Delete — clickable Delete/Cancel dialog in the GUI (y/n/Enter/Esc too), y/n prompt in the TUI; directories delete recursively; deletes the whole multi-selection |
 | Backspace or u | Re-root the tree at the parent directory |
 | x then p | Move: x marks the selected entry (or the whole multi-selection), p drops into the selected folder (or a selected file's folder); no-clobber, open tabs follow |
-| Shift+Up/Down | (GUI) Extend a range selection row by row |
+| Shift+Up/Down | Extend a range selection row by row (both frontends) |
 | Ctrl+C / X / V | (GUI) File clipboard: copy / cut the selection, paste into the selected folder |
 | / | (GUI) Incremental name search — type to jump, Enter/Escape ends, arrows exit and navigate |
 | Escape | Cancel a pending x move first, then clear a multi-selection; otherwise return focus to the editor |
@@ -767,7 +774,9 @@ Ctrl/Alt chords (Ctrl+P, Ctrl+B, ...) still work while the tree is focused.
 ### TUI specifics
 - Rendered as a column band with a `│` separator; the terminal cursor hides while the tree is focused (the selection bar takes its place) and the panel header brightens
 - Panel is skipped (and focus released) below 40 terminal columns; width is capped at half the terminal
-- Create/rename/delete prompts appear on the status line, same as Save As
+- Create/rename/delete prompts appear on the status line, same as Save As (the delete prompt shows the count for a multi-selection)
+- Multi-select is keyboard-driven: Shift+Up/Down extends, Escape clears, and d/x/p operate on the whole selection through the same core as the GUI
+- Nerdfont icons via `tui_filetree_icons` (see the icons bullet in Basics)
 
 ### Commands (palette)
 | Command | Description |
@@ -779,6 +788,7 @@ Ctrl/Alt chords (Ctrl+P, Ctrl+B, ...) still work while the tree is focused.
 | `filetree_copy_path` | Copy the selected entry's absolute path to the clipboard |
 | `filetree_copy_relative_path` | Copy the selected entry's root-relative path (native separators) |
 | `filetree_reveal_explorer` | Show the selected entry in the system file manager (Explorer `/select` on Windows, `open -R` on macOS, `xdg-open` of the parent elsewhere) |
+| `toggle_tui_icons` | Toggle the TUI tree's nerdfont icons live (the TUI has no settings panel); persists to init.lua |
 | `filetree_copy` / `filetree_cut` | Fill the file clipboard from the selection (Ctrl+C/X while the tree is focused) |
 | `filetree_paste` | Paste the file clipboard into the selected folder (Ctrl+V) — cut moves, copy copies recursively |
 
@@ -786,7 +796,7 @@ Ctrl/Alt chords (Ctrl+P, Ctrl+B, ...) still work while the tree is focused.
 Tree rows are colored from `git status --porcelain` (a one-shot `git` shell-out — no libgit2): **untracked** and **added** files green/teal, **modified** amber, and any directory containing changes rolls up as modified; children of an untracked folder inherit untracked. In the GUI each changed row also gets a right-edge **badge**: an A/M/D/U letter on files, a `•` dot on directories rolling up changes (long names clip before the badge instead of running under it). Refreshed on panel load, manual refresh (Shift+R / `filetree_refresh`), after create/rename/delete, and after saves (including auto-save). Outside a git repo (or without git installed) rows simply stay uncolored. Colors are theme fields overridable via `zide.set("color_git_added" | "color_git_modified" | "color_git_deleted" | "color_git_untracked", "#hex")` and the `tui_color_git_*` equivalents.
 
 ### Settings
-Settings dialog (GUI) or `zide.set` in init.lua: `filetree_visible` (bool, default true), `filetree_side` ("left"/"right"), `filetree_width` (120–600 px), `tui_filetree_width` (16–80 cols), `filetree_root` (path text field in the dialog — Enter applies and persists), `filetree_git_colors` (bool, default true — off stops the git status coloring and its `git status` subprocess calls entirely), `filetree_auto_reveal` (bool, default true — select the active file in the tree on tab switch).
+Settings dialog (GUI) or `zide.set` in init.lua: `filetree_visible` (bool, default true), `filetree_side` ("left"/"right"), `filetree_width` (120–600 px), `tui_filetree_width` (16–80 cols), `filetree_root` (path text field in the dialog — Enter applies and persists), `filetree_git_colors` (bool, default true — off stops the git status coloring and its `git status` subprocess calls entirely), `filetree_auto_reveal` (bool, default true — select the active file in the tree on tab switch), `tui_filetree_icons` (bool, default false — nerdfont icons in the TUI tree; needs a Nerd Font terminal font).
 
 ## Performance
 - **Gap buffer** text storage — inserts/deletes at cursor are O(1) amortized instead of O(n) memmove

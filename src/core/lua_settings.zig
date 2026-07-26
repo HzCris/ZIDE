@@ -449,6 +449,8 @@ fn luaSet(state: ?*zlua.LuaState) callconv(.c) c_int {
         editor.filetree_visible = lua.toBoolean(2);
     } else if (std.mem.eql(u8, key_str, "filetree_auto_reveal")) {
         editor.filetree_auto_reveal = lua.toBoolean(2);
+    } else if (std.mem.eql(u8, key_str, "tui_filetree_icons")) {
+        editor.tui_filetree_icons = lua.toBoolean(2);
     } else if (std.mem.eql(u8, key_str, "filetree_side")) {
         // zide.set("filetree_side", "left") / "right"
         const val = lua.toString(2) catch return 0;
@@ -667,6 +669,9 @@ fn luaGet(state: ?*zlua.LuaState) callconv(.c) c_int {
         return 1;
     } else if (std.mem.eql(u8, key_str, "filetree_auto_reveal")) {
         lua.pushBoolean(editor.filetree_auto_reveal);
+        return 1;
+    } else if (std.mem.eql(u8, key_str, "tui_filetree_icons")) {
+        lua.pushBoolean(editor.tui_filetree_icons);
         return 1;
     } else if (std.mem.eql(u8, key_str, "filetree_side")) {
         _ = lua.pushString(@tagName(editor.filetree_side));

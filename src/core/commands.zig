@@ -212,6 +212,7 @@ pub fn registerBuiltins(registry: *CommandRegistry) !void {
     try registry.register("filetree_copy_path", "Copy the selected file tree entry's absolute path", cmdFiletreeCopyPath);
     try registry.register("filetree_copy_relative_path", "Copy the selected file tree entry's root-relative path", cmdFiletreeCopyRelPath);
     try registry.register("filetree_reveal_explorer", "Show the selected file tree entry in the system file manager", cmdFiletreeRevealExplorer);
+    try registry.register("toggle_tui_icons", "Toggle nerdfont icons in the TUI file tree (persists to init.lua)", cmdToggleTuiIcons);
     try registry.register("filetree_copy", "Copy the selected file tree entries to the file clipboard", cmdFiletreeClipCopy);
     try registry.register("filetree_cut", "Cut the selected file tree entries to the file clipboard", cmdFiletreeClipCut);
     try registry.register("filetree_paste", "Paste the file clipboard into the selected folder", cmdFiletreeClipPaste);
@@ -647,6 +648,17 @@ fn cmdFiletreeReveal(editor: *Editor, _: ?[]const u8) void {
 fn cmdFiletreeCollapseAll(editor: *Editor, _: ?[]const u8) void {
     const ft = editor.ensureFiletree() orelse return;
     ft.collapseAll() catch {};
+}
+
+/// The TUI has no settings panel — this palette command is its switch
+/// for the nerdfont tree icons (and persists like the GUI dialog would).
+fn cmdToggleTuiIcons(editor: *Editor, _: ?[]const u8) void {
+    editor.tui_filetree_icons = !editor.tui_filetree_icons;
+    lua_settings.writeSettingToFile("tui_filetree_icons", if (editor.tui_filetree_icons) "true" else "false") catch {};
+    editor.status_message = if (editor.tui_filetree_icons)
+        "TUI file tree icons ON (glyphs need a Nerd Font terminal font)"
+    else
+        "TUI file tree icons OFF";
 }
 
 /// Selected tree entry as an owned absolute path, or null (with a status

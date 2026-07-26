@@ -13,6 +13,8 @@ const Document = @import("document.zig").Document;
 const lua_settings = @import("lua_settings.zig");
 const lsp_mod = @import("lsp.zig");
 const filetree_mod = @import("filetree.zig");
+const fileicons = @import("fileicons.zig");
+const ThemeColor = @import("theme.zig").ThemeColor;
 
 const Lua = zlua.Lua;
 
@@ -72,6 +74,10 @@ pub fn registerInto(lua: *Lua, editor: *Editor) void {
     // Diagnostics
     lua.pushFunction(&luaSetDiagnostics);
     lua.setField(-2, "set_diagnostics");
+
+    // File tree icon overrides
+    lua.pushFunction(&luaSetIcon);
+    lua.setField(-2, "set_icon");
 }
 
 // ---------------------------------------------------------------------------
@@ -744,6 +750,44 @@ fn severityFromName(name: []const u8) lsp_mod.DiagnosticSeverity {
 /// "error"). Pass an empty table to clear. Paths that aren't open are
 /// ignored. Positions go stale as the user edits — same as LSP, the next
 /// lint run replaces them.
+/// zide.set_icon(key, kind [, "#rrggbb"]) — override a file tree icon.
+/// `key` is an extension ("zig") or exact basename ("Makefile", "src");
+/// `kind` is one of the fileicons.IconKind tag names ("code", "image",
+/// "folder", ...). Omitting the color keeps the theme's text color.
+fn luaSetIcon(state: ?*zlua.LuaState) callconv(.c) c_int {
+    var lua: *Lua = @ptrCast(@alignCast(state orelse return 0));
+    const editor = lua_settings.getEditor(state) orelse return 0;
+
+    const key = lua.toString(1) catch {
+        std.log.warn("zide.set_icon: key (string) required", .{});
+        return 0;
+    };
+    const kind_str = lua.toString(2) catch {
+        std.log.warn("zide.set_icon: kind (string) required", .{});
+        return 0;
+    };
+    const kind = fileicons.kindFromName(kind_str) orelse {
+        std.log.warn("zide.set_icon: unknown kind '{s}'", .{kind_str});
+        return 0;
+    };
+    var color: ?fileicons.Rgb = null;
+    if (lua.getTop() >= 3 and !lua.isNil(3)) {
+        const hex = lua.toString(3) catch {
+            std.log.warn("zide.set_icon: color must be a '#rrggbb' string", .{});
+            return 0;
+        };
+        const tc = ThemeColor.fromHex(hex) orelse {
+            std.log.warn("zide.set_icon: bad color '{s}'", .{hex});
+            return 0;
+        };
+        color = .{ .r = tc.r, .g = tc.g, .b = tc.b };
+    }
+    editor.setIconOverride(key, kind, color) catch {
+        std.log.warn("zide.set_icon: could not register '{s}'", .{key});
+    };
+    return 0;
+}
+
 fn luaSetDiagnostics(state: ?*zlua.LuaState) callconv(.c) c_int {
     var lua: *Lua = @ptrCast(@alignCast(state orelse return 0));
     const editor = lua_settings.getEditor(state) orelse return 0;
@@ -1240,6 +1284,28 @@ test "off-switch settings round-trip through zide.set/get" {
     try testing.expect(!editor.lsp_enabled);
     try testing.expect(!editor.syntax_highlighting);
     try testing.expect(!editor.filetree_git_colors);
+}
+
+test "zide.set_icon overrides tree icons by ext and basename" {
+    var lua = try Lua.init(testing.allocator);
+    defer lua.deinit();
+    lua.openLibs();
+    var editor = try Editor.init(testing.allocator, testing.io);
+    defer editor.deinit();
+    lua_settings.registerApi(lua, &editor);
+
+    try lua.doString(
+        \\zide.set_icon('zig', 'image', '#ff0000')
+        \\zide.set_icon('SRC', 'git')
+    );
+    const zig_icon = editor.filetreeIconFor("main.zig", false);
+    try testing.expectEqual(fileicons.IconKind.image, zig_icon.kind);
+    try testing.expectEqual(@as(u8, 0xFF), zig_icon.color.?.r);
+    // Basename match, case-insensitive both directions, works for dirs
+    try testing.expectEqual(fileicons.IconKind.git, editor.filetreeIconFor("src", true).kind);
+    // Unknown kind is rejected without registering
+    try lua.doString("zide.set_icon('md', 'nonsense')");
+    try testing.expectEqual(fileicons.IconKind.text, editor.filetreeIconFor("notes.md", false).kind);
 }
 
 test "reload_extensions drops Lua commands and handlers" {

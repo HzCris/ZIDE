@@ -12,7 +12,7 @@ Checked items are tagged: **(native)** = built into the Zig core,
 - [] Terminal Splitting
 - [] Extension fetching (Think like how neovim pulls from github/codeberg)
 - [] Debug Support
-- [] Nerdfont/Custom Icon integration (GUI half done natively 2026-07-26 — `src/core/fileicons.zig` classification is frontend-agnostic, so this is now "map IconKind → nerdfont glyphs in tui.zig" plus a terminal-font caveat)
+- [x] Nerdfont/Custom Icon integration (native + extension hook, 2026-07-26: `tui_filetree_icons` renders nerdfont glyphs + truecolor accents from the shared `fileicons.zig` kinds — off by default, needs a Nerd Font terminal font; `zide.set_icon(key, kind, "#hex")` overrides any assignment in both frontends)
 - [x] Linting (extension — `extensions/example-lint-zig.lua` ships as a commented template: on-save `zig ast-check` → gutter/underline/status diagnostics via zide.on + zide.spawn + zide.set_diagnostics; copy it for any other linter)
 - [x] Block/column selection (native; Alt+drag; Ctrl+Shift+Up/Down and Alt+click already stacked cursors)
 - [x] Ctrl+/ to comment highlighted text (native; uses register_language's line_comment/block_comment fields — upkeep lives in Lua configs)
