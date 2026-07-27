@@ -729,7 +729,7 @@ fn drawFileTree(win: Window, editor: *Editor, w: u16, h: u16) void {
             if (row != ft.selected) {
                 if (fi.color) |c| icon_style.fg = .{ .rgb = .{ c.r, c.g, c.b } };
             }
-            x = writeStr(win, x, screen_row, fileicons.nerdGlyph(fi.kind), icon_style);
+            x = writeStr(win, x, screen_row, fi.nerd orelse fileicons.nerdGlyph(fi.kind), icon_style);
             x = writeStr(win, x, screen_row, " ", style);
         } else {
             const glyph: []const u8 = switch (node.kind) {

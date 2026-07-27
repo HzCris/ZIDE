@@ -472,6 +472,16 @@ fn luaSet(state: ?*zlua.LuaState) callconv(.c) c_int {
         if (val >= 16 and val <= 80) {
             editor.tui_filetree_width = @intCast(val);
         }
+    } else if (std.mem.eql(u8, key_str, "filetree_font_size")) {
+        const val = lua.toInteger(2) catch return 0;
+        if (val >= 0 and val <= 32) {
+            editor.filetree_font_size = @floatFromInt(val);
+        }
+    } else if (std.mem.eql(u8, key_str, "filetree_icon_scale")) {
+        const val = lua.toInteger(2) catch return 0;
+        if (val >= 50 and val <= 200) {
+            editor.filetree_icon_scale = @intCast(val);
+        }
     } else if (std.mem.eql(u8, key_str, "filetree_root")) {
         // zide.set("filetree_root", "C:/path/to/project") — "" = cwd
         const val = lua.toString(2) catch return 0;
@@ -681,6 +691,12 @@ fn luaGet(state: ?*zlua.LuaState) callconv(.c) c_int {
         return 1;
     } else if (std.mem.eql(u8, key_str, "tui_filetree_width")) {
         lua.pushInteger(@intCast(editor.tui_filetree_width));
+        return 1;
+    } else if (std.mem.eql(u8, key_str, "filetree_font_size")) {
+        lua.pushInteger(@intFromFloat(editor.filetree_font_size));
+        return 1;
+    } else if (std.mem.eql(u8, key_str, "filetree_icon_scale")) {
+        lua.pushInteger(@intCast(editor.filetree_icon_scale));
         return 1;
     } else if (std.mem.eql(u8, key_str, "filetree_root")) {
         _ = lua.pushString(editor.filetree_root orelse "");

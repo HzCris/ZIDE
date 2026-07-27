@@ -31,6 +31,10 @@ pub const FileIcon = struct {
     /// Fixed accent color chosen to read on both dark and light themes;
     /// null means "use the theme's text color".
     color: ?Rgb,
+    /// Per-language nerdfont logo (TUI) — the Zig zero, Rust gear, Lua
+    /// moon, ... Codepoints come from nvim-web-devicons (the de-facto
+    /// standard mapping). Null = fall back to the kind's category glyph.
+    nerd: ?[]const u8 = null,
 };
 
 // Accent palette (brand-ish, mid-lightness so both theme families work).
@@ -60,58 +64,60 @@ const lock_gold: Rgb = .{ .r = 0xC9, .g = 0xB4, .b = 0x58 };
 const folder_blue: Rgb = .{ .r = 0x7F, .g = 0xA0, .b = 0xC4 };
 
 /// Extension (lowercased, no dot) -> icon. Kept sorted-ish by family.
+/// `.nerd` glyphs are the per-language logos (nvim-web-devicons
+/// codepoints); entries without one use the kind's category glyph.
 const ext_map = std.StaticStringMap(FileIcon).initComptime(.{
-    .{ "zig", FileIcon{ .kind = .code, .color = zig_orange } },
-    .{ "zon", FileIcon{ .kind = .config, .color = zig_orange } },
-    .{ "lua", FileIcon{ .kind = .code, .color = lua_blue } },
-    .{ "c", FileIcon{ .kind = .code, .color = c_blue } },
-    .{ "h", FileIcon{ .kind = .code, .color = c_blue } },
-    .{ "cpp", FileIcon{ .kind = .code, .color = cpp_blue } },
-    .{ "cc", FileIcon{ .kind = .code, .color = cpp_blue } },
-    .{ "cxx", FileIcon{ .kind = .code, .color = cpp_blue } },
-    .{ "hpp", FileIcon{ .kind = .code, .color = cpp_blue } },
-    .{ "rs", FileIcon{ .kind = .code, .color = rust_tan } },
-    .{ "go", FileIcon{ .kind = .code, .color = go_cyan } },
-    .{ "js", FileIcon{ .kind = .code, .color = js_yellow } },
-    .{ "mjs", FileIcon{ .kind = .code, .color = js_yellow } },
-    .{ "cjs", FileIcon{ .kind = .code, .color = js_yellow } },
-    .{ "ts", FileIcon{ .kind = .code, .color = ts_blue } },
-    .{ "tsx", FileIcon{ .kind = .code, .color = ts_blue } },
-    .{ "jsx", FileIcon{ .kind = .code, .color = js_yellow } },
-    .{ "py", FileIcon{ .kind = .code, .color = py_blue } },
-    .{ "java", FileIcon{ .kind = .code, .color = .{ .r = 0xB0, .g = 0x72, .b = 0x19 } } },
-    .{ "cs", FileIcon{ .kind = .code, .color = .{ .r = 0x9A, .g = 0x5B, .b = 0xA5 } } },
-    .{ "html", FileIcon{ .kind = .code, .color = web_orange } },
-    .{ "htm", FileIcon{ .kind = .code, .color = web_orange } },
-    .{ "css", FileIcon{ .kind = .code, .color = css_violet } },
-    .{ "sh", FileIcon{ .kind = .executable, .color = exec_green } },
-    .{ "bash", FileIcon{ .kind = .executable, .color = exec_green } },
-    .{ "zsh", FileIcon{ .kind = .executable, .color = exec_green } },
-    .{ "ps1", FileIcon{ .kind = .executable, .color = exec_green } },
-    .{ "psm1", FileIcon{ .kind = .executable, .color = exec_green } },
+    .{ "zig", FileIcon{ .kind = .code, .color = zig_orange, .nerd = "\u{e6a9}" } },
+    .{ "zon", FileIcon{ .kind = .config, .color = zig_orange, .nerd = "\u{e6a9}" } },
+    .{ "lua", FileIcon{ .kind = .code, .color = lua_blue, .nerd = "\u{e620}" } },
+    .{ "c", FileIcon{ .kind = .code, .color = c_blue, .nerd = "\u{e61e}" } },
+    .{ "h", FileIcon{ .kind = .code, .color = c_blue, .nerd = "\u{f0fd}" } },
+    .{ "cpp", FileIcon{ .kind = .code, .color = cpp_blue, .nerd = "\u{e61d}" } },
+    .{ "cc", FileIcon{ .kind = .code, .color = cpp_blue, .nerd = "\u{e61d}" } },
+    .{ "cxx", FileIcon{ .kind = .code, .color = cpp_blue, .nerd = "\u{e61d}" } },
+    .{ "hpp", FileIcon{ .kind = .code, .color = cpp_blue, .nerd = "\u{f0fd}" } },
+    .{ "rs", FileIcon{ .kind = .code, .color = rust_tan, .nerd = "\u{e68b}" } },
+    .{ "go", FileIcon{ .kind = .code, .color = go_cyan, .nerd = "\u{e627}" } },
+    .{ "js", FileIcon{ .kind = .code, .color = js_yellow, .nerd = "\u{e60c}" } },
+    .{ "mjs", FileIcon{ .kind = .code, .color = js_yellow, .nerd = "\u{e60c}" } },
+    .{ "cjs", FileIcon{ .kind = .code, .color = js_yellow, .nerd = "\u{e60c}" } },
+    .{ "ts", FileIcon{ .kind = .code, .color = ts_blue, .nerd = "\u{e628}" } },
+    .{ "tsx", FileIcon{ .kind = .code, .color = ts_blue, .nerd = "\u{e7ba}" } },
+    .{ "jsx", FileIcon{ .kind = .code, .color = js_yellow, .nerd = "\u{e625}" } },
+    .{ "py", FileIcon{ .kind = .code, .color = py_blue, .nerd = "\u{e606}" } },
+    .{ "java", FileIcon{ .kind = .code, .color = .{ .r = 0xB0, .g = 0x72, .b = 0x19 }, .nerd = "\u{e738}" } },
+    .{ "cs", FileIcon{ .kind = .code, .color = .{ .r = 0x9A, .g = 0x5B, .b = 0xA5 }, .nerd = "\u{f031b}" } },
+    .{ "html", FileIcon{ .kind = .code, .color = web_orange, .nerd = "\u{e736}" } },
+    .{ "htm", FileIcon{ .kind = .code, .color = web_orange, .nerd = "\u{e736}" } },
+    .{ "css", FileIcon{ .kind = .code, .color = css_violet, .nerd = "\u{e6b8}" } },
+    .{ "sh", FileIcon{ .kind = .executable, .color = exec_green, .nerd = "\u{e795}" } },
+    .{ "bash", FileIcon{ .kind = .executable, .color = exec_green, .nerd = "\u{e760}" } },
+    .{ "zsh", FileIcon{ .kind = .executable, .color = exec_green, .nerd = "\u{e795}" } },
+    .{ "ps1", FileIcon{ .kind = .executable, .color = exec_green, .nerd = "\u{f0a0a}" } },
+    .{ "psm1", FileIcon{ .kind = .executable, .color = exec_green, .nerd = "\u{f0a0a}" } },
     .{ "bat", FileIcon{ .kind = .executable, .color = exec_green } },
     .{ "cmd", FileIcon{ .kind = .executable, .color = exec_green } },
     .{ "exe", FileIcon{ .kind = .executable, .color = exec_green } },
     .{ "com", FileIcon{ .kind = .executable, .color = exec_green } },
     .{ "msi", FileIcon{ .kind = .executable, .color = exec_green } },
-    .{ "md", FileIcon{ .kind = .text, .color = doc_blue } },
-    .{ "markdown", FileIcon{ .kind = .text, .color = doc_blue } },
+    .{ "md", FileIcon{ .kind = .text, .color = doc_blue, .nerd = "\u{f48a}" } },
+    .{ "markdown", FileIcon{ .kind = .text, .color = doc_blue, .nerd = "\u{f48a}" } },
     .{ "rst", FileIcon{ .kind = .text, .color = plain_gray } },
     .{ "org", FileIcon{ .kind = .text, .color = plain_gray } },
     .{ "adoc", FileIcon{ .kind = .text, .color = plain_gray } },
     .{ "txt", FileIcon{ .kind = .text, .color = plain_gray } },
     .{ "log", FileIcon{ .kind = .text, .color = plain_gray } },
-    .{ "pdf", FileIcon{ .kind = .book, .color = .{ .r = 0xD0, .g = 0x60, .b = 0x5E } } },
-    .{ "json", FileIcon{ .kind = .config, .color = js_yellow } },
-    .{ "jsonc", FileIcon{ .kind = .config, .color = js_yellow } },
-    .{ "toml", FileIcon{ .kind = .config, .color = cfg_gray } },
-    .{ "yaml", FileIcon{ .kind = .config, .color = cfg_gray } },
-    .{ "yml", FileIcon{ .kind = .config, .color = cfg_gray } },
+    .{ "pdf", FileIcon{ .kind = .book, .color = .{ .r = 0xD0, .g = 0x60, .b = 0x5E }, .nerd = "\u{eaeb}" } },
+    .{ "json", FileIcon{ .kind = .config, .color = js_yellow, .nerd = "\u{e60b}" } },
+    .{ "jsonc", FileIcon{ .kind = .config, .color = js_yellow, .nerd = "\u{e60b}" } },
+    .{ "toml", FileIcon{ .kind = .config, .color = cfg_gray, .nerd = "\u{e6b2}" } },
+    .{ "yaml", FileIcon{ .kind = .config, .color = cfg_gray, .nerd = "\u{e8eb}" } },
+    .{ "yml", FileIcon{ .kind = .config, .color = cfg_gray, .nerd = "\u{e8eb}" } },
     .{ "ini", FileIcon{ .kind = .config, .color = cfg_gray } },
     .{ "cfg", FileIcon{ .kind = .config, .color = cfg_gray } },
     .{ "conf", FileIcon{ .kind = .config, .color = cfg_gray } },
     .{ "rc", FileIcon{ .kind = .config, .color = cfg_gray } },
-    .{ "svg", FileIcon{ .kind = .image, .color = img_purple } },
+    .{ "svg", FileIcon{ .kind = .image, .color = img_purple, .nerd = "\u{f0721}" } },
     .{ "png", FileIcon{ .kind = .image, .color = img_purple } },
     .{ "jpg", FileIcon{ .kind = .image, .color = img_purple } },
     .{ "jpeg", FileIcon{ .kind = .image, .color = img_purple } },
@@ -152,9 +158,9 @@ const ext_map = std.StaticStringMap(FileIcon).initComptime(.{
     .{ "bin", FileIcon{ .kind = .binary, .color = bin_slate } },
     .{ "dat", FileIcon{ .kind = .binary, .color = bin_slate } },
     .{ "wasm", FileIcon{ .kind = .binary, .color = bin_slate } },
-    .{ "db", FileIcon{ .kind = .data, .color = data_amber } },
-    .{ "sqlite", FileIcon{ .kind = .data, .color = data_amber } },
-    .{ "sql", FileIcon{ .kind = .data, .color = data_amber } },
+    .{ "db", FileIcon{ .kind = .data, .color = data_amber, .nerd = "\u{e706}" } },
+    .{ "sqlite", FileIcon{ .kind = .data, .color = data_amber, .nerd = "\u{e706}" } },
+    .{ "sql", FileIcon{ .kind = .data, .color = data_amber, .nerd = "\u{e706}" } },
     .{ "lock", FileIcon{ .kind = .lock, .color = lock_gold } },
     .{ "ttf", FileIcon{ .kind = .font_file, .color = plain_gray } },
     .{ "otf", FileIcon{ .kind = .font_file, .color = plain_gray } },
@@ -309,6 +315,20 @@ test "fileicons: extOf edge cases" {
     try t.expectEqualStrings("gz", extOf("file.tar.gz"));
     try t.expectEqualStrings("", extOf(".gitignore"));
     try t.expectEqualStrings("", extOf("noext"));
+}
+
+test "fileicons: per-language nerd logos with category fallback" {
+    // The Zig logo, not the generic </>
+    try t.expectEqualStrings("\u{e6a9}", iconFor("main.zig", false).nerd.?);
+    try t.expectEqualStrings("\u{e620}", iconFor("init.lua", false).nerd.?);
+    // No logo entry -> null -> caller falls back to nerdGlyph(kind)
+    try t.expectEqual(@as(?[]const u8, null), iconFor("photo.png", false).nerd);
+    try t.expectEqual(@as(?[]const u8, null), iconFor("src", true).nerd);
+    // Overrides come back logo-less (they pick a category kind)
+    var map: OverrideMap = .empty;
+    defer map.deinit(t.allocator);
+    try map.put(t.allocator, "zig", .{ .kind = .image, .color = null });
+    try t.expectEqual(@as(?[]const u8, null), iconForWithOverrides(&map, "main.zig", false).nerd);
 }
 
 test "fileicons: kindFromName parses enum tags" {

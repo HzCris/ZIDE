@@ -98,6 +98,11 @@ pub const Editor = struct {
     /// Nerdfont file icons in the TUI tree rows (off by default — the
     /// terminal font must be a patched Nerd Font for the glyphs to show).
     tui_filetree_icons: bool = false,
+    /// GUI tree row font size in points; rows and icons scale together.
+    /// 0 = the theme's UI font size.
+    filetree_font_size: f32 = 0,
+    /// GUI tree icon size as a percentage of the row font (50-200).
+    filetree_icon_scale: u16 = 90,
     /// Icon overrides from `zide.set_icon` (lowercase basename/ext keys,
     /// owned) — consulted by both frontends before the built-in tables.
     icon_overrides: fileicons.OverrideMap = .empty,

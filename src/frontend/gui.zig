@@ -993,7 +993,8 @@ fn filetreePanel(editor: *Editor) void {
     filetree_panel_rect = area;
     filetree_panel_scale = scale;
 
-    const font = dvui.Font.theme(.body);
+    var font = dvui.Font.theme(.body);
+    if (editor.filetree_font_size > 0) font = font.withSize(editor.filetree_font_size);
     const line_height = font.lineHeight() * scale;
     if (line_height <= 0 or area.h <= 0 or area.w <= 0) return;
 
@@ -1120,6 +1121,11 @@ fn filetreePanel(editor: *Editor) void {
     const text_color = toDvui(editor.theme.text);
     const sel_bg = toDvui(editor.theme.selection);
     const guide_color = toDvui(editor.theme.gutter_separator);
+    // Type icons render as text from the mono font (bundled Fira Code
+    // Nerd Font — the devicon glyphs are guaranteed present), sized by
+    // filetree_icon_scale relative to the row text, evened out per glyph
+    // family (iconFamilyScale), and re-centered vertically.
+    const icon_font = dvui.Font.theme(.mono).withSize(font.size * filetreeIconScale(editor));
     var row = filetree_scroll;
     var y = m.rows_y;
     while (row < row_count and y + line_height <= area.y + area.h + 0.5) : (row += 1) {
@@ -1184,21 +1190,19 @@ fn filetreePanel(editor: *Editor) void {
         }
         // Entries sitting in the cut clipboard render dimmed.
         const in_cut = editor.filetree_clip_cut and editor.filetreeClipContains(node.rel_path);
-        // Type icon: fixed accent colors (plus zide.set_icon overrides);
-        // unknown types use dimmed text.
+        // Type icon: nerdfont glyphs (per-language logos where they
+        // exist) rendered as text from the bundled mono Nerd Font, in
+        // fixed accent colors plus zide.set_icon overrides.
         const fi = editor.filetreeIconFor(node.name, node.kind == .dir);
-        const glyph = filetreeIconTvg(fi.kind);
         var tint: dvui.Color = if (fi.color) |c|
             .{ .r = c.r, .g = c.g, .b = c.b, .a = 255 }
         else
             text_color.opacity(0.75);
         if (in_cut) tint = tint.opacity(0.45);
-        renderIconTinted(glyph.name, glyph.tvg, .{
-            .x = x + m.chevron_w,
-            .y = icon_y,
-            .w = m.icon_size,
-            .h = m.icon_size,
-        }, scale, tint);
+        const icon_glyph = fi.nerd orelse fileicons.nerdGlyph(fi.kind);
+        const glyph_font = icon_font.withSize(icon_font.size * iconFamilyScale(icon_glyph));
+        const glyph_dy = (line_height - glyph_font.lineHeight() * scale) / 2;
+        renderOverlayText(glyph_font, icon_glyph, x + m.chevron_w, y + glyph_dy, rs, tint);
         // Git status drives the name color (dirs roll up contained changes)
         const status = ft.statusFor(idx);
         var row_color = if (status) |st| toDvui(switch (st) {
@@ -1423,28 +1427,30 @@ fn filetreeSbThumb(ft: *const FileTree, m: FiletreeMetrics) ?dvui.Rect.Physical 
     };
 }
 
-/// TinyVG glyph for a file-icon kind (entypo set bundled with dvui). The
-/// name only keys error logs and the no-tvg fallback, not the cache.
-fn filetreeIconTvg(kind: fileicons.IconKind) struct { name: []const u8, tvg: []const u8 } {
-    return switch (kind) {
-        .folder => .{ .name = "ft_folder", .tvg = dvui.entypo.folder },
-        .code => .{ .name = "ft_code", .tvg = dvui.entypo.code },
-        .text => .{ .name = "ft_text", .tvg = dvui.entypo.text_document },
-        .book => .{ .name = "ft_book", .tvg = dvui.entypo.open_book },
-        .license => .{ .name = "ft_license", .tvg = dvui.entypo.shield },
-        .config => .{ .name = "ft_config", .tvg = dvui.entypo.cog },
-        .data => .{ .name = "ft_data", .tvg = dvui.entypo.database },
-        .image => .{ .name = "ft_image", .tvg = dvui.entypo.image },
-        .audio => .{ .name = "ft_audio", .tvg = dvui.entypo.music },
-        .video => .{ .name = "ft_video", .tvg = dvui.entypo.video },
-        .archive => .{ .name = "ft_archive", .tvg = dvui.entypo.box },
-        .binary => .{ .name = "ft_binary", .tvg = dvui.entypo.layers },
-        .executable => .{ .name = "ft_exec", .tvg = dvui.entypo.flash },
-        .git => .{ .name = "ft_git", .tvg = dvui.entypo.flow_branch },
-        .lock => .{ .name = "ft_lock", .tvg = dvui.entypo.lock },
-        .font_file => .{ .name = "ft_font", .tvg = dvui.entypo.text },
-        .generic => .{ .name = "ft_file", .tvg = dvui.entypo.document },
-    };
+/// filetree_icon_scale as a multiplier (the setting is a percentage).
+fn filetreeIconScale(editor: *const Editor) f32 {
+    return @as(f32, @floatFromInt(std.math.clamp(editor.filetree_icon_scale, 50, 200))) / 100.0;
+}
+
+/// Nerd Font sub-sets draw at visibly different sizes — Seti glyphs
+/// (including the Zig zero) are small in the em square while Font
+/// Awesome fills it. Per-family compensation so tree icons read evenly.
+fn iconFamilyScale(glyph: []const u8) f32 {
+    const len = std.unicode.utf8ByteSequenceLength(glyph[0]) catch return 1.0;
+    if (glyph.len < len) return 1.0;
+    const cp = std.unicode.utf8Decode(glyph[0..len]) catch return 1.0;
+    return if (cp >= 0xE5FA and cp <= 0xE6B7)
+        1.3 // seti-ui
+    else if (cp >= 0xE700 and cp <= 0xE8FF)
+        1.2 // devicons and extensions
+    else if (cp >= 0xEA60 and cp <= 0xEBFF)
+        1.15 // codicons
+    else if (cp >= 0xF400 and cp <= 0xF533)
+        1.1 // octicons
+    else if (cp >= 0xF0001)
+        1.15 // material design (supplementary plane)
+    else
+        1.0; // font awesome & friends
 }
 
 /// Paint a tinted TinyVG icon into a physical rect. dvui caches the
@@ -1498,20 +1504,17 @@ fn filetreeDrawInlineEntry(editor: *Editor, m: FiletreeMetrics, rs: dvui.RectSca
         const is_dir = input.len > 0 and (input[input.len - 1] == '/' or input[input.len - 1] == '\\');
         break :blk editor.filetreeIconFor(if (is_dir) "" else input, is_dir);
     };
-    const glyph = filetreeIconTvg(fi.kind);
     const text_color = toDvui(editor.theme.text);
     const tint: dvui.Color = if (fi.color) |c|
         .{ .r = c.r, .g = c.g, .b = c.b, .a = 255 }
     else
         text_color.opacity(0.75);
     const x = m.rowX(depth);
-    const icon_y = y + (m.line_height - m.icon_size) / 2;
-    renderIconTinted(glyph.name, glyph.tvg, .{
-        .x = x + m.chevron_w,
-        .y = icon_y,
-        .w = m.icon_size,
-        .h = m.icon_size,
-    }, scale, tint);
+    const icon_glyph = fi.nerd orelse fileicons.nerdGlyph(fi.kind);
+    const icon_font = dvui.Font.theme(.mono)
+        .withSize(font.size * filetreeIconScale(editor) * iconFamilyScale(icon_glyph));
+    const icon_font_dy = (m.line_height - icon_font.lineHeight() * scale) / 2;
+    renderOverlayText(icon_font, icon_glyph, x + m.chevron_w, y + icon_font_dy, rs, tint);
     // Input box: text and caret over an underline.
     const name_x = x + m.chevron_w + m.icon_w;
     const box_w = @max(0, m.badge_right - name_x);
@@ -4563,6 +4566,8 @@ const settings_defs = [_]SettingDef{
     .{ .key = "filetree_width", .label = "File Tree Width (GUI)", .kind = .number, .desc = "Panel width in pixels (120-600)", .min = 120, .max = 600 },
     .{ .key = "tui_filetree_width", .label = "File Tree Width (TUI)", .kind = .number, .desc = "Panel width in columns (16-80)", .min = 16, .max = 80 },
     .{ .key = "tui_filetree_icons", .label = "File Tree Icons (TUI)", .kind = .boolean, .desc = "Nerdfont file icons in the TUI tree (terminal font must be a Nerd Font)" },
+    .{ .key = "filetree_font_size", .label = "File Tree Font Size (GUI)", .kind = .number, .desc = "Row text size in points — rows and icons scale together; 0 = theme default (0-32)", .min = 0, .max = 32 },
+    .{ .key = "filetree_icon_scale", .label = "File Tree Icon Scale (GUI)", .kind = .number, .desc = "Icon size as a percentage of the row font (50-200)", .min = 50, .max = 200 },
     .{ .key = "filetree_root", .label = "File Tree Root", .kind = .text, .desc = "Starting directory — empty = current dir (Enter applies)" },
 };
 
@@ -4598,6 +4603,15 @@ fn settingsDialog(editor: *Editor) void {
     }
 
     float.dragAreaSet(dvui.windowHeader("Settings", "", &open));
+
+    // The settings list outgrew short windows — scroll inside a capped
+    // viewport instead of clipping at the screen edge.
+    const view_h = @min(560.0, @max(300.0, dvui.windowRect().h * 0.8));
+    var scroll = dvui.scrollArea(@src(), .{}, .{
+        .expand = .horizontal,
+        .min_size_content = .{ .w = 480, .h = view_h },
+    });
+    defer scroll.deinit();
 
     var vbox = dvui.box(@src(), .{ .dir = .vertical }, .{
         .expand = .both,
@@ -4781,6 +4795,8 @@ fn getSettingNumber(editor: *const Editor, key: []const u8) i64 {
     if (std.mem.eql(u8, key, "max_undo_history")) return @intCast(editor.max_undo_history);
     if (std.mem.eql(u8, key, "filetree_width")) return @intFromFloat(editor.filetree_width);
     if (std.mem.eql(u8, key, "tui_filetree_width")) return @intCast(editor.tui_filetree_width);
+    if (std.mem.eql(u8, key, "filetree_font_size")) return @intFromFloat(editor.filetree_font_size);
+    if (std.mem.eql(u8, key, "filetree_icon_scale")) return @intCast(editor.filetree_icon_scale);
     return 0;
 }
 
@@ -4807,6 +4823,12 @@ fn applySettingNumber(editor: *Editor, key: []const u8, val: i64) void {
     }
     if (std.mem.eql(u8, key, "filetree_width")) {
         if (val >= 120 and val <= 600) editor.filetree_width = @floatFromInt(val);
+    }
+    if (std.mem.eql(u8, key, "filetree_font_size")) {
+        if (val >= 0 and val <= 32) editor.filetree_font_size = @floatFromInt(val);
+    }
+    if (std.mem.eql(u8, key, "filetree_icon_scale")) {
+        if (val >= 50 and val <= 200) editor.filetree_icon_scale = @intCast(val);
     }
     if (std.mem.eql(u8, key, "tui_filetree_width")) {
         if (val >= 16 and val <= 80) editor.tui_filetree_width = @intCast(val);
