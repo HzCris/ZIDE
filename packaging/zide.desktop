@@ -1,0 +1,10 @@
+[Desktop Entry]
+Name=ZIDE
+Comment=Zig IDE — fast, Lua-extensible editor
+Exec=zide %F
+Icon=zide
+Type=Application
+Categories=Development;TextEditor;IDE;
+Terminal=false
+StartupWMClass=ZIDE
+MimeType=text/plain;

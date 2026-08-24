@@ -1,6 +1,9 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const builtin = @import("builtin");
+// Linux helpers run through the process-wide Io/environ globals — the
+// clipboard is called from paths that don't thread an io parameter.
+const lua_settings = @import("lua_settings.zig");
 
 /// Cross-platform system clipboard access.
 /// Windows: Win32 OpenClipboard/GetClipboardData/SetClipboardData
@@ -37,8 +40,9 @@ pub const SystemClipboard = struct {
     const LinuxBackend = enum { wayland, x11, none };
 
     fn detectLinuxBackend() LinuxBackend {
-        if (std.process.hasEnvVarConstant("WAYLAND_DISPLAY")) return .wayland;
-        if (std.process.hasEnvVarConstant("DISPLAY")) return .x11;
+        const env = lua_settings.process_environ orelse return .none;
+        if (env.get("WAYLAND_DISPLAY") != null) return .wayland;
+        if (env.get("DISPLAY") != null) return .x11;
         return .none;
     }
 
@@ -74,59 +78,40 @@ pub const SystemClipboard = struct {
 
     /// Spawn a command and capture its stdout as clipboard text.
     fn runClipboardRead(allocator: Allocator, argv: []const []const u8) ?[]const u8 {
-        var child = std.process.Child.init(argv, allocator);
-        child.stdout_behavior = .Pipe;
-        child.stderr_behavior = .Pipe;
-        child.spawn() catch return null;
-
-        var stdout: std.ArrayList(u8) = .empty;
-        var stderr: std.ArrayList(u8) = .empty;
-        defer stderr.deinit(allocator);
-
-        child.collectOutput(allocator, &stdout, &stderr, 1024 * 1024) catch {
-            stdout.deinit(allocator);
-            return null;
-        };
-
-        const term = child.wait() catch {
-            stdout.deinit(allocator);
-            return null;
-        };
-
-        if (term != .Exited or term.Exited != 0) {
-            stdout.deinit(allocator);
+        const io = lua_settings.global_io orelse return null;
+        const res = std.process.run(allocator, io, .{
+            .argv = argv,
+            .stdout_limit = .limited(1024 * 1024),
+            .stderr_limit = .limited(4096),
+        }) catch return null;
+        defer allocator.free(res.stderr);
+        const ok = res.term == .exited and res.term.exited == 0;
+        if (!ok or res.stdout.len == 0) {
+            allocator.free(res.stdout);
             return null;
         }
-
-        if (stdout.items.len == 0) {
-            stdout.deinit(allocator);
-            return null;
-        }
-
-        return stdout.toOwnedSlice(allocator) catch {
-            stdout.deinit(allocator);
-            return null;
-        };
+        return res.stdout;
     }
 
     /// Spawn a command and write text to its stdin.
     fn runClipboardWrite(argv: []const []const u8, text: []const u8) bool {
-        // Use page_allocator since we don't store the result and this is a short-lived operation.
-        var child = std.process.Child.init(argv, std.heap.page_allocator);
-        child.stdin_behavior = .Pipe;
-        child.stdout_behavior = .Pipe;
-        child.stderr_behavior = .Pipe;
-        child.spawn() catch return false;
+        const io = lua_settings.global_io orelse return false;
+        var child = std.process.spawn(io, .{
+            .argv = argv,
+            .stdin = .pipe,
+            .stdout = .ignore,
+            .stderr = .ignore,
+        }) catch return false;
 
-        // Write text to child's stdin, then close it so the child sees EOF.
+        // Write text to the child's stdin, then close it for EOF.
         if (child.stdin) |stdin| {
-            stdin.writeAll(text) catch {};
-            stdin.close();
+            stdin.writeStreamingAll(io, text) catch {};
+            stdin.close(io);
             child.stdin = null;
         }
 
-        const term = child.wait() catch return false;
-        return term == .Exited and term.Exited == 0;
+        const term = child.wait(io) catch return false;
+        return term == .exited and term.exited == 0;
     }
 
     // =========================================================================

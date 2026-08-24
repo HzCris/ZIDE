@@ -223,6 +223,20 @@ pub const Pty = struct {
     // Linux posix PTY implementation
     // =========================================================================
 
+    // openpty/execvp aren't declared in std.c; both live in libc proper
+    // (openpty merged from libutil in glibc 2.34), so "c" externs suffice.
+    extern "c" fn openpty(
+        amaster: *std.posix.fd_t,
+        aslave: *std.posix.fd_t,
+        name: ?[*]u8,
+        termp: ?*const anyopaque,
+        winp: ?*const std.posix.winsize,
+    ) c_int;
+    extern "c" fn execvp(
+        file: [*:0]const u8,
+        argv: [*:null]const ?[*:0]const u8,
+    ) c_int;
+
     fn spawnLinux(allocator: Allocator, command: []const u8, cols: u16, rows: u16) !Pty {
         if (!is_linux) unreachable;
 
@@ -230,34 +244,37 @@ pub const Pty = struct {
         var master: std.posix.fd_t = undefined;
         var slave: std.posix.fd_t = undefined;
         var ws: std.posix.winsize = .{
-            .ws_col = cols,
-            .ws_row = rows,
-            .ws_xpixel = 0,
-            .ws_ypixel = 0,
+            .col = cols,
+            .row = rows,
+            .xpixel = 0,
+            .ypixel = 0,
         };
 
-        const rc = std.c.openpty(&master, &slave, null, null, &ws);
+        const rc = openpty(&master, &slave, null, null, &ws);
         if (rc != 0) return error.OpenPtyFailed;
-        errdefer std.posix.close(master);
+        errdefer _ = std.c.close(master);
 
-        const pid = try std.posix.fork();
+        // std.posix.fork/dup2/exit/getenv were removed in 0.16 — this
+        // whole child setup goes through libc directly.
+        const pid = std.c.fork();
+        if (pid < 0) return error.ForkFailed;
         if (pid == 0) {
             // Child process
-            std.posix.close(master);
+            _ = std.c.close(master);
 
             // Create new session, set controlling terminal
             _ = std.c.setsid();
             _ = std.c.ioctl(slave, std.posix.T.IOCSCTTY, @as(?*anyopaque, null));
 
             // Redirect stdio to slave
-            std.posix.dup2(slave, 0) catch std.posix.exit(1);
-            std.posix.dup2(slave, 1) catch std.posix.exit(1);
-            std.posix.dup2(slave, 2) catch std.posix.exit(1);
-            if (slave > 2) std.posix.close(slave);
+            if (std.c.dup2(slave, 0) < 0) std.c._exit(1);
+            if (std.c.dup2(slave, 1) < 0) std.c._exit(1);
+            if (std.c.dup2(slave, 2) < 0) std.c._exit(1);
+            if (slave > 2) _ = std.c.close(slave);
 
             // Run the requested command; fall back to $SHELL (previously the
             // command argument was silently ignored on Linux)
-            const shell = std.posix.getenv("SHELL") orelse "/bin/bash";
+            const shell: [*:0]const u8 = std.c.getenv("SHELL") orelse "/bin/bash";
             var cmd_buf: [256]u8 = undefined;
             const prog: [*:0]const u8 = blk: {
                 if (command.len > 0 and command.len < cmd_buf.len) {
@@ -265,15 +282,15 @@ pub const Pty = struct {
                     cmd_buf[command.len] = 0;
                     break :blk cmd_buf[0..command.len :0].ptr;
                 }
-                break :blk shell.ptr;
+                break :blk shell;
             };
             const argv = [_:null]?[*:0]const u8{ prog, null };
-            _ = std.c.execvp(prog, &argv);
-            std.posix.exit(1);
+            _ = execvp(prog, &argv);
+            std.c._exit(1);
         }
 
         // Parent process
-        std.posix.close(slave);
+        _ = std.c.close(slave);
 
         return Pty{
             .allocator = allocator,
@@ -295,8 +312,11 @@ pub const Pty = struct {
         const fd = self.master_fd orelse return error.NotStarted;
         var offset: usize = 0;
         while (offset < data.len) {
-            const n = std.posix.write(fd, data[offset..]) catch return error.WriteFailed;
-            offset += n;
+            // std.posix.write was removed in 0.16 — raw fd writes go
+            // through libc, matching the rest of this file's std.c usage.
+            const rc = std.c.write(fd, data[offset..].ptr, data.len - offset);
+            if (rc <= 0) return error.WriteFailed;
+            offset += @intCast(rc);
         }
     }
 
@@ -304,10 +324,10 @@ pub const Pty = struct {
         if (!is_linux) unreachable;
         const fd = self.master_fd orelse return;
         var ws: std.posix.winsize = .{
-            .ws_col = cols,
-            .ws_row = rows,
-            .ws_xpixel = 0,
-            .ws_ypixel = 0,
+            .col = cols,
+            .row = rows,
+            .xpixel = 0,
+            .ypixel = 0,
         };
         _ = std.c.ioctl(fd, std.posix.T.IOCSWINSZ, &ws);
     }
@@ -317,10 +337,11 @@ pub const Pty = struct {
         if (self.child_pid) |pid| {
             // Send SIGHUP to gracefully terminate
             std.posix.kill(pid, std.posix.SIG.HUP) catch {};
-            // Reap child
-            _ = std.posix.waitpid(pid, .{}) catch {};
+            // Reap child (std.posix.waitpid was removed in 0.16)
+            var status: c_int = 0;
+            _ = std.c.waitpid(pid, &status, 0);
         }
-        if (self.master_fd) |fd| std.posix.close(fd);
+        if (self.master_fd) |fd| _ = std.c.close(fd);
     }
 };
 
