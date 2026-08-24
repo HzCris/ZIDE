@@ -28,9 +28,12 @@ pub const Match = struct {
     col: u32,
     /// Owned trimmed display line.
     excerpt: []u8,
+    /// Byte offset of excerpt[0] within the raw line (leading trim) — lets
+    /// views highlight THIS occurrence, not just the first on the line.
+    excerpt_off: u32,
 };
 
-pub const Field = enum { query, replace, filter, results };
+pub const Field = enum { query, replace, filter, exclude, results };
 
 pub const ReplaceScope = enum { all, open_only };
 
@@ -46,6 +49,9 @@ pub const SearchPanel = struct {
     /// Path filter: "*.ext" = extension match, otherwise substring.
     filter_buf: [128]u8 = undefined,
     filter_len: usize = 0,
+    /// Path exclude (same pattern rules; empty = exclude nothing).
+    exclude_buf: [128]u8 = undefined,
+    exclude_len: usize = 0,
     case_sensitive: bool = false,
     whole_word: bool = false,
     field: Field = .query,
@@ -65,6 +71,9 @@ pub const SearchPanel = struct {
     files_searched_open: usize = 0,
     /// Worker in flight (display "searching…").
     searching: bool = false,
+    /// Bumped by every start() — lets views reset per-search state
+    /// (e.g. the GUI's collapsed-file set).
+    generation: u64 = 0,
 
     // --- Worker plumbing (guarded by mutex unless noted) ---
     mutex: std.Io.Mutex = .init,
@@ -97,6 +106,9 @@ pub const SearchPanel = struct {
     pub fn filter(self: *const SearchPanel) []const u8 {
         return self.filter_buf[0..self.filter_len];
     }
+    pub fn exclude(self: *const SearchPanel) []const u8 {
+        return self.exclude_buf[0..self.exclude_len];
+    }
 
     /// Append typed text to the focused input field.
     pub fn appendText(self: *SearchPanel, txt: []const u8) void {
@@ -104,6 +116,7 @@ pub const SearchPanel = struct {
             .query => .{ .buf = &self.query_buf, .len = &self.query_len },
             .replace => .{ .buf = &self.replace_buf, .len = &self.replace_len },
             .filter => .{ .buf = &self.filter_buf, .len = &self.filter_len },
+            .exclude => .{ .buf = &self.exclude_buf, .len = &self.exclude_len },
             .results => return,
         };
         for (txt) |ch| {
@@ -121,18 +134,20 @@ pub const SearchPanel = struct {
             .query => &self.query_len,
             .replace => &self.replace_len,
             .filter => &self.filter_len,
+            .exclude => &self.exclude_len,
             .results => return,
         };
         if (len.* > 0) len.* -= 1;
         self.confirm_armed = false;
     }
 
-    /// Tab: cycle query → replace → filter → results → query.
+    /// Tab: cycle query → replace → filter → exclude → results → query.
     pub fn cycleField(self: *SearchPanel) void {
         self.field = switch (self.field) {
             .query => .replace,
             .replace => .filter,
-            .filter => .results,
+            .filter => .exclude,
+            .exclude => .results,
             .results => .query,
         };
     }
@@ -154,6 +169,7 @@ pub const SearchPanel = struct {
         self.cancelJoin();
         self.clearResults();
         self.confirm_armed = false;
+        self.generation +%= 1;
         const needle = self.query();
         if (needle.len == 0) return;
 
@@ -165,6 +181,7 @@ pub const SearchPanel = struct {
             .root = &.{},
             .needle = &.{},
             .filter = &.{},
+            .exclude = &.{},
             .case_sensitive = self.case_sensitive,
             .whole_word = self.whole_word,
         };
@@ -182,8 +199,15 @@ pub const SearchPanel = struct {
             ok = false;
             break :blk &.{};
         };
-        // The path filter uses '/' separators internally.
+        ctx.exclude = self.allocator.dupe(u8, self.exclude()) catch blk: {
+            ok = false;
+            break :blk &.{};
+        };
+        // The path filters use '/' separators internally.
         for (@constCast(ctx.filter)) |*ch| {
+            if (ch.* == '\\') ch.* = '/';
+        }
+        for (@constCast(ctx.exclude)) |*ch| {
             if (ch.* == '\\') ch.* = '/';
         }
 
@@ -305,14 +329,15 @@ pub const SearchPanel = struct {
                     };
                     emitted_path = true;
                 }
-                const excerpt = makeExcerpt(self.allocator, line) catch return;
+                const excerpt = makeExcerpt(self.allocator, line, at, needle.len) catch return;
                 self.matches.append(self.allocator, .{
                     .path_idx = @intCast(self.paths.items.len - 1),
                     .line = line_no,
                     .col = @intCast(at),
-                    .excerpt = excerpt,
+                    .excerpt = excerpt.text,
+                    .excerpt_off = excerpt.off,
                 }) catch {
-                    self.allocator.free(excerpt);
+                    self.allocator.free(excerpt.text);
                     return;
                 };
                 from = at + needle.len;
@@ -474,10 +499,35 @@ fn replaceAllInFile(allocator: std.mem.Allocator, io: std.Io, path: []const u8, 
     return res.count;
 }
 
-fn makeExcerpt(allocator: std.mem.Allocator, line: []const u8) ![]u8 {
-    var s = std.mem.trim(u8, line, " \t\r");
-    if (s.len > excerpt_max) s = s[0..excerpt_max];
-    return allocator.dupe(u8, s);
+const Excerpt = struct { text: []u8, off: u32 };
+
+/// Capture the display excerpt for ONE occurrence: whitespace-trimmed and,
+/// when the line exceeds the cap, windowed so THIS match sits inside it
+/// (about a third in) — a from-the-start cap left far-right matches with
+/// no highlightable text at all.
+fn makeExcerpt(allocator: std.mem.Allocator, line: []const u8, col: usize, needle_len: usize) !Excerpt {
+    const left_ws = line.len - std.mem.trimStart(u8, line, " \t\r").len;
+    const trimmed_end = std.mem.trimEnd(u8, line, " \t\r").len;
+    var start: usize = @min(left_ws, trimmed_end);
+    var end: usize = trimmed_end;
+    if (end - start > excerpt_max) {
+        const hit_end = @min(col + needle_len, end);
+        if (hit_end > start + excerpt_max) {
+            start = @max(start, @min(col -| (excerpt_max / 3), end - excerpt_max));
+        }
+        end = @min(end, start + excerpt_max);
+        start = utf8FloorIdx(line, start);
+        end = utf8FloorIdx(line, end);
+        if (start > end) start = end;
+    }
+    return .{ .text = try allocator.dupe(u8, line[start..end]), .off = @intCast(start) };
+}
+
+/// Move a byte index back to the start of its UTF-8 sequence.
+fn utf8FloorIdx(s: []const u8, idx: usize) usize {
+    var i = @min(idx, s.len);
+    while (i > 0 and i < s.len and (s[i] & 0xC0) == 0x80) i -= 1;
+    return i;
 }
 
 // ---------------------------------------------------------------------------
@@ -491,6 +541,7 @@ const WorkerCtx = struct {
     root: []const u8,
     needle: []const u8,
     filter: []const u8,
+    exclude: []const u8,
     case_sensitive: bool,
     whole_word: bool,
     open_paths: std.ArrayList([]u8) = .empty,
@@ -508,6 +559,7 @@ const WorkerCtx = struct {
         a.free(self.root);
         a.free(self.needle);
         a.free(self.filter);
+        a.free(self.exclude);
         for (self.open_paths.items) |p| a.free(p);
         self.open_paths.deinit(a);
         a.destroy(self);
@@ -562,6 +614,7 @@ fn searchDiskFile(ctx: *WorkerCtx, dir: std.Io.Dir, prefix: []const u8, name: []
     var rel_buf: [1024]u8 = undefined;
     const rel = std.fmt.bufPrint(&rel_buf, "{s}{s}", .{ prefix, name }) catch return;
     if (!filterMatch(rel, ctx.filter)) return;
+    if (ctx.exclude.len > 0 and filterMatch(rel, ctx.exclude)) return;
 
     // Full (root-joined) path — what results store and openOrFocus uses.
     var full_buf: [1200]u8 = undefined;
@@ -595,14 +648,15 @@ fn searchDiskFile(ctx: *WorkerCtx, dir: std.Io.Dir, prefix: []const u8, name: []
                 ctx.stopped = true;
                 break :scan;
             }
-            const excerpt = makeExcerpt(ctx.allocator, line) catch break :scan;
+            const excerpt = makeExcerpt(ctx.allocator, line, at, ctx.needle.len) catch break :scan;
             file_matches.append(ctx.allocator, .{
                 .path_idx = ctx.base_path_idx + ctx.emitted_paths,
                 .line = line_no,
                 .col = @intCast(at),
-                .excerpt = excerpt,
+                .excerpt = excerpt.text,
+                .excerpt_off = excerpt.off,
             }) catch {
-                ctx.allocator.free(excerpt);
+                ctx.allocator.free(excerpt.text);
                 break :scan;
             };
             from = at + ctx.needle.len;

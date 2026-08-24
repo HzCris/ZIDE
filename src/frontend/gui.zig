@@ -2236,6 +2236,12 @@ var search_disp: std.ArrayList(SearchDispEntry) = .empty;
 var search_scroll_rows: usize = 0;
 /// Last selection scrolled into view (wheel browsing must not snap back).
 var search_last_sel: usize = std.math.maxInt(usize);
+/// Collapsed file groups (path_idx set); cleared per search generation.
+var search_collapsed: std.AutoHashMapUnmanaged(u32, void) = .empty;
+var search_gen_seen: u64 = std.math.maxInt(u64);
+/// Display index of the sticky (pinned) header drawn last frame, if any —
+/// clicks on the first result row toggle it instead of the row beneath.
+var search_sticky: ?usize = null;
 
 /// Docked workspace search & replace panel (bottom strip), VS Code-style:
 /// bordered input boxes with placeholders and inline Aa/W toggle chips,
@@ -2247,11 +2253,19 @@ fn searchPanelGui(editor: *Editor) void {
     if (!build_options.has_gui) return;
     const sp = &editor.search;
 
+    // New search: collapsed-file set and viewport are stale — reset.
+    if (sp.generation != search_gen_seen) {
+        search_gen_seen = sp.generation;
+        search_collapsed.clearRetainingCapacity();
+        search_scroll_rows = 0;
+        search_sticky = null;
+    }
+
     var pbox = dvui.box(@src(), .{ .dir = .vertical }, .{
         .expand = .horizontal,
         .background = true,
         .style = .content,
-        .min_size_content = .{ .h = 240 },
+        .min_size_content = .{ .h = 324 },
         .name = "search_panel",
     });
     defer pbox.deinit();
@@ -2266,23 +2280,29 @@ fn searchPanelGui(editor: *Editor) void {
     const font = dvui.Font.theme(.mono);
     const lh = font.lineHeight() * scale;
     const pad: f32 = 8 * scale;
-    const gap: f32 = 5 * scale;
-    const box_h = lh + 8 * scale;
-    const row_h = lh + 4 * scale;
+    const gap: f32 = 4 * scale;
+    const box_h = lh + 6 * scale;
+    const row_h = lh + 3 * scale;
     const box_w = @min(area.w - pad * 2, 520 * scale);
+    const half_w = (box_w - gap) / 2;
 
     const fg = toDvui(editor.theme.text);
-    const dim = toDvui(editor.theme.gutter_text);
+    // Secondary text blends the THEME text color toward the panel — a
+    // fixed gray (gutter_text) was unreadable on the light theme.
+    const dim = fg.opacity(0.55);
     const sel_bg = toDvui(editor.theme.selection);
     const accent = toDvui(editor.theme.cursor);
     const box_bg = toDvui(editor.theme.gutter_bg);
     const focused = editor.search_focused;
 
-    // Geometry
+    // Geometry: search on row 1, replace + include share row 2,
+    // exclude on row 3
     const search_y = area.y + pad;
-    const replace_y = search_y + box_h + gap;
-    const filter_y = replace_y + box_h + gap;
-    const status_y = filter_y + box_h + gap;
+    const row2_y = search_y + box_h + gap;
+    const replace_x = area.x + pad;
+    const filter_x = replace_x + half_w + gap;
+    const row3_y = row2_y + box_h + gap;
+    const status_y = row3_y + box_h + gap;
     const results_y = status_y + lh + gap;
     const rows_visible: usize = if (row_h > 0 and area.y + area.h > results_y)
         @intFromFloat(@floor((area.y + area.h - results_y) / row_h))
@@ -2330,22 +2350,27 @@ fn searchPanelGui(editor: *Editor) void {
                 const in_box_x = me.p.x >= area.x + pad and me.p.x <= area.x + pad + box_w;
                 if (in_box_x and me.p.y >= search_y and me.p.y < search_y + box_h) {
                     sp.field = .query;
-                } else if (in_box_x and me.p.y >= replace_y and me.p.y < replace_y + box_h) {
-                    sp.field = .replace;
-                } else if (in_box_x and me.p.y >= filter_y and me.p.y < filter_y + box_h) {
-                    sp.field = .filter;
+                } else if (in_box_x and me.p.y >= row2_y and me.p.y < row2_y + box_h) {
+                    sp.field = if (me.p.x < filter_x) .replace else .filter;
+                } else if (in_box_x and me.p.y >= row3_y and me.p.y < row3_y + box_h and me.p.x < filter_x) {
+                    sp.field = .exclude;
                 } else if (me.p.y >= results_y) {
                     const row: usize = @intFromFloat(@floor((me.p.y - results_y) / row_h));
-                    const disp_idx = search_scroll_rows + row;
+                    var disp_idx = search_scroll_rows + row;
+                    // The sticky header overlays the first result row —
+                    // clicks there act on it, not on the row beneath.
+                    if (row == 0) {
+                        if (search_sticky) |sidx| disp_idx = sidx;
+                    }
                     if (disp_idx < search_disp.items.len) {
                         sp.field = .results;
                         switch (search_disp.items[disp_idx]) {
                             .header => |h| {
-                                for (sp.matches.items, 0..) |m2, midx| {
-                                    if (m2.path_idx == h.path_idx) {
-                                        sp.selected = midx;
-                                        break;
-                                    }
+                                // Toggle collapse for this file group
+                                if (search_collapsed.contains(h.path_idx)) {
+                                    _ = search_collapsed.remove(h.path_idx);
+                                } else {
+                                    search_collapsed.put(editor.allocator, h.path_idx, {}) catch {};
                                 }
                             },
                             .match => |mi| {
@@ -2397,7 +2422,10 @@ fn searchPanelGui(editor: *Editor) void {
                 search_disp.append(editor.allocator, .{ .header = .{ .path_idx = m.path_idx, .count = 0 } }) catch break;
                 last_path = m.path_idx;
             }
-            search_disp.append(editor.allocator, .{ .match = i }) catch break;
+            // Collapsed groups keep their header (and full count) only
+            if (!search_collapsed.contains(m.path_idx)) {
+                search_disp.append(editor.allocator, .{ .match = i }) catch break;
+            }
             search_disp.items[hdr_idx].header.count += 1;
         }
     }
@@ -2416,8 +2444,9 @@ fn searchPanelGui(editor: *Editor) void {
 
     // --- Draw: input boxes + chips ---
     drawSearchBox(font, render_rs, area.x + pad, search_y, box_w, box_h, scale, "Search", sp.query(), focused and sp.field == .query, fg, dim, accent, box_bg);
-    drawSearchBox(font, render_rs, area.x + pad, replace_y, box_w, box_h, scale, "Replace", sp.replacement(), focused and sp.field == .replace, fg, dim, accent, box_bg);
-    drawSearchBox(font, render_rs, area.x + pad, filter_y, box_w, box_h, scale, "files to include (*.zig or substring)", sp.filter(), focused and sp.field == .filter, fg, dim, accent, box_bg);
+    drawSearchBox(font, render_rs, replace_x, row2_y, half_w, box_h, scale, "Replace", sp.replacement(), focused and sp.field == .replace, fg, dim, accent, box_bg);
+    drawSearchBox(font, render_rs, filter_x, row2_y, half_w, box_h, scale, "files to include", sp.filter(), focused and sp.field == .filter, fg, dim, accent, box_bg);
+    drawSearchBox(font, render_rs, replace_x, row3_y, half_w, box_h, scale, "files to exclude", sp.exclude(), focused and sp.field == .exclude, fg, dim, accent, box_bg);
     drawSearchChip(font, render_rs, chip_case_x, chip_y, chip_w, chip_h, scale, "Aa", sp.case_sensitive, fg, dim, sel_bg);
     drawSearchChip(font, render_rs, chip_word_x, chip_y, chip_w, chip_h, scale, "W", sp.whole_word, fg, dim, sel_bg);
 
@@ -2433,7 +2462,7 @@ fn searchPanelGui(editor: *Editor) void {
         const main_txt = std.fmt.bufPrint(&sbuf, "{d} results in {d} files{s}{s}", .{ sp.matches.items.len, sp.paths.items.len, busy, cap }) catch "";
         renderOverlayText(font, main_txt, area.x + pad, status_y, render_rs, fg);
         const main_w = font.textSize(main_txt).w * scale;
-        renderOverlayText(font, "   Alt+C case · Alt+W word · Tab fields · Enter on Replace = replace all", area.x + pad + main_w, status_y, render_rs, dim.opacity(0.8));
+        renderOverlayText(font, "   Alt+C case · Alt+W word · Tab fields · Enter on Replace = replace all", area.x + pad + main_w, status_y, render_rs, dim);
     }
 
     // --- Results: file headers + highlighted match rows ---
@@ -2441,35 +2470,45 @@ fn searchPanelGui(editor: *Editor) void {
     const needle = sp.query();
     const prev_clip = dvui.clip(area);
     defer dvui.clipSet(prev_clip);
+
+    // Sticky header: decided BEFORE drawing — row 0 renders the pinned
+    // header IN PLACE OF the row beneath it (never painted over content;
+    // fills don't reliably cover already-drawn text).
+    search_sticky = null;
+    if (search_scroll_rows < search_disp.items.len and
+        search_disp.items[@min(search_scroll_rows, search_disp.items.len - 1)] != .header)
+    {
+        var hi: usize = @min(search_scroll_rows, search_disp.items.len - 1);
+        while (true) {
+            if (search_disp.items[hi] == .header) {
+                search_sticky = hi;
+                break;
+            }
+            if (hi == 0) break;
+            hi -= 1;
+        }
+    }
+
     var r: usize = 0;
     while (r < rows_visible) : (r += 1) {
+        const ry = results_y + @as(f32, @floatFromInt(r)) * row_h;
+        if (r == 0) {
+            if (search_sticky) |si| {
+                var sticky_bg = box_bg;
+                sticky_bg.a = 255;
+                const bar: dvui.Rect.Physical = .{ .x = area.x, .y = ry, .w = area.w, .h = row_h };
+                bar.fill(.{}, .{ .color = sticky_bg, .fade = 1.0 });
+                const sep_line: dvui.Rect.Physical = .{ .x = area.x, .y = ry + row_h - @max(1.0, 1 * scale), .w = area.w, .h = @max(1.0, 1 * scale) };
+                sep_line.fill(.{}, .{ .color = dim, .fade = 1.0 });
+                drawSearchHeaderRow(editor, font, render_rs, area, pad, scale, row_h, ry, search_disp.items[si].header, fg, dim);
+                continue;
+            }
+        }
         const disp_idx = search_scroll_rows + r;
         if (disp_idx >= search_disp.items.len) break;
-        const ry = results_y + @as(f32, @floatFromInt(r)) * row_h;
         switch (search_disp.items[disp_idx]) {
             .header => |h| {
-                if (h.path_idx >= sp.paths.items.len) continue;
-                const path = sp.paths.items[h.path_idx];
-                const sep = std.mem.lastIndexOfAny(u8, path, "/\\");
-                const base = if (sep) |s| path[s + 1 ..] else path;
-                const dir = if (sep) |s| path[0..s] else "";
-                // File-type glyph (same nerdfont machinery as the tree)
-                const fi = editor.filetreeIconFor(base, false);
-                const tint: dvui.Color = if (fi.color) |c| .{ .r = c.r, .g = c.g, .b = c.b, .a = 255 } else fg.opacity(0.75);
-                const glyph = fi.nerd orelse fileicons.nerdGlyph(fi.kind);
-                const glyph_font = font.withSize(font.size * 0.85 * iconFamilyScale(glyph));
-                const glyph_dy = (row_h - glyph_font.lineHeight() * scale) / 2;
-                renderOverlayText(glyph_font, glyph, area.x + pad, ry + glyph_dy, render_rs, tint);
-                const name_x = area.x + pad + 18 * scale;
-                renderOverlayText(font, base, name_x, ry, render_rs, fg);
-                if (dir.len > 0) {
-                    const base_w = font.textSize(base).w * scale;
-                    renderOverlayText(font, dir, name_x + base_w + 8 * scale, ry, render_rs, dim.opacity(0.7));
-                }
-                var cbuf: [16]u8 = undefined;
-                const count_txt = std.fmt.bufPrint(&cbuf, "{d}", .{h.count}) catch "";
-                const count_w = font.textSize(count_txt).w * scale;
-                renderOverlayText(font, count_txt, area.x + area.w - pad - count_w, ry, render_rs, dim);
+                drawSearchHeaderRow(editor, font, render_rs, area, pad, scale, row_h, ry, h, fg, dim);
             },
             .match => |mi| {
                 if (mi >= sp.matches.items.len) continue;
@@ -2482,38 +2521,160 @@ fn searchPanelGui(editor: *Editor) void {
                 var x = area.x + pad + 18 * scale;
                 var lbuf: [16]u8 = undefined;
                 const line_txt = std.fmt.bufPrint(&lbuf, "{d}", .{m.line + 1}) catch "";
-                renderOverlayText(font, line_txt, x, ry, render_rs, dim.opacity(0.7));
+                renderOverlayText(font, line_txt, x, ry, render_rs, dim);
                 x += font.textSize("00000").w * scale;
-                // Excerpt with the first hit highlighted
-                if (search_mod.findInText(m.excerpt, needle, sp.case_sensitive, sp.whole_word, 0)) |hit| {
-                    const pre = m.excerpt[0..hit];
-                    const mid = m.excerpt[hit .. hit + @min(needle.len, m.excerpt.len - hit)];
-                    const post = m.excerpt[hit + mid.len ..];
+
+                // Fit the excerpt to the row, VS Code style: cut with "…"
+                // and shift the window so the match is always visible.
+                const char_w = font.textSize("0").w * scale;
+                const avail = area.x + area.w - pad - x;
+                if (char_w <= 0 or avail < char_w * 8) continue;
+                const max_chars: usize = @intFromFloat(@floor(avail / char_w));
+                // Highlight THIS row's occurrence (col mapped through the
+                // excerpt's trim offset); lines with several matches get one
+                // row each, so first-occurrence-always looked like dupes.
+                const hit_opt: ?usize = if (m.col >= m.excerpt_off and
+                    (m.col - m.excerpt_off) + needle.len <= m.excerpt.len)
+                    m.col - m.excerpt_off
+                else
+                    search_mod.findInText(m.excerpt, needle, sp.case_sensitive, sp.whole_word, 0);
+                var start: usize = 0;
+                var end: usize = m.excerpt.len;
+                var lead = false;
+                var trail = false;
+                if (m.excerpt.len > max_chars) {
+                    var span = max_chars - 1;
+                    trail = true;
+                    if (hit_opt) |hit| {
+                        const h_end = @min(hit + needle.len, m.excerpt.len);
+                        if (h_end > span) {
+                            lead = true;
+                            span = max_chars - 2;
+                            start = h_end -| (span * 2 / 3);
+                        }
+                    }
+                    end = @min(m.excerpt.len, start + span);
+                    if (end == m.excerpt.len) trail = false;
+                    start = utf8Floor(m.excerpt, start);
+                    end = utf8Floor(m.excerpt, end);
+                }
+                if (lead) {
+                    renderOverlayText(font, "…", x, ry, render_rs, dim);
+                    x += char_w;
+                }
+                if (hit_opt) |hit| {
+                    const h_end = @min(hit + needle.len, m.excerpt.len);
+                    const c_pre_end = std.math.clamp(hit, start, end);
+                    const c_hit_end = std.math.clamp(h_end, start, end);
+                    const pre = m.excerpt[start..c_pre_end];
+                    const mid = m.excerpt[c_pre_end..c_hit_end];
+                    const post = m.excerpt[c_hit_end..end];
                     if (pre.len > 0) {
-                        renderOverlayText(font, pre, x, ry, render_rs, if (is_sel) fg else dim);
+                        renderOverlayText(font, pre, x, ry, render_rs, fg);
                         x += font.textSize(pre).w * scale;
                     }
-                    const mid_w = font.textSize(mid).w * scale;
-                    const hl: dvui.Rect.Physical = .{ .x = x - 1 * scale, .y = ry, .w = mid_w + 2 * scale, .h = row_h };
-                    hl.fill(.{ .x = 2 * scale, .y = 2 * scale, .w = 2 * scale, .h = 2 * scale }, .{ .color = accent.opacity(0.35), .fade = 1.0 });
-                    renderOverlayText(font, mid, x, ry, render_rs, fg);
-                    x += mid_w;
+                    if (mid.len > 0) {
+                        const mid_w = font.textSize(mid).w * scale;
+                        const hl: dvui.Rect.Physical = .{ .x = x - 1 * scale, .y = ry, .w = mid_w + 2 * scale, .h = row_h };
+                        hl.fill(.{ .x = 2 * scale, .y = 2 * scale, .w = 2 * scale, .h = 2 * scale }, .{ .color = accent.opacity(0.35), .fade = 1.0 });
+                        renderOverlayText(font, mid, x, ry, render_rs, fg);
+                        x += mid_w;
+                    }
                     if (post.len > 0) {
-                        renderOverlayText(font, post, x, ry, render_rs, if (is_sel) fg else dim);
+                        renderOverlayText(font, post, x, ry, render_rs, fg);
+                        x += font.textSize(post).w * scale;
                     }
                 } else {
-                    renderOverlayText(font, m.excerpt, x, ry, render_rs, if (is_sel) fg else dim);
+                    const win = m.excerpt[start..end];
+                    renderOverlayText(font, win, x, ry, render_rs, fg);
+                    x += font.textSize(win).w * scale;
+                }
+                if (trail) {
+                    renderOverlayText(font, "…", x, ry, render_rs, dim);
                 }
             },
         }
     }
+
+}
+
+/// Move the result selection over VISIBLE matches only — matches inside
+/// collapsed file groups are skipped (collapse is GUI view state, so the
+/// core moveSelection can't know about it). A selection already inside a
+/// folded group escapes to the next visible match in the given direction.
+fn searchMoveVisible(editor: *Editor, down: bool, step: usize) void {
+    const sp = &editor.search;
+    const count = sp.matches.items.len;
+    if (count == 0) return;
+    var cur = @min(sp.selected, count - 1);
+    var moved: usize = 0;
+    while (moved < step) {
+        var i = cur;
+        const next: ?usize = blk: {
+            while (true) {
+                if (down) {
+                    if (i + 1 >= count) break :blk null;
+                    i += 1;
+                } else {
+                    if (i == 0) break :blk null;
+                    i -= 1;
+                }
+                if (!search_collapsed.contains(sp.matches.items[i].path_idx)) break :blk i;
+            }
+        };
+        if (next) |n| {
+            cur = n;
+            moved += 1;
+        } else break;
+    }
+    sp.selected = cur;
+}
+
+/// One file-group header row: collapse chevron, type glyph, name, dim
+/// directory, right-aligned match count. Used for list rows AND the
+/// sticky pinned header.
+fn drawSearchHeaderRow(editor: *Editor, font: dvui.Font, render_rs: dvui.RectScale, area: dvui.Rect.Physical, pad: f32, scale: f32, row_h: f32, ry: f32, h: anytype, fg: dvui.Color, dim: dvui.Color) void {
+    const sp = &editor.search;
+    if (h.path_idx >= sp.paths.items.len) return;
+    const path = sp.paths.items[h.path_idx];
+    const sep = std.mem.lastIndexOfAny(u8, path, "/\\");
+    const base = if (sep) |s| path[s + 1 ..] else path;
+    const dir = if (sep) |s| path[0..s] else "";
+    const collapsed = search_collapsed.contains(h.path_idx);
+    // Collapse chevron
+    const chev_sz = @min(row_h - 4 * scale, 12 * scale);
+    const chev: []const u8 = if (collapsed) dvui.entypo.chevron_small_right else dvui.entypo.chevron_small_down;
+    renderIconTinted(if (collapsed) "srch_chev" else "srch_chev_open", chev, .{
+        .x = area.x + pad,
+        .y = ry + (row_h - chev_sz) / 2,
+        .w = chev_sz,
+        .h = chev_sz,
+    }, scale, dim);
+    // File-type glyph (same nerdfont machinery as the tree)
+    const icon_x = area.x + pad + 14 * scale;
+    const fi = editor.filetreeIconFor(base, false);
+    const tint: dvui.Color = if (fi.color) |c| .{ .r = c.r, .g = c.g, .b = c.b, .a = 255 } else fg.opacity(0.75);
+    const glyph = fi.nerd orelse fileicons.nerdGlyph(fi.kind);
+    const glyph_font = font.withSize(font.size * 0.85 * iconFamilyScale(glyph));
+    const glyph_dy = (row_h - glyph_font.lineHeight() * scale) / 2;
+    renderOverlayText(glyph_font, glyph, icon_x, ry + glyph_dy, render_rs, tint);
+    const name_x = icon_x + 18 * scale;
+    renderOverlayText(font, base, name_x, ry, render_rs, fg);
+    if (dir.len > 0) {
+        const base_w = font.textSize(base).w * scale;
+        renderOverlayText(font, dir, name_x + base_w + 8 * scale, ry, render_rs, dim);
+    }
+    var cbuf: [16]u8 = undefined;
+    const count_txt = std.fmt.bufPrint(&cbuf, "{d}", .{h.count}) catch "";
+    const count_w = font.textSize(count_txt).w * scale;
+    renderOverlayText(font, count_txt, area.x + area.w - pad - count_w, ry, render_rs, dim);
 }
 
 /// Bordered input box with placeholder text and a cursor when active.
 fn drawSearchBox(font: dvui.Font, rs: dvui.RectScale, x: f32, y: f32, w: f32, h: f32, scale: f32, placeholder: []const u8, value: []const u8, active: bool, fg: dvui.Color, dim: dvui.Color, accent: dvui.Color, box_bg: dvui.Color) void {
     const rad = 3 * scale;
     const border: dvui.Rect.Physical = .{ .x = x, .y = y, .w = w, .h = h };
-    border.fill(.{ .x = rad, .y = rad, .w = rad, .h = rad }, .{ .color = if (active) accent else dim.opacity(0.45), .fade = 1.0 });
+    border.fill(.{ .x = rad, .y = rad, .w = rad, .h = rad }, .{ .color = if (active) accent else dim, .fade = 1.0 });
     const bw = @max(1.0, 1 * scale);
     const inner: dvui.Rect.Physical = .{ .x = x + bw, .y = y + bw, .w = w - bw * 2, .h = h - bw * 2 };
     inner.fill(.{ .x = rad, .y = rad, .w = rad, .h = rad }, .{ .color = box_bg, .fade = 1.0 });
@@ -2524,7 +2685,7 @@ fn drawSearchBox(font: dvui.Font, rs: dvui.RectScale, x: f32, y: f32, w: f32, h:
     const prev_clip = dvui.clip(inner);
     defer dvui.clipSet(prev_clip);
     if (value.len == 0 and !active) {
-        renderOverlayText(font, placeholder, tx, ty, rs, dim.opacity(0.6));
+        renderOverlayText(font, placeholder, tx, ty, rs, dim);
         return;
     }
     var buf: [300]u8 = undefined;
@@ -2542,7 +2703,15 @@ fn drawSearchChip(font: dvui.Font, rs: dvui.RectScale, x: f32, y: f32, w: f32, h
     }
     const lh = font.lineHeight() * rs.s;
     const tw = font.textSize(label).w * rs.s;
-    renderOverlayText(font, label, x + (w - tw) / 2, y + (h - lh) / 2, rs, if (on) fg else dim.opacity(0.7));
+    renderOverlayText(font, label, x + (w - tw) / 2, y + (h - lh) / 2, rs, if (on) fg else dim);
+}
+
+/// Move a byte index back to the start of its UTF-8 sequence so windowed
+/// slicing never cuts a codepoint in half.
+fn utf8Floor(s: []const u8, idx: usize) usize {
+    var i = @min(idx, s.len);
+    while (i > 0 and i < s.len and (s[i] & 0xC0) == 0x80) i -= 1;
+    return i;
 }
 
 /// Keys while the search panel owns the keyboard (mirrors the TUI handler;
@@ -2601,7 +2770,7 @@ fn handleSearchKeysGui(editor: *Editor, wd: *dvui.WidgetData) void {
                     .enter => {
                         e.handle(@src(), wd);
                         switch (sp.field) {
-                            .query, .filter => editor.searchStart(),
+                            .query, .filter, .exclude => editor.searchStart(),
                             .replace => {
                                 if (sp.matches.items.len > 0) sp.confirm_armed = true;
                             },
@@ -2613,19 +2782,19 @@ fn handleSearchKeysGui(editor: *Editor, wd: *dvui.WidgetData) void {
                     },
                     .up => {
                         e.handle(@src(), wd);
-                        sp.moveSelection(false, 1);
+                        searchMoveVisible(editor, false, 1);
                     },
                     .down => {
                         e.handle(@src(), wd);
-                        sp.moveSelection(true, 1);
+                        searchMoveVisible(editor, true, 1);
                     },
                     .page_up => {
                         e.handle(@src(), wd);
-                        sp.moveSelection(false, 8);
+                        searchMoveVisible(editor, false, 8);
                     },
                     .page_down => {
                         e.handle(@src(), wd);
-                        sp.moveSelection(true, 8);
+                        searchMoveVisible(editor, true, 8);
                     },
                     .backspace => {
                         e.handle(@src(), wd);

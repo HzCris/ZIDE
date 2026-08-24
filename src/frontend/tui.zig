@@ -608,7 +608,7 @@ fn drawEditor(win: Window, editor: *Editor, width: u16, height: u16) void {
     const tab_bar_height: u16 = if (editor.docCount() > 1) 1 else 0;
     const status_height: u16 = 1;
     const search_h: u16 = if (editor.search_visible)
-        @min(13, (height -| tab_bar_height -| status_height) / 2)
+        @min(14, (height -| tab_bar_height -| status_height) / 2)
     else
         0;
     const content_height = height -| tab_bar_height -| status_height -| search_h;
@@ -2447,7 +2447,8 @@ fn drawSearchPanel(win: Window, editor: *Editor, width: u16, panel_h: u16) void 
     const focused = editor.search_focused;
     drawSearchInputRow(win, 0, width, "Search ", sp.query(), focused and sp.field == .query, bg_style, label_active);
     drawSearchInputRow(win, 1, width, "Replace", sp.replacement(), focused and sp.field == .replace, bg_style, label_active);
-    drawSearchInputRow(win, 2, width, "Filter ", sp.filter(), focused and sp.field == .filter, bg_style, label_active);
+    drawSearchInputRow(win, 2, width, "Include", sp.filter(), focused and sp.field == .filter, bg_style, label_active);
+    drawSearchInputRow(win, 3, width, "Exclude", sp.exclude(), focused and sp.field == .exclude, bg_style, label_active);
 
     // Status / confirm row
     var sbuf: [300]u8 = undefined;
@@ -2464,12 +2465,12 @@ fn drawSearchPanel(win: Window, editor: *Editor, width: u16, panel_h: u16) void 
         const cap: []const u8 = if (sp.capped) "  (capped)" else "";
         break :blk std.fmt.bufPrint(&sbuf, "{s}{s}  {d} match(es) in {d} file(s), {d} scanned{s}{s}   Alt+C case · Alt+W word · Tab fields · Enter on Replace = replace all", .{ case_s, word_s, sp.matches.items.len, sp.paths.items.len, sp.files_searched, busy, cap }) catch "";
     };
-    const srow = win.child(.{ .y_off = 3, .height = 1, .width = width });
+    const srow = win.child(.{ .y_off = 4, .height = 1, .width = width });
     srow.fill(.{ .style = status_style });
     _ = writeStr(srow, 0, 0, status_txt, status_style);
 
     // Result rows
-    const rows: usize = panel_h -| 4;
+    const rows: usize = panel_h -| 5;
     if (rows == 0 or sp.matches.items.len == 0) return;
     if (sp.selected < sp.scroll) sp.scroll = sp.selected;
     if (sp.selected >= sp.scroll + rows) sp.scroll = sp.selected - rows + 1;
@@ -2482,7 +2483,7 @@ fn drawSearchPanel(win: Window, editor: *Editor, width: u16, panel_h: u16) void 
         var rbuf: [512]u8 = undefined;
         const txt = std.fmt.bufPrint(&rbuf, " {s}:{d}: {s}", .{ sp.paths.items[m.path_idx], m.line + 1, m.excerpt }) catch " ?";
         const is_sel = idx == sp.selected;
-        const row_win = win.child(.{ .y_off = @intCast(4 + r), .height = 1, .width = width });
+        const row_win = win.child(.{ .y_off = @intCast(5 + r), .height = 1, .width = width });
         if (is_sel) row_win.fill(.{ .style = sel_style });
         _ = writeStr(row_win, 0, 0, txt, if (is_sel) sel_style else bg_style);
     }
@@ -2537,7 +2538,7 @@ fn handleSearchKey(editor: *Editor, key: Key) void {
     }
     if (key.codepoint == Key.enter) {
         switch (sp.field) {
-            .query, .filter => editor.searchStart(),
+            .query, .filter, .exclude => editor.searchStart(),
             .replace => {
                 if (sp.matches.items.len > 0) sp.confirm_armed = true;
             },
@@ -2581,9 +2582,10 @@ fn handleSearchClick(editor: *Editor, band: SearchBand, row: u16) void {
         0 => sp.field = .query,
         1 => sp.field = .replace,
         2 => sp.field = .filter,
-        3 => {},
+        3 => sp.field = .exclude,
+        4 => {},
         else => {
-            const idx = sp.scroll + (rel - 4);
+            const idx = sp.scroll + (rel - 5);
             if (idx < sp.matches.items.len) {
                 sp.field = .results;
                 sp.selected = idx;

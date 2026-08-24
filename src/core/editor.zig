@@ -2492,6 +2492,17 @@ test "workspace search and replace end to end" {
     try t.expectEqual(@as(usize, 4), sp.matches.items.len);
     try t.expectEqual(@as(usize, 2), sp.paths.items.len);
 
+    // Exclude filter drops disk-walked files (open docs always searched)
+    @memcpy(sp.exclude_buf[0..5], "*.zig");
+    sp.exclude_len = 5;
+    sp.start(&editor);
+    waitSearch(sp);
+    try t.expectEqual(@as(usize, 3), sp.matches.items.len);
+    sp.exclude_len = 0;
+    sp.start(&editor);
+    waitSearch(sp);
+    try t.expectEqual(@as(usize, 4), sp.matches.items.len);
+
     // Jump to the b.zig hit: opens the file with the match selected
     var zig_idx: usize = 0;
     for (sp.matches.items, 0..) |m, i| {
