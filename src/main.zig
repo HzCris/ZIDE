@@ -11,6 +11,32 @@ pub const std_options: std.Options = .{
     .logFn = logToFile,
 };
 
+pub const panic = std.debug.FullPanic(zidePanic);
+
+/// Set at startup so the panic handler can write a crash file — panics in
+/// a GUI launch are otherwise invisible (stderr goes nowhere).
+var panic_io: ?std.Io = null;
+
+/// Leave a breadcrumb in ~/.config/zide/zide-crash.log (latest crash only:
+/// message + raw return addresses), then chain to the default panic.
+fn zidePanic(msg: []const u8, first_trace_addr: ?usize) noreturn {
+    crash_note: {
+        const io = panic_io orelse break :crash_note;
+        const dir = lua_settings.getConfigDir() orelse break :crash_note;
+        var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+        const path = std.fmt.bufPrint(&path_buf, "{s}/zide-crash.log", .{dir}) catch break :crash_note;
+        const f = std.Io.Dir.cwd().createFile(io, path, .{}) catch break :crash_note;
+        defer f.close(io);
+        var buf: [4096]u8 = undefined;
+        const body = std.fmt.bufPrint(&buf, "panic: {s}\nfirst return address: 0x{x}\n(run zide from a terminal to get a full symbolized stack trace)\n", .{ msg, first_trace_addr orelse 0 }) catch {
+            f.writeStreamingAll(io, "panic (message too long to format)\n") catch {};
+            break :crash_note;
+        };
+        f.writeStreamingAll(io, body) catch {};
+    }
+    std.debug.defaultPanic(msg, first_trace_addr);
+}
+
 // ---------------------------------------------------------------------------
 // Logging
 //
@@ -103,6 +129,7 @@ const welcome_text =
     \\//   Ctrl+F            find               Ctrl+H           find & replace
     \\//   Ctrl+G            go to line         Ctrl+P           command palette
     \\//   Ctrl+E            open file by fuzzy name (arrows live-preview, Esc restores)
+    \\//   Ctrl+Shift+F      workspace search & replace   F4/Shift+F4  cycle results
     \\//   Ctrl+Left/Right   jump by word       Ctrl+Home/End    file start / end
     \\//   (add Shift to the two above to select while moving)
     \\//
@@ -140,6 +167,7 @@ pub fn main(init: std.process.Init) !void {
     // environment + an Io before any Editor exists.
     lua_settings.process_environ = init.environ_map;
     lua_settings.global_io = io;
+    panic_io = io;
 
     var buf: [4096]u8 = undefined;
     var stdout_w = std.Io.File.stdout().writer(io, &buf);

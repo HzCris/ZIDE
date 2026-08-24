@@ -19,6 +19,7 @@ const syntax = @import("syntax.zig");
 pub const lsp_mod = @import("lsp.zig");
 pub const filetree_mod = @import("filetree.zig");
 pub const lua_api = @import("lua_api.zig");
+pub const search_mod = @import("search.zig");
 const zlua = @import("zlua");
 
 /// The central editor state. NOT a global singleton — passed explicitly.
@@ -79,6 +80,14 @@ pub const Editor = struct {
     finder_preview_appended: bool = false,
     /// Active doc index to restore when the finder is cancelled.
     finder_prev_active: usize = 0,
+
+    /// Workspace search & replace panel state/engine (see search.zig).
+    search: search_mod.SearchPanel,
+    /// The docked results panel is shown.
+    search_visible: bool = false,
+    /// Keyboard focus is on the panel (frontends route keys to it, like
+    /// filetree_focused).
+    search_focused: bool = false,
     /// Go to line input buffer.
     goto_buf: [32]u8 = undefined,
     goto_buf_len: usize = 0,
@@ -298,6 +307,7 @@ pub const Editor = struct {
             .terminals = .empty,
             .languages = .empty,
             .lang_syntax_overrides = .empty,
+            .search = .{ .allocator = allocator, .io = io },
         };
         // Register built-in languages (heap-allocated: see `languages` doc)
         const zig_lang = try allocator.create(syntax.LanguageDef);
@@ -363,6 +373,7 @@ pub const Editor = struct {
         self.finderClearFiles();
         self.finder_files.deinit(self.allocator);
         self.finder_matches.deinit(self.allocator);
+        self.search.deinit();
         if (self.filetree_prompt_target) |tgt| self.allocator.free(tgt);
         if (self.filetree_move_src) |src| self.allocator.free(src);
         for (self.filetree_move_srcs.items) |p| self.allocator.free(p);
@@ -700,6 +711,94 @@ pub const Editor = struct {
         const target = @min(self.finder_prev_active, self.documents.items.len -| 1);
         self.active_doc_idx = target;
         self.paneShowDoc(target);
+    }
+
+    // ------------------------------------------------------------------
+    // Workspace search & replace panel (find_in_files)
+    // ------------------------------------------------------------------
+
+    /// Ctrl+Shift+F cycle: hidden → shown + focused; shown but editor
+    /// focused → focus the panel; panel focused → hide (results persist
+    /// for next_result / prev_result).
+    pub fn searchToggle(self: *Editor) void {
+        if (!self.search_visible) {
+            self.search_visible = true;
+            self.search_focused = true;
+            self.search.field = .query;
+        } else if (!self.search_focused) {
+            self.search_focused = true;
+        } else {
+            self.search_visible = false;
+            self.search_focused = false;
+        }
+    }
+
+    /// Hide the panel (Escape). Results persist for next/prev_result.
+    pub fn searchHide(self: *Editor) void {
+        self.search_visible = false;
+        self.search_focused = false;
+    }
+
+    /// Run the search with the panel's current inputs.
+    pub fn searchStart(self: *Editor) void {
+        self.search.start(self);
+        if (self.search.matches.items.len > 0 or self.search.searching) {
+            self.search.field = .results;
+        }
+    }
+
+    /// Open the selected result at its match (real tab, match selected).
+    pub fn searchOpenSelected(self: *Editor) void {
+        const sp = &self.search;
+        if (sp.selected >= sp.matches.items.len) return;
+        const m = sp.matches.items[sp.selected];
+        const path = sp.paths.items[m.path_idx];
+        _ = self.openOrFocus(path) catch {
+            const msg = std.fmt.bufPrint(&self.status_buf, "Cannot open {s}", .{path}) catch "Cannot open result";
+            self.status_message = msg;
+            return;
+        };
+        const doc = self.activeDoc();
+        // Positions may be stale after edits — clamp defensively.
+        const line = @min(m.line, @as(u32, @intCast(doc.buffer.lineCount() -| 1)));
+        const line_len = doc.buffer.lineContent(line).len;
+        const col = @min(m.col, @as(u32, @intCast(line_len)));
+        const start_off = doc.buffer.posToOffset(line, col);
+        doc.cursors.clearSecondary();
+        const c = doc.cursors.primary();
+        c.anchor = start_off;
+        c.offset = @min(start_off + sp.query_len, doc.buffer.byteLen());
+        c.preferred_col = doc.buffer.offsetToPos(c.offset).col;
+        self.search_focused = false;
+    }
+
+    /// Cycle to the next/previous result and jump to it (works with the
+    /// panel hidden — quickfix style).
+    pub fn searchCycleResult(self: *Editor, forward: bool) void {
+        const sp = &self.search;
+        const count = sp.matches.items.len;
+        if (count == 0) {
+            self.status_message = "No search results (Ctrl+Shift+F to search)";
+            return;
+        }
+        if (forward) {
+            sp.selected = (sp.selected + 1) % count;
+        } else {
+            sp.selected = if (sp.selected == 0) count - 1 else sp.selected - 1;
+        }
+        self.searchOpenSelected();
+        const msg = std.fmt.bufPrint(&self.status_buf, "Result {d}/{d}", .{ sp.selected + 1, count }) catch "";
+        self.status_message = msg;
+    }
+
+    /// Execute the armed replace and report; re-runs the search after so
+    /// the results reflect the new state.
+    pub fn searchExecuteReplace(self: *Editor, scope: search_mod.ReplaceScope) void {
+        const res = self.search.executeReplace(self, scope);
+        self.search.start(self);
+        const noun: []const u8 = if (scope == .open_only) "open doc(s)" else "file(s)";
+        const msg = std.fmt.bufPrint(&self.status_buf, "Replaced {d} match(es) in {d} {s}", .{ res.count, res.files, noun }) catch "Replace done";
+        self.status_message = msg;
     }
 
     /// Free the workspace snapshot (paths, matches, root).
@@ -2346,6 +2445,92 @@ test "fuzzy finder: filter, preview, commit and cancel" {
     try t.expectEqual(@as(usize, 2), editor.documents.items.len);
     editor.finderCommit();
     try t.expect(std.mem.endsWith(u8, editor.activeDoc().file_path.?, "alpha.zig"));
+}
+
+/// Test helper: bounded wait for the search worker to finish.
+fn waitSearch(sp: *search_mod.SearchPanel) void {
+    var spins: usize = 0;
+    while (sp.searching and spins < 10_000_000) : (spins += 1) {
+        _ = sp.drain();
+        std.Thread.yield() catch {};
+    }
+    _ = sp.drain();
+}
+
+test "workspace search and replace end to end" {
+    const t = std.testing;
+    const root = ".zig-cache/zide-test-search";
+    std.Io.Dir.cwd().createDirPath(t.io, root ++ "/sub") catch {};
+    {
+        const f = try std.Io.Dir.cwd().createFile(t.io, root ++ "/a.txt", .{});
+        defer f.close(t.io);
+        try f.writeStreamingAll(t.io, "the cat sat\nno match here\ncat again\n");
+    }
+    {
+        const f = try std.Io.Dir.cwd().createFile(t.io, root ++ "/sub/b.zig", .{});
+        defer f.close(t.io);
+        try f.writeStreamingAll(t.io, "// cat in zig\n");
+    }
+    defer std.Io.Dir.cwd().deleteTree(t.io, root) catch {};
+
+    var editor = try Editor.init(t.allocator, t.io);
+    defer editor.deinit();
+    editor.filetree_root = try t.allocator.dupe(u8, root);
+
+    // Open a.txt and edit the buffer — the search must see the buffer,
+    // not the stale disk copy.
+    const doc0 = try editor.openFile(root ++ "/a.txt");
+    try doc0.insertAtCursor("cat extra\n");
+
+    const sp = &editor.search;
+    @memcpy(sp.query_buf[0..3], "cat");
+    sp.query_len = 3;
+    sp.start(&editor);
+    waitSearch(sp);
+    // 3 buffer hits in a.txt (2 original + 1 typed) + 1 in b.zig on disk;
+    // a.txt's disk copy is skipped because the doc is open.
+    try t.expectEqual(@as(usize, 4), sp.matches.items.len);
+    try t.expectEqual(@as(usize, 2), sp.paths.items.len);
+
+    // Jump to the b.zig hit: opens the file with the match selected
+    var zig_idx: usize = 0;
+    for (sp.matches.items, 0..) |m, i| {
+        if (std.mem.endsWith(u8, sp.paths.items[m.path_idx], "b.zig")) zig_idx = i;
+    }
+    sp.selected = zig_idx;
+    editor.searchOpenSelected();
+    try t.expect(std.mem.endsWith(u8, editor.activeDoc().file_path.?, "b.zig"));
+    try t.expectEqualStrings("cat", editor.activeDoc().selectedText().?);
+
+    // Replace in open docs only: a.txt buffer changes, b.zig untouched...
+    // except b.zig is now open too (we just jumped into it) — so replace
+    // open-only converts every open buffer and leaves nothing on disk.
+    @memcpy(sp.replace_buf[0..3], "dog");
+    sp.replace_len = 3;
+    editor.searchExecuteReplace(.open_only);
+    waitSearch(sp);
+    try t.expectEqual(@as(usize, 0), sp.matches.items.len);
+    const adoc = &editor.documents.items[1]; // a.txt (0 = initial untitled)
+    const atext = adoc.buffer.slice(0, adoc.buffer.byteLen());
+    try t.expect(std.mem.indexOf(u8, atext, "cat") == null);
+    try t.expect(std.mem.indexOf(u8, atext, "dog") != null);
+    try t.expect(adoc.dirty);
+
+    // Disk-scope replace: put a needle in an unopened file and replace .all
+    {
+        const f = try std.Io.Dir.cwd().createFile(t.io, root ++ "/sub/c.txt", .{});
+        defer f.close(t.io);
+        try f.writeStreamingAll(t.io, "closed cat file\n");
+    }
+    sp.start(&editor);
+    waitSearch(sp);
+    try t.expectEqual(@as(usize, 1), sp.matches.items.len);
+    editor.searchExecuteReplace(.all);
+    waitSearch(sp);
+    try t.expectEqual(@as(usize, 0), sp.matches.items.len);
+    const rewritten = try std.Io.Dir.cwd().readFileAlloc(t.io, root ++ "/sub/c.txt", t.allocator, .limited(4096));
+    defer t.allocator.free(rewritten);
+    try t.expectEqualStrings("closed dog file\n", rewritten);
 }
 
 test "editor external-change poll and save guard" {

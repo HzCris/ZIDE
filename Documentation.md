@@ -91,6 +91,7 @@ Windows terminals commonly intercept Alt combos (Windows Terminal binds Alt+arro
 - Go to line (Ctrl+G)
 - Command palette with fuzzy matching (Ctrl+P)
 - Quick open (Ctrl+E, `quick_open` in the palette): fuzzy-find any workspace file by name — basename matches rank first; arrowing through results **live-previews** each file in the pane behind the bottom-anchored panel (no tab is created — nothing like VS Code's italic preview tabs); PageUp/PageDown scroll the preview; Enter opens it as a normal tab, Escape restores exactly where you were. Walks the file tree root (dot-folders and `zig-out` skipped)
+- Workspace search & replace (Ctrl+Shift+F, `find_in_files`): **docked bottom panel** with search / replace / path-filter fields (Tab cycles, click focuses), case (Alt+C) and whole-word (Alt+W) toggles. A background worker streams `path:line: excerpt` results in live — open documents are searched **in-buffer** (dirty edits included) and skipped on disk; dot-folders, `zig-out`, binaries, and files > 8 MB are skipped; results cap at 2000 with an explicit "(capped)" note. Enter (or double-click) opens a result with the match selected; Escape hides the panel but results persist — **F4 / Shift+F4** cycle through them while editing. Replace All (Enter on the Replace field) asks per operation: `[A]ll` (open docs get one undoable edit group each and stay unsaved; closed files are rewritten on disk — **not undoable**) or `[O]pen docs only`. Matching is literal (no regex yet); the filter takes `*.ext` or a path substring
 - Ctrl+Home/End for file start/end
 - Page Up/Down
 
@@ -189,6 +190,7 @@ Windows terminals commonly intercept Alt combos (Windows Terminal binds Alt+arro
 - Find and Replace (Ctrl+H, Tab to switch fields, Enter for next, Ctrl+A replace all, shows count)
 - Command palette with fuzzy matching (Ctrl+P)
 - Quick open (Ctrl+E): fuzzy file finder with live preview behind a bottom-anchored panel — same behavior as the TUI (Enter opens a normal tab, Escape restores; previews never appear in the tab bar); PageUp/PageDown and the mouse wheel scroll the preview
+- Workspace search & replace (Ctrl+Shift+F): same engine and behavior as the TUI, with a VS Code-style panel — bordered input boxes with placeholders, clickable `Aa`/`W` toggle chips inside the search box (toggling re-runs the search), results **grouped under file headers** (type icon + name + directory + match count) with the match **highlighted inside each excerpt**; click fields to focus, double-click a result to open it, wheel scrolls, F4/Shift+F4 cycle results while editing
 - Keybinding remapping (Lua integration — `zide.bind`/`zide.unbind` via init.lua)
 - Auto-save (saves dirty documents with file paths after configurable interval, default 5s)
 - Application icon embedded in exe

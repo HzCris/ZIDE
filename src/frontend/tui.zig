@@ -241,6 +241,8 @@ pub fn run(allocator: std.mem.Allocator, editor: *Editor) !void {
         lsp_client.tui_wake_fn = &lspWakeFn;
     }
     editor.terminal_wake_fn = &terminalWakeFn;
+    // Search worker results wake the blocking loop the same way.
+    editor.search.wake_fn = &terminalWakeFn;
     @import("../core/lua_api.zig").setLuaWake(editor, &luaJobWakeFn);
 
     // Enter alternate screen
@@ -330,6 +332,9 @@ pub fn run(allocator: std.mem.Allocator, editor: *Editor) !void {
                 editor.pollExternalChanges();
             }
         }
+
+        // Pull in workspace-search results (worker wakes the loop on new hits)
+        _ = editor.search.drain();
 
         // Update page_size based on terminal height
         const win = vx.window();
@@ -458,7 +463,12 @@ fn dispatchKey(editor: *Editor, key: Key) void {
         return;
     }
     switch (editor.mode) {
-        .normal => if (editor.filetree_focused) handleFiletreeKey(editor, key) else handleKey(editor, key),
+        .normal => if (editor.filetree_focused)
+            handleFiletreeKey(editor, key)
+        else if (editor.search_focused)
+            handleSearchKey(editor, key)
+        else
+            handleKey(editor, key),
         .find => handleFindKey(editor, key),
         .find_replace => handleFindReplaceKey(editor, key),
         .file_open => handleFileOpenKey(editor, key),
@@ -572,6 +582,11 @@ fn resolvePaneAt(editor: *Editor, col: i16, row: i16) ?struct { pane_id: u8, loc
 const FiletreeBand = struct { x: u16, y: u16, w: u16, h: u16 };
 var filetree_band: ?FiletreeBand = null;
 
+/// Docked search panel rows (full width above the status bar); null when
+/// hidden. Used for mouse hit-testing like filetree_band.
+const SearchBand = struct { y: u16, h: u16 };
+var search_band: ?SearchBand = null;
+
 /// Double-click state for tree rows: single click on a row NAME only
 /// selects; a second click on the same row within the threshold toggles
 /// a folder or opens a file. (The +/- glyph stays single-click.)
@@ -588,10 +603,15 @@ var doc_poll_ns: i128 = 0;
 fn drawEditor(win: Window, editor: *Editor, width: u16, height: u16) void {
     pane_rect_count = 0;
     filetree_band = null;
+    search_band = null;
 
     const tab_bar_height: u16 = if (editor.docCount() > 1) 1 else 0;
     const status_height: u16 = 1;
-    const content_height = height -| tab_bar_height -| status_height;
+    const search_h: u16 = if (editor.search_visible)
+        @min(13, (height -| tab_bar_height -| status_height) / 2)
+    else
+        0;
+    const content_height = height -| tab_bar_height -| status_height -| search_h;
 
     // Tab bar (global, spans full width)
     if (tab_bar_height > 0) {
@@ -634,6 +654,17 @@ fn drawEditor(win: Window, editor: *Editor, width: u16, height: u16) void {
     // one row up / one col right, drawing the cursor next to the wrong line
     // and skewing mouse hit-testing.)
     renderPaneLayout(content_win, editor, 0, content_x, tab_bar_height, content_width, content_height);
+
+    // Docked search panel (full width, above the status bar)
+    if (search_h > 0) {
+        const sw = win.child(.{
+            .y_off = @intCast(tab_bar_height + content_height),
+            .height = search_h,
+            .width = width,
+        });
+        drawSearchPanel(sw, editor, width, search_h);
+        search_band = .{ .y = tab_bar_height + content_height, .h = search_h };
+    }
 
     // Status bar
     const status_win = win.child(.{
@@ -786,6 +817,12 @@ fn mouseOverFiletree(mouse: vaxis.Mouse) bool {
     const mr: i32 = @intCast(mouse.row);
     return mc >= band.x and mc < @as(i32, band.x) + band.w and
         mr >= band.y and mr < @as(i32, band.y) + band.h;
+}
+
+fn mouseOverSearch(mouse: vaxis.Mouse) bool {
+    const band = search_band orelse return false;
+    const mr: i32 = @intCast(mouse.row);
+    return mr >= band.y and mr < @as(i32, band.y) + band.h;
 }
 
 /// Left click inside the file tree band: focus the tree and select the
@@ -1934,6 +1971,14 @@ fn handleMouse(editor: *Editor, mouse: vaxis.Mouse) void {
                     return;
                 }
 
+                // Search panel band: clicks focus the panel / pick a row
+                if (search_band) |band| {
+                    if (mouse.row >= band.y and mouse.row < band.y + band.h) {
+                        handleSearchClick(editor, band, @intCast(mouse.row));
+                        return;
+                    }
+                }
+
                 // File tree band: clicks focus/select/toggle/open in the tree
                 if (filetree_band) |band| {
                     if (mouseOverFiletree(mouse)) {
@@ -2020,7 +2065,9 @@ fn handleMouse(editor: *Editor, mouse: vaxis.Mouse) void {
             }
         },
         .wheel_up => {
-            if (mouseOverFiletree(mouse)) {
+            if (mouseOverSearch(mouse)) {
+                editor.search.moveSelection(false, 3);
+            } else if (mouseOverFiletree(mouse)) {
                 editor.tui_filetree_scroll -|= 3;
             } else {
                 const doc = editor.activeDoc();
@@ -2029,7 +2076,9 @@ fn handleMouse(editor: *Editor, mouse: vaxis.Mouse) void {
             }
         },
         .wheel_down => {
-            if (mouseOverFiletree(mouse)) {
+            if (mouseOverSearch(mouse)) {
+                editor.search.moveSelection(true, 3);
+            } else if (mouseOverFiletree(mouse)) {
                 editor.tui_filetree_scroll +|= 3; // clamped at draw time
             } else {
                 const doc = editor.activeDoc();
@@ -2384,6 +2433,165 @@ fn drawOverlay(win: Window, editor: *Editor, label: []const u8, input: []const u
 }
 
 /// Draw the command palette overlay.
+/// Draw the docked workspace search panel: three input rows, a status /
+/// confirm row, then result rows.
+fn drawSearchPanel(win: Window, editor: *Editor, width: u16, panel_h: u16) void {
+    const sp = &editor.search;
+    const th = &editor.tui_theme;
+    const bg_style: Style = .{ .bg = toVaxis(th.overlay_bg), .fg = toVaxis(th.overlay_fg) };
+    const dim_style: Style = .{ .bg = toVaxis(th.overlay_bg), .fg = toVaxis(th.overlay_dim) };
+    const sel_style: Style = .{ .bg = toVaxis(th.overlay_selection_bg), .fg = toVaxis(th.overlay_selection_fg), .bold = true };
+    const label_active: Style = .{ .bg = toVaxis(th.overlay_bg), .fg = toVaxis(th.overlay_fg), .bold = true, .reverse = true };
+    win.fill(.{ .style = bg_style });
+
+    const focused = editor.search_focused;
+    drawSearchInputRow(win, 0, width, "Search ", sp.query(), focused and sp.field == .query, bg_style, label_active);
+    drawSearchInputRow(win, 1, width, "Replace", sp.replacement(), focused and sp.field == .replace, bg_style, label_active);
+    drawSearchInputRow(win, 2, width, "Filter ", sp.filter(), focused and sp.field == .filter, bg_style, label_active);
+
+    // Status / confirm row
+    var sbuf: [300]u8 = undefined;
+    var status_style = dim_style;
+    const status_txt = blk: {
+        if (sp.confirm_armed) {
+            status_style = bg_style;
+            const tgt = sp.replaceTargets(editor);
+            break :blk std.fmt.bufPrint(&sbuf, "Replace {d} match(es)? [A]ll ({d} open + {d} on disk — disk is NOT undoable) / [O]pen docs only / [C]ancel", .{ sp.matches.items.len, tgt.open, tgt.disk }) catch "Replace? [A]ll / [O]pen only / [C]ancel";
+        }
+        const case_s: []const u8 = if (sp.case_sensitive) "[Aa]" else " aa ";
+        const word_s: []const u8 = if (sp.whole_word) "[W]" else " w ";
+        const busy: []const u8 = if (sp.searching) "  searching…" else "";
+        const cap: []const u8 = if (sp.capped) "  (capped)" else "";
+        break :blk std.fmt.bufPrint(&sbuf, "{s}{s}  {d} match(es) in {d} file(s), {d} scanned{s}{s}   Alt+C case · Alt+W word · Tab fields · Enter on Replace = replace all", .{ case_s, word_s, sp.matches.items.len, sp.paths.items.len, sp.files_searched, busy, cap }) catch "";
+    };
+    const srow = win.child(.{ .y_off = 3, .height = 1, .width = width });
+    srow.fill(.{ .style = status_style });
+    _ = writeStr(srow, 0, 0, status_txt, status_style);
+
+    // Result rows
+    const rows: usize = panel_h -| 4;
+    if (rows == 0 or sp.matches.items.len == 0) return;
+    if (sp.selected < sp.scroll) sp.scroll = sp.selected;
+    if (sp.selected >= sp.scroll + rows) sp.scroll = sp.selected - rows + 1;
+    if (sp.scroll >= sp.matches.items.len) sp.scroll = sp.matches.items.len - 1;
+    var r: usize = 0;
+    while (r < rows) : (r += 1) {
+        const idx = sp.scroll + r;
+        if (idx >= sp.matches.items.len) break;
+        const m = sp.matches.items[idx];
+        var rbuf: [512]u8 = undefined;
+        const txt = std.fmt.bufPrint(&rbuf, " {s}:{d}: {s}", .{ sp.paths.items[m.path_idx], m.line + 1, m.excerpt }) catch " ?";
+        const is_sel = idx == sp.selected;
+        const row_win = win.child(.{ .y_off = @intCast(4 + r), .height = 1, .width = width });
+        if (is_sel) row_win.fill(.{ .style = sel_style });
+        _ = writeStr(row_win, 0, 0, txt, if (is_sel) sel_style else bg_style);
+    }
+}
+
+fn drawSearchInputRow(win: Window, y: u16, width: u16, label: []const u8, value: []const u8, active: bool, base: Style, active_label: Style) void {
+    const row = win.child(.{ .y_off = @intCast(y), .height = 1, .width = width });
+    row.fill(.{ .style = base });
+    var x = writeStr(row, 0, 0, label, if (active) active_label else base);
+    x = writeStr(row, x, 0, " ", base);
+    x = writeStr(row, x, 0, value, base);
+    if (active) _ = writeStr(row, x, 0, "_", base);
+}
+
+/// Keys while the search panel owns the keyboard.
+fn handleSearchKey(editor: *Editor, key: Key) void {
+    const sp = &editor.search;
+    if (key.isModifier()) return;
+
+    if (sp.confirm_armed) {
+        switch (key.codepoint) {
+            'a', 'A' => editor.searchExecuteReplace(.all),
+            'o', 'O' => editor.searchExecuteReplace(.open_only),
+            'c', 'C', Key.escape => sp.confirm_armed = false,
+            else => {},
+        }
+        return;
+    }
+    if (key.codepoint == Key.escape) {
+        editor.searchHide();
+        return;
+    }
+    // Global chords still work from the panel (Ctrl+Shift+F cycle, F4, …)
+    if (tryKeybindCommand(editor, key)) return;
+    if (key.mods.alt) {
+        switch (key.codepoint) {
+            'c' => {
+                sp.case_sensitive = !sp.case_sensitive;
+                if (sp.query_len > 0) editor.searchStart();
+            },
+            'w' => {
+                sp.whole_word = !sp.whole_word;
+                if (sp.query_len > 0) editor.searchStart();
+            },
+            else => {},
+        }
+        return;
+    }
+    if (key.codepoint == Key.tab) {
+        sp.cycleField();
+        return;
+    }
+    if (key.codepoint == Key.enter) {
+        switch (sp.field) {
+            .query, .filter => editor.searchStart(),
+            .replace => {
+                if (sp.matches.items.len > 0) sp.confirm_armed = true;
+            },
+            .results => editor.searchOpenSelected(),
+        }
+        return;
+    }
+    if (key.codepoint == Key.up) {
+        sp.moveSelection(false, 1);
+        return;
+    }
+    if (key.codepoint == Key.down) {
+        sp.moveSelection(true, 1);
+        return;
+    }
+    if (key.codepoint == Key.page_up) {
+        sp.moveSelection(false, 8);
+        return;
+    }
+    if (key.codepoint == Key.page_down) {
+        sp.moveSelection(true, 8);
+        return;
+    }
+    if (key.codepoint == Key.backspace) {
+        sp.backspace();
+        return;
+    }
+    if (key.codepoint >= 32 and key.codepoint < 127) {
+        const ch: [1]u8 = .{@intCast(key.codepoint)};
+        sp.appendText(&ch);
+    }
+}
+
+/// Click inside the search band: focus the panel, pick a field or result.
+fn handleSearchClick(editor: *Editor, band: SearchBand, row: u16) void {
+    const sp = &editor.search;
+    editor.search_focused = true;
+    editor.filetree_focused = false;
+    const rel = row - band.y;
+    switch (rel) {
+        0 => sp.field = .query,
+        1 => sp.field = .replace,
+        2 => sp.field = .filter,
+        3 => {},
+        else => {
+            const idx = sp.scroll + (rel - 4);
+            if (idx < sp.matches.items.len) {
+                sp.field = .results;
+                sp.selected = idx;
+            }
+        },
+    }
+}
+
 /// Draw the fuzzy file finder overlay (same layout as the palette; the
 /// previewed file renders in the pane behind it).
 fn drawFileFinder(win: Window, editor: *Editor, width: u16, height: u16) void {

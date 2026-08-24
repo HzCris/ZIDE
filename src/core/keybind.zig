@@ -69,6 +69,9 @@ pub const KeybindMap = struct {
         try self.set("ctrl+o", "file_open");
         try self.set("ctrl+p", "command_palette");
         try self.set("ctrl+e", "quick_open");
+        try self.set("ctrl+shift+f", "find_in_files");
+        try self.set("f4", "next_result");
+        try self.set("shift+f4", "prev_result");
         try self.set("ctrl+g", "goto_line");
         try self.set("ctrl+shift+d", "duplicate_line");
         try self.set("ctrl+k", "delete_line");

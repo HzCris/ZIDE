@@ -204,6 +204,9 @@ pub fn registerBuiltins(registry: *CommandRegistry) !void {
     try registry.register("next_todo", "Jump to next TODO/FIXME/XXX/HACK/BUG/NOTE marker", cmdNextTodo);
     try registry.register("open_documentation", "Open ZIDE documentation (Documentation.md)", cmdOpenDocumentation);
     try registry.register("quick_open", "Fuzzy-find a file in the workspace (live preview)", cmdQuickOpen);
+    try registry.register("find_in_files", "Search & replace across the workspace (results panel)", cmdFindInFiles);
+    try registry.register("next_result", "Jump to the next workspace search result", cmdNextResult);
+    try registry.register("prev_result", "Jump to the previous workspace search result", cmdPrevResult);
     try registry.register("reload_extensions", "Reload Lua extensions (re-runs extensions/*.lua)", cmdReloadExtensions);
     // File tree commands
     try registry.register("toggle_filetree", "Toggle the file tree side panel", cmdToggleFiletree);
@@ -879,6 +882,20 @@ fn cmdCursorFileEndSelect(editor: *Editor, _: ?[]const u8) void {
 
 fn cmdQuickOpen(editor: *Editor, _: ?[]const u8) void {
     editor.finderOpen();
+}
+
+// --- Workspace search & replace ---
+
+fn cmdFindInFiles(editor: *Editor, _: ?[]const u8) void {
+    editor.searchToggle();
+}
+
+fn cmdNextResult(editor: *Editor, _: ?[]const u8) void {
+    editor.searchCycleResult(true);
+}
+
+fn cmdPrevResult(editor: *Editor, _: ?[]const u8) void {
+    editor.searchCycleResult(false);
 }
 
 // --- Documentation ---
