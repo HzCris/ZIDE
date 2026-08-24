@@ -128,6 +128,7 @@ Windows terminals commonly intercept Alt combos (Windows Terminal binds Alt+arro
 - Open file by path (Ctrl+O)
 - Save (Ctrl+S), Save As (Ctrl+Shift+S)
 - Line ending detection (LF / CRLF)
+- External change detection: open files are polled (~1.5s, same cadence as the file tree probe) — clean buffers reload in place with the cursor preserved; dirty buffers are flagged and saving asks `[O]verwrite [R]eload [C]ancel` instead of silently clobbering; auto-save skips flagged files; a file deleted on disk marks its buffer dirty so the content survives and can be re-saved
 - Dirty tracking
 - Unsaved changes prompt on quit (Save/Discard/Cancel)
 - Session persistence (opt-in: `zide.set("session_persistence", true)` or the Settings dialog): on quit the open files, cursor positions, scroll offsets and active tab are written to `~/.config/zide/session`; launching ZIDE without file arguments restores them (missing files are skipped, untitled buffers are not recorded). Applies to both frontends.
@@ -175,6 +176,7 @@ Windows terminals commonly intercept Alt combos (Windows Terminal binds Alt+arro
 - Markdown editing: Enter continues list/quote markers (`- `, `1. ` with auto-increment, `> `, `- [ ] `); Enter on an empty item ends the list; `toggle_checkbox` palette command flips `[ ]`/`[x]` (bundled `extensions/markdown.lua`)
 - Word wrap (word-boundary aware, configurable, wrap continuation markers)
 - Save / Save As (native OS file dialog)
+- External change detection (same behavior as the TUI): clean buffers auto-reload when the file changes on disk; dirty buffers get a `[O]verwrite [R]eload [C]ancel` prompt on save; auto-save never clobbers an external change
 - Open file (native OS file dialog)
 - Multi-document tabs (tab bar with close buttons)
 - New document (Ctrl+N)

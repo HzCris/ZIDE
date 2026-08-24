@@ -321,6 +321,16 @@ pub fn run(allocator: std.mem.Allocator, editor: *Editor) !void {
             }
         }
 
+        // Open buffers: pick up external edits — reload clean docs, flag
+        // dirty ones (save then asks). Same cheap-stat cadence as the tree.
+        {
+            const poll_now: i128 = std.Io.Clock.now(.awake, editor.io).nanoseconds;
+            if (poll_now - doc_poll_ns > 1500 * std.time.ns_per_ms) {
+                doc_poll_ns = poll_now;
+                editor.pollExternalChanges();
+            }
+        }
+
         // Update page_size based on terminal height
         const win = vx.window();
         const width = win.width;
@@ -382,6 +392,9 @@ pub fn run(allocator: std.mem.Allocator, editor: *Editor) !void {
             },
             .confirm_quit => {
                 drawOverlay(win, editor, "Unsaved changes! [S]ave [D]iscard [C]ancel: ", "", width, height);
+            },
+            .confirm_overwrite => {
+                drawOverlay(win, editor, "File changed on disk! [O]verwrite [R]eload [C]ancel: ", "", width, height);
             },
             .settings => {
                 // Settings panel is GUI-only; in TUI just show a hint
@@ -450,6 +463,7 @@ fn dispatchKey(editor: *Editor, key: Key) void {
         .command_palette => handlePaletteKey(editor, key),
         .goto_line => handleGotoLineKey(editor, key),
         .confirm_quit => handleConfirmQuitKey(editor, key),
+        .confirm_overwrite => handleConfirmOverwriteKey(editor, key),
         .settings => {
             // Settings panel is GUI-only; Escape returns to normal
             if (key.codepoint == 0x1b) editor.mode = .normal; // Escape
@@ -563,6 +577,8 @@ var filetree_last_click_row: usize = std.math.maxInt(usize);
 /// Last external-change mtime probe (run-loop poll; the TUI loop is
 /// event-driven, so the check fires when input arrives).
 var filetree_poll_ns: i128 = 0;
+/// Last open-document external-change probe (same event-driven cadence).
+var doc_poll_ns: i128 = 0;
 
 /// Draw the full editor screen.
 fn drawEditor(win: Window, editor: *Editor, width: u16, height: u16) void {
@@ -2741,6 +2757,17 @@ fn replaceAll(editor: *Editor) void {
             @as([]const u8, if (count == 1) "" else "s"),
         }) catch "Replaced all";
         editor.status_message = msg;
+    }
+}
+
+/// Handle keys in Confirm Overwrite mode (disk changed under a save).
+fn handleConfirmOverwriteKey(editor: *Editor, key: Key) void {
+    if (key.isModifier()) return;
+    switch (key.codepoint) {
+        'o', 'O' => editor.resolveOverwrite(.overwrite),
+        'r', 'R' => editor.resolveOverwrite(.reload),
+        'c', 'C', 0x1b => editor.resolveOverwrite(.cancel), // 0x1b = Escape
+        else => {},
     }
 }
 

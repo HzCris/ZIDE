@@ -384,6 +384,16 @@ pub fn frame(editor: *Editor) bool {
         }
     }
 
+    // Open buffers: pick up external edits — reload clean docs, flag dirty
+    // ones (save then asks). Same cheap-stat cadence as the tree poll.
+    {
+        const poll_now: i128 = std.Io.Clock.now(.awake, editor.io).nanoseconds;
+        if (poll_now - doc_poll_ns > 1500 * std.time.ns_per_ms) {
+            doc_poll_ns = poll_now;
+            editor.pollExternalChanges();
+        }
+    }
+
     // Auto-save check
     if (editor.auto_save and editor.hasUnsavedChanges()) {
         const now_ns: i128 = std.Io.Clock.now(.awake, editor.io).nanoseconds;
@@ -869,6 +879,8 @@ fn filetreeDndArm(editor: *Editor, ft: *FileTree, p: dvui.Point.Physical, r: usi
 }
 /// Last external-change mtime probe (see the poll in frame()).
 var filetree_poll_ns: i128 = 0;
+/// Last open-document external-change probe (see the poll in frame()).
+var doc_poll_ns: i128 = 0;
 /// Row under the mouse cursor (hover highlight); null when the pointer
 /// is outside the panel or a drag is in flight.
 var filetree_hover_row: ?usize = null;
@@ -3987,6 +3999,12 @@ fn openFileDialog(editor: *Editor) void {
 fn save(editor: *Editor) void {
     const doc = editor.activeDoc();
     if (doc.file_path != null) {
+        // Disk changed since load/save — prompt instead of clobbering.
+        if (doc.checkExternalChange(editor.io)) {
+            doc.external_changed = true;
+            editor.mode = .confirm_overwrite;
+            return;
+        }
         doc.save(editor.io) catch |err| {
             editor.status_message = @errorName(err);
             return;
@@ -4393,6 +4411,7 @@ fn handleModalKey(editor: *Editor, key: dvui.Event.Key) void {
         .find_replace => handleFindReplaceKeyGui(editor, key),
         .command_palette => handlePaletteKeyGui(editor, key),
         .confirm_quit => handleConfirmQuitKeyGui(editor, key),
+        .confirm_overwrite => handleConfirmOverwriteKeyGui(editor, key),
         .settings => {}, // DVUI dialog handles its own input (settingsDialog)
         .file_open, .save_as => {}, // handled by native dialogs in GUI
         .filetree_prompt => handleFiletreePromptKeyGui(editor, key),
@@ -4590,6 +4609,16 @@ fn handleFiletreePromptKeyGui(editor: *Editor, key: dvui.Event.Key) void {
         .backspace => {
             if (editor.open_buf_len > 0) editor.open_buf_len -= 1;
         },
+        else => {},
+    }
+}
+
+/// Confirm Overwrite mode (disk changed under a save).
+fn handleConfirmOverwriteKeyGui(editor: *Editor, key: dvui.Event.Key) void {
+    switch (key.code) {
+        .o => editor.resolveOverwrite(.overwrite),
+        .r => editor.resolveOverwrite(.reload),
+        .c, .escape => editor.resolveOverwrite(.cancel),
         else => {},
     }
 }
@@ -5464,6 +5493,11 @@ fn drawModalOverlay(editor: *Editor, render_area: dvui.Rect.Physical, render_rs:
             const h = lh + pad * 2;
             fillBar(render_area, 0, h, bg);
             renderOverlayText(font, "Unsaved changes! [S]ave [D]iscard [C]ancel", render_area.x + pad, render_area.y + pad, render_rs, fg);
+        },
+        .confirm_overwrite => {
+            const h = lh + pad * 2;
+            fillBar(render_area, 0, h, bg);
+            renderOverlayText(font, "File changed on disk! [O]verwrite [R]eload [C]ancel", render_area.x + pad, render_area.y + pad, render_rs, fg);
         },
         // .settings is a real DVUI floating dialog now (settingsDialog),
         // not a custom-rendered overlay.

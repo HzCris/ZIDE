@@ -260,6 +260,9 @@ pub const Editor = struct {
         command_palette,
         goto_line,
         confirm_quit,
+        /// Save requested but the file changed on disk since load —
+        /// user picks overwrite / reload / cancel (resolveOverwrite).
+        confirm_overwrite,
         settings,
         filetree_prompt,
     };
@@ -1101,6 +1104,13 @@ pub const Editor = struct {
         }
         if (std.mem.eql(u8, action, "save")) {
             const doc = self.activeDoc();
+            // Disk changed since load/save (external edit or delete) —
+            // don't clobber it silently; let the user decide.
+            if (doc.file_path != null and doc.checkExternalChange(self.io)) {
+                doc.external_changed = true;
+                self.mode = .confirm_overwrite;
+                return true;
+            }
             doc.save(self.io) catch |err| {
                 if (err == error.NoFilePath) {
                     // Untitled buffer — route to Save As instead of silently
@@ -1276,12 +1286,83 @@ pub const Editor = struct {
         return self.clipboard;
     }
 
+    /// Poll open documents for external changes (frontends call this on a
+    /// ~1.5s timer, like the file tree's probe). Clean buffers reload in
+    /// place; dirty buffers are flagged so save prompts; vanished files are
+    /// flagged AND marked dirty so quit protects the surviving buffer.
+    pub fn pollExternalChanges(self: *Editor) void {
+        for (self.documents.items) |*doc| {
+            const path = doc.file_path orelse continue;
+            if (doc.external_changed) continue; // flagged; waiting on the user
+            if (doc.disk_mtime == null) continue; // no stamp to compare
+            const st = std.Io.Dir.cwd().statFile(self.io, path, .{}) catch {
+                doc.external_changed = true;
+                doc.dirty = true;
+                const msg = std.fmt.bufPrint(&self.status_buf, "{s}: file deleted on disk (buffer kept)", .{doc.display_name}) catch "File deleted on disk (buffer kept)";
+                self.status_message = msg;
+                continue;
+            };
+            if (st.mtime.nanoseconds == doc.disk_mtime.?) continue;
+            if (doc.dirty) {
+                doc.external_changed = true;
+                const msg = std.fmt.bufPrint(&self.status_buf, "{s} changed on disk — saving will ask", .{doc.display_name}) catch "File changed on disk";
+                self.status_message = msg;
+            } else {
+                doc.reloadFromDisk(self.io) catch {
+                    doc.external_changed = true;
+                    continue;
+                };
+                const msg = std.fmt.bufPrint(&self.status_buf, "{s} reloaded (changed on disk)", .{doc.display_name}) catch "Reloaded (changed on disk)";
+                self.status_message = msg;
+            }
+        }
+    }
+
+    pub const OverwriteChoice = enum { overwrite, reload, cancel };
+
+    /// Resolve the .confirm_overwrite prompt for the active document.
+    pub fn resolveOverwrite(self: *Editor, choice: OverwriteChoice) void {
+        const doc = self.activeDoc();
+        self.mode = .normal;
+        switch (choice) {
+            .overwrite => {
+                doc.save(self.io) catch |err| {
+                    const msg = std.fmt.bufPrint(&self.status_buf, "Save failed: {s}", .{@errorName(err)}) catch "Save failed";
+                    self.status_message = msg;
+                    return;
+                };
+                self.lspDidSave(doc);
+                self.noteFileSaved(false, doc);
+                const msg = std.fmt.bufPrint(&self.status_buf, "Saved {s} (overwrote external change)", .{doc.display_name}) catch "Saved";
+                self.status_message = msg;
+            },
+            .reload => {
+                doc.reloadFromDisk(self.io) catch |err| {
+                    const msg = std.fmt.bufPrint(&self.status_buf, "Reload failed: {s}", .{@errorName(err)}) catch "Reload failed";
+                    self.status_message = msg;
+                    return;
+                };
+                const msg = std.fmt.bufPrint(&self.status_buf, "Reloaded {s} from disk", .{doc.display_name}) catch "Reloaded";
+                self.status_message = msg;
+            },
+            .cancel => {
+                self.status_message = "Save cancelled (file changed on disk)";
+            },
+        }
+    }
+
     /// Auto-save all dirty documents that have a file path.
     /// Returns the number of documents saved.
     pub fn autoSaveAll(self: *Editor) usize {
         var saved: usize = 0;
         for (self.documents.items) |*doc| {
             if (doc.dirty and doc.file_path != null) {
+                // Never auto-clobber an external change — a timer can't
+                // ask; flag it and let the explicit save path prompt.
+                if (doc.external_changed or doc.checkExternalChange(self.io)) {
+                    doc.external_changed = true;
+                    continue;
+                }
                 doc.save(self.io) catch continue;
                 saved += 1;
                 // Per-document extension event; the file tree note below
@@ -1926,4 +2007,71 @@ test "editor undo via command" {
 
     _ = editor.execCommand("redo", null);
     try std.testing.expectEqualStrings("Xhello", editor.activeDoc().lineContent(0));
+}
+
+test "editor external-change poll and save guard" {
+    const t = std.testing;
+    const path = ".zig-cache/zide-test-editor-external.txt";
+    {
+        const f = try std.Io.Dir.cwd().createFile(t.io, path, .{});
+        defer f.close(t.io);
+        try f.writeStreamingAll(t.io, "one\n");
+    }
+    defer std.Io.Dir.cwd().deleteFile(t.io, path) catch {};
+
+    var editor = try Editor.init(t.allocator, t.io);
+    defer editor.deinit();
+    const doc = try editor.openFile(path);
+
+    // Rewrite on disk until the mtime visibly moves (coarse Windows ticks)
+    var attempts: usize = 0;
+    while (!doc.checkExternalChange(t.io) and attempts < 10_000) : (attempts += 1) {
+        const f = std.Io.Dir.cwd().createFile(t.io, path, .{}) catch break;
+        defer f.close(t.io);
+        f.writeStreamingAll(t.io, "two\n") catch break;
+    }
+
+    // Clean buffer: poll reloads in place
+    editor.pollExternalChanges();
+    try t.expectEqualStrings("two\n", doc.buffer.slice(0, doc.buffer.byteLen()));
+    try t.expect(!doc.external_changed);
+
+    // Dirty buffer: poll flags instead of reloading
+    try doc.insertAtCursor("local ");
+    attempts = 0;
+    while (!doc.checkExternalChange(t.io) and attempts < 10_000) : (attempts += 1) {
+        const f = std.Io.Dir.cwd().createFile(t.io, path, .{}) catch break;
+        defer f.close(t.io);
+        f.writeStreamingAll(t.io, "three\n") catch break;
+    }
+    editor.pollExternalChanges();
+    try t.expect(doc.external_changed);
+    try t.expectEqualStrings("local two\n", doc.buffer.slice(0, doc.buffer.byteLen()));
+
+    // Save now prompts instead of clobbering
+    try t.expect(editor.execAction("save"));
+    try t.expectEqual(Editor.Mode.confirm_overwrite, editor.mode);
+
+    // Reload choice takes the disk content ("three\n" survived the blocked
+    // save) and returns to normal mode
+    editor.resolveOverwrite(.reload);
+    try t.expectEqual(Editor.Mode.normal, editor.mode);
+    try t.expectEqualStrings("three\n", doc.buffer.slice(0, doc.buffer.byteLen()));
+    try t.expect(!doc.dirty);
+    try t.expect(!doc.external_changed);
+
+    // Overwrite choice: dirty the buffer, change disk again, save over it
+    try doc.insertAtCursor("mine ");
+    attempts = 0;
+    while (!doc.checkExternalChange(t.io) and attempts < 10_000) : (attempts += 1) {
+        const f = std.Io.Dir.cwd().createFile(t.io, path, .{}) catch break;
+        defer f.close(t.io);
+        f.writeStreamingAll(t.io, "four\n") catch break;
+    }
+    try t.expect(editor.execAction("save"));
+    try t.expectEqual(Editor.Mode.confirm_overwrite, editor.mode);
+    editor.resolveOverwrite(.overwrite);
+    try t.expectEqual(Editor.Mode.normal, editor.mode);
+    try t.expect(!doc.dirty);
+    try t.expect(!doc.checkExternalChange(t.io)); // mtime re-stamped
 }

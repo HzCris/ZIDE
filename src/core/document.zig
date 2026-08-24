@@ -31,6 +31,11 @@ pub const Document = struct {
     readonly: bool = false,
     /// Whether the file uses CRLF line endings.
     crlf: bool = false,
+    /// On-disk mtime (ns) recorded at load/save — external-change detection.
+    disk_mtime: ?i96 = null,
+    /// The disk copy changed under a dirty buffer (or the file vanished):
+    /// saving prompts before overwriting. Cleared by save/reload.
+    external_changed: bool = false,
 
     /// Scroll state: top visible line.
     scroll_top: usize = 0,
@@ -154,6 +159,8 @@ pub const Document = struct {
         self.invalidateLineStates(0);
         self.resetCursors();
         self.detectLineEndings();
+        self.external_changed = false;
+        self.refreshDiskMtime(io);
     }
 
     /// Update the stored file path (e.g. after a rename on disk) without
@@ -182,6 +189,8 @@ pub const Document = struct {
         const path = self.file_path orelse return error.NoFilePath;
         try self.buffer.saveFile(io, path);
         self.dirty = false;
+        self.external_changed = false;
+        self.refreshDiskMtime(io);
     }
 
     /// Save to a new path (Save As).
@@ -193,6 +202,53 @@ pub const Document = struct {
         self.file_path = try self.allocator.dupe(u8, path);
         self.setDisplayNameFromPath(path);
         self.dirty = false;
+        self.external_changed = false;
+        self.refreshDiskMtime(io);
+    }
+
+    /// Record the file's current on-disk mtime (null when stat fails).
+    pub fn refreshDiskMtime(self: *Document, io: std.Io) void {
+        const path = self.file_path orelse {
+            self.disk_mtime = null;
+            return;
+        };
+        const st = std.Io.Dir.cwd().statFile(io, path, .{}) catch {
+            self.disk_mtime = null;
+            return;
+        };
+        self.disk_mtime = st.mtime.nanoseconds;
+    }
+
+    /// True when the disk copy no longer matches what was loaded/saved
+    /// (different mtime, or the file vanished).
+    pub fn checkExternalChange(self: *const Document, io: std.Io) bool {
+        const path = self.file_path orelse return false;
+        const recorded = self.disk_mtime orelse return false;
+        const st = std.Io.Dir.cwd().statFile(io, path, .{}) catch return true;
+        return st.mtime.nanoseconds != recorded;
+    }
+
+    /// Re-read the file from disk, replacing buffer contents. Cursor and
+    /// scroll survive (clamped to the new content); undo history is cleared
+    /// — undoing across a content swap would corrupt the buffer. (No binary
+    /// probe here: a text file morphing to binary mid-session isn't worth
+    /// guarding.)
+    pub fn reloadFromDisk(self: *Document, io: std.Io) !void {
+        const path = self.file_path orelse return error.NoFilePath;
+        const cursor_offset = self.cursors.primaryConst().offset;
+        const scroll = self.scroll_top;
+        try self.buffer.loadFile(io, path);
+        self.dirty = false;
+        self.external_changed = false;
+        self.history.clear();
+        self.invalidateLineStates(0);
+        self.resetCursors();
+        self.detectLineEndings();
+        // Content changed: bump so syncLspDocuments pushes a fresh didChange.
+        self.lsp_version +%= 1;
+        self.cursors.primary().offset = @min(cursor_offset, self.buffer.byteLen());
+        self.scroll_top = @min(scroll, self.buffer.lineCount() -| 1);
+        self.refreshDiskMtime(io);
     }
 
     /// Insert text at the primary cursor position.
@@ -1337,4 +1393,50 @@ test "document line ending detection" {
 
     try doc.loadText("hello\nworld");
     try std.testing.expect(!doc.crlf);
+}
+
+test "document external change detection and reload" {
+    const t = std.testing;
+    const path = ".zig-cache/zide-test-external.txt";
+    {
+        const f = try std.Io.Dir.cwd().createFile(t.io, path, .{});
+        defer f.close(t.io);
+        try f.writeStreamingAll(t.io, "hello\nworld\n");
+    }
+    defer std.Io.Dir.cwd().deleteFile(t.io, path) catch {};
+
+    var doc = try Document.init(t.allocator);
+    defer doc.deinit();
+    try doc.open(t.io, path);
+    try t.expect(doc.disk_mtime != null);
+    try t.expect(!doc.checkExternalChange(t.io));
+
+    // Rewrite behind the editor's back until the mtime visibly moves
+    // (Windows file times tick coarsely — same churn as the filetree test).
+    var attempts: usize = 0;
+    while (!doc.checkExternalChange(t.io) and attempts < 10_000) : (attempts += 1) {
+        const f = std.Io.Dir.cwd().createFile(t.io, path, .{}) catch break;
+        defer f.close(t.io);
+        f.writeStreamingAll(t.io, "hello\nworld\nagain\n") catch break;
+    }
+    try t.expect(doc.checkExternalChange(t.io));
+
+    // Reload picks up new content, keeps the cursor, clears flags
+    doc.cursors.primary().offset = 12; // end of the old content
+    try doc.reloadFromDisk(t.io);
+    try t.expectEqualStrings("hello\nworld\nagain\n", doc.buffer.slice(0, doc.buffer.byteLen()));
+    try t.expectEqual(@as(usize, 12), doc.cursors.primaryConst().offset);
+    try t.expect(!doc.checkExternalChange(t.io));
+    try t.expect(!doc.dirty);
+
+    // Saving re-stamps the mtime so our own write isn't a "change"
+    try doc.buffer.loadText("mine\n");
+    doc.dirty = true;
+    try doc.save(t.io);
+    try t.expect(!doc.checkExternalChange(t.io));
+    try t.expect(!doc.external_changed);
+
+    // A vanished file counts as changed
+    try std.Io.Dir.cwd().deleteFile(t.io, path);
+    try t.expect(doc.checkExternalChange(t.io));
 }
