@@ -102,6 +102,7 @@ const welcome_text =
     \\// Find & go
     \\//   Ctrl+F            find               Ctrl+H           find & replace
     \\//   Ctrl+G            go to line         Ctrl+P           command palette
+    \\//   Ctrl+E            open file by fuzzy name (arrows live-preview, Esc restores)
     \\//   Ctrl+Left/Right   jump by word       Ctrl+Home/End    file start / end
     \\//   (add Shift to the two above to select while moving)
     \\//

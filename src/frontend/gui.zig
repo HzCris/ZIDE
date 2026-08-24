@@ -613,6 +613,7 @@ pub fn frame(editor: *Editor) bool {
         defer tab_box.deinit();
 
         for (editor.documents.items, 0..) |doc, i| {
+            if (doc.preview) continue; // hidden from the tab bar
             const is_active = (i == editor.active_doc_idx);
             var label_buf: [256]u8 = undefined;
             const dirty_marker: []const u8 = if (doc.dirty) " *" else "";
@@ -2303,6 +2304,18 @@ fn editorPane(editor: *Editor, pane_id: u8) void {
                 if (e.evt != .mouse) continue;
                 switch (e.evt.mouse.action) {
                     .press, .release, .motion => e.handle(@src(), wd),
+                    .wheel_y => |delta| {
+                        // Quick-open: let the wheel peek deeper into the
+                        // live preview behind the finder panel.
+                        if (editor.mode == .file_finder) {
+                            e.handle(@src(), wd);
+                            scroll_pinned = true;
+                            const scroll_lines: i32 = @intFromFloat(@round(-delta / dvui.scroll_speed * 3));
+                            const new_top = @as(i64, @intCast(doc.scroll_top)) + scroll_lines;
+                            const max_top: i64 = @intCast(doc.buffer.lineCount() -| 1);
+                            doc.scroll_top = @intCast(@max(0, @min(new_top, max_top)));
+                        }
+                    },
                     else => {},
                 }
             }
@@ -4410,6 +4423,7 @@ fn handleModalKey(editor: *Editor, key: dvui.Event.Key) void {
         .find => handleFindKeyGui(editor, key),
         .find_replace => handleFindReplaceKeyGui(editor, key),
         .command_palette => handlePaletteKeyGui(editor, key),
+        .file_finder => handleFinderKeyGui(editor, key),
         .confirm_quit => handleConfirmQuitKeyGui(editor, key),
         .confirm_overwrite => handleConfirmOverwriteKeyGui(editor, key),
         .settings => {}, // DVUI dialog handles its own input (settingsDialog)
@@ -4454,6 +4468,10 @@ fn handleModalText(editor: *Editor, txt: []const u8) void {
         .command_palette => {
             guiAppendText(&editor.palette_buf, &editor.palette_buf_len, txt);
             editor.palette_selected = 0;
+        },
+        .file_finder => {
+            guiAppendText(&editor.finder_buf, &editor.finder_buf_len, txt);
+            editor.finderRefresh();
         },
         else => {},
     }
@@ -4541,6 +4559,34 @@ fn handleFindReplaceKeyGui(editor: *Editor, key: dvui.Event.Key) void {
                 guiReplaceAll(editor);
             }
         },
+    }
+}
+
+/// Fuzzy File Finder mode (quick_open); typed characters arrive via
+/// handleModalText.
+fn handleFinderKeyGui(editor: *Editor, key: dvui.Event.Key) void {
+    switch (key.code) {
+        .escape => editor.finderCancel(),
+        .enter => editor.finderCommit(),
+        .down, .tab => editor.finderMove(true),
+        .up => editor.finderMove(false),
+        .page_down => {
+            // Keyboard parity with the wheel: scroll the preview behind
+            // the panel (pin so ensureCursorVisible doesn't yank it back).
+            scroll_pinned = true;
+            editor.finderScrollPage(true);
+        },
+        .page_up => {
+            scroll_pinned = true;
+            editor.finderScrollPage(false);
+        },
+        .backspace => {
+            if (editor.finder_buf_len > 0) {
+                editor.finder_buf_len -= 1;
+                editor.finderRefresh();
+            }
+        },
+        else => {},
     }
 }
 
@@ -5487,6 +5533,67 @@ fn drawModalOverlay(editor: *Editor, render_area: dvui.Rect.Physical, render_rs:
                 }
                 item_y += lh + pad;
                 shown += 1;
+            }
+        },
+        .file_finder => {
+            const filter = editor.finder_buf[0..editor.finder_buf_len];
+            const max_items: usize = 8;
+            const match_count = @min(editor.finder_matches.items.len, max_items);
+            if (match_count > 0) {
+                if (editor.finder_selected >= match_count) editor.finder_selected = match_count - 1;
+            } else {
+                editor.finder_selected = 0;
+            }
+            // Compact top-centered dropdown with an OPAQUE background — the
+            // whole point is reading the live preview around and below it,
+            // so no full-width bar and no translucent overlay_bg here.
+            const row_h = lh + pad;
+            const rows: f32 = @floatFromInt(@max(match_count, 1)); // one row for "(no matches)"
+            const panel_w = @min(render_area.w * 0.9, 640 * scale);
+            const panel_h = row_h * (rows + 1) + pad * 2;
+            // Bottom-anchored: the preview's opening lines stay visible at
+            // the top, and the wheel can scroll the preview for more.
+            const panel: dvui.Rect.Physical = .{
+                .x = render_area.x + (render_area.w - panel_w) / 2,
+                .y = render_area.y + @max(0, render_area.h - panel_h - 8 * scale),
+                .w = panel_w,
+                .h = panel_h,
+            };
+            var border = dim;
+            border.a = 255;
+            panel.fill(.{}, .{ .color = border, .fade = 1.0 });
+            var solid_bg = bg;
+            solid_bg.a = 255;
+            const inset = @max(1.0, 1 * scale);
+            const inner: dvui.Rect.Physical = .{
+                .x = panel.x + inset,
+                .y = panel.y + inset,
+                .w = panel.w - inset * 2,
+                .h = panel.h - inset * 2,
+            };
+            inner.fill(.{}, .{ .color = solid_bg, .fade = 1.0 });
+
+            const prev_clip = dvui.clip(panel);
+            defer dvui.clipSet(prev_clip);
+
+            var input_buf: [300]u8 = undefined;
+            const input_txt = std.fmt.bufPrint(&input_buf, "> {s}_", .{filter}) catch "> ";
+            renderOverlayText(font, input_txt, panel.x + pad, panel.y + pad, render_rs, fg);
+            const sel_highlight = toDvui(editor.theme.overlay_selection);
+            var item_y: f32 = panel.y + pad + row_h;
+            for (editor.finder_matches.items[0..match_count], 0..) |fi, shown| {
+                const path = editor.finder_files.items[fi];
+                if (shown == editor.finder_selected) {
+                    const bar: dvui.Rect.Physical = .{ .x = inner.x, .y = item_y, .w = inner.w, .h = row_h };
+                    bar.fill(.{}, .{ .color = sel_highlight, .fade = 1.0 });
+                    renderOverlayText(font, path, panel.x + pad + pad, item_y, render_rs, fg);
+                } else {
+                    renderOverlayText(font, path, panel.x + pad + pad, item_y, render_rs, dim);
+                }
+                item_y += row_h;
+            }
+            if (editor.finder_matches.items.len == 0) {
+                renderOverlayText(font, "(no matching files)", panel.x + pad + pad, item_y, render_rs, dim);
             }
         },
         .confirm_quit => {

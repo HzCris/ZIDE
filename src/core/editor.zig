@@ -63,6 +63,22 @@ pub const Editor = struct {
     /// Command palette input buffer.
     palette_buf: [256]u8 = undefined,
     palette_buf_len: usize = 0,
+
+    /// Fuzzy file finder (quick_open) — see finderOpen. Typed filter:
+    finder_buf: [256]u8 = undefined,
+    finder_buf_len: usize = 0,
+    /// Selected row in finder_matches.
+    finder_selected: usize = 0,
+    /// Workspace-relative file paths (owned), snapshot taken by finderOpen.
+    finder_files: std.ArrayList([]u8) = .empty,
+    /// Indices into finder_files matching the filter (basename hits first).
+    finder_matches: std.ArrayList(u32) = .empty,
+    /// Owned snapshot of the workspace root ("" = cwd) paths join against.
+    finder_root: ?[]u8 = null,
+    /// A transient preview document sits at the end of `documents`.
+    finder_preview_appended: bool = false,
+    /// Active doc index to restore when the finder is cancelled.
+    finder_prev_active: usize = 0,
     /// Go to line input buffer.
     goto_buf: [32]u8 = undefined,
     goto_buf_len: usize = 0,
@@ -259,6 +275,8 @@ pub const Editor = struct {
         save_as,
         command_palette,
         goto_line,
+        /// Fuzzy file finder (quick_open) with live preview.
+        file_finder,
         confirm_quit,
         /// Save requested but the file changed on disk since load —
         /// user picks overwrite / reload / cancel (resolveOverwrite).
@@ -342,6 +360,9 @@ pub const Editor = struct {
         }
         if (self.filetree) |*ft| ft.deinit();
         if (self.filetree_root) |r| self.allocator.free(r);
+        self.finderClearFiles();
+        self.finder_files.deinit(self.allocator);
+        self.finder_matches.deinit(self.allocator);
         if (self.filetree_prompt_target) |tgt| self.allocator.free(tgt);
         if (self.filetree_move_src) |src| self.allocator.free(src);
         for (self.filetree_move_srcs.items) |p| self.allocator.free(p);
@@ -447,6 +468,249 @@ pub const Editor = struct {
             }
         }
         return try self.openFile(path);
+    }
+
+    // ------------------------------------------------------------------
+    // Fuzzy file finder (quick_open) — Ctrl+E overlay with live preview.
+    // The preview shows in the pane behind the overlay; it is NOT a tab:
+    // one transient Document rides at the end of `documents`, hidden from
+    // tab bars / sessions / LSP, reused per peek, popped on cancel and
+    // promoted to a normal document on commit.
+    // ------------------------------------------------------------------
+
+    const finder_max_files = 20_000;
+    const finder_max_matches = 200;
+
+    /// Enter .file_finder mode with a fresh workspace file snapshot.
+    pub fn finderOpen(self: *Editor) void {
+        self.finderClearFiles();
+        self.finder_buf_len = 0;
+        self.finder_selected = 0;
+        self.finder_prev_active = self.active_doc_idx;
+        const root = self.filetree_root orelse "";
+        self.finder_root = self.allocator.dupe(u8, root) catch null;
+        const open_root = if (root.len == 0) "." else root;
+        if (std.Io.Dir.cwd().openDir(self.io, open_root, .{ .iterate = true })) |dir| {
+            var d = dir;
+            defer d.close(self.io);
+            self.finderWalk(d, "", 0);
+        } else |_| {}
+        self.finderFilter();
+        self.mode = .file_finder;
+    }
+
+    /// Collect relative file paths under `dir`, skipping dot-entries and
+    /// zig-out, bounded by depth and finder_max_files.
+    fn finderWalk(self: *Editor, dir: std.Io.Dir, prefix: []const u8, depth: usize) void {
+        if (depth > 12) return;
+        var it = dir.iterate();
+        while (it.next(self.io) catch null) |entry| {
+            if (self.finder_files.items.len >= finder_max_files) return;
+            if (entry.name.len == 0 or entry.name[0] == '.') continue;
+            switch (entry.kind) {
+                .file => {
+                    const rel = std.fmt.allocPrint(self.allocator, "{s}{s}", .{ prefix, entry.name }) catch continue;
+                    self.finder_files.append(self.allocator, rel) catch self.allocator.free(rel);
+                },
+                .directory => {
+                    if (std.mem.eql(u8, entry.name, "zig-out")) continue;
+                    var sub = dir.openDir(self.io, entry.name, .{ .iterate = true }) catch continue;
+                    defer sub.close(self.io);
+                    const sub_prefix = std.fmt.allocPrint(self.allocator, "{s}{s}/", .{ prefix, entry.name }) catch continue;
+                    defer self.allocator.free(sub_prefix);
+                    self.finderWalk(sub, sub_prefix, depth + 1);
+                },
+                else => {},
+            }
+        }
+    }
+
+    /// Case-insensitive subsequence match.
+    fn fuzzySubseq(haystack: []const u8, needle: []const u8) bool {
+        if (needle.len == 0) return true;
+        var ni: usize = 0;
+        for (haystack) |hc| {
+            if (std.ascii.toLower(hc) == std.ascii.toLower(needle[ni])) {
+                ni += 1;
+                if (ni == needle.len) return true;
+            }
+        }
+        return false;
+    }
+
+    /// Recompute finder_matches from the current filter: basename
+    /// subsequence hits rank ahead of path-only hits.
+    pub fn finderFilter(self: *Editor) void {
+        self.finder_matches.clearRetainingCapacity();
+        const filter = self.finder_buf[0..self.finder_buf_len];
+        var pass: usize = 0;
+        while (pass < 2) : (pass += 1) {
+            for (self.finder_files.items, 0..) |path, i| {
+                if (self.finder_matches.items.len >= finder_max_matches) break;
+                const base_hit = fuzzySubseq(std.fs.path.basename(path), filter);
+                const hit = if (pass == 0)
+                    base_hit
+                else
+                    !base_hit and fuzzySubseq(path, filter);
+                if (hit) self.finder_matches.append(self.allocator, @intCast(i)) catch return;
+            }
+            if (filter.len == 0) break; // empty filter: pass 0 matched all
+        }
+        if (self.finder_selected >= self.finder_matches.items.len) self.finder_selected = 0;
+    }
+
+    /// Filter changed: re-rank from the top and refresh the preview.
+    pub fn finderRefresh(self: *Editor) void {
+        self.finder_selected = 0;
+        self.finderFilter();
+        self.finderPreviewSelected();
+    }
+
+    /// Move the finder selection and preview the newly selected file.
+    pub fn finderMove(self: *Editor, down: bool) void {
+        const count = self.finder_matches.items.len;
+        if (count == 0) return;
+        if (down) {
+            if (self.finder_selected + 1 < count) self.finder_selected += 1;
+        } else {
+            self.finder_selected -|= 1;
+        }
+        self.finderPreviewSelected();
+    }
+
+    /// Root-joined path of the selected match (written into `buf` when the
+    /// workspace root isn't the cwd).
+    fn finderSelectedPath(self: *Editor, buf: []u8) ?[]const u8 {
+        if (self.finder_selected >= self.finder_matches.items.len) return null;
+        const rel = self.finder_files.items[self.finder_matches.items[self.finder_selected]];
+        const root = self.finder_root orelse "";
+        if (root.len == 0) return rel;
+        return std.fmt.bufPrint(buf, "{s}/{s}", .{ root, rel }) catch null;
+    }
+
+    /// Show the selected match in the pane behind the finder overlay.
+    /// Already-open files get their real tab shown instead.
+    pub fn finderPreviewSelected(self: *Editor) void {
+        if (self.mode != .file_finder) return;
+        var pbuf: [1024]u8 = undefined;
+        const path = self.finderSelectedPath(&pbuf) orelse return;
+        for (self.documents.items, 0..) |*doc, idx| {
+            if (doc.preview) continue;
+            const dp = doc.file_path orelse continue;
+            if (filetree_mod.normPathEql(dp, path)) {
+                self.finderDropPreview();
+                self.active_doc_idx = idx;
+                self.paneShowDoc(idx);
+                return;
+            }
+        }
+        if (!self.finder_preview_appended) {
+            var doc = Document.init(self.allocator) catch return;
+            doc.preview = true;
+            self.documents.append(self.allocator, doc) catch {
+                doc.deinit();
+                return;
+            };
+            self.finder_preview_appended = true;
+        }
+        const pidx = self.documents.items.len - 1;
+        const pdoc = &self.documents.items[pidx];
+        pdoc.open(self.io, path) catch {
+            // Unreadable/binary — drop the peek, show where we were.
+            self.finderDropPreview();
+            self.finderShowPrev();
+            return;
+        };
+        pdoc.detectLanguage(self);
+        // The preview doc is reused across peeks — don't carry the previous
+        // file's scroll into this one.
+        pdoc.scroll_top = 0;
+        pdoc.scroll_left = 0;
+        self.active_doc_idx = pidx;
+        self.paneShowDoc(pidx);
+    }
+
+    /// PageUp/PageDown while the finder is open: scroll the previewed
+    /// document behind the panel (keyboard parity with the wheel).
+    pub fn finderScrollPage(self: *Editor, down: bool) void {
+        const doc = self.activeDoc();
+        if (down) {
+            const max_top = doc.buffer.lineCount() -| 1;
+            doc.scroll_top = @min(doc.scroll_top + self.page_size, max_top);
+        } else {
+            doc.scroll_top -|= self.page_size;
+        }
+    }
+
+    /// Escape: drop any preview and restore the view exactly as it was.
+    pub fn finderCancel(self: *Editor) void {
+        self.finderDropPreview();
+        self.finderShowPrev();
+        self.mode = .normal;
+        self.finderClearFiles();
+    }
+
+    /// Enter: promote the preview to a real tab (or focus/open the file).
+    pub fn finderCommit(self: *Editor) void {
+        var pbuf: [1024]u8 = undefined;
+        const maybe_path = self.finderSelectedPath(&pbuf);
+        self.mode = .normal;
+        const path = maybe_path orelse {
+            // Nothing selected — behave like cancel.
+            self.finderDropPreview();
+            self.finderShowPrev();
+            self.finderClearFiles();
+            return;
+        };
+        if (self.finder_preview_appended) {
+            const pidx = self.documents.items.len - 1;
+            const pdoc = &self.documents.items[pidx];
+            if (pdoc.file_path != null and filetree_mod.normPathEql(pdoc.file_path.?, path)) {
+                // Promote in place — same post-open bookkeeping as openFile.
+                pdoc.preview = false;
+                self.finder_preview_appended = false;
+                self.active_doc_idx = pidx;
+                self.paneShowDoc(pidx);
+                self.lspNotifyOpen(pdoc);
+                lua_api.fireEvent(self, .open, pdoc.file_path);
+                self.finderClearFiles();
+                return;
+            }
+            // Preview is stale (selection changed without a refresh) —
+            // drop it and open cleanly below.
+            self.finderDropPreview();
+            self.finderShowPrev();
+        }
+        _ = self.openOrFocus(path) catch {};
+        self.finderClearFiles();
+    }
+
+    /// Pop and free the transient preview document, if present.
+    fn finderDropPreview(self: *Editor) void {
+        if (!self.finder_preview_appended) return;
+        self.finder_preview_appended = false;
+        if (self.documents.pop()) |popped| {
+            var doc = popped;
+            doc.deinit();
+        }
+    }
+
+    /// Point the active pane back at the pre-finder document (clamped).
+    fn finderShowPrev(self: *Editor) void {
+        const target = @min(self.finder_prev_active, self.documents.items.len -| 1);
+        self.active_doc_idx = target;
+        self.paneShowDoc(target);
+    }
+
+    /// Free the workspace snapshot (paths, matches, root).
+    fn finderClearFiles(self: *Editor) void {
+        for (self.finder_files.items) |p| self.allocator.free(p);
+        self.finder_files.clearRetainingCapacity();
+        self.finder_matches.clearRetainingCapacity();
+        if (self.finder_root) |r| {
+            self.allocator.free(r);
+            self.finder_root = null;
+        }
     }
 
     /// Get the file tree, creating it on first use. Returns null (with a
@@ -1243,7 +1507,12 @@ pub const Editor = struct {
 
     /// Number of open documents.
     pub fn docCount(self: *const Editor) usize {
-        return self.documents.items.len;
+        // Preview docs are invisible (no tab), so don't count them.
+        var n: usize = 0;
+        for (self.documents.items) |*doc| {
+            if (!doc.preview) n += 1;
+        }
+        return n;
     }
 
     /// Set the clipboard content (both internal and system).
@@ -1414,7 +1683,7 @@ pub const Editor = struct {
         var active_saved: usize = 0;
         var n: usize = 0;
         for (self.documents.items, 0..) |*doc, i| {
-            if (doc.file_path == null) continue;
+            if (doc.file_path == null or doc.preview) continue;
             if (i == self.active_doc_idx) active_saved = n;
             n += 1;
         }
@@ -1426,6 +1695,7 @@ pub const Editor = struct {
         const head = std.fmt.bufPrint(&buf, "active {d}\n", .{active_saved}) catch return;
         file.writeStreamingAll(self.io, head) catch return;
         for (self.documents.items) |*doc| {
+            if (doc.preview) continue;
             const fp = doc.file_path orelse continue;
             const line = std.fmt.bufPrint(&buf, "doc {d} {d} {s}\n", .{
                 doc.cursors.primaryConst().offset, doc.scroll_top, fp,
@@ -1764,6 +2034,9 @@ pub const Editor = struct {
         if (!lsp_client.isReady()) return;
 
         for (self.documents.items) |*doc| {
+            // Transient previews never touch the server (no didOpen churn
+            // while the user arrows through the finder).
+            if (doc.preview) continue;
             // Send didOpen for docs that haven't been registered with LSP yet
             if (!doc.lsp_opened) {
                 self.lspNotifyOpen(doc);
@@ -2007,6 +2280,72 @@ test "editor undo via command" {
 
     _ = editor.execCommand("redo", null);
     try std.testing.expectEqualStrings("Xhello", editor.activeDoc().lineContent(0));
+}
+
+test "fuzzy finder: filter, preview, commit and cancel" {
+    const t = std.testing;
+    const root = ".zig-cache/zide-test-finder";
+    std.Io.Dir.cwd().createDirPath(t.io, root ++ "/docs") catch {};
+    {
+        const f = try std.Io.Dir.cwd().createFile(t.io, root ++ "/alpha.zig", .{});
+        f.close(t.io);
+    }
+    {
+        const f = try std.Io.Dir.cwd().createFile(t.io, root ++ "/docs/readme.md", .{});
+        defer f.close(t.io);
+        try f.writeStreamingAll(t.io, "# hi\n");
+    }
+    defer std.Io.Dir.cwd().deleteTree(t.io, root) catch {};
+
+    var editor = try Editor.init(t.allocator, t.io);
+    defer editor.deinit();
+    editor.filetree_root = try t.allocator.dupe(u8, root);
+
+    editor.finderOpen();
+    try t.expectEqual(Editor.Mode.file_finder, editor.mode);
+    try t.expectEqual(@as(usize, 2), editor.finder_files.items.len);
+    try t.expectEqual(@as(usize, 1), editor.documents.items.len); // no preview yet
+
+    // Type "read" → readme.md matches; the preview doc appears (hidden)
+    @memcpy(editor.finder_buf[0..4], "read");
+    editor.finder_buf_len = 4;
+    editor.finderRefresh();
+    try t.expectEqual(@as(usize, 1), editor.finder_matches.items.len);
+    try t.expect(editor.finder_preview_appended);
+    try t.expectEqual(@as(usize, 2), editor.documents.items.len);
+    try t.expect(editor.activeDoc().preview);
+    try t.expect(std.mem.endsWith(u8, editor.activeDoc().file_path.?, "readme.md"));
+    try t.expectEqual(@as(usize, 1), editor.docCount()); // preview has no tab
+
+    // Escape restores exactly the pre-finder state
+    editor.finderCancel();
+    try t.expectEqual(Editor.Mode.normal, editor.mode);
+    try t.expectEqual(@as(usize, 1), editor.documents.items.len);
+    try t.expectEqual(@as(usize, 0), editor.active_doc_idx);
+    try t.expectEqual(@as(usize, 0), editor.finder_files.items.len);
+
+    // Commit promotes the preview to a real tab
+    editor.finderOpen();
+    @memcpy(editor.finder_buf[0..5], "alpha");
+    editor.finder_buf_len = 5;
+    editor.finderRefresh();
+    try t.expect(editor.finder_preview_appended);
+    editor.finderCommit();
+    try t.expectEqual(Editor.Mode.normal, editor.mode);
+    try t.expectEqual(@as(usize, 2), editor.documents.items.len);
+    try t.expect(!editor.activeDoc().preview);
+    try t.expect(std.mem.endsWith(u8, editor.activeDoc().file_path.?, "alpha.zig"));
+    try t.expectEqual(@as(usize, 2), editor.docCount());
+
+    // Selecting an already-open file shows its real tab — no preview doc
+    editor.finderOpen();
+    @memcpy(editor.finder_buf[0..5], "alpha");
+    editor.finder_buf_len = 5;
+    editor.finderRefresh();
+    try t.expect(!editor.finder_preview_appended);
+    try t.expectEqual(@as(usize, 2), editor.documents.items.len);
+    editor.finderCommit();
+    try t.expect(std.mem.endsWith(u8, editor.activeDoc().file_path.?, "alpha.zig"));
 }
 
 test "editor external-change poll and save guard" {

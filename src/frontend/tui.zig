@@ -390,6 +390,9 @@ pub fn run(allocator: std.mem.Allocator, editor: *Editor) !void {
             .goto_line => {
                 drawOverlay(win, editor, "Go to line: ", editor.goto_buf[0..editor.goto_buf_len], width, height);
             },
+            .file_finder => {
+                drawFileFinder(win, editor, width, height);
+            },
             .confirm_quit => {
                 drawOverlay(win, editor, "Unsaved changes! [S]ave [D]iscard [C]ancel: ", "", width, height);
             },
@@ -461,6 +464,7 @@ fn dispatchKey(editor: *Editor, key: Key) void {
         .file_open => handleFileOpenKey(editor, key),
         .save_as => handleSaveAsKey(editor, key),
         .command_palette => handlePaletteKey(editor, key),
+        .file_finder => handleFinderKey(editor, key),
         .goto_line => handleGotoLineKey(editor, key),
         .confirm_quit => handleConfirmQuitKey(editor, key),
         .confirm_overwrite => handleConfirmOverwriteKey(editor, key),
@@ -1041,6 +1045,7 @@ fn tabWidth(doc: *const Document) u16 {
 fn tabAtX(editor: *Editor, click_x: u16) ?usize {
     var x: u16 = 0;
     for (editor.documents.items, 0..) |*doc, i| {
+        if (doc.preview) continue; // hidden from the tab bar
         const w = tabWidth(doc);
         if (click_x >= x and click_x < x + w) return i;
         x += w;
@@ -1058,6 +1063,7 @@ fn drawTabBar(win: Window, editor: *Editor, width: u16) void {
 
     var x: u16 = 0;
     for (editor.documents.items, 0..) |doc, i| {
+        if (doc.preview) continue; // hidden from the tab bar
         const is_active = (i == editor.active_doc_idx);
         const style = if (is_active) active_style else bg_style;
 
@@ -2378,6 +2384,69 @@ fn drawOverlay(win: Window, editor: *Editor, label: []const u8, input: []const u
 }
 
 /// Draw the command palette overlay.
+/// Draw the fuzzy file finder overlay (same layout as the palette; the
+/// previewed file renders in the pane behind it).
+fn drawFileFinder(win: Window, editor: *Editor, width: u16, height: u16) void {
+    const filter = editor.finder_buf[0..editor.finder_buf_len];
+
+    // Bottom-anchored (above the status bar) so the preview's opening
+    // lines stay visible — unlike the palette's centered box.
+    const list_rows: u16 = @min(8, height -| 4);
+    const input_y: u16 = height -| (list_rows + 3);
+    const finder_width: u16 = @min(width -| 4, 70);
+    const finder_x: u16 = (width -| finder_width) / 2;
+
+    const border_style: Style = .{ .bg = toVaxis(editor.tui_theme.overlay_bg), .fg = toVaxis(editor.tui_theme.overlay_border) };
+    const input_style: Style = .{ .bg = toVaxis(editor.tui_theme.overlay_bg), .fg = toVaxis(editor.tui_theme.overlay_fg), .bold = true };
+    const item_style: Style = .{ .bg = toVaxis(editor.tui_theme.overlay_bg), .fg = toVaxis(editor.tui_theme.overlay_fg) };
+    const selected_style: Style = .{ .bg = toVaxis(editor.tui_theme.overlay_selection_bg), .fg = toVaxis(editor.tui_theme.overlay_selection_fg), .bold = true, .reverse = true };
+
+    // Header / input line
+    const header_win = win.child(.{ .x_off = @intCast(finder_x), .y_off = @intCast(input_y), .width = finder_width, .height = 1 });
+    header_win.fill(.{ .style = border_style });
+    _ = header_win.printSegment(.{ .text = "> ", .style = border_style }, .{ .wrap = .none });
+    if (filter.len > 0) {
+        const filter_win = header_win.child(.{ .x_off = 2, .width = finder_width -| 2 });
+        _ = filter_win.printSegment(.{ .text = filter, .style = input_style }, .{ .wrap = .none });
+    }
+    const cursor_col = finder_x + 2 + @as(u16, @intCast(@min(filter.len, finder_width -| 2)));
+    win.showCursor(cursor_col, input_y);
+    win.setCursorShape(.beam_blink);
+
+    // Matches (paths are heap-allocated in finder_files — safe to reference)
+    const max_items: u16 = @min(height -| input_y -| 2, 8);
+    const count = editor.finder_matches.items.len;
+    const visible_count: usize = @min(count, max_items);
+    if (visible_count > 0) {
+        if (editor.finder_selected >= visible_count) editor.finder_selected = visible_count - 1;
+    } else {
+        editor.finder_selected = 0;
+    }
+
+    var item_y: u16 = 1;
+    for (editor.finder_matches.items[0..visible_count], 0..) |fi, shown| {
+        const path = editor.finder_files.items[fi];
+        const is_selected = shown == editor.finder_selected;
+        const style = if (is_selected) selected_style else item_style;
+        const row_win = win.child(.{
+            .x_off = @intCast(finder_x),
+            .y_off = @intCast(input_y + item_y),
+            .width = finder_width,
+            .height = 1,
+        });
+        row_win.fill(.{ .style = style });
+        _ = row_win.printSegment(.{ .text = " ", .style = style }, .{ .wrap = .none });
+        const text_win = row_win.child(.{ .x_off = 1, .width = finder_width -| 1 });
+        _ = text_win.printSegment(.{ .text = path, .style = style }, .{ .wrap = .none });
+        item_y += 1;
+    }
+    if (count == 0) {
+        const row_win = win.child(.{ .x_off = @intCast(finder_x), .y_off = @intCast(input_y + 1), .width = finder_width, .height = 1 });
+        row_win.fill(.{ .style = item_style });
+        _ = row_win.printSegment(.{ .text = " (no matching files)", .style = item_style }, .{ .wrap = .none });
+    }
+}
+
 fn drawCommandPalette(win: Window, editor: *Editor, width: u16, height: u16) void {
     const filter = editor.palette_buf[0..editor.palette_buf_len];
 
@@ -2958,6 +3027,46 @@ fn handleFiletreePromptKey(editor: *Editor, key: Key) void {
 }
 
 /// Handle keys in Command Palette mode.
+/// Handle keys in Fuzzy File Finder mode (quick_open).
+fn handleFinderKey(editor: *Editor, key: Key) void {
+    if (key.isModifier()) return;
+
+    if (key.codepoint == Key.escape) {
+        editor.finderCancel();
+        return;
+    }
+    if (key.codepoint == Key.enter) {
+        editor.finderCommit();
+        return;
+    }
+    if (key.codepoint == Key.down or key.codepoint == Key.tab) {
+        editor.finderMove(true);
+        return;
+    }
+    if (key.codepoint == Key.up) {
+        editor.finderMove(false);
+        return;
+    }
+    if (key.codepoint == Key.page_down) {
+        editor.finderScrollPage(true);
+        return;
+    }
+    if (key.codepoint == Key.page_up) {
+        editor.finderScrollPage(false);
+        return;
+    }
+    if (key.codepoint == Key.backspace) {
+        if (editor.finder_buf_len > 0) {
+            editor.finder_buf_len -= 1;
+            editor.finderRefresh();
+        }
+        return;
+    }
+    const before = editor.finder_buf_len;
+    appendToInputBuf(&editor.finder_buf, &editor.finder_buf_len, key);
+    if (editor.finder_buf_len != before) editor.finderRefresh();
+}
+
 fn handlePaletteKey(editor: *Editor, key: Key) void {
     if (key.isModifier()) return;
 

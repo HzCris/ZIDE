@@ -36,6 +36,9 @@ pub const Document = struct {
     /// The disk copy changed under a dirty buffer (or the file vanished):
     /// saving prompts before overwriting. Cleared by save/reload.
     external_changed: bool = false,
+    /// Transient quick-open preview: hidden from tab bars, sessions, and
+    /// LSP sync; promoted to a real document on finder commit.
+    preview: bool = false,
 
     /// Scroll state: top visible line.
     scroll_top: usize = 0,

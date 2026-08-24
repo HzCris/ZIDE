@@ -203,6 +203,7 @@ pub fn registerBuiltins(registry: *CommandRegistry) !void {
     try registry.register("toggle_comment", "Toggle comment on selected lines", cmdToggleComment);
     try registry.register("next_todo", "Jump to next TODO/FIXME/XXX/HACK/BUG/NOTE marker", cmdNextTodo);
     try registry.register("open_documentation", "Open ZIDE documentation (Documentation.md)", cmdOpenDocumentation);
+    try registry.register("quick_open", "Fuzzy-find a file in the workspace (live preview)", cmdQuickOpen);
     try registry.register("reload_extensions", "Reload Lua extensions (re-runs extensions/*.lua)", cmdReloadExtensions);
     // File tree commands
     try registry.register("toggle_filetree", "Toggle the file tree side panel", cmdToggleFiletree);
@@ -872,6 +873,12 @@ fn cmdCursorFileEndSelect(editor: *Editor, _: ?[]const u8) void {
     const c = doc.cursors.primary();
     if (!c.hasSelection()) c.startSelection();
     c.moveToEnd(&doc.buffer);
+}
+
+// --- Fuzzy file finder ---
+
+fn cmdQuickOpen(editor: *Editor, _: ?[]const u8) void {
+    editor.finderOpen();
 }
 
 // --- Documentation ---
