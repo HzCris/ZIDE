@@ -26,6 +26,22 @@ fn toVaxis(c: TuiColor) Color {
     };
 }
 
+/// Style for a syntax token: theme color plus markdown text attributes
+/// (headings/bold render bold, italics italic, links underlined).
+fn synTokenStyle(syn_theme: anytype, token: syntax.TokenType, default_fg: Color, bg: Color) Style {
+    var st: Style = .{
+        .fg = if (syn_theme.colorForToken(token)) |tc| toVaxis(tc) else default_fg,
+        .bg = bg,
+    };
+    switch (token) {
+        .heading, .strong => st.bold = true,
+        .emphasis => st.italic = true,
+        .link => st.ul_style = .single,
+        else => {},
+    }
+    return st;
+}
+
 // ===========================================================================
 // Safe text rendering helpers
 //
@@ -1487,14 +1503,12 @@ fn drawContent(win: Window, doc: *Document, editor: *Editor, width: u16, height:
                                     // Partial overlap — split into pre-sel, sel, post-sel
                                     const pre_end = @max(vis_start, sel_begin);
                                     const post_start = @min(vis_end, sel_end_local);
-                                    const token_fg = syn_theme.colorForToken(span_buf[si].token);
-                                    const syn_style: Style = .{ .fg = if (token_fg) |tc| toVaxis(tc) else text_style.fg, .bg = bg };
+                                    const syn_style = synTokenStyle(syn_theme, span_buf[si].token, text_style.fg, bg);
                                     if (pre_end > vis_start) col = writeStr(text_win, col, 0, span_text[0 .. pre_end - vis_start], syn_style);
                                     if (post_start > pre_end) col = writeStr(text_win, col, 0, span_text[pre_end - vis_start .. post_start - vis_start], sel_style);
                                     if (vis_end > post_start) col = writeStr(text_win, col, 0, span_text[post_start - vis_start ..], syn_style);
                                 } else {
-                                    const token_fg = syn_theme.colorForToken(span_buf[si].token);
-                                    const syn_style: Style = .{ .fg = if (token_fg) |tc| toVaxis(tc) else text_style.fg, .bg = bg };
+                                    const syn_style = synTokenStyle(syn_theme, span_buf[si].token, text_style.fg, bg);
                                     col = writeStr(text_win, col, 0, span_text, syn_style);
                                 }
                             }

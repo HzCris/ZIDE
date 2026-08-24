@@ -18,6 +18,7 @@ Checked items are tagged: **(native)** = built into the Zig core,
 - [x] Ctrl+/ to comment highlighted text (native; uses register_language's line_comment/block_comment fields — upkeep lives in Lua configs)
 - [x] Session Persistance Option (native; `zide.set("session_persistence", true)` — restores files/cursors/active tab on bare launch)
 - [x] TODO comment integration (native; TODO/FIXME/XXX/HACK/BUG/NOTE highlighted in comments, `next_todo` palette command, `syn_todo` color override)
+- [x] Markdown editing (native structural tokenizer for `.md` — headings/bold/italic/code/fences/links/lists/task boxes/quotes/tables, real bold/italic/underline cells in the TUI; Enter continues `- `/`1. `/`> `/`- [ ] ` markers and ends lists on empty items; `extensions/markdown.lua` ships active with a `toggle_checkbox` palette command; `syn_heading`/`syn_strong`/`syn_emphasis`/`syn_link` overrides, 2026-08-24)
 - [x] Syntax highlighting (native engine; languages are Lua-declared via zide.register_language)
 - [x] LSP support (native client; servers are Lua-declared via zide.register_lsp)
 - [x] File tree / project browser (native; Ctrl+B toggle, dockable left/right via `filetree_side`, starting directory via `zide.set("filetree_root", path)`, a/r/d file ops, Shift+R refresh, reveal-current-file, git status row colors)
@@ -37,6 +38,7 @@ Checked items are tagged: **(native)** = built into the Zig core,
 - [x] File tree / project browser (native; Ctrl+B toggle, dockable left/right, starting directory via `filetree_root`, click + keyboard browsing, right-click menu, a/r/d file ops, git status row colors)
 - [x] Session Persistance Option (native; `zide.set("session_persistence", true)` or Settings dialog — restores files/cursors/active tab on bare launch)
 - [x] TODO comment integration (native; TODO/FIXME/XXX/HACK/BUG/NOTE highlighted in comments, `next_todo` palette command, `syn_todo` color override)
+- [x] Markdown editing (native structural tokenizer for `.md` — headings/bold/italic/code/fences/links/lists/task boxes/quotes/tables; Enter continues `- `/`1. `/`> `/`- [ ] ` markers and ends lists on empty items; same `extensions/markdown.lua` `toggle_checkbox` command — runtime is frontend-agnostic; `syn_heading`/`syn_strong`/`syn_emphasis`/`syn_link` overrides, 2026-08-24)
 
 
 ### File tree follow-ups (queued 2026-06-10, shipped same day)

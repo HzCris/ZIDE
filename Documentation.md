@@ -96,6 +96,8 @@ Windows terminals commonly intercept Alt combos (Windows Terminal binds Alt+arro
 **Display:**
 - Syntax highlighting (Zig built-in, extensible via Lua — see Syntax Highlighting section)
 - TODO comment highlighting: `TODO`/`FIXME`/`XXX`/`HACK`/`BUG`/`NOTE` inside comments get the `todo` syntax color; `next_todo` command (palette) jumps to the next marker with wrap-around
+- Markdown highlighting (built-in for `.md`/`.markdown`): headings, bold/italic, inline code and ``` fences, links/images/autolinks, list bullets + task checkboxes, blockquotes, tables, strikethrough, HTML comments (TODO markers inside get the `todo` color). The TUI additionally renders headings/bold in real bold, italics in italic, links underlined
+- Markdown editing: Enter continues list/quote markers (`- `, `1. ` with auto-increment, `> `, `- [ ] `); Enter on an empty item ends the list; `toggle_checkbox` palette command flips `[ ]`/`[x]` (bundled `extensions/markdown.lua`)
 - Line numbers with active line highlight
 - Visual-row cursor movement with word wrap (Up/Down navigate wrapped rows, not logical lines)
 - Status bar: filename, dirty marker (`*`), `Ln X, Col Y`
@@ -169,6 +171,8 @@ Windows terminals commonly intercept Alt combos (Windows Terminal binds Alt+arro
 - Text editing via DVUI TextEntryWidget (undo/redo/clipboard handled by widget)
 - Syntax highlighting (Zig built-in, extensible via Lua — see Syntax Highlighting section)
 - TODO comment highlighting: `TODO`/`FIXME`/`XXX`/`HACK`/`BUG`/`NOTE` inside comments get the `todo` syntax color; `next_todo` command (palette) jumps to the next marker with wrap-around
+- Markdown highlighting (built-in for `.md`/`.markdown`): headings, bold/italic, inline code and ``` fences, links/images/autolinks, list bullets + task checkboxes, blockquotes, tables, strikethrough, HTML comments (TODO markers inside get the `todo` color)
+- Markdown editing: Enter continues list/quote markers (`- `, `1. ` with auto-increment, `> `, `- [ ] `); Enter on an empty item ends the list; `toggle_checkbox` palette command flips `[ ]`/`[x]` (bundled `extensions/markdown.lua`)
 - Word wrap (word-boundary aware, configurable, wrap continuation markers)
 - Save / Save As (native OS file dialog)
 - Open file (native OS file dialog)
@@ -218,7 +222,8 @@ Windows terminals commonly intercept Alt combos (Windows Terminal binds Alt+arro
 - Theme setting in Settings dialog: dropdown (dark/light/high_contrast) — TUI settings panel keeps the cycleable enum (Enter/Space cycles)
 - Open Theme File: opens `~/.config/zide/themes/gui-theme.lua` in editor (creates commented template with per-field descriptions if missing)
 - Open Theme Folder: opens `~/.config/zide/themes/` in OS file explorer
-- Help > Documentation: opens Documentation.md in the editor
+- Help > Documentation: opens Documentation.md in the editor (searches the exe's directory and its ancestors — works from `zig-out/bin` and desktop launches; also available as the `open_documentation` palette command in both frontends)
+- Editor pane scrollbar: slim pill overlay on the right edge (same style as the file tree) — drag the thumb, click the band to page up/down, hover brightens; per split pane
 - Tab bar styling: inactive tabs have visible borders and control-style background
 - Right-click context menu in editor panes: Cut, Copy, Paste, Select All, Go to Definition
   - Right-click outside the selection moves the cursor to the click point first; inside the selection it keeps the selection (so Cut/Copy act on it)
@@ -232,7 +237,9 @@ Windows terminals commonly intercept Alt combos (Windows Terminal binds Alt+arro
 
 ### Overview
 
-ZIDE uses an **extension-first** architecture for syntax highlighting. Language definitions are data — loaded from Lua files at startup — not hardcoded into the binary. Only **Zig** is built-in (it's a Zig IDE). Users install extensions for other languages by placing Lua files in `~/.config/zide/extensions/`.
+ZIDE uses an **extension-first** architecture for syntax highlighting. Language definitions are data — loaded from Lua files at startup — not hardcoded into the binary. Only **Zig** and **Markdown** are built-in (it's a Zig IDE, and its docs are markdown). Users install extensions for other languages by placing Lua files in `~/.config/zide/extensions/`.
+
+Markdown is the one exception to the data-driven model: its grammar is structural (headings, fences, emphasis), not keyword-based, so it has a dedicated native tokenizer (`tokenizer = .markdown` on the language def) instead of a `zide.register_language` table. It still uses the same span/color pipeline and theme overrides as every other language.
 
 ### How It Works
 
@@ -260,6 +267,10 @@ The tokenizer produces spans with one of these token types:
 | `preprocessor` | Preprocessor directives (`#include`, etc.) | Light purple `#be84d2` |
 | `attribute` | Attributes/decorators | Gold `#e5c07b` |
 | `todo` | `TODO`/`FIXME`/`XXX`/`HACK`/`BUG`/`NOTE` markers inside comments (word-boundary matched) | Gold `#e5c07b` |
+| `heading` | Markdown heading lines (`# ...`) — bold in the TUI | Soft red `#e06c75` |
+| `strong` | Markdown bold (`**...**`) — bold in the TUI | Orange `#d19a66` |
+| `emphasis` | Markdown italic (`*...*`) — italic in the TUI | Purple `#c678dd` |
+| `link` | Markdown link/image text and autolinks — underlined in the TUI (the `(url)` part renders dim as `comment`) | Blue `#61afef` |
 | `text` | Plain text / identifiers | Default text color |
 
 ### Syntax Themes
@@ -290,6 +301,11 @@ zide.set("syn_punctuation", "#abb2bf")
 zide.set("syn_preprocessor", "#be84d2")
 zide.set("syn_attribute", "#e5c07b")
 zide.set("syn_char_literal", "#98c379")
+zide.set("syn_todo", "#e5c07b")
+zide.set("syn_heading", "#e06c75")
+zide.set("syn_strong", "#d19a66")
+zide.set("syn_emphasis", "#c678dd")
+zide.set("syn_link", "#61afef")
 ```
 
 For TUI-only overrides, use the `tui_syn_*` prefix (e.g., `tui_syn_keyword`).
@@ -472,6 +488,17 @@ mistake: the findings land in the gutter and status bar exactly like LSP
 diagnostics, in both frontends. It's the recommended copy-paste starting
 point for wiring up any other linter or tool: hook `"save"`, run the tool
 with `zide.spawn`, parse its output, call `zide.set_diagnostics`.
+
+#### The Shipped Extension: markdown.lua
+
+On first launch ZIDE also creates `~/.config/zide/extensions/markdown.lua` —
+**active** out of the box (unlike the lint example it's a pure buffer edit
+with no side effects). It registers the `toggle_checkbox` palette command:
+flip the first GFM task box on the cursor line between `[ ]` and `[x]`, one
+undo step, cursor stays put. It's the smallest working demo of the buffer
+API (`zide.cursor` / `zide.get_line` / `zide.set_line`) — copy it to build
+your own line-editing commands. Edit it freely; it's only recreated if the
+file is deleted.
 
 The `reload_extensions` command (palette) drops all Lua-registered commands
 and event handlers and re-runs every `extensions/*.lua` — edit-extension,

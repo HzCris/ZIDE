@@ -229,6 +229,15 @@ var drag_area: dvui.Rect.Physical = .{};
 /// Cleared when the cursor moves (key press, click, etc.).
 var scroll_pinned: bool = false;
 
+/// Editor-pane scrollbar state (mirrors the file tree's pill scrollbar).
+/// The band is the mouse hit zone along the pane's right edge; the pill
+/// thumb drags, clicks in the band page toward the click.
+const editor_sb_band: f32 = 12;
+var editor_sb_drag: bool = false;
+var editor_sb_pane: u8 = 0;
+var editor_sb_grab_dy: f32 = 0;
+var editor_sb_hover_pane: ?u8 = null;
+
 /// Multi-click detection state (double-click = word, triple-click = line).
 var last_click_time_ns: i128 = 0;
 var last_click_offset: usize = 0;
@@ -558,7 +567,7 @@ pub fn frame(editor: *Editor) bool {
             var fw = dvui.floatingMenu(@src(), .{ .from = r }, .{});
             defer fw.deinit();
             if (dvui.menuItemLabel(@src(), "Documentation", .{}, .{ .expand = .horizontal }) != null) {
-                openDocumentation(editor);
+                _ = editor.execCommand("open_documentation", null);
                 m.close();
             }
             _ = dvui.menuItemLabel(@src(), "About ZIDE v0.0.1", .{}, .{ .expand = .horizontal });
@@ -1423,6 +1432,35 @@ fn filetreeSbThumb(ft: *const FileTree, m: FiletreeMetrics) ?dvui.Rect.Physical 
         .x = m.sb_x + 1 * m.scale,
         .y = m.rows_y + (m.rows_h - thumb_h) * frac,
         .w = m.sb_w - 2 * m.scale,
+        .h = thumb_h,
+    };
+}
+
+/// Visible logical lines in an editor pane rect (minimum 1).
+fn editorSbVisLines(area: dvui.Rect.Physical, line_height: f32) usize {
+    if (line_height <= 0 or area.h <= line_height) return 1;
+    return @intFromFloat(@floor(area.h / line_height));
+}
+
+/// Editor-pane scrollbar thumb rect, or null when the whole buffer fits.
+/// Logical-line approximation (wrapped rows are not counted), matching the
+/// wheel's scroll model. Works off the rect's right edge, so the events'
+/// gutter-trimmed rect and the render rect agree.
+fn editorSbThumb(doc: *const Document, area: dvui.Rect.Physical, line_height: f32, scale: f32) ?dvui.Rect.Physical {
+    if (area.h <= 0 or line_height <= 0) return null;
+    const total = doc.buffer.lineCount();
+    const vis = editorSbVisLines(area, line_height);
+    if (total <= vis) return null;
+    const total_f: f32 = @floatFromInt(total);
+    const vis_f: f32 = @floatFromInt(vis);
+    const thumb_h = @min(area.h, @max(20 * scale, area.h * vis_f / total_f));
+    const denom: f32 = @floatFromInt(total - vis);
+    const frac = @min(1.0, @as(f32, @floatFromInt(doc.scroll_top)) / denom);
+    const pill_w = 6 * scale;
+    return .{
+        .x = area.x + area.w - pill_w - 2 * scale,
+        .y = area.y + (area.h - thumb_h) * frac,
+        .w = pill_w,
         .h = thumb_h,
     };
 }
@@ -2710,6 +2748,18 @@ fn editorPane(editor: *Editor, pane_id: u8) void {
         (dvui.Rect.Physical{ .x = render_area.x + render_area.w - border_w, .y = render_area.y, .w = border_w, .h = render_area.h }).fill(.{}, .{ .color = focus_color, .fade = 0.6 });
     }
 
+    // --- Scrollbar: slim pill over the right edge (matches the file tree) ---
+    if (editorSbThumb(doc, render_area, line_height, scale)) |thumb| {
+        const active = (editor_sb_drag and editor_sb_pane == pane_id) or
+            editor_sb_hover_pane == pane_id;
+        const sb_color = if (active)
+            toDvui(editor.theme.text).opacity(0.55)
+        else
+            toDvui(editor.theme.gutter_text).opacity(0.4);
+        const rad = thumb.w / 2;
+        thumb.fill(.{ .x = rad, .y = rad, .w = rad, .h = rad }, .{ .color = sb_color, .fade = 1.0 });
+    }
+
     // --- Modal overlays (find, find_replace, command_palette, goto_line, confirm_quit) ---
     // Only render modals in the focused pane.
     if (is_active_pane and editor.mode != .normal) {
@@ -3174,8 +3224,8 @@ fn handleMouseEvents(editor: *Editor, pane_id: u8, wd: *dvui.WidgetData, area: d
 
         const me = e.evt.mouse;
 
-        // Only match events inside our area (or drag continuation)
-        if (!drag_active) {
+        // Only match events inside our area (or drag/scrollbar-drag continuation)
+        if (!drag_active and !(editor_sb_drag and editor_sb_pane == pane_id)) {
             if (me.p.x < area.x or me.p.x > area.x + area.w or
                 me.p.y < area.y or me.p.y > area.y + area.h)
                 continue;
@@ -3219,6 +3269,26 @@ fn handleMouseEvents(editor: *Editor, pane_id: u8, wd: *dvui.WidgetData, area: d
                 // Focus this pane on click (and take focus back from the tree)
                 editor.focusPane(pane_id);
                 editor.filetree_focused = false;
+
+                // Scrollbar band: drag the thumb, or page toward the click.
+                if (me.p.x >= area.x + area.w - editor_sb_band * scale) {
+                    if (editorSbThumb(doc, area, line_height, scale)) |thumb| {
+                        scroll_pinned = true;
+                        if (me.p.y >= thumb.y and me.p.y < thumb.y + thumb.h) {
+                            editor_sb_drag = true;
+                            editor_sb_pane = pane_id;
+                            editor_sb_grab_dy = me.p.y - thumb.y;
+                        } else {
+                            const vis = editorSbVisLines(area, line_height);
+                            if (me.p.y < thumb.y) {
+                                doc.scroll_top -|= vis;
+                            } else {
+                                doc.scroll_top = @min(doc.scroll_top + vis, doc.buffer.lineCount() -| vis);
+                            }
+                        }
+                        continue;
+                    }
+                }
 
                 const offset = screenToOffset(doc, area, font, line_height, scale, me.p, tab_width, do_wrap);
 
@@ -3312,12 +3382,30 @@ fn handleMouseEvents(editor: *Editor, pane_id: u8, wd: *dvui.WidgetData, area: d
                 }
             },
             .release => {
+                if (editor_sb_drag and editor_sb_pane == pane_id) {
+                    e.handle(@src(), wd);
+                    editor_sb_drag = false;
+                }
                 if (drag_active and drag_pane == pane_id) {
                     e.handle(@src(), wd);
                     drag_active = false;
                 }
             },
             .motion => {
+                if (editor_sb_drag and editor_sb_pane == pane_id) {
+                    e.handle(@src(), wd);
+                    if (editorSbThumb(doc, area, line_height, scale)) |thumb| {
+                        const usable = area.h - thumb.h;
+                        if (usable > 0) {
+                            const vis = editorSbVisLines(area, line_height);
+                            const total = doc.buffer.lineCount();
+                            const denom: f32 = @floatFromInt(total - vis);
+                            const frac = std.math.clamp((me.p.y - editor_sb_grab_dy - area.y) / usable, 0.0, 1.0);
+                            doc.scroll_top = @intFromFloat(@round(frac * denom));
+                        }
+                    }
+                    continue;
+                }
                 if (drag_active and drag_pane == pane_id) {
                     e.handle(@src(), wd);
                     // Auto-scroll when dragging past edges
@@ -3401,7 +3489,10 @@ fn handleMouseEvents(editor: *Editor, pane_id: u8, wd: *dvui.WidgetData, area: d
                 if (me.p.x >= area.x and me.p.x <= area.x + area.w and
                     me.p.y >= area.y and me.p.y <= area.y + area.h)
                 {
-                    dvui.cursorSet(.ibeam);
+                    const in_band = me.p.x >= area.x + area.w - editor_sb_band * scale and
+                        editorSbThumb(doc, area, line_height, scale) != null;
+                    editor_sb_hover_pane = if (in_band) pane_id else null;
+                    if (!in_band) dvui.cursorSet(.ibeam);
                 }
             },
             else => {},
@@ -4927,29 +5018,6 @@ fn openThemeFolder(io: std.Io) void {
 
     const argv = [_][]const u8{ opener, dir_z };
     _ = std.process.spawn(io, .{ .argv = &argv }) catch return;
-}
-
-/// Open Documentation.md in the editor.
-fn openDocumentation(editor: *Editor) void {
-    // Try to find Documentation.md relative to the executable
-    var exe_dir_buf: [512]u8 = undefined;
-    if (std.process.executableDirPath(editor.io, &exe_dir_buf)) |exe_dir_len| {
-        const exe_dir = exe_dir_buf[0..exe_dir_len];
-        var doc_buf: [600]u8 = undefined;
-        const doc_path = std.fmt.bufPrint(&doc_buf, "{s}/Documentation.md", .{exe_dir}) catch return;
-        if (doc_path.len >= doc_buf.len) return;
-        doc_buf[doc_path.len] = 0;
-        const z_path: [:0]const u8 = doc_buf[0..doc_path.len :0];
-        if (std.Io.Dir.cwd().access(editor.io, z_path, .{})) |_| {
-            _ = editor.openFile(z_path) catch {};
-            return;
-        } else |_| {}
-    } else |_| {}
-
-    // Fallback: try current working directory
-    if (std.Io.Dir.cwd().access(editor.io, "Documentation.md", .{})) |_| {
-        _ = editor.openFile("Documentation.md") catch {};
-    } else |_| {}
 }
 
 // ===========================================================================

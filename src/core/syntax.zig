@@ -22,6 +22,14 @@ pub const TokenType = enum {
     preprocessor,
     /// TODO/FIXME-style marker inside a comment.
     todo,
+    /// Markdown heading line (`# ...`).
+    heading,
+    /// Markdown bold (`**...**`).
+    strong,
+    /// Markdown italic (`*...*`).
+    emphasis,
+    /// Markdown link/image text or autolink.
+    link,
 };
 
 /// Markers highlighted inside comments (word-boundary matched, case-sensitive).
@@ -37,11 +45,22 @@ pub const LineState = enum(u8) {
     normal = 0,
     in_block_comment = 1,
     in_string = 2,
+    /// Markdown: inside a ``` / ~~~ fenced code block.
+    in_code_fence = 3,
+    /// Markdown: inside a multi-line HTML comment (`<!-- ... -->`).
+    in_html_comment = 4,
 };
 
 // ---------------------------------------------------------------------------
 // Language definition
 // ---------------------------------------------------------------------------
+
+pub const TokenizerKind = enum {
+    /// Keyword/comment/string tokenizer driven by the LanguageDef tables.
+    generic,
+    /// Dedicated Markdown tokenizer (the LanguageDef tables are unused).
+    markdown,
+};
 
 pub const LanguageDef = struct {
     name: []const u8,
@@ -57,6 +76,8 @@ pub const LanguageDef = struct {
     has_char_literals: bool,
     builtin_prefix: ?u8,
     preproc_prefix: ?u8,
+    /// Which tokenizer processes this language's lines.
+    tokenizer: TokenizerKind = .generic,
     /// Arena for Lua-allocated language defs. null for built-in (Zig).
     arena: ?std.heap.ArenaAllocator,
 
@@ -145,6 +166,30 @@ pub const lang_zig = LanguageDef{
 };
 
 // ---------------------------------------------------------------------------
+// Built-in Markdown language definition
+// ---------------------------------------------------------------------------
+
+/// Markdown is structural, not keyword-based — the tables stay empty and
+/// `tokenizer = .markdown` routes lines to the dedicated tokenizer.
+pub const lang_markdown = LanguageDef{
+    .name = "markdown",
+    .extensions = &.{ "md", "markdown" },
+    .keywords = &.{},
+    .types = &.{},
+    .constants = &.{},
+    .builtins = &.{},
+    .line_comment = null,
+    .block_comment_start = null,
+    .block_comment_end = null,
+    .string_delimiters = "",
+    .has_char_literals = false,
+    .builtin_prefix = null,
+    .preproc_prefix = null,
+    .tokenizer = .markdown,
+    .arena = null,
+};
+
+// ---------------------------------------------------------------------------
 // Tokenizer
 // ---------------------------------------------------------------------------
 
@@ -162,6 +207,8 @@ pub fn tokenizeLine(
     state_in: LineState,
     spans_buf: []HighlightSpan,
 ) TokenizeResult {
+    if (lang.tokenizer == .markdown) return tokenizeMarkdownLine(line, state_in, spans_buf);
+
     var i: usize = 0;
     var count: usize = 0;
     var state = state_in;
@@ -183,11 +230,10 @@ pub fn tokenizeLine(
         }
     }
 
-    // NOTE: .in_string is currently unreachable — no tokenizer path emits it
-    // (Zig's \\ strings are line-scoped; multi-line string languages would
-    // need a continuation rule here). Normalize defensively if a stale cache
-    // ever hands one in.
-    if (state == .in_string) state = .normal;
+    // Any other carried state is foreign here: .in_string is unreachable (no
+    // tokenizer path emits it) and the fence/HTML-comment states belong to the
+    // markdown tokenizer. Normalize defensively if a stale cache hands one in.
+    if (state != .normal) state = .normal;
 
     // --- Main tokenization loop ---
     while (i < line.len and count < spans_buf.len) {
@@ -420,6 +466,455 @@ fn isPunctuation(ch: u8) bool {
 }
 
 // ---------------------------------------------------------------------------
+// Markdown tokenizer
+//
+// Line-oriented approximation of CommonMark + GFM, matched to the per-line
+// span/state architecture above. Deliberate cuts: setext (`===`) headings,
+// indented code blocks (false-positives on nested lists), and embedded
+// highlighting inside fences (per-line u8 state can't carry a language).
+// ---------------------------------------------------------------------------
+
+fn tokenizeMarkdownLine(line: []const u8, state_in: LineState, spans_buf: []HighlightSpan) TokenizeResult {
+    var count: usize = 0;
+
+    // --- Continuation: fenced code block ---
+    if (state_in == .in_code_fence) {
+        const first = skipMdSpace(line, 0);
+        if (fenceEnd(line, first)) |run_end| {
+            if (skipMdSpace(line, run_end) >= line.len) {
+                // Closing fence
+                addSpan(&count, spans_buf, first, run_end, .operator);
+                return .{ .count = count, .state = .normal };
+            }
+        }
+        addSpan(&count, spans_buf, 0, line.len, .string);
+        return .{ .count = count, .state = .in_code_fence };
+    }
+
+    // --- Continuation: multi-line HTML comment ---
+    if (state_in == .in_html_comment) {
+        if (std.mem.indexOf(u8, line, "-->")) |close| {
+            addCommentSpans(&count, spans_buf, line, 0, close + 3);
+            const state = scanMdInline(line, close + 3, &count, spans_buf);
+            return .{ .count = count, .state = state };
+        }
+        addCommentSpans(&count, spans_buf, line, 0, line.len);
+        return .{ .count = count, .state = .in_html_comment };
+    }
+
+    // --- Containers: blockquote markers and list bullets ---
+    var pos = skipMdSpace(line, 0);
+    if (pos >= line.len) return .{ .count = count, .state = .normal };
+
+    var saw_list = false;
+    while (pos < line.len) {
+        // Thematic break wins over list markers ("- - -" vs "- item")
+        if (hrEnd(line, pos)) |end| {
+            addSpan(&count, spans_buf, pos, end, .operator);
+            return .{ .count = count, .state = .normal };
+        }
+        if (line[pos] == '>') {
+            addSpan(&count, spans_buf, pos, pos + 1, .operator);
+            pos = skipMdSpace(line, pos + 1);
+            continue;
+        }
+        if (!saw_list) {
+            if (listMarkerEnd(line, pos)) |end| {
+                addSpan(&count, spans_buf, pos, end, .operator);
+                saw_list = true;
+                pos = skipMdSpace(line, end);
+                // GFM task checkbox directly after the bullet
+                if (taskBoxEnd(line, pos)) |box_end| {
+                    addSpan(&count, spans_buf, pos, box_end, .constant);
+                    pos = skipMdSpace(line, box_end);
+                }
+                continue;
+            }
+        }
+        break;
+    }
+    if (pos >= line.len) return .{ .count = count, .state = .normal };
+
+    // --- Leaf blocks ---
+    // Fence open (``` or ~~~, optional info string)
+    if (fenceEnd(line, pos)) |run_end| {
+        addSpan(&count, spans_buf, pos, run_end, .operator);
+        const info_start = skipMdSpace(line, run_end);
+        const info_end = trimMdEnd(line);
+        if (info_end > info_start) addSpan(&count, spans_buf, info_start, info_end, .type_name);
+        return .{ .count = count, .state = .in_code_fence };
+    }
+    // ATX heading: 1-6 '#' then space or end-of-line
+    if (line[pos] == '#') {
+        var h = pos;
+        while (h < line.len and line[h] == '#') h += 1;
+        if (h - pos <= 6 and (h >= line.len or line[h] == ' ' or line[h] == '\t')) {
+            addSpan(&count, spans_buf, pos, line.len, .heading);
+            return .{ .count = count, .state = .normal };
+        }
+    }
+    // Table delimiter row ("| --- | :---: |") — all structural, one span
+    if (tableDelimEnd(line, pos)) |end| {
+        addSpan(&count, spans_buf, pos, end, .operator);
+        return .{ .count = count, .state = .normal };
+    }
+
+    // --- Inline content ---
+    const state = scanMdInline(line, pos, &count, spans_buf);
+    return .{ .count = count, .state = state };
+}
+
+/// Inline markdown scanner from `start` to end of line, emitting spans in
+/// left-to-right order. Returns .in_html_comment if an HTML comment opened
+/// without closing on this line, else .normal.
+fn scanMdInline(line: []const u8, start: usize, count: *usize, spans_buf: []HighlightSpan) LineState {
+    var i = start;
+    while (i < line.len) {
+        switch (line[i]) {
+            '\\' => i = @min(i + 2, line.len),
+            '`' => {
+                var run = i;
+                while (run < line.len and line[run] == '`') run += 1;
+                if (codeSpanClose(line, run, run - i)) |close_end| {
+                    addSpan(count, spans_buf, i, close_end, .string);
+                    i = close_end;
+                } else {
+                    // Unmatched backticks are literal
+                    i = run;
+                }
+            },
+            '*' => i = emphasisSpan(line, i, '*', count, spans_buf),
+            '_' => i = emphasisSpan(line, i, '_', count, spans_buf),
+            '~' => {
+                if (i + 1 < line.len and line[i + 1] == '~') {
+                    if (delimClose(line, i + 2, "~~")) |close| {
+                        addSpan(count, spans_buf, i, close + 2, .comment);
+                        i = close + 2;
+                    } else {
+                        i += 2;
+                    }
+                } else {
+                    i += 1;
+                }
+            },
+            '!', '[' => {
+                const bracket = if (line[i] == '!') i + 1 else i;
+                if (bracket < line.len and line[bracket] == '[') {
+                    if (linkSpan(line, i, bracket, count, spans_buf)) |next| {
+                        i = next;
+                        continue;
+                    }
+                }
+                i += 1;
+            },
+            '<' => {
+                if (prefixAt(line, i, "<!--")) {
+                    if (std.mem.indexOfPos(u8, line, i + 4, "-->")) |close| {
+                        addCommentSpans(count, spans_buf, line, i, close + 3);
+                        i = close + 3;
+                    } else {
+                        addCommentSpans(count, spans_buf, line, i, line.len);
+                        return .in_html_comment;
+                    }
+                } else if (autolinkEnd(line, i)) |end| {
+                    addSpan(count, spans_buf, i, end, .link);
+                    i = end;
+                } else {
+                    i += 1;
+                }
+            },
+            '|' => {
+                // Table cell separator
+                addSpan(count, spans_buf, i, i + 1, .operator);
+                i += 1;
+            },
+            else => i += 1,
+        }
+    }
+    return .normal;
+}
+
+/// Emphasis / strong at `i` with marker `ch` ('*' or '_'). Emits a span when a
+/// valid closer exists on the line; returns the position to resume scanning.
+fn emphasisSpan(line: []const u8, i: usize, ch: u8, count: *usize, spans_buf: []HighlightSpan) usize {
+    var run = i;
+    while (run < line.len and line[run] == ch) run += 1;
+    const open_len = run - i;
+
+    // Opener must be followed by a non-space; '_' additionally must not sit
+    // inside a word (snake_case stays plain).
+    if (run >= line.len or line[run] == ' ' or line[run] == '\t') return run;
+    if (ch == '_' and i > 0 and isIdentChar(line[i - 1])) return run;
+
+    const want: usize = @min(open_len, 2);
+    var j = run;
+    while (j < line.len) {
+        if (line[j] != ch) {
+            j += 1;
+            continue;
+        }
+        var close_run = j;
+        while (close_run < line.len and line[close_run] == ch) close_run += 1;
+        const prev = line[j - 1];
+        const prev_ok = prev != ' ' and prev != '\t' and prev != ch;
+        const word_ok = ch != '_' or close_run >= line.len or !isIdentChar(line[close_run]);
+        if (close_run - j >= want and prev_ok and word_ok) {
+            addSpan(count, spans_buf, i, close_run, if (want == 2) .strong else .emphasis);
+            return close_run;
+        }
+        j = close_run;
+    }
+    return run;
+}
+
+/// Link or image at `i` (`bracket` = index of '['). Emits `[text]` as .link
+/// and an inline `(url)` destination as .comment (dim). Returns the resume
+/// position, or null when there is no closing ']' on the line.
+fn linkSpan(line: []const u8, i: usize, bracket: usize, count: *usize, spans_buf: []HighlightSpan) ?usize {
+    var depth: usize = 0;
+    var j = bracket;
+    const close_bracket = while (j < line.len) : (j += 1) {
+        switch (line[j]) {
+            '\\' => j += 1, // skip escaped char
+            '[' => depth += 1,
+            ']' => {
+                depth -= 1;
+                if (depth == 0) break j;
+            },
+            else => {},
+        }
+    } else return null;
+
+    addSpan(count, spans_buf, i, close_bracket + 1, .link);
+    if (close_bracket + 1 < line.len and line[close_bracket + 1] == '(') {
+        var pdepth: usize = 0;
+        var k = close_bracket + 1;
+        while (k < line.len) : (k += 1) {
+            switch (line[k]) {
+                '\\' => k += 1,
+                '(' => pdepth += 1,
+                ')' => {
+                    pdepth -= 1;
+                    if (pdepth == 0) {
+                        addSpan(count, spans_buf, close_bracket + 1, k + 1, .comment);
+                        return k + 1;
+                    }
+                },
+                else => {},
+            }
+        }
+    }
+    return close_bracket + 1;
+}
+
+/// Find a closing backtick run of exactly `n` backticks at or after `from`.
+/// Returns the index just past the closing run.
+fn codeSpanClose(line: []const u8, from: usize, n: usize) ?usize {
+    var i = from;
+    while (i < line.len) {
+        if (line[i] == '`') {
+            var run = i;
+            while (run < line.len and line[run] == '`') run += 1;
+            if (run - i == n) return run;
+            i = run;
+        } else {
+            i += 1;
+        }
+    }
+    return null;
+}
+
+/// Find closing delimiter `delim` at or after `from` preceded by a non-space
+/// character. Returns its start index.
+fn delimClose(line: []const u8, from: usize, delim: []const u8) ?usize {
+    var i = from;
+    while (i + delim.len <= line.len) : (i += 1) {
+        if (std.mem.startsWith(u8, line[i..], delim)) {
+            if (i > 0 and line[i - 1] != ' ' and line[i - 1] != '\t') return i;
+        }
+    }
+    return null;
+}
+
+/// Autolink `<scheme://...>` with no spaces inside. Returns index past '>'.
+fn autolinkEnd(line: []const u8, i: usize) ?usize {
+    var j = i + 1;
+    var has_scheme = false;
+    while (j < line.len) : (j += 1) {
+        switch (line[j]) {
+            '>' => return if (has_scheme) j + 1 else null,
+            ' ', '\t', '<' => return null,
+            ':' => {
+                if (prefixAt(line, j, "://")) has_scheme = true;
+            },
+            else => {},
+        }
+    }
+    return null;
+}
+
+/// If a code-fence delimiter run (3+ backticks or tildes) starts at `pos`,
+/// return the index just past the run.
+fn fenceEnd(line: []const u8, pos: usize) ?usize {
+    if (pos >= line.len) return null;
+    const ch = line[pos];
+    if (ch != '`' and ch != '~') return null;
+    var i = pos;
+    while (i < line.len and line[i] == ch) i += 1;
+    if (i - pos < 3) return null;
+    return i;
+}
+
+/// Thematic break: 3+ of the same '-' / '*' / '_' with only spaces between
+/// and nothing else on the line. Returns the trimmed end.
+fn hrEnd(line: []const u8, pos: usize) ?usize {
+    if (pos >= line.len) return null;
+    const ch = line[pos];
+    if (ch != '-' and ch != '*' and ch != '_') return null;
+    var n: usize = 0;
+    var i = pos;
+    while (i < line.len) : (i += 1) {
+        if (line[i] == ch) {
+            n += 1;
+        } else if (line[i] != ' ' and line[i] != '\t' and line[i] != '\r') {
+            return null;
+        }
+    }
+    if (n < 3) return null;
+    return trimMdEnd(line);
+}
+
+/// List marker at `pos`: "- " / "* " / "+ " bullet or "12." / "12)" ordered.
+/// Returns the index just past the marker (excluding the following space).
+/// A bare marker at end-of-line also counts (empty list item).
+fn listMarkerEnd(line: []const u8, pos: usize) ?usize {
+    const ch = line[pos];
+    if (ch == '-' or ch == '*' or ch == '+') {
+        const after = pos + 1;
+        if (after >= line.len or line[after] == ' ' or line[after] == '\t') return after;
+        return null;
+    }
+    if (std.ascii.isDigit(ch)) {
+        var i = pos;
+        while (i < line.len and std.ascii.isDigit(line[i]) and i - pos < 9) i += 1;
+        if (i < line.len and (line[i] == '.' or line[i] == ')')) {
+            const after = i + 1;
+            if (after >= line.len or line[after] == ' ' or line[after] == '\t') return after;
+        }
+        return null;
+    }
+    return null;
+}
+
+/// GFM task checkbox "[ ]" / "[x]" / "[X]" at `pos` followed by a space or
+/// end-of-line. Returns the index just past the ']'.
+fn taskBoxEnd(line: []const u8, pos: usize) ?usize {
+    if (pos + 3 > line.len) return null;
+    if (line[pos] != '[') return null;
+    const c = line[pos + 1];
+    if (c != ' ' and c != 'x' and c != 'X') return null;
+    if (line[pos + 2] != ']') return null;
+    if (pos + 3 < line.len and line[pos + 3] != ' ' and line[pos + 3] != '\t') return null;
+    return pos + 3;
+}
+
+/// Table delimiter row: only '|', '-', ':' and spaces, with at least one pipe
+/// and three dashes. Returns the trimmed end.
+fn tableDelimEnd(line: []const u8, pos: usize) ?usize {
+    var pipes: usize = 0;
+    var dashes: usize = 0;
+    var i = pos;
+    while (i < line.len) : (i += 1) {
+        switch (line[i]) {
+            '|' => pipes += 1,
+            '-' => dashes += 1,
+            ':', ' ', '\t', '\r' => {},
+            else => return null,
+        }
+    }
+    if (pipes == 0 or dashes < 3) return null;
+    return trimMdEnd(line);
+}
+
+fn skipMdSpace(line: []const u8, from: usize) usize {
+    var i = from;
+    while (i < line.len and (line[i] == ' ' or line[i] == '\t' or line[i] == '\r')) i += 1;
+    return i;
+}
+
+fn trimMdEnd(line: []const u8) usize {
+    var end = line.len;
+    while (end > 0 and (line[end - 1] == ' ' or line[end - 1] == '\t' or line[end - 1] == '\r')) end -= 1;
+    return end;
+}
+
+// ---------------------------------------------------------------------------
+// Markdown editing support (Enter-continuation of lists/quotes)
+// ---------------------------------------------------------------------------
+
+pub const MdListInfo = struct {
+    /// Column where the marker chain (indent, quotes, bullet, checkbox) ends
+    /// and content would begin.
+    content_start: usize,
+    /// Number of '>' blockquote levels.
+    quote_levels: u8,
+    list: ?ListKind,
+    /// Whether a task checkbox follows the bullet.
+    task: bool,
+    /// Whether any non-whitespace content follows the markers.
+    has_content: bool,
+
+    pub const ListKind = union(enum) {
+        /// Bullet char: '-', '*', or '+'.
+        bullet: u8,
+        /// Ordered item number and its delimiter ('.' or ')').
+        ordered: struct { number: u64, delim: u8 },
+    };
+};
+
+/// Parse blockquote/list markers at the start of a markdown line, for
+/// Enter-continuation. Returns null when the line has no markers (or is a
+/// thematic break, which only looks like a bullet).
+pub fn mdListInfo(line: []const u8) ?MdListInfo {
+    var info = MdListInfo{
+        .content_start = 0,
+        .quote_levels = 0,
+        .list = null,
+        .task = false,
+        .has_content = false,
+    };
+    var pos = skipMdSpace(line, 0);
+    while (pos < line.len) {
+        if (hrEnd(line, pos) != null) return null;
+        if (line[pos] == '>') {
+            info.quote_levels +|= 1;
+            pos = skipMdSpace(line, pos + 1);
+            continue;
+        }
+        if (info.list == null) {
+            if (listMarkerEnd(line, pos)) |end| {
+                const ch = line[pos];
+                info.list = if (std.ascii.isDigit(ch)) .{ .ordered = .{
+                    .number = std.fmt.parseInt(u64, line[pos .. end - 1], 10) catch 0,
+                    .delim = line[end - 1],
+                } } else .{ .bullet = ch };
+                pos = skipMdSpace(line, end);
+                if (taskBoxEnd(line, pos)) |box_end| {
+                    info.task = true;
+                    pos = skipMdSpace(line, box_end);
+                }
+                continue;
+            }
+        }
+        break;
+    }
+    if (info.quote_levels == 0 and info.list == null) return null;
+    info.content_start = pos;
+    info.has_content = pos < line.len;
+    return info;
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -610,4 +1105,208 @@ test "language extension matching" {
     try std.testing.expect(lang_zig.matchesExtension("zig"));
     try std.testing.expect(lang_zig.matchesExtension("zon"));
     try std.testing.expect(!lang_zig.matchesExtension("py"));
+    try std.testing.expect(lang_markdown.matchesExtension("md"));
+    try std.testing.expect(lang_markdown.matchesExtension("markdown"));
+}
+
+test "markdown heading" {
+    var buf: [64]HighlightSpan = undefined;
+    const r = tokenizeLine("## Title", &lang_markdown, .normal, &buf);
+    try std.testing.expectEqual(@as(usize, 1), r.count);
+    try std.testing.expectEqual(TokenType.heading, buf[0].token);
+    try std.testing.expectEqual(@as(u16, 0), buf[0].start);
+    try std.testing.expectEqual(@as(u16, 8), buf[0].end);
+    // Missing space after '#' → not a heading
+    const r2 = tokenizeLine("#nospace", &lang_markdown, .normal, &buf);
+    for (buf[0..r2.count]) |s| try std.testing.expect(s.token != .heading);
+}
+
+test "markdown bold and italic" {
+    var buf: [64]HighlightSpan = undefined;
+    const r = tokenizeLine("mix **bold** and *ital*", &lang_markdown, .normal, &buf);
+    try std.testing.expectEqual(@as(usize, 2), r.count);
+    try std.testing.expectEqual(TokenType.strong, buf[0].token);
+    try std.testing.expectEqual(@as(u16, 4), buf[0].start);
+    try std.testing.expectEqual(@as(u16, 12), buf[0].end);
+    try std.testing.expectEqual(TokenType.emphasis, buf[1].token);
+    // Bold-italic run covered as one strong span
+    const r2 = tokenizeLine("***both***", &lang_markdown, .normal, &buf);
+    try std.testing.expectEqual(@as(usize, 1), r2.count);
+    try std.testing.expectEqual(TokenType.strong, buf[0].token);
+    try std.testing.expectEqual(@as(u16, 10), buf[0].end);
+}
+
+test "markdown snake_case is not emphasis" {
+    var buf: [64]HighlightSpan = undefined;
+    const r = tokenizeLine("use foo_bar_baz here", &lang_markdown, .normal, &buf);
+    try std.testing.expectEqual(@as(usize, 0), r.count);
+    // Unclosed '*' and space-flanked '*' stay plain
+    const r2 = tokenizeLine("a * b * c", &lang_markdown, .normal, &buf);
+    try std.testing.expectEqual(@as(usize, 0), r2.count);
+}
+
+test "markdown inline code" {
+    var buf: [64]HighlightSpan = undefined;
+    const r = tokenizeLine("run `zig build` now", &lang_markdown, .normal, &buf);
+    try std.testing.expectEqual(@as(usize, 1), r.count);
+    try std.testing.expectEqual(TokenType.string, buf[0].token);
+    try std.testing.expectEqual(@as(u16, 4), buf[0].start);
+    try std.testing.expectEqual(@as(u16, 15), buf[0].end);
+    // Unmatched backtick stays plain, emphasis inside code is swallowed
+    const r2 = tokenizeLine("a ` b", &lang_markdown, .normal, &buf);
+    try std.testing.expectEqual(@as(usize, 0), r2.count);
+    const r3 = tokenizeLine("`a *b* c`", &lang_markdown, .normal, &buf);
+    try std.testing.expectEqual(@as(usize, 1), r3.count);
+    try std.testing.expectEqual(TokenType.string, buf[0].token);
+}
+
+test "markdown fenced code block state" {
+    var buf: [64]HighlightSpan = undefined;
+    const r1 = tokenizeLine("```zig", &lang_markdown, .normal, &buf);
+    try std.testing.expectEqual(LineState.in_code_fence, r1.state);
+    try std.testing.expectEqual(TokenType.operator, buf[0].token);
+    try std.testing.expectEqual(TokenType.type_name, buf[1].token); // info string
+    const r2 = tokenizeLine("const x = 1;", &lang_markdown, .in_code_fence, &buf);
+    try std.testing.expectEqual(LineState.in_code_fence, r2.state);
+    try std.testing.expectEqual(TokenType.string, buf[0].token);
+    // A heading inside a fence is code, not a heading
+    const r3 = tokenizeLine("# not a heading", &lang_markdown, .in_code_fence, &buf);
+    try std.testing.expectEqual(TokenType.string, buf[0].token);
+    try std.testing.expectEqual(LineState.in_code_fence, r3.state);
+    const r4 = tokenizeLine("```", &lang_markdown, .in_code_fence, &buf);
+    try std.testing.expectEqual(LineState.normal, r4.state);
+}
+
+test "markdown link and image" {
+    var buf: [64]HighlightSpan = undefined;
+    const r = tokenizeLine("see [docs](http://x.io) ok", &lang_markdown, .normal, &buf);
+    try std.testing.expectEqual(@as(usize, 2), r.count);
+    try std.testing.expectEqual(TokenType.link, buf[0].token); // [docs]
+    try std.testing.expectEqual(@as(u16, 4), buf[0].start);
+    try std.testing.expectEqual(@as(u16, 10), buf[0].end);
+    try std.testing.expectEqual(TokenType.comment, buf[1].token); // (url) dim
+    const r2 = tokenizeLine("![img](a.png)", &lang_markdown, .normal, &buf);
+    try std.testing.expectEqual(@as(usize, 2), r2.count);
+    try std.testing.expectEqual(TokenType.link, buf[0].token);
+    try std.testing.expectEqual(@as(u16, 0), buf[0].start); // includes '!'
+    // Reference-style link: text part only
+    const r3 = tokenizeLine("see [docs][ref]", &lang_markdown, .normal, &buf);
+    try std.testing.expectEqual(@as(usize, 2), r3.count);
+    try std.testing.expectEqual(TokenType.link, buf[0].token);
+    try std.testing.expectEqual(TokenType.link, buf[1].token);
+}
+
+test "markdown list bullets and task boxes" {
+    var buf: [64]HighlightSpan = undefined;
+    const r = tokenizeLine("- [x] done **now**", &lang_markdown, .normal, &buf);
+    try std.testing.expectEqual(@as(usize, 3), r.count);
+    try std.testing.expectEqual(TokenType.operator, buf[0].token); // -
+    try std.testing.expectEqual(TokenType.constant, buf[1].token); // [x]
+    try std.testing.expectEqual(TokenType.strong, buf[2].token);
+    const r2 = tokenizeLine("3. item", &lang_markdown, .normal, &buf);
+    try std.testing.expect(r2.count >= 1);
+    try std.testing.expectEqual(TokenType.operator, buf[0].token); // "3."
+    try std.testing.expectEqual(@as(u16, 0), buf[0].start);
+    try std.testing.expectEqual(@as(u16, 2), buf[0].end);
+}
+
+test "markdown blockquote and nested markers" {
+    var buf: [64]HighlightSpan = undefined;
+    const r = tokenizeLine("> - item", &lang_markdown, .normal, &buf);
+    try std.testing.expectEqual(@as(usize, 2), r.count);
+    try std.testing.expectEqual(TokenType.operator, buf[0].token); // >
+    try std.testing.expectEqual(TokenType.operator, buf[1].token); // -
+    const r2 = tokenizeLine("> # Quoted title", &lang_markdown, .normal, &buf);
+    try std.testing.expectEqual(@as(usize, 2), r2.count);
+    try std.testing.expectEqual(TokenType.heading, buf[1].token);
+}
+
+test "markdown thematic break vs bullet" {
+    var buf: [64]HighlightSpan = undefined;
+    const r = tokenizeLine("---", &lang_markdown, .normal, &buf);
+    try std.testing.expectEqual(@as(usize, 1), r.count);
+    try std.testing.expectEqual(TokenType.operator, buf[0].token);
+    try std.testing.expectEqual(@as(u16, 3), buf[0].end);
+    const r2 = tokenizeLine("- - -", &lang_markdown, .normal, &buf);
+    try std.testing.expectEqual(@as(usize, 1), r2.count); // one rule span, not bullets
+}
+
+test "markdown table rows" {
+    var buf: [64]HighlightSpan = undefined;
+    const r = tokenizeLine("| a | b |", &lang_markdown, .normal, &buf);
+    try std.testing.expectEqual(@as(usize, 3), r.count); // three pipes
+    for (buf[0..r.count]) |s| try std.testing.expectEqual(TokenType.operator, s.token);
+    const r2 = tokenizeLine("| --- | :---: |", &lang_markdown, .normal, &buf);
+    try std.testing.expectEqual(@as(usize, 1), r2.count); // whole delimiter row
+    try std.testing.expectEqual(TokenType.operator, buf[0].token);
+}
+
+test "markdown strikethrough" {
+    var buf: [64]HighlightSpan = undefined;
+    const r = tokenizeLine("a ~~gone~~ b", &lang_markdown, .normal, &buf);
+    try std.testing.expectEqual(@as(usize, 1), r.count);
+    try std.testing.expectEqual(TokenType.comment, buf[0].token);
+    try std.testing.expectEqual(@as(u16, 2), buf[0].start);
+    try std.testing.expectEqual(@as(u16, 10), buf[0].end);
+}
+
+test "markdown html comment with TODO" {
+    var buf: [64]HighlightSpan = undefined;
+    const r = tokenizeLine("<!-- TODO: write -->", &lang_markdown, .normal, &buf);
+    try std.testing.expectEqual(LineState.normal, r.state);
+    try std.testing.expectEqual(TokenType.comment, buf[0].token);
+    try std.testing.expectEqual(TokenType.todo, buf[1].token);
+    // Unclosed comment carries state to the next line
+    const r2 = tokenizeLine("text <!-- open", &lang_markdown, .normal, &buf);
+    try std.testing.expectEqual(LineState.in_html_comment, r2.state);
+    const r3 = tokenizeLine("still hidden -->", &lang_markdown, .in_html_comment, &buf);
+    try std.testing.expectEqual(LineState.normal, r3.state);
+    try std.testing.expectEqual(TokenType.comment, buf[0].token);
+}
+
+test "markdown autolink" {
+    var buf: [64]HighlightSpan = undefined;
+    const r = tokenizeLine("go <https://ziglang.org> now", &lang_markdown, .normal, &buf);
+    try std.testing.expectEqual(@as(usize, 1), r.count);
+    try std.testing.expectEqual(TokenType.link, buf[0].token);
+    // Plain html tag is not an autolink
+    const r2 = tokenizeLine("a <b> c", &lang_markdown, .normal, &buf);
+    try std.testing.expectEqual(@as(usize, 0), r2.count);
+}
+
+test "generic tokenizer normalizes foreign markdown states" {
+    var buf: [64]HighlightSpan = undefined;
+    const r = tokenizeLine("const x = 1;", &lang_zig, .in_code_fence, &buf);
+    try std.testing.expectEqual(LineState.normal, r.state);
+    const r2 = tokenizeLine("const y = 2;", &lang_zig, .in_html_comment, &buf);
+    try std.testing.expectEqual(LineState.normal, r2.state);
+}
+
+test "mdListInfo continuation parsing" {
+    // Bullet with content
+    const b = mdListInfo("  - item").?;
+    try std.testing.expectEqual(@as(u8, 0), b.quote_levels);
+    try std.testing.expect(b.list.? == .bullet);
+    try std.testing.expect(b.has_content);
+    try std.testing.expectEqual(@as(usize, 4), b.content_start);
+    // Empty items (bare marker, marker + trailing space)
+    try std.testing.expect(!mdListInfo("- ").?.has_content);
+    try std.testing.expect(!mdListInfo("-").?.has_content);
+    // Ordered
+    const o = mdListInfo("12. ").?;
+    try std.testing.expectEqual(@as(u64, 12), o.list.?.ordered.number);
+    try std.testing.expectEqual(@as(u8, '.'), o.list.?.ordered.delim);
+    try std.testing.expect(!o.has_content);
+    // Task item
+    const t = mdListInfo("- [x] done").?;
+    try std.testing.expect(t.task);
+    try std.testing.expect(t.has_content);
+    // Quote, nested quote + bullet
+    try std.testing.expectEqual(@as(u8, 1), mdListInfo("> text").?.quote_levels);
+    const n = mdListInfo("> > - x").?;
+    try std.testing.expectEqual(@as(u8, 2), n.quote_levels);
+    try std.testing.expect(n.list != null);
+    // No markers / thematic break
+    try std.testing.expect(mdListInfo("plain text") == null);
+    try std.testing.expect(mdListInfo("- - -") == null);
 }

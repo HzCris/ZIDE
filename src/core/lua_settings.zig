@@ -926,6 +926,7 @@ pub fn loadExtensions(lua: *Lua) void {
     const ext_path = std.fmt.bufPrint(&ext_buf, "{s}/extensions", .{dir}) catch return;
     std.Io.Dir.cwd().createDirPath(io, ext_path) catch {};
     createLintExampleTemplate();
+    createMarkdownExtensionTemplate();
 
     var iter_dir = std.Io.Dir.cwd().openDir(io, ext_path, .{ .iterate = true }) catch return;
     defer iter_dir.close(io);
@@ -1001,6 +1002,50 @@ fn createLintExampleTemplate() void {
         \\--     end
         \\--   end)
         \\-- end)
+        \\
+    ) catch {};
+}
+
+/// Create extensions/markdown.lua if it doesn't exist — a small, active
+/// extension dogfooding the buffer API: a palette command that toggles the
+/// GFM task checkbox on the cursor line. Unlike the lint example it ships
+/// enabled (pure buffer edit, no side effects); users can edit or gut it.
+fn createMarkdownExtensionTemplate() void {
+    const dir = getConfigDir() orelse return;
+    const io = global_io orelse return;
+    var path_buf: [512]u8 = undefined;
+    const path = std.fmt.bufPrint(&path_buf, "{s}/extensions/markdown.lua", .{dir}) catch return;
+    if (path.len >= path_buf.len) return;
+    path_buf[path.len] = 0;
+    const z_path: [:0]const u8 = path_buf[0..path.len :0];
+    if (std.Io.Dir.cwd().access(io, z_path, .{})) |_| return else |_| {}
+    const f = std.Io.Dir.cwd().createFile(io, z_path, .{}) catch return;
+    defer f.close(io);
+    f.writeStreamingAll(io,
+        \\-- ZIDE bundled extension: markdown helpers.
+        \\--
+        \\-- `toggle_checkbox` (palette, Ctrl+P) flips the first GFM task box on
+        \\-- the cursor line between "[ ]" and "[x]". One undo step, same-length
+        \\-- edit so the cursor stays put.
+        \\--
+        \\-- This file is a working example of the buffer API (zide.cursor /
+        \\-- get_line / set_line) — copy it to build your own line-editing
+        \\-- commands. Edit freely; it is only recreated if deleted.
+        \\
+        \\zide.command("toggle_checkbox", "Toggle markdown task checkbox on cursor line", function()
+        \\  local line = zide.cursor()
+        \\  local text = zide.get_line(line)
+        \\  if text == nil then return end
+        \\  local s, n = text:gsub("%[ %]", "[x]", 1)
+        \\  if n == 0 then
+        \\    s, n = text:gsub("%[[xX]%]", "[ ]", 1)
+        \\  end
+        \\  if n > 0 then
+        \\    zide.set_line(line, s)
+        \\  else
+        \\    zide.status("No checkbox on this line")
+        \\  end
+        \\end)
         \\
     ) catch {};
 }
@@ -1097,6 +1142,11 @@ fn createSyntaxThemeTemplate(path: [:0]const u8) void {
         \\-- zide.set("syn_punctuation", "#abb2bf")    -- Punctuation ({, }, ;, etc.)
         \\-- zide.set("syn_preprocessor", "#be84d2")   -- Preprocessor (#include, etc.)
         \\-- zide.set("syn_attribute", "#e5c07b")      -- Attributes / decorators
+        \\-- zide.set("syn_todo", "#e5c07b")           -- TODO/FIXME markers in comments
+        \\-- zide.set("syn_heading", "#e06c75")        -- Markdown headings
+        \\-- zide.set("syn_strong", "#d19a66")         -- Markdown bold
+        \\-- zide.set("syn_emphasis", "#c678dd")       -- Markdown italic
+        \\-- zide.set("syn_link", "#61afef")           -- Markdown links
         \\
     ) catch {};
 }

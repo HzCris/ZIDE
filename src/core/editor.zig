@@ -278,11 +278,15 @@ pub const Editor = struct {
             .languages = .empty,
             .lang_syntax_overrides = .empty,
         };
-        // Register built-in Zig language (heap-allocated: see `languages` doc)
+        // Register built-in languages (heap-allocated: see `languages` doc)
         const zig_lang = try allocator.create(syntax.LanguageDef);
         zig_lang.* = syntax.lang_zig;
         errdefer allocator.destroy(zig_lang);
         try editor.languages.append(allocator, zig_lang);
+        const md_lang = try allocator.create(syntax.LanguageDef);
+        md_lang.* = syntax.lang_markdown;
+        errdefer allocator.destroy(md_lang);
+        try editor.languages.append(allocator, md_lang);
         // Always have at least one empty document
         var doc = try Document.init(allocator);
         doc.history.max_size = editor.max_undo_history;

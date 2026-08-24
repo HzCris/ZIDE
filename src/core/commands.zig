@@ -202,6 +202,7 @@ pub fn registerBuiltins(registry: *CommandRegistry) !void {
     try registry.register("dedent", "Dedent (remove leading whitespace)", cmdDedent);
     try registry.register("toggle_comment", "Toggle comment on selected lines", cmdToggleComment);
     try registry.register("next_todo", "Jump to next TODO/FIXME/XXX/HACK/BUG/NOTE marker", cmdNextTodo);
+    try registry.register("open_documentation", "Open ZIDE documentation (Documentation.md)", cmdOpenDocumentation);
     try registry.register("reload_extensions", "Reload Lua extensions (re-runs extensions/*.lua)", cmdReloadExtensions);
     // File tree commands
     try registry.register("toggle_filetree", "Toggle the file tree side panel", cmdToggleFiletree);
@@ -873,6 +874,36 @@ fn cmdCursorFileEndSelect(editor: *Editor, _: ?[]const u8) void {
     c.moveToEnd(&doc.buffer);
 }
 
+// --- Documentation ---
+
+/// Open Documentation.md: search the exe's directory and its ancestors
+/// (zig-out/bin/zide.exe → repo root), then the current working directory.
+fn cmdOpenDocumentation(editor: *Editor, _: ?[]const u8) void {
+    var exe_dir_buf: [512]u8 = undefined;
+    if (std.process.executableDirPath(editor.io, &exe_dir_buf)) |exe_dir_len| {
+        var dir: []const u8 = exe_dir_buf[0..exe_dir_len];
+        var level: usize = 0;
+        while (level < 4) : (level += 1) {
+            var doc_buf: [600]u8 = undefined;
+            const doc_path = std.fmt.bufPrint(&doc_buf, "{s}/Documentation.md", .{dir}) catch break;
+            if (doc_path.len + 1 >= doc_buf.len) break;
+            doc_buf[doc_path.len] = 0;
+            const z_path: [:0]const u8 = doc_buf[0..doc_path.len :0];
+            if (std.Io.Dir.cwd().access(editor.io, z_path, .{})) |_| {
+                _ = editor.openFile(z_path) catch {};
+                return;
+            } else |_| {}
+            dir = std.fs.path.dirname(dir) orelse break;
+        }
+    } else |_| {}
+    // Fallback: current working directory
+    if (std.Io.Dir.cwd().access(editor.io, "Documentation.md", .{})) |_| {
+        _ = editor.openFile("Documentation.md") catch {};
+        return;
+    } else |_| {}
+    editor.status_message = "Documentation.md not found";
+}
+
 // --- Auto-indent newline ---
 
 fn cmdInsertNewlineAuto(editor: *Editor, _: ?[]const u8) void {
@@ -893,6 +924,52 @@ fn cmdInsertNewlineAuto(editor: *Editor, _: ?[]const u8) void {
         if (ch == ' ' or ch == '\t') {
             indent_len += 1;
         } else break;
+    }
+
+    // Markdown: continue list/quote markers ("- ", "3. ", "> ", "- [ ] ").
+    if (doc.language) |lang| md: {
+        if (lang.tokenizer != .markdown) break :md;
+        const info = syntax.mdListInfo(line) orelse break :md;
+        // Enter inside/before the markers behaves like a plain newline
+        if (pos.col < info.content_start) break :md;
+        if (!info.has_content and pos.col >= line.len and !doc.cursors.primaryConst().hasSelection()) {
+            // Enter on an empty item terminates the list: clear the line.
+            // Marker chains are pure ASCII, so byte count == column count.
+            doc.deleteBackward(line.len) catch {};
+            return;
+        }
+        var mbuf: [256]u8 = undefined;
+        var w: usize = 0;
+        mbuf[w] = '\n';
+        w += 1;
+        const ind = @min(indent_len, 128);
+        @memcpy(mbuf[w .. w + ind], line[0..ind]);
+        w += ind;
+        var q: usize = 0;
+        while (q < info.quote_levels and w + 2 <= mbuf.len) : (q += 1) {
+            mbuf[w] = '>';
+            mbuf[w + 1] = ' ';
+            w += 2;
+        }
+        if (info.list) |list| switch (list) {
+            .bullet => |ch| {
+                if (w + 2 > mbuf.len) break :md;
+                mbuf[w] = ch;
+                mbuf[w + 1] = ' ';
+                w += 2;
+            },
+            .ordered => |o| {
+                const s = std.fmt.bufPrint(mbuf[w..], "{d}{c} ", .{ o.number + 1, o.delim }) catch break :md;
+                w += s.len;
+            },
+        };
+        if (info.task) {
+            if (w + 4 > mbuf.len) break :md;
+            @memcpy(mbuf[w .. w + 4], "[ ] ");
+            w += 4;
+        }
+        doc.insertAtCursor(mbuf[0..w]) catch {};
+        return;
     }
 
     // Build newline + indent string
@@ -1153,4 +1230,69 @@ test "add_next_occurrence selects word then finds next" {
     const new_c = &editor.activeDoc().cursors.cursors.items[1];
     try std.testing.expectEqual(@as(usize, 17), new_c.offset);
     try std.testing.expectEqual(@as(usize, 12), new_c.anchor.?);
+}
+
+test "markdown Enter continues list markers" {
+    const allocator = std.testing.allocator;
+    var editor = try Editor.init(allocator, std.testing.io);
+    defer editor.deinit();
+    const doc = editor.activeDoc();
+    doc.language = editor.findLanguage("md");
+    try std.testing.expect(doc.language != null);
+
+    // Bullet
+    try doc.loadText("- item");
+    doc.cursors.primary().offset = 6;
+    cmdInsertNewlineAuto(&editor, null);
+    try std.testing.expectEqualStrings("- item\n- ", doc.buffer.slice(0, doc.buffer.byteLen()));
+
+    // Ordered list increments
+    try doc.loadText("3. x");
+    doc.cursors.primary().offset = 4;
+    cmdInsertNewlineAuto(&editor, null);
+    try std.testing.expectEqualStrings("3. x\n4. ", doc.buffer.slice(0, doc.buffer.byteLen()));
+
+    // Task checkbox continues unchecked; indent preserved
+    try doc.loadText("  - [x] done");
+    doc.cursors.primary().offset = 12;
+    cmdInsertNewlineAuto(&editor, null);
+    try std.testing.expectEqualStrings("  - [x] done\n  - [ ] ", doc.buffer.slice(0, doc.buffer.byteLen()));
+
+    // Blockquote
+    try doc.loadText("> hi");
+    doc.cursors.primary().offset = 4;
+    cmdInsertNewlineAuto(&editor, null);
+    try std.testing.expectEqualStrings("> hi\n> ", doc.buffer.slice(0, doc.buffer.byteLen()));
+}
+
+test "markdown Enter on empty item terminates the list" {
+    const allocator = std.testing.allocator;
+    var editor = try Editor.init(allocator, std.testing.io);
+    defer editor.deinit();
+    const doc = editor.activeDoc();
+    doc.language = editor.findLanguage("md");
+
+    try doc.loadText("- a\n- ");
+    doc.cursors.primary().offset = 6; // end of the empty "- " item
+    cmdInsertNewlineAuto(&editor, null);
+    try std.testing.expectEqualStrings("- a\n", doc.buffer.slice(0, doc.buffer.byteLen()));
+
+    // Enter before the marker does not duplicate it
+    try doc.loadText("- item");
+    doc.cursors.primary().offset = 1;
+    cmdInsertNewlineAuto(&editor, null);
+    try std.testing.expectEqualStrings("-\n item", doc.buffer.slice(0, doc.buffer.byteLen()));
+}
+
+test "non-markdown Enter keeps plain auto-indent" {
+    const allocator = std.testing.allocator;
+    var editor = try Editor.init(allocator, std.testing.io);
+    defer editor.deinit();
+    const doc = editor.activeDoc();
+    doc.language = editor.findLanguage("zig");
+
+    try doc.loadText("- item");
+    doc.cursors.primary().offset = 6;
+    cmdInsertNewlineAuto(&editor, null);
+    try std.testing.expectEqualStrings("- item\n", doc.buffer.slice(0, doc.buffer.byteLen()));
 }

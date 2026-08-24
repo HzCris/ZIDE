@@ -488,6 +488,10 @@ pub const SyntaxTheme = struct {
     preprocessor: ThemeColor,
     attribute: ThemeColor,
     todo: ThemeColor,
+    heading: ThemeColor,
+    strong: ThemeColor,
+    emphasis: ThemeColor,
+    link: ThemeColor,
 
     /// Returns the color for a token type, or null for plain text (use default).
     pub fn colorForToken(self: *const SyntaxTheme, token: syntax.TokenType) ?ThemeColor {
@@ -507,6 +511,10 @@ pub const SyntaxTheme = struct {
             .preprocessor => self.preprocessor,
             .attribute => self.attribute,
             .todo => self.todo,
+            .heading => self.heading,
+            .strong => self.strong,
+            .emphasis => self.emphasis,
+            .link => self.link,
         };
     }
 };
@@ -530,6 +538,10 @@ pub const TuiSyntaxTheme = struct {
     preprocessor: TuiColor,
     attribute: TuiColor,
     todo: TuiColor,
+    heading: TuiColor,
+    strong: TuiColor,
+    emphasis: TuiColor,
+    link: TuiColor,
 
     /// Returns the color for a token type, or null for plain text (use default).
     pub fn colorForToken(self: *const TuiSyntaxTheme, token: syntax.TokenType) ?TuiColor {
@@ -549,6 +561,10 @@ pub const TuiSyntaxTheme = struct {
             .preprocessor => self.preprocessor,
             .attribute => self.attribute,
             .todo => self.todo,
+            .heading => self.heading,
+            .strong => self.strong,
+            .emphasis => self.emphasis,
+            .link => self.link,
         };
     }
 };
@@ -573,6 +589,10 @@ pub const syn_gui_dark = SyntaxTheme{
     .preprocessor = .{ .r = 190, .g = 132, .b = 210 }, // #be84d2 light purple
     .attribute = .{ .r = 229, .g = 192, .b = 123 }, // #e5c07b gold
     .todo = .{ .r = 229, .g = 192, .b = 123 }, // #e5c07b gold — pops against gray comments
+    .heading = .{ .r = 224, .g = 108, .b = 117 }, // #e06c75 soft red
+    .strong = .{ .r = 209, .g = 154, .b = 102 }, // #d19a66 orange
+    .emphasis = .{ .r = 198, .g = 120, .b = 221 }, // #c678dd purple
+    .link = .{ .r = 97, .g = 175, .b = 239 }, // #61afef blue
 };
 
 /// Light syntax theme (One Light inspired).
@@ -591,6 +611,10 @@ pub const syn_gui_light = SyntaxTheme{
     .preprocessor = .{ .r = 166, .g = 38, .b = 164 }, // #a626a4 purple
     .attribute = .{ .r = 152, .g = 104, .b = 1 }, // #986801 dark orange
     .todo = .{ .r = 193, .g = 132, .b = 1 }, // #c18401 amber — pops against gray comments
+    .heading = .{ .r = 228, .g = 86, .b = 73 }, // #e45649 red
+    .strong = .{ .r = 152, .g = 104, .b = 1 }, // #986801 dark orange
+    .emphasis = .{ .r = 166, .g = 38, .b = 164 }, // #a626a4 purple
+    .link = .{ .r = 64, .g = 120, .b = 242 }, // #4078f2 blue
 };
 
 /// High-contrast syntax theme.
@@ -609,6 +633,10 @@ pub const syn_gui_high_contrast = SyntaxTheme{
     .preprocessor = .{ .r = 255, .g = 100, .b = 255 }, // bright magenta
     .attribute = .{ .r = 255, .g = 255, .b = 100 }, // bright yellow
     .todo = .{ .r = 255, .g = 255, .b = 100 }, // bright yellow
+    .heading = .{ .r = 255, .g = 100, .b = 100 }, // bright red
+    .strong = .{ .r = 255, .g = 200, .b = 100 }, // bright orange
+    .emphasis = .{ .r = 255, .g = 100, .b = 255 }, // bright magenta
+    .link = .{ .r = 100, .g = 180, .b = 255 }, // bright blue
 };
 
 // ---------------------------------------------------------------------------
@@ -631,6 +659,10 @@ pub const syn_tui_terminal = TuiSyntaxTheme{
     .preprocessor = .{ .ansi = 5 }, // magenta
     .attribute = .{ .ansi = 3 }, // yellow
     .todo = .{ .ansi = 11 }, // bright yellow — pops against bright-black comments
+    .heading = .{ .ansi = 1 }, // red
+    .strong = .{ .ansi = 3 }, // yellow
+    .emphasis = .{ .ansi = 5 }, // magenta
+    .link = .{ .ansi = 4 }, // blue
 };
 
 /// Dark TUI syntax theme — RGB colors.
@@ -649,6 +681,10 @@ pub const syn_tui_dark = TuiSyntaxTheme{
     .preprocessor = .{ .rgb = .{ .r = 190, .g = 132, .b = 210 } },
     .attribute = .{ .rgb = .{ .r = 229, .g = 192, .b = 123 } },
     .todo = .{ .rgb = .{ .r = 229, .g = 192, .b = 123 } },
+    .heading = .{ .rgb = .{ .r = 224, .g = 108, .b = 117 } },
+    .strong = .{ .rgb = .{ .r = 209, .g = 154, .b = 102 } },
+    .emphasis = .{ .rgb = .{ .r = 198, .g = 120, .b = 221 } },
+    .link = .{ .rgb = .{ .r = 97, .g = 175, .b = 239 } },
 };
 
 /// Light TUI syntax theme — ANSI-256 colors.
@@ -667,6 +703,10 @@ pub const syn_tui_light = TuiSyntaxTheme{
     .preprocessor = .{ .ansi = 128 }, // dark magenta
     .attribute = .{ .ansi = 130 }, // dark orange
     .todo = .{ .ansi = 136 }, // dark goldenrod
+    .heading = .{ .ansi = 124 }, // dark red
+    .strong = .{ .ansi = 130 }, // dark orange
+    .emphasis = .{ .ansi = 128 }, // dark magenta
+    .link = .{ .ansi = 33 }, // blue
 };
 
 /// High-contrast TUI syntax theme — RGB colors.
@@ -685,6 +725,10 @@ pub const syn_tui_high_contrast = TuiSyntaxTheme{
     .preprocessor = .{ .rgb = .{ .r = 255, .g = 100, .b = 255 } },
     .attribute = .{ .rgb = .{ .r = 255, .g = 255, .b = 100 } },
     .todo = .{ .rgb = .{ .r = 255, .g = 255, .b = 100 } },
+    .heading = .{ .rgb = .{ .r = 255, .g = 100, .b = 100 } },
+    .strong = .{ .rgb = .{ .r = 255, .g = 200, .b = 100 } },
+    .emphasis = .{ .rgb = .{ .r = 255, .g = 100, .b = 255 } },
+    .link = .{ .rgb = .{ .r = 100, .g = 180, .b = 255 } },
 };
 
 // ---------------------------------------------------------------------------
