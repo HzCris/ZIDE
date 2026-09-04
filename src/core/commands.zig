@@ -208,6 +208,7 @@ pub fn registerBuiltins(registry: *CommandRegistry) !void {
     try registry.register("next_result", "Jump to the next workspace search result", cmdNextResult);
     try registry.register("prev_result", "Jump to the previous workspace search result", cmdPrevResult);
     try registry.register("reload_extensions", "Reload Lua extensions (re-runs extensions/*.lua)", cmdReloadExtensions);
+    try registry.register("lsp_restart", "Restart language servers (re-reads registrations, clears failures)", cmdLspRestart);
     // File tree commands
     try registry.register("toggle_filetree", "Toggle the file tree side panel", cmdToggleFiletree);
     try registry.register("filetree_reveal", "Reveal the current file in the file tree", cmdFiletreeReveal);
@@ -309,6 +310,7 @@ fn cmdCursorEnd(editor: *Editor, _: ?[]const u8) void {
 fn cmdInsertChar(editor: *Editor, args: ?[]const u8) void {
     const text = args orelse return;
     const doc = editor.activeDoc();
+    const auto_close = editor.autoCloseBracketsFor(doc);
 
     // Multi-cursor: simple insert at all cursors, skip auto-close complexity
     if (doc.cursors.count() > 1) {
@@ -321,7 +323,7 @@ fn cmdInsertChar(editor: *Editor, args: ?[]const u8) void {
     }
 
     // Skip-over: if typing a closing bracket and cursor is on that same char, just move right
-    if (editor.auto_close_brackets and text.len == 1) {
+    if (auto_close and text.len == 1) {
         const ch = text[0];
         if (ch == ')' or ch == ']' or ch == '}' or ch == '\'' or ch == '"' or ch == '`') {
             const offset = doc.cursors.primary().offset;
@@ -338,7 +340,7 @@ fn cmdInsertChar(editor: *Editor, args: ?[]const u8) void {
     doc.insertAtCursor(text) catch {};
 
     // Auto-close brackets/quotes
-    if (editor.auto_close_brackets and text.len == 1) {
+    if (auto_close and text.len == 1) {
         const closing: ?[]const u8 = switch (text[0]) {
             '(' => ")",
             '[' => "]",
@@ -572,17 +574,18 @@ fn cmdSmartHomeSelect(editor: *Editor, _: ?[]const u8) void {
 
 fn cmdIndent(editor: *Editor, _: ?[]const u8) void {
     const doc = editor.activeDoc();
-    if (editor.use_tabs) {
+    if (editor.useTabsFor(doc)) {
         doc.insertAtAllCursors("\t") catch {};
     } else {
         const spaces = "                "; // 16 spaces max
-        const width = @min(editor.tab_width, 16);
+        const width = @min(editor.tabWidthFor(doc), 16);
         doc.insertAtAllCursors(spaces[0..width]) catch {};
     }
 }
 
 fn cmdDedent(editor: *Editor, _: ?[]const u8) void {
-    editor.activeDoc().dedentLine(editor.tab_width) catch {};
+    const doc = editor.activeDoc();
+    doc.dedentLine(editor.tabWidthFor(doc)) catch {};
 }
 
 // --- Comment toggle ---
@@ -612,6 +615,12 @@ fn cmdToggleComment(editor: *Editor, _: ?[]const u8) void {
 
 fn cmdReloadExtensions(editor: *Editor, _: ?[]const u8) void {
     lua_api.reloadExtensions(editor);
+}
+
+// --- Language servers ---
+
+fn cmdLspRestart(editor: *Editor, _: ?[]const u8) void {
+    editor.restartLsp();
 }
 
 // --- File tree ---

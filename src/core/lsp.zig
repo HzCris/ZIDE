@@ -6,10 +6,19 @@ const builtin = @import("builtin");
 // LSP message types (static structs for std.json.parseFromSlice)
 // ---------------------------------------------------------------------------
 
-/// Minimal envelope — just enough to dispatch by method/id.
+/// Minimal envelope — just enough to classify and dispatch. `id` is a
+/// dynamic value: JSON-RPC allows string ids and servers use them for their
+/// own requests (an `?i64` made such messages fail to parse and vanish,
+/// leaving the server waiting on an answer forever).
 const RpcEnvelope = struct {
-    id: ?i64 = null,
+    id: ?std.json.Value = null,
     method: ?[]const u8 = null,
+};
+
+/// `error` member of a failed response.
+const RpcError = struct {
+    code: i64 = 0,
+    message: []const u8 = "",
 };
 
 /// publishDiagnostics notification params.
@@ -40,6 +49,9 @@ const CompletionItem = struct {
     detail: ?[]const u8 = null,
     insertText: ?[]const u8 = null,
     kind: ?u32 = null,
+    /// TextEdit or InsertReplaceEdit — both carry `newText`; used as the
+    /// insert text when `insertText` is absent (vscode servers, clangd).
+    textEdit: ?struct { newText: []const u8 } = null,
 };
 
 /// Definition response.
@@ -71,6 +83,173 @@ pub const Diagnostic = struct {
         allocator.free(self.message);
     }
 };
+
+// ---------------------------------------------------------------------------
+// Server configuration (from zide.register_lsp)
+// ---------------------------------------------------------------------------
+
+/// One language server: the languages it serves, how to launch it, and what
+/// to hand it at initialize time. Every slice is owned by the config — they
+/// are duplicated on creation and never alias Lua memory or LanguageDef
+/// names (those die when a language is re-registered).
+pub const ServerConfig = struct {
+    /// Language names as given to zide.register_language (matched case-insensitively).
+    languages: []const []const u8,
+    /// LSP `languageId` per language, parallel to `languages`; defaults to
+    /// the lowercased name (mutable slice so setLanguageId can swap one).
+    language_ids: [][]const u8,
+    /// argv[0] = program (resolved on PATH by the spawner), rest = arguments.
+    argv: []const []const u8,
+    /// JSON text answered to `workspace/configuration` requests and pushed
+    /// via `workspace/didChangeConfiguration` after the handshake.
+    settings_json: ?[]const u8 = null,
+    /// JSON text spliced into `initializationOptions`.
+    init_options_json: ?[]const u8 = null,
+    /// Registered while extensions/*.lua were loading — such configs are
+    /// dropped and re-added by reload_extensions (init.lua ones persist).
+    from_extension: bool = false,
+    /// Spawn failed / server died / initialize rejected. Stops the per-frame
+    /// lazy start from retrying a broken server every frame. Cleared by
+    /// lsp_restart or by re-registration.
+    failed: bool = false,
+
+    /// Build a config with default language ids (lowercased names).
+    pub fn fromArgv(gpa: Allocator, languages: []const []const u8, argv: []const []const u8) !ServerConfig {
+        const langs = try dupeStrings(gpa, languages);
+        errdefer freeStrings(gpa, langs);
+        const ids = try gpa.alloc([]const u8, languages.len);
+        var filled: usize = 0;
+        errdefer {
+            for (ids[0..filled]) |s| gpa.free(s);
+            gpa.free(ids);
+        }
+        for (languages, 0..) |lang, i| {
+            const id = try gpa.alloc(u8, lang.len);
+            _ = std.ascii.lowerString(id, lang);
+            ids[i] = id;
+            filled += 1;
+        }
+        const args = try dupeStrings(gpa, argv);
+        return .{ .languages = langs, .language_ids = ids, .argv = args };
+    }
+
+    pub fn clone(self: *const ServerConfig, gpa: Allocator) !ServerConfig {
+        const langs = try dupeStrings(gpa, self.languages);
+        errdefer freeStrings(gpa, langs);
+        const ids = try dupeStrings(gpa, self.language_ids);
+        errdefer freeStrings(gpa, ids);
+        const args = try dupeStrings(gpa, self.argv);
+        errdefer freeStrings(gpa, args);
+        const settings: ?[]const u8 = if (self.settings_json) |s| try gpa.dupe(u8, s) else null;
+        errdefer if (settings) |s| gpa.free(s);
+        const init_opts: ?[]const u8 = if (self.init_options_json) |s| try gpa.dupe(u8, s) else null;
+        return .{
+            .languages = langs,
+            .language_ids = ids,
+            .argv = args,
+            .settings_json = settings,
+            .init_options_json = init_opts,
+            .from_extension = self.from_extension,
+            .failed = self.failed,
+        };
+    }
+
+    /// Override the `languageId` sent for `languages[index]`.
+    pub fn setLanguageId(self: *ServerConfig, gpa: Allocator, index: usize, id: []const u8) !void {
+        const duped = try gpa.dupe(u8, id);
+        gpa.free(self.language_ids[index]);
+        self.language_ids[index] = duped;
+    }
+
+    pub fn deinit(self: *ServerConfig, gpa: Allocator) void {
+        freeStrings(gpa, self.languages);
+        freeStrings(gpa, self.language_ids);
+        freeStrings(gpa, self.argv);
+        if (self.settings_json) |s| gpa.free(s);
+        if (self.init_options_json) |s| gpa.free(s);
+        self.* = undefined;
+    }
+
+    pub fn servesLanguage(self: *const ServerConfig, lang_name: []const u8) bool {
+        for (self.languages) |l| {
+            if (std.ascii.eqlIgnoreCase(l, lang_name)) return true;
+        }
+        return false;
+    }
+
+    /// The `languageId` to send for a language (the name itself when the
+    /// config does not serve it — callers only ask for served languages).
+    pub fn languageIdFor(self: *const ServerConfig, lang_name: []const u8) []const u8 {
+        for (self.languages, self.language_ids) |l, id| {
+            if (std.ascii.eqlIgnoreCase(l, lang_name)) return id;
+        }
+        return lang_name;
+    }
+
+    /// Short human name for logs and the status bar: basename of argv[0]
+    /// without a .exe/.cmd/.bat suffix.
+    pub fn displayName(self: *const ServerConfig) []const u8 {
+        if (self.argv.len == 0) return "?";
+        return programDisplayName(self.argv[0]);
+    }
+
+    /// Same server in every way that matters to a running process.
+    pub fn eql(a: *const ServerConfig, b: *const ServerConfig) bool {
+        return stringsEql(a.languages, b.languages) and
+            stringsEql(a.language_ids, b.language_ids) and
+            stringsEql(a.argv, b.argv) and
+            optStrEql(a.settings_json, b.settings_json) and
+            optStrEql(a.init_options_json, b.init_options_json);
+    }
+};
+
+/// Basename of a program path (either separator) minus .exe/.cmd/.bat.
+pub fn programDisplayName(program: []const u8) []const u8 {
+    var start: usize = 0;
+    for (program, 0..) |c, i| {
+        if (c == '/' or c == '\\') start = i + 1;
+    }
+    var base = program[start..];
+    inline for (.{ ".exe", ".cmd", ".bat" }) |ext| {
+        if (base.len > ext.len and std.ascii.endsWithIgnoreCase(base, ext)) {
+            base = base[0 .. base.len - ext.len];
+        }
+    }
+    return base;
+}
+
+fn dupeStrings(gpa: Allocator, items: []const []const u8) ![][]const u8 {
+    const out = try gpa.alloc([]const u8, items.len);
+    var filled: usize = 0;
+    errdefer {
+        for (out[0..filled]) |s| gpa.free(s);
+        gpa.free(out);
+    }
+    for (items, 0..) |s, i| {
+        out[i] = try gpa.dupe(u8, s);
+        filled += 1;
+    }
+    return out;
+}
+
+fn freeStrings(gpa: Allocator, items: []const []const u8) void {
+    for (items) |s| gpa.free(s);
+    gpa.free(items);
+}
+
+fn stringsEql(a: []const []const u8, b: []const []const u8) bool {
+    if (a.len != b.len) return false;
+    for (a, b) |x, y| {
+        if (!std.mem.eql(u8, x, y)) return false;
+    }
+    return true;
+}
+
+fn optStrEql(a: ?[]const u8, b: ?[]const u8) bool {
+    if (a == null and b == null) return true;
+    if (a == null or b == null) return false;
+    return std.mem.eql(u8, a.?, b.?);
+}
 
 // ---------------------------------------------------------------------------
 // Thread-safe message queue (ring buffer)
@@ -120,16 +299,31 @@ pub const LspClient = struct {
     io: std.Io,
     process: ?std.process.Child = null,
     reader_thread: ?std.Thread = null,
+    /// "Keep reading" — cleared by stop() before the reader is joined.
     running: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    /// Set by the reader thread when it exits (EOF = the server closed its
+    /// stdout, i.e. it exited or crashed). `process != null and reader_done`
+    /// is how the editor detects a server that died on its own.
+    reader_done: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     incoming: MessageQueue = .{},
     next_id: i64 = 1,
     initialized: bool = false,
+    /// The server rejected `initialize` (or the handshake could not be
+    /// written): treated like a dead server by the editor's sweep.
+    dead: bool = false,
 
     // Optional TUI loop wake function
     tui_wake_fn: ?*const fn () void = null,
 
     // Pending request tracking
     pending: std.AutoHashMap(i64, RequestMethod) = undefined,
+
+    /// Deep copy of the registration this server was started from — the
+    /// editor's config list can be rewritten (reload_extensions) while the
+    /// server keeps running. Null until start().
+    config: ?ServerConfig = null,
+    /// Absolute workspace root handed to the server at initialize. Owned.
+    root_path: []const u8 = "",
 
     const RequestMethod = enum {
         initialize,
@@ -151,14 +345,45 @@ pub const LspClient = struct {
         self.pending.deinit();
     }
 
+    /// Human name for logs and the status bar: basename of argv[0].
+    pub fn name(self: *const LspClient) []const u8 {
+        if (self.config) |*cfg| return cfg.displayName();
+        return "lsp";
+    }
+
+    /// The languages this server serves, comma-joined into `buf`.
+    pub fn languagesText(self: *const LspClient, buf: []u8) []const u8 {
+        const cfg = if (self.config) |*c| c else return "?";
+        var len: usize = 0;
+        for (cfg.languages, 0..) |lang, i| {
+            const sep: []const u8 = if (i == 0) "" else ", ";
+            if (len + sep.len + lang.len > buf.len) break;
+            @memcpy(buf[len..][0..sep.len], sep);
+            len += sep.len;
+            @memcpy(buf[len..][0..lang.len], lang);
+            len += lang.len;
+        }
+        return buf[0..len];
+    }
+
     // ----- Process lifecycle -----
 
-    pub fn start(self: *LspClient, command: []const u8) !void {
-        if (self.process != null) return;
+    /// Launch `config.argv` with the workspace rooted at `root_path` and
+    /// send `initialize`. The config and root are deep-copied. On error the
+    /// client is left stopped (nothing to clean up beyond `deinit`), except
+    /// that a failed handshake write leaves it `dead` for the sweep.
+    pub fn start(self: *LspClient, config: *const ServerConfig, root_path: []const u8) !void {
+        if (self.process != null) return error.AlreadyStarted;
+        if (config.argv.len == 0) return error.NoCommand;
 
-        const argv: []const []const u8 = &.{command};
+        var cfg = try config.clone(self.allocator);
+        var cfg_moved = false;
+        errdefer if (!cfg_moved) cfg.deinit(self.allocator);
+        const root = try self.allocator.dupe(u8, root_path);
+        errdefer if (!cfg_moved) self.allocator.free(root);
+
         const child = try std.process.spawn(self.io, .{
-            .argv = argv,
+            .argv = cfg.argv,
             .stdin = .pipe,
             .stdout = .pipe,
             // Nobody drains stderr — a pipe would fill up (~4KB) and block the
@@ -170,55 +395,102 @@ pub const LspClient = struct {
             .create_no_window = true,
         });
         self.process = child;
+        self.initialized = false;
+        self.dead = false;
+        self.reader_done.store(false, .release);
         self.running.store(true, .release);
 
-        // Start reader thread
-        self.reader_thread = try std.Thread.spawn(.{}, readerThreadFn, .{self});
+        // Start reader thread (it reads self.process.stdout)
+        self.reader_thread = std.Thread.spawn(.{}, readerThreadFn, .{self}) catch |err| {
+            self.running.store(false, .release);
+            if (self.process) |*proc| proc.kill(self.io);
+            self.process = null;
+            return err;
+        };
 
-        // Send initialize request
-        try self.sendInitialize();
+        self.config = cfg;
+        self.root_path = root;
+        cfg_moved = true;
+
+        // A write failure here means the server is already gone.
+        self.sendInitialize() catch |err| {
+            self.dead = true;
+            return err;
+        };
     }
 
+    /// Shut the server down: polite shutdown/exit, close stdin, give it up
+    /// to ~1s to leave on its own, kill it otherwise, join the reader, free
+    /// everything. Safe on a never-started or already-dead client.
     pub fn stop(self: *LspClient) void {
-        if (self.process == null) return;
-
-        // Send shutdown request then exit notification
-        if (self.initialized) {
-            _ = self.sendRequest("shutdown", "null") catch {};
-            self.sendNotification("exit", "null") catch {};
-        }
-
-        self.running.store(false, .release);
-
-        // Close stdin to signal EOF to the process
-        if (self.process) |*proc| {
-            if (proc.stdin) |stdin| {
-                stdin.close(self.io);
-                proc.stdin = null;
+        if (self.process != null) {
+            if (self.initialized and !self.dead and !self.reader_done.load(.acquire)) {
+                _ = self.sendRequest("shutdown", "null") catch {};
+                self.sendNotification("exit", "null") catch {};
             }
-        }
+            self.running.store(false, .release);
 
-        // Join reader thread
-        if (self.reader_thread) |thread| {
-            thread.join();
-            self.reader_thread = null;
-        }
+            // Close stdin to signal EOF to the process
+            if (self.process) |*proc| {
+                if (proc.stdin) |stdin| {
+                    stdin.close(self.io);
+                    proc.stdin = null;
+                }
+            }
 
-        // Wait for process and clean up
-        if (self.process) |*proc| {
-            _ = proc.wait(self.io) catch {};
+            // Grace period: a well-behaved server exits after `exit`, which
+            // closes its stdout and lets the reader thread finish. A hung
+            // server would block join() forever — kill it instead.
+            var waited_ms: u32 = 0;
+            while (!self.reader_done.load(.acquire) and waited_ms < 1000) : (waited_ms += 10) {
+                std.Io.sleep(self.io, .fromMilliseconds(10), .awake) catch break;
+            }
+            var killed = false;
+            if (!self.reader_done.load(.acquire)) {
+                if (self.process) |*proc| proc.kill(self.io); // blocks + reaps
+                killed = true;
+            }
+
+            // Join reader thread (the server's stdout is closed either way)
+            if (self.reader_thread) |thread| {
+                thread.join();
+                self.reader_thread = null;
+            }
+
+            // Reap — kill() already did when it ran (wait() asserts otherwise)
+            if (!killed) {
+                if (self.process) |*proc| _ = proc.wait(self.io) catch {};
+            }
+            self.process = null;
         }
-        self.process = null;
         self.initialized = false;
+        self.dead = false;
+        self.pending.clearRetainingCapacity();
 
         // Drain remaining messages
         while (self.incoming.tryPop(self.io)) |msg| {
             self.allocator.free(msg.json_bytes);
         }
+        if (self.config) |*cfg| {
+            cfg.deinit(self.allocator);
+            self.config = null;
+        }
+        if (self.root_path.len > 0) {
+            self.allocator.free(self.root_path);
+            self.root_path = "";
+        }
     }
 
+    /// Handshake done and the server is still alive.
     pub fn isReady(self: *const LspClient) bool {
-        return self.process != null and self.initialized;
+        return self.process != null and self.initialized and !self.dead and !self.reader_done.load(.acquire);
+    }
+
+    /// The server went away on its own (crash/exit) or rejected initialize.
+    /// The editor sweeps such clients (stop + destroy) and marks their
+    /// config failed so the lazy start doesn't respawn a crashing server.
+    pub fn isDead(self: *const LspClient) bool {
+        return self.process != null and (self.dead or self.reader_done.load(.acquire));
     }
 
     // ----- Sending messages -----
@@ -269,28 +541,28 @@ pub const LspClient = struct {
     // ----- Initialize handshake -----
 
     fn sendInitialize(self: *LspClient) !void {
-        // Build root URI from cwd
-        var cwd_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
-        const cwd_len = std.process.currentPath(self.io, &cwd_buf) catch 0;
-        const cwd: []const u8 = if (cwd_len > 0) cwd_buf[0..cwd_len] else ".";
-        const root_uri = try pathToUri(self.allocator, cwd);
-        defer self.allocator.free(root_uri);
+        const cfg = if (self.config) |*c| c else return error.NotRunning;
+        const params = try buildInitializeParams(self.allocator, self.root_path, cfg.init_options_json);
+        defer self.allocator.free(params);
+
+        const id = try self.sendRequest("initialize", params);
+        self.pending.put(id, .initialize) catch {};
+    }
+
+    /// Push the registration's `settings` table after the handshake — the
+    /// same JSON answers `workspace/configuration` pulls, so servers of
+    /// either persuasion see it.
+    fn sendDidChangeConfiguration(self: *LspClient) !void {
+        const cfg = if (self.config) |*c| c else return;
+        const settings = cfg.settings_json orelse return;
 
         var params: std.ArrayList(u8) = .empty;
         defer params.deinit(self.allocator);
+        try params.appendSlice(self.allocator, "{\"settings\":");
+        try params.appendSlice(self.allocator, settings);
+        try params.append(self.allocator, '}');
 
-        try params.appendSlice(self.allocator, "{\"processId\":null,\"rootUri\":\"");
-        try params.appendSlice(self.allocator,root_uri);
-        try params.appendSlice(self.allocator,"\",\"capabilities\":{");
-        try params.appendSlice(self.allocator,"\"textDocument\":{");
-        try params.appendSlice(self.allocator,"\"synchronization\":{\"didSave\":true,\"didOpen\":true,\"didClose\":true},");
-        try params.appendSlice(self.allocator,"\"completion\":{\"completionItem\":{}},");
-        try params.appendSlice(self.allocator,"\"publishDiagnostics\":{},");
-        try params.appendSlice(self.allocator,"\"definition\":{}");
-        try params.appendSlice(self.allocator,"}}}");
-
-        const id = try self.sendRequest("initialize", params.items);
-        self.pending.put(id, .initialize) catch {};
+        try self.sendNotification("workspace/didChangeConfiguration", params.items);
     }
 
     // ----- Document sync helpers -----
@@ -415,12 +687,14 @@ pub const LspClient = struct {
         }) catch return;
         defer envelope.deinit();
 
-        if (envelope.value.id) |id| {
-            // It's a response
-            self.handleResponse(id, json_bytes, editor);
-        } else if (envelope.value.method) |method| {
-            // It's a notification
-            self.handleNotification(method, json_bytes, editor);
+        switch (classifyMessage(envelope.value.id, envelope.value.method)) {
+            .request => self.handleServerRequest(envelope.value.id.?, envelope.value.method.?, json_bytes, editor),
+            .response => switch (envelope.value.id.?) {
+                .integer => |id| self.handleResponse(id, json_bytes, editor),
+                else => {}, // we only ever send integer ids
+            },
+            .notification => self.handleNotification(envelope.value.method.?, json_bytes, editor),
+            .invalid => {},
         }
     }
 
@@ -428,13 +702,31 @@ pub const LspClient = struct {
         const method = self.pending.get(id) orelse return;
         _ = self.pending.remove(id);
 
+        // A failed request carries `error` instead of `result`.
+        const ErrForm = struct { @"error": ?RpcError = null };
+        if (std.json.parseFromSlice(ErrForm, self.allocator, json_bytes, .{ .ignore_unknown_fields = true })) |parsed| {
+            defer parsed.deinit();
+            if (parsed.value.@"error") |e| {
+                std.log.warn("LSP[{s}] {s} failed: {d} {s}", .{ self.name(), @tagName(method), e.code, e.message });
+                if (method == .initialize) {
+                    // Nothing else will ever work — the sweep retires the client.
+                    self.dead = true;
+                    editor.status_message = std.fmt.bufPrint(&editor.status_buf, "LSP {s} rejected initialize — see zide.log", .{self.name()}) catch "LSP initialize failed — see zide.log";
+                }
+                return;
+            }
+        } else |_| {}
+
         switch (method) {
             .initialize => {
                 self.initialized = true;
-                // Send initialized notification
+                // Send initialized notification, then the settings
                 self.sendNotification("initialized", "{}") catch {};
-                std.log.info("LSP initialized (handshake complete)", .{});
-                editor.status_message = "LSP ready";
+                self.sendDidChangeConfiguration() catch {};
+                var langs_buf: [64]u8 = undefined;
+                const langs = self.languagesText(&langs_buf);
+                std.log.info("LSP[{s}] initialized (handshake complete) for {s}", .{ self.name(), langs });
+                editor.status_message = std.fmt.bufPrint(&editor.status_buf, "LSP ready: {s} ({s})", .{ self.name(), langs }) catch "LSP ready";
             },
             .completion => {
                 self.handleCompletionResponse(json_bytes, editor);
@@ -449,8 +741,102 @@ pub const LspClient = struct {
     fn handleNotification(self: *LspClient, method: []const u8, json_bytes: []const u8, editor: anytype) void {
         if (std.mem.eql(u8, method, "textDocument/publishDiagnostics")) {
             self.handleDiagnostics(json_bytes, editor);
+        } else if (std.mem.eql(u8, method, "window/logMessage") or std.mem.eql(u8, method, "window/showMessage")) {
+            const Msg = struct { params: struct { type: u32 = 4, message: []const u8 = "" } };
+            const parsed = std.json.parseFromSlice(Msg, self.allocator, json_bytes, .{ .ignore_unknown_fields = true }) catch return;
+            defer parsed.deinit();
+            const p = parsed.value.params;
+            if (p.type <= 2) {
+                std.log.warn("LSP[{s}] {s}", .{ self.name(), p.message });
+            } else {
+                std.log.info("LSP[{s}] {s}", .{ self.name(), p.message });
+            }
+            // showMessage errors are meant for the user's eyes
+            if (p.type == 1 and std.mem.eql(u8, method, "window/showMessage")) {
+                editor.status_message = std.fmt.bufPrint(&editor.status_buf, "LSP {s}: {s}", .{ self.name(), p.message }) catch "LSP error — see zide.log";
+            }
         }
-        // Other notifications (window/logMessage, etc.) are ignored for now
+        // $/progress and anything else: ignored
+    }
+
+    /// Server→client requests must be answered or the server may wait
+    /// forever (lua-language-server blocks on workspace/configuration).
+    fn handleServerRequest(self: *LspClient, id: std.json.Value, method: []const u8, json_bytes: []const u8, editor: anytype) void {
+        _ = editor;
+        if (std.mem.eql(u8, method, "workspace/configuration")) {
+            self.answerConfiguration(id, json_bytes);
+        } else if (std.mem.eql(u8, method, "workspace/workspaceFolders")) {
+            var result: std.ArrayList(u8) = .empty;
+            defer result.deinit(self.allocator);
+            const uri = pathToUri(self.allocator, self.root_path) catch return;
+            defer self.allocator.free(uri);
+            result.appendSlice(self.allocator, "[{\"uri\":") catch return;
+            writeJsonString(&result, self.allocator, uri) catch return;
+            result.appendSlice(self.allocator, ",\"name\":") catch return;
+            writeJsonString(&result, self.allocator, std.fs.path.basename(self.root_path)) catch return;
+            result.appendSlice(self.allocator, "}]") catch return;
+            self.respond(id, result.items);
+        } else if (std.mem.eql(u8, method, "client/registerCapability") or
+            std.mem.eql(u8, method, "client/unregisterCapability") or
+            std.mem.eql(u8, method, "window/workDoneProgress/create") or
+            std.mem.eql(u8, method, "window/showMessageRequest"))
+        {
+            self.respond(id, "null");
+        } else {
+            std.log.info("LSP[{s}] unsupported request {s} — answered MethodNotFound", .{ self.name(), method });
+            self.respondError(id, -32601, "method not found");
+        }
+    }
+
+    fn respond(self: *LspClient, id: std.json.Value, result_json: []const u8) void {
+        const body = buildResponse(self.allocator, id, result_json) catch return;
+        defer self.allocator.free(body);
+        self.writeMessage(body) catch {};
+    }
+
+    fn respondError(self: *LspClient, id: std.json.Value, code: i64, message: []const u8) void {
+        const body = buildErrorResponse(self.allocator, id, code, message) catch return;
+        defer self.allocator.free(body);
+        self.writeMessage(body) catch {};
+    }
+
+    /// Answer `workspace/configuration`: one entry per requested item, the
+    /// dotted `section` looked up in the registration's `settings` table
+    /// (null when unset or missing). The JSON is parsed per request — it
+    /// arrives once or a handful of times, not worth caching a tree.
+    fn answerConfiguration(self: *LspClient, id: std.json.Value, json_bytes: []const u8) void {
+        const Req = struct { params: struct { items: []const struct { section: ?[]const u8 = null } = &.{} } };
+        const parsed = std.json.parseFromSlice(Req, self.allocator, json_bytes, .{ .ignore_unknown_fields = true }) catch {
+            self.respond(id, "[]");
+            return;
+        };
+        defer parsed.deinit();
+        const items = parsed.value.params.items;
+
+        var settings: ?std.json.Parsed(std.json.Value) = null;
+        defer if (settings) |*s| s.deinit();
+        if (self.config) |*cfg| {
+            if (cfg.settings_json) |text| {
+                settings = std.json.parseFromSlice(std.json.Value, self.allocator, text, .{}) catch null;
+            }
+        }
+
+        var result: std.ArrayList(u8) = .empty;
+        defer result.deinit(self.allocator);
+        result.append(self.allocator, '[') catch return;
+        for (items, 0..) |item, i| {
+            if (i > 0) result.append(self.allocator, ',') catch return;
+            const value: ?std.json.Value = if (settings) |s| settingsSection(s.value, item.section orelse "") else null;
+            if (value) |v| {
+                const text = std.json.Stringify.valueAlloc(self.allocator, v, .{}) catch return;
+                defer self.allocator.free(text);
+                result.appendSlice(self.allocator, text) catch return;
+            } else {
+                result.appendSlice(self.allocator, "null") catch return;
+            }
+        }
+        result.append(self.allocator, ']') catch return;
+        self.respond(id, result.items);
     }
 
     fn handleDiagnostics(self: *LspClient, json_bytes: []const u8, editor: anytype) void {
@@ -508,31 +894,14 @@ pub const LspClient = struct {
     }
 
     fn handleCompletionResponse(self: *LspClient, json_bytes: []const u8, editor: anytype) void {
-        // Completion response can be CompletionItem[] or CompletionList { items: [] }
-        // Try both forms
-        const ListForm = struct {
-            result: ?struct {
-                items: ?[]const CompletionItem = null,
-            } = null,
-        };
+        const items = parseCompletionItems(self.allocator, json_bytes) catch return;
+        defer self.allocator.free(items);
 
-        const parsed = std.json.parseFromSlice(ListForm, self.allocator, json_bytes, .{
-            .ignore_unknown_fields = true,
-        }) catch return;
-        defer parsed.deinit();
-
-        const items = if (parsed.value.result) |r| (r.items orelse &.{}) else &.{};
-
-        // Store in editor completion state
+        // Store in editor completion state (the editor owns the strings now)
         editor.clearCompletionItems();
         for (items) |item| {
-            const label = self.allocator.dupe(u8, item.label) catch continue;
-            const detail = if (item.detail) |d| (self.allocator.dupe(u8, d) catch null) else null;
-            const insert_text = if (item.insertText) |t| (self.allocator.dupe(u8, t) catch null) else null;
-            editor.addCompletionItem(label, detail, insert_text) catch {
-                self.allocator.free(label);
-                if (detail) |d| self.allocator.free(d);
-                if (insert_text) |t| self.allocator.free(t);
+            editor.addCompletionItem(item.label, item.detail, item.insert_text) catch {
+                freeCompletionEntry(self.allocator, item);
             };
         }
     }
@@ -625,6 +994,11 @@ pub const LspClient = struct {
                 wake();
             }
         }
+        // EOF / read error / stop(): tell the main thread the server's
+        // stdout is gone (death detection + stop()'s grace loop) and wake
+        // the TUI so it notices without waiting for a keypress.
+        self.reader_done.store(true, .release);
+        if (self.tui_wake_fn) |wake| wake();
     }
 };
 
@@ -854,7 +1228,7 @@ pub fn utf16ColToByte(line: []const u8, utf16_col: u32) usize {
 // JSON string escaping
 // ---------------------------------------------------------------------------
 
-fn writeJsonString(list: *std.ArrayList(u8), gpa: Allocator, text: []const u8) !void {
+pub fn writeJsonString(list: *std.ArrayList(u8), gpa: Allocator, text: []const u8) !void {
     try list.append(gpa, '"');
     for (text) |ch| {
         switch (ch) {
@@ -873,6 +1247,163 @@ fn writeJsonString(list: *std.ArrayList(u8), gpa: Allocator, text: []const u8) !
         }
     }
     try list.append(gpa, '"');
+}
+
+// ---------------------------------------------------------------------------
+// JSON-RPC classification, envelope builders, initialize params
+// ---------------------------------------------------------------------------
+
+pub const MessageKind = enum { response, request, notification, invalid };
+
+/// A message with both id and method is a server→client REQUEST (it wants
+/// an answer); id alone is a response to one of ours; method alone is a
+/// notification. A JSON `null` id counts as absent.
+pub fn classifyMessage(id: ?std.json.Value, method: ?[]const u8) MessageKind {
+    const has_id = if (id) |v| v != .null else false;
+    if (has_id and method != null) return .request;
+    if (has_id) return .response;
+    if (method != null) return .notification;
+    return .invalid;
+}
+
+/// Write a JSON-RPC id back out (integer or string; anything else → null).
+pub fn writeJsonId(list: *std.ArrayList(u8), gpa: Allocator, id: std.json.Value) !void {
+    switch (id) {
+        .integer => |n| try list.print(gpa, "{d}", .{n}),
+        .string => |s| try writeJsonString(list, gpa, s),
+        else => try list.appendSlice(gpa, "null"),
+    }
+}
+
+/// `{"jsonrpc":"2.0","id":<id>,"result":<result_json>}`
+pub fn buildResponse(gpa: Allocator, id: std.json.Value, result_json: []const u8) ![]u8 {
+    var body: std.ArrayList(u8) = .empty;
+    errdefer body.deinit(gpa);
+    try body.appendSlice(gpa, "{\"jsonrpc\":\"2.0\",\"id\":");
+    try writeJsonId(&body, gpa, id);
+    try body.appendSlice(gpa, ",\"result\":");
+    try body.appendSlice(gpa, result_json);
+    try body.append(gpa, '}');
+    return body.toOwnedSlice(gpa);
+}
+
+/// `{"jsonrpc":"2.0","id":<id>,"error":{"code":<code>,"message":<message>}}`
+pub fn buildErrorResponse(gpa: Allocator, id: std.json.Value, code: i64, message: []const u8) ![]u8 {
+    var body: std.ArrayList(u8) = .empty;
+    errdefer body.deinit(gpa);
+    try body.appendSlice(gpa, "{\"jsonrpc\":\"2.0\",\"id\":");
+    try writeJsonId(&body, gpa, id);
+    try body.appendSlice(gpa, ",\"error\":{\"code\":");
+    try body.print(gpa, "{d}", .{code});
+    try body.appendSlice(gpa, ",\"message\":");
+    try writeJsonString(&body, gpa, message);
+    try body.appendSlice(gpa, "}}");
+    return body.toOwnedSlice(gpa);
+}
+
+/// Look up a dotted `section` ("Lua.diagnostics") inside a parsed settings
+/// tree. Empty section = the whole tree; a missing step = null.
+pub fn settingsSection(root: std.json.Value, section: []const u8) ?std.json.Value {
+    if (section.len == 0) return root;
+    var cur = root;
+    var it = std.mem.splitScalar(u8, section, '.');
+    while (it.next()) |part| {
+        if (part.len == 0) continue;
+        switch (cur) {
+            .object => |obj| cur = obj.get(part) orelse return null,
+            else => return null,
+        }
+    }
+    return cur;
+}
+
+/// The `initialize` request params for a workspace rooted at `root_path`
+/// (absolute). Declares the client capabilities ZIDE actually implements
+/// plus the workspace ones needed for settings passthrough.
+pub fn buildInitializeParams(gpa: Allocator, root_path: []const u8, init_options_json: ?[]const u8) ![]u8 {
+    const root_uri = try pathToUri(gpa, root_path);
+    defer gpa.free(root_uri);
+    const folder_name = std.fs.path.basename(root_path);
+
+    var p: std.ArrayList(u8) = .empty;
+    errdefer p.deinit(gpa);
+    try p.appendSlice(gpa, "{\"processId\":null,\"rootUri\":");
+    try writeJsonString(&p, gpa, root_uri);
+    try p.appendSlice(gpa, ",\"rootPath\":");
+    try writeJsonString(&p, gpa, root_path);
+    try p.appendSlice(gpa, ",\"workspaceFolders\":[{\"uri\":");
+    try writeJsonString(&p, gpa, root_uri);
+    try p.appendSlice(gpa, ",\"name\":");
+    try writeJsonString(&p, gpa, if (folder_name.len > 0) folder_name else root_path);
+    try p.appendSlice(gpa, "}],\"capabilities\":{");
+    try p.appendSlice(gpa, "\"textDocument\":{");
+    try p.appendSlice(gpa, "\"synchronization\":{\"didSave\":true,\"didOpen\":true,\"didClose\":true},");
+    try p.appendSlice(gpa, "\"completion\":{\"completionItem\":{}},");
+    try p.appendSlice(gpa, "\"publishDiagnostics\":{},");
+    try p.appendSlice(gpa, "\"definition\":{}},");
+    try p.appendSlice(gpa, "\"workspace\":{\"workspaceFolders\":true,\"configuration\":true,\"didChangeConfiguration\":{\"dynamicRegistration\":false}}");
+    try p.append(gpa, '}');
+    if (init_options_json) |opts| {
+        try p.appendSlice(gpa, ",\"initializationOptions\":");
+        try p.appendSlice(gpa, opts);
+    }
+    try p.append(gpa, '}');
+    return p.toOwnedSlice(gpa);
+}
+
+// ---------------------------------------------------------------------------
+// Completion response parsing
+// ---------------------------------------------------------------------------
+
+pub const CompletionEntry = struct {
+    label: []const u8,
+    detail: ?[]const u8 = null,
+    insert_text: ?[]const u8 = null,
+};
+
+/// Parse a completion response in either shape — `CompletionList{items}`
+/// (zls, clangd, lua-language-server) or a bare `CompletionItem[]` (the
+/// vscode servers). Strings are duplicated with `gpa`; the caller owns
+/// them and the returned slice.
+pub fn parseCompletionItems(gpa: Allocator, json_bytes: []const u8) ![]CompletionEntry {
+    var out: std.ArrayList(CompletionEntry) = .empty;
+    errdefer {
+        for (out.items) |e| freeCompletionEntry(gpa, e);
+        out.deinit(gpa);
+    }
+
+    const ListForm = struct {
+        result: ?struct { items: ?[]const CompletionItem = null } = null,
+    };
+    if (std.json.parseFromSlice(ListForm, gpa, json_bytes, .{ .ignore_unknown_fields = true })) |parsed| {
+        defer parsed.deinit();
+        const items = if (parsed.value.result) |r| (r.items orelse &.{}) else &.{};
+        for (items) |item| try appendCompletionEntry(gpa, &out, item);
+        return out.toOwnedSlice(gpa);
+    } else |_| {}
+
+    const ArrayForm = struct { result: ?[]const CompletionItem = null };
+    const parsed = try std.json.parseFromSlice(ArrayForm, gpa, json_bytes, .{ .ignore_unknown_fields = true });
+    defer parsed.deinit();
+    for (parsed.value.result orelse &.{}) |item| try appendCompletionEntry(gpa, &out, item);
+    return out.toOwnedSlice(gpa);
+}
+
+fn appendCompletionEntry(gpa: Allocator, out: *std.ArrayList(CompletionEntry), item: CompletionItem) !void {
+    const label = try gpa.dupe(u8, item.label);
+    errdefer gpa.free(label);
+    const detail: ?[]const u8 = if (item.detail) |d| try gpa.dupe(u8, d) else null;
+    errdefer if (detail) |d| gpa.free(d);
+    const insert_src: ?[]const u8 = item.insertText orelse (if (item.textEdit) |te| te.newText else null);
+    const insert_text: ?[]const u8 = if (insert_src) |t| try gpa.dupe(u8, t) else null;
+    errdefer if (insert_text) |t| gpa.free(t);
+    try out.append(gpa, .{ .label = label, .detail = detail, .insert_text = insert_text });
+}
+
+pub fn freeCompletionEntry(gpa: Allocator, e: CompletionEntry) void {
+    gpa.free(e.label);
+    if (e.detail) |d| gpa.free(d);
+    if (e.insert_text) |t| gpa.free(t);
 }
 
 // ---------------------------------------------------------------------------
@@ -975,6 +1506,112 @@ test "MessageQueue push pop" {
     try std.testing.expectEqualStrings("hello", popped.json_bytes);
     alloc.free(popped.json_bytes);
     try std.testing.expect(q.tryPop(io) == null);
+}
+
+test "ServerConfig defaults, lookup, equality, display name" {
+    const alloc = std.testing.allocator;
+    var cfg = try ServerConfig.fromArgv(alloc, &.{ "C", "Cpp" }, &.{ "C:/x/clangd.exe", "--background-index" });
+    defer cfg.deinit(alloc);
+    try std.testing.expectEqualStrings("c", cfg.languageIdFor("c"));
+    try std.testing.expectEqualStrings("cpp", cfg.languageIdFor("CPP"));
+    try std.testing.expectEqualStrings("other", cfg.languageIdFor("other")); // unknown → passthrough
+    try std.testing.expect(cfg.servesLanguage("cpp"));
+    try std.testing.expect(!cfg.servesLanguage("zig"));
+    try std.testing.expectEqualStrings("clangd", cfg.displayName());
+    try std.testing.expectEqualStrings("pyright-langserver", programDisplayName("pyright-langserver.cmd"));
+    try std.testing.expectEqualStrings("zls", programDisplayName("/usr/bin/zls"));
+
+    var same = try cfg.clone(alloc);
+    defer same.deinit(alloc);
+    try std.testing.expect(cfg.eql(&same));
+    try std.testing.expectEqualStrings("cpp", same.languageIdFor("cpp"));
+    same.settings_json = try alloc.dupe(u8, "{}");
+    try std.testing.expect(!cfg.eql(&same));
+}
+
+test "classifyMessage" {
+    const int_id: std.json.Value = .{ .integer = 3 };
+    const str_id: std.json.Value = .{ .string = "abc" };
+    const null_id: std.json.Value = .null;
+    try std.testing.expectEqual(MessageKind.response, classifyMessage(int_id, null));
+    try std.testing.expectEqual(MessageKind.request, classifyMessage(str_id, "workspace/configuration"));
+    try std.testing.expectEqual(MessageKind.request, classifyMessage(int_id, "client/registerCapability"));
+    try std.testing.expectEqual(MessageKind.notification, classifyMessage(null, "$/progress"));
+    try std.testing.expectEqual(MessageKind.notification, classifyMessage(null_id, "$/progress"));
+    try std.testing.expectEqual(MessageKind.invalid, classifyMessage(null, null));
+}
+
+test "response envelopes echo integer and string ids" {
+    const alloc = std.testing.allocator;
+    const a = try buildResponse(alloc, .{ .integer = 7 }, "null");
+    defer alloc.free(a);
+    try std.testing.expectEqualStrings("{\"jsonrpc\":\"2.0\",\"id\":7,\"result\":null}", a);
+    const b = try buildErrorResponse(alloc, .{ .string = "x\"y" }, -32601, "method not found");
+    defer alloc.free(b);
+    try std.testing.expectEqualStrings("{\"jsonrpc\":\"2.0\",\"id\":\"x\\\"y\",\"error\":{\"code\":-32601,\"message\":\"method not found\"}}", b);
+}
+
+test "settingsSection walks dotted paths" {
+    const alloc = std.testing.allocator;
+    const parsed = try std.json.parseFromSlice(std.json.Value, alloc, "{\"Lua\":{\"diagnostics\":{\"globals\":[\"zide\"]}}}", .{});
+    defer parsed.deinit();
+    const hit = settingsSection(parsed.value, "Lua.diagnostics").?;
+    try std.testing.expect(hit == .object);
+    try std.testing.expect(hit.object.get("globals") != null);
+    try std.testing.expect(settingsSection(parsed.value, "Lua.nope") == null);
+    try std.testing.expect(settingsSection(parsed.value, "").? == .object);
+    const text = try std.json.Stringify.valueAlloc(alloc, settingsSection(parsed.value, "Lua.diagnostics.globals").?, .{});
+    defer alloc.free(text);
+    try std.testing.expectEqualStrings("[\"zide\"]", text);
+}
+
+test "buildInitializeParams carries root, folders and init options" {
+    const alloc = std.testing.allocator;
+    const root = if (builtin.os.tag == .windows) "C:\\proj\\demo" else "/proj/demo";
+    const params = try buildInitializeParams(alloc, root, "{\"a\":1}");
+    defer alloc.free(params);
+    try std.testing.expect(std.mem.indexOf(u8, params, "\"rootUri\":\"file:///") != null);
+    try std.testing.expect(std.mem.indexOf(u8, params, "\"workspaceFolders\":[{\"uri\":\"file:///") != null);
+    try std.testing.expect(std.mem.indexOf(u8, params, "\"name\":\"demo\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, params, "\"initializationOptions\":{\"a\":1}") != null);
+    try std.testing.expect(std.mem.indexOf(u8, params, "\"configuration\":true") != null);
+    if (builtin.os.tag == .windows) {
+        // backslashes in rootPath must be JSON-escaped
+        try std.testing.expect(std.mem.indexOf(u8, params, "\"rootPath\":\"C:\\\\proj\\\\demo\"") != null);
+    }
+    // Must be valid JSON
+    const parsed = try std.json.parseFromSlice(std.json.Value, alloc, params, .{});
+    defer parsed.deinit();
+
+    const plain = try buildInitializeParams(alloc, root, null);
+    defer alloc.free(plain);
+    try std.testing.expect(std.mem.indexOf(u8, plain, "initializationOptions") == null);
+}
+
+test "parseCompletionItems handles list and array forms" {
+    const alloc = std.testing.allocator;
+    const list = try parseCompletionItems(alloc, "{\"id\":1,\"result\":{\"isIncomplete\":false,\"items\":[{\"label\":\"foo\",\"detail\":\"fn\"},{\"label\":\"bar\",\"textEdit\":{\"range\":{},\"newText\":\"bar()\"}}]}}");
+    defer {
+        for (list) |e| freeCompletionEntry(alloc, e);
+        alloc.free(list);
+    }
+    try std.testing.expectEqual(@as(usize, 2), list.len);
+    try std.testing.expectEqualStrings("foo", list[0].label);
+    try std.testing.expectEqualStrings("fn", list[0].detail.?);
+    try std.testing.expect(list[0].insert_text == null);
+    try std.testing.expectEqualStrings("bar()", list[1].insert_text.?);
+
+    const arr = try parseCompletionItems(alloc, "{\"id\":2,\"result\":[{\"label\":\"baz\",\"insertText\":\"baz\"}]}");
+    defer {
+        for (arr) |e| freeCompletionEntry(alloc, e);
+        alloc.free(arr);
+    }
+    try std.testing.expectEqual(@as(usize, 1), arr.len);
+    try std.testing.expectEqualStrings("baz", arr[0].insert_text.?);
+
+    const none = try parseCompletionItems(alloc, "{\"id\":3,\"result\":null}");
+    defer alloc.free(none);
+    try std.testing.expectEqual(@as(usize, 0), none.len);
 }
 
 test "MessageQueue overflow frees dropped messages" {

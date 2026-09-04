@@ -5,6 +5,8 @@ const theme_mod = @import("theme.zig");
 const ThemeColor = theme_mod.ThemeColor;
 const syntax = @import("syntax.zig");
 const lua_api = @import("lua_api.zig");
+const lua_json = @import("lua_json.zig");
+const lsp_mod = @import("lsp.zig");
 
 const Lua = zlua.Lua;
 
@@ -40,6 +42,12 @@ pub fn registerApi(lua: *Lua, editor: *Editor) void {
     // zide.unbind
     lua.pushFunction(&luaUnbind);
     lua.setField(-2, "unbind");
+
+    // zide.set_language / zide.get_language (per-language setting overrides)
+    lua.pushFunction(&luaSetLanguage);
+    lua.setField(-2, "set_language");
+    lua.pushFunction(&luaGetLanguage);
+    lua.setField(-2, "get_language");
 
     // zide.register_language
     lua.pushFunction(&luaRegisterLanguage);
@@ -435,7 +443,7 @@ fn luaSet(state: ?*zlua.LuaState) callconv(.c) c_int {
     } else if (std.mem.eql(u8, key_str, "session_persistence")) {
         editor.session_persistence = lua.toBoolean(2);
     } else if (std.mem.eql(u8, key_str, "lsp_enabled")) {
-        // Read before the LSP starts; runtime changes take effect next launch.
+        // Takes effect on the next frame: servers stop, or may start lazily.
         editor.lsp_enabled = lua.toBoolean(2);
     } else if (std.mem.eql(u8, key_str, "syntax_highlighting")) {
         editor.syntax_highlighting = lua.toBoolean(2);
@@ -727,6 +735,19 @@ fn luaBind(state: ?*zlua.LuaState) callconv(.c) c_int {
     const key_str: []const u8 = key_z;
     const cmd_str: []const u8 = cmd_z;
 
+    // zide.bind(key, cmd, { language = "zig" }) → that language's overlay,
+    // consulted before the global map while editing such a file.
+    if (bindLanguageOpt(lua, 3)) |lang| {
+        const prof = editor.langProfile(lang) catch {
+            std.log.warn("zide.bind: no profile for language '{s}' (name too long?)", .{lang});
+            return 0;
+        };
+        prof.keybinds.set(key_str, cmd_str) catch {
+            std.log.err("zide.bind: failed to set keybinding", .{});
+        };
+        return 0;
+    }
+
     editor.keybinds.set(key_str, cmd_str) catch {
         std.log.err("zide.bind: failed to set keybinding", .{});
     };
@@ -734,7 +755,7 @@ fn luaBind(state: ?*zlua.LuaState) callconv(.c) c_int {
     return 0;
 }
 
-/// zide.unbind(key_combo)
+/// zide.unbind(key_combo [, { language = "zig" }])
 /// e.g. zide.unbind("ctrl+k")
 fn luaUnbind(state: ?*zlua.LuaState) callconv(.c) c_int {
     var lua: *Lua = @ptrCast(@alignCast(state orelse return 0));
@@ -743,16 +764,139 @@ fn luaUnbind(state: ?*zlua.LuaState) callconv(.c) c_int {
     const key_z = lua.toString(1) catch return 0;
     const key_str: []const u8 = key_z;
 
+    if (bindLanguageOpt(lua, 2)) |lang| {
+        // Never creates a profile: nothing registered means nothing to remove.
+        var buf: [Editor.max_lang_name]u8 = undefined;
+        if (lang.len <= buf.len) {
+            const key = std.ascii.lowerString(&buf, lang);
+            if (editor.lang_profiles.getPtr(key)) |p| p.keybinds.remove(key_str);
+        }
+        return 0;
+    }
+
     editor.keybinds.remove(key_str);
 
     return 0;
+}
+
+/// The `language` string of an options table at `index`, if any. The
+/// slice is Lua-owned (kept alive by the table for the duration of the
+/// call) — copy it before the next collection point if it must persist.
+fn bindLanguageOpt(lua: *Lua, index: i32) ?[]const u8 {
+    if (lua.typeOf(index) != .table) return null;
+    _ = lua.getField(index, "language");
+    defer lua.pop(1);
+    if (lua.typeOf(-1) != .string) return null;
+    const s: []const u8 = lua.toString(-1) catch return null;
+    return s;
 }
 
 // ---------------------------------------------------------------------------
 // zide.register_language(table) — register a language from Lua
 // ---------------------------------------------------------------------------
 
+/// zide.set_language(name, { tab_width = 2, use_tabs = false, word_wrap = true, auto_close_brackets = false })
+/// Per-language overrides of the global settings (merge: only the keys
+/// given change). Works for built-in languages and for names that are
+/// registered later — or never. Kept separate from zide.set because the
+/// settings dialog rewrites `zide.set("tab_width"` lines in init.lua.
+fn luaSetLanguage(state: ?*zlua.LuaState) callconv(.c) c_int {
+    var lua: *Lua = @ptrCast(@alignCast(state orelse return 0));
+    const editor = getEditor(state) orelse return 0;
+    if (lua.typeOf(1) != .string) {
+        std.log.warn("zide.set_language: first argument must be the language name", .{});
+        return 0;
+    }
+    const name: []const u8 = lua.toString(1) catch return 0;
+    if (lua.typeOf(2) != .table) {
+        std.log.warn("zide.set_language('{s}'): second argument must be a table of settings", .{name});
+        return 0;
+    }
+    applyLanguageSettingsTable(lua, editor, 2, name);
+    return 0;
+}
+
+/// zide.get_language(name) → table with only the overridden keys, or nil.
+fn luaGetLanguage(state: ?*zlua.LuaState) callconv(.c) c_int {
+    var lua: *Lua = @ptrCast(@alignCast(state orelse return 0));
+    const editor = getEditor(state) orelse return 0;
+    if (lua.typeOf(1) != .string) {
+        lua.pushNil();
+        return 1;
+    }
+    const name: []const u8 = lua.toString(1) catch return 0;
+    const prof = editor.langProfileNamed(name) orelse {
+        lua.pushNil();
+        return 1;
+    };
+    const s = prof.settings;
+    if (s.tab_width == null and s.use_tabs == null and s.word_wrap == null and s.auto_close_brackets == null) {
+        lua.pushNil();
+        return 1;
+    }
+    lua.newTable();
+    if (s.tab_width) |v| {
+        lua.pushInteger(@intCast(v));
+        lua.setField(-2, "tab_width");
+    }
+    if (s.use_tabs) |v| {
+        lua.pushBoolean(v);
+        lua.setField(-2, "use_tabs");
+    }
+    if (s.word_wrap) |v| {
+        lua.pushBoolean(v);
+        lua.setField(-2, "word_wrap");
+    }
+    if (s.auto_close_brackets) |v| {
+        lua.pushBoolean(v);
+        lua.setField(-2, "auto_close_brackets");
+    }
+    return 1;
+}
+
+/// Read the per-language setting keys from the table at `tbl` into the
+/// language's profile (created on demand). Absent keys are left alone and
+/// no profile is created when none is present.
+fn applyLanguageSettingsTable(lua: *Lua, editor: *Editor, tbl: i32, name: []const u8) void {
+    const t = lua.absIndex(tbl);
+    const tab_width = readOptInteger(lua, t, "tab_width");
+    const use_tabs = readOptBool(lua, t, "use_tabs");
+    const word_wrap = readOptBool(lua, t, "word_wrap");
+    const auto_close = readOptBool(lua, t, "auto_close_brackets");
+    if (tab_width == null and use_tabs == null and word_wrap == null and auto_close == null) return;
+    const prof = editor.langProfile(name) catch {
+        std.log.warn("zide.set_language: no profile for '{s}' (name too long or out of memory)", .{name});
+        return;
+    };
+    if (tab_width) |v| {
+        if (v >= 1 and v <= 16) {
+            prof.settings.tab_width = @intCast(v);
+        } else {
+            std.log.warn("zide.set_language('{s}'): tab_width must be 1..16 (got {d}) — ignored", .{ name, v });
+        }
+    }
+    if (use_tabs) |v| prof.settings.use_tabs = v;
+    if (word_wrap) |v| prof.settings.word_wrap = v;
+    if (auto_close) |v| prof.settings.auto_close_brackets = v;
+}
+
+fn readOptBool(lua: *Lua, tbl: i32, field: [:0]const u8) ?bool {
+    _ = lua.getField(tbl, field);
+    defer lua.pop(1);
+    if (lua.typeOf(-1) != .boolean) return null;
+    return lua.toBoolean(-1);
+}
+
+fn readOptInteger(lua: *Lua, tbl: i32, field: [:0]const u8) ?i64 {
+    _ = lua.getField(tbl, field);
+    defer lua.pop(1);
+    if (lua.typeOf(-1) != .number) return null;
+    return lua.toInteger(-1) catch null;
+}
+
 /// zide.register_language({ name="python", extensions={"py","pyw"}, keywords={...}, ... })
+/// The per-language setting keys (tab_width, use_tabs, word_wrap,
+/// auto_close_brackets) are accepted here too, as sugar for set_language.
 fn luaRegisterLanguage(state: ?*zlua.LuaState) callconv(.c) c_int {
     var lua: *Lua = @ptrCast(@alignCast(state orelse return 0));
     const editor = getEditor(state) orelse return 0;
@@ -773,8 +917,24 @@ fn luaRegisterLanguage(state: ?*zlua.LuaState) callconv(.c) c_int {
         return 0;
     };
 
+    // Optional tokenizer selection: "generic" (default, table-driven) or
+    // "markdown" (the structural native tokenizer). Read without allocating.
+    var tokenizer_given = false;
+    const tokenizer: syntax.TokenizerKind = blk: {
+        _ = lua.getField(1, "tokenizer");
+        defer lua.pop(1);
+        if (lua.typeOf(-1) != .string) break :blk .generic;
+        tokenizer_given = true;
+        const s: []const u8 = lua.toString(-1) catch break :blk .generic;
+        break :blk std.meta.stringToEnum(syntax.TokenizerKind, s) orelse {
+            std.log.warn("zide.register_language: unknown tokenizer '{s}' for '{s}' (using generic)", .{ s, name });
+            break :blk .generic;
+        };
+    };
+
     const lang = syntax.LanguageDef{
         .name = name,
+        .tokenizer = tokenizer,
         .extensions = readTableStringArray(lua, alloc, "extensions"),
         .keywords = readTableStringArray(lua, alloc, "keywords"),
         .types = readTableStringArray(lua, alloc, "types"),
@@ -789,6 +949,25 @@ fn luaRegisterLanguage(state: ?*zlua.LuaState) callconv(.c) c_int {
         .preproc_prefix = readTableChar(lua, "preproc_prefix"),
         .arena = arena,
     };
+
+    // Re-registering a name replaces the definition IN PLACE: documents keep
+    // pointing at the same heap slot and simply see the new tables. Their
+    // highlight cache is dropped so the new definition takes effect at once.
+    // This is a full replacement — a table that tweaks the built-in markdown
+    // must restate `tokenizer = "markdown"` or it degrades to generic.
+    if (editor.findLanguageByName(name)) |old| {
+        if (old.tokenizer == .markdown and !tokenizer_given) {
+            std.log.warn("zide.register_language: '{s}' replaces the markdown definition without tokenizer = \"markdown\" — structural markdown highlighting is now off", .{name});
+        }
+        old.deinit();
+        old.* = lang;
+        for (editor.documents.items) |*doc| {
+            if (doc.language == @as(?*const syntax.LanguageDef, old)) doc.invalidateLineStates(0);
+        }
+        applyLanguageSettingsTable(lua, editor, 1, name);
+        std.log.info("Re-registered language: {s}", .{name});
+        return 0;
+    }
 
     // Heap-allocate so the pointer documents hold stays stable (the editor's
     // languages list stores *LanguageDef — see Editor.languages).
@@ -806,57 +985,141 @@ fn luaRegisterLanguage(state: ?*zlua.LuaState) callconv(.c) c_int {
         return 0;
     };
 
+    applyLanguageSettingsTable(lua, editor, 1, name);
     std.log.info("Registered language: {s}", .{name});
     return 0;
 }
 
-/// Register an LSP server for a language.
-/// Usage: zide.register_lsp({ language = "Python", command = "pyright-langserver" })
+/// Register a language server for one or more languages.
+///
+///   zide.register_lsp({
+///     language = "c",                          -- or languages = {"c", "cpp"}: one server serves all
+///     command = {"clangd", "--background-index"}, -- table = argv; a string is argv[0] ONLY (never split)
+///     language_id = "c",                       -- optional; string (single language) or { [language] = id }
+///     settings = { ... },                      -- optional table → JSON (workspace/configuration + didChangeConfiguration)
+///     init_options = { ... },                  -- optional table → initializationOptions
+///   })
+///
+/// Nothing is validated against the language registry (init.lua runs
+/// before extensions register languages); resolution happens by name when
+/// a document opens. A later registration for the same language wins.
 fn luaRegisterLsp(state: ?*zlua.LuaState) callconv(.c) c_int {
     var lua: *Lua = @ptrCast(@alignCast(state orelse return 0));
     const editor = getEditor(state) orelse return 0;
+    const gpa = editor.allocator;
 
     // Argument must be a table at stack position 1
     if (lua.typeOf(1) != .table) {
-        std.log.err("zide.register_lsp: argument must be a table", .{});
+        std.log.warn("zide.register_lsp: argument must be a table", .{});
         return 0;
     }
 
-    const language = blk: {
+    // languages = {...} wins over language = "..."
+    const langs: []const []const u8 = readTableStringArrayAlloc(lua, gpa, 1, "languages") orelse blk: {
         _ = lua.getField(1, "language");
         defer lua.pop(1);
-        const s = lua.toString(-1) catch {
-            std.log.err("zide.register_lsp: 'language' field required", .{});
+        const s: []const u8 = lua.toString(-1) catch {
+            std.log.warn("zide.register_lsp: 'language' (or 'languages') field required", .{});
             return 0;
         };
-        break :blk editor.allocator.dupe(u8, s) catch return 0;
+        const one = gpa.alloc([]const u8, 1) catch return 0;
+        one[0] = gpa.dupe(u8, s) catch {
+            gpa.free(one);
+            return 0;
+        };
+        break :blk one;
     };
+    defer {
+        for (langs) |l| gpa.free(l);
+        gpa.free(langs);
+    }
 
-    const command = blk: {
+    // command: string = argv[0] only (paths with spaces work); table = argv
+    const argv: []const []const u8 = blk: {
         _ = lua.getField(1, "command");
         defer lua.pop(1);
-        const s = lua.toString(-1) catch {
-            std.log.err("zide.register_lsp: 'command' field required", .{});
-            editor.allocator.free(language);
-            return 0;
-        };
-        break :blk editor.allocator.dupe(u8, s) catch {
-            editor.allocator.free(language);
-            return 0;
-        };
+        switch (lua.typeOf(-1)) {
+            .string => {
+                const s: []const u8 = lua.toString(-1) catch "";
+                const one = gpa.alloc([]const u8, 1) catch return 0;
+                one[0] = gpa.dupe(u8, s) catch {
+                    gpa.free(one);
+                    return 0;
+                };
+                break :blk one;
+            },
+            .table => break :blk lua_api.readArgvAlloc(lua, gpa, -1) orelse {
+                std.log.warn("zide.register_lsp: 'command' table must be a non-empty list of strings", .{});
+                return 0;
+            },
+            else => {
+                std.log.warn("zide.register_lsp: 'command' field required (string or argv table)", .{});
+                return 0;
+            },
+        }
     };
+    defer {
+        for (argv) |a| gpa.free(a);
+        gpa.free(argv);
+    }
 
-    editor.lsp_configs.append(editor.allocator, .{
-        .language = language,
-        .command = command,
-    }) catch {
-        editor.allocator.free(language);
-        editor.allocator.free(command);
+    var cfg = lsp_mod.ServerConfig.fromArgv(gpa, langs, argv) catch return 0;
+
+    // language_id: string (exactly one language) or { [language] = id }
+    _ = lua.getField(1, "language_id");
+    switch (lua.typeOf(-1)) {
+        .string => {
+            if (langs.len == 1) {
+                const id: []const u8 = lua.toString(-1) catch "";
+                cfg.setLanguageId(gpa, 0, id) catch {};
+            } else {
+                std.log.warn("zide.register_lsp: language_id as a string needs exactly one language — use a table {{ [language] = id }} (ignored)", .{});
+            }
+        },
+        .table => {
+            lua.pushNil();
+            while (lua.next(-2)) {
+                defer lua.pop(1);
+                if (lua.typeOf(-2) != .string or lua.typeOf(-1) != .string) continue;
+                const k: []const u8 = lua.toString(-2) catch continue;
+                const v: []const u8 = lua.toString(-1) catch continue;
+                for (cfg.languages, 0..) |lang, i| {
+                    if (std.ascii.eqlIgnoreCase(lang, k)) cfg.setLanguageId(gpa, i, v) catch {};
+                }
+            }
+        },
+        else => {},
+    }
+    lua.pop(1);
+
+    cfg.settings_json = lua_json.tableFieldToJsonAlloc(lua, gpa, 1, "settings");
+    cfg.init_options_json = lua_json.tableFieldToJsonAlloc(lua, gpa, 1, "init_options");
+    cfg.from_extension = editor.loading_extensions;
+
+    editor.lsp_configs.append(gpa, cfg) catch {
+        cfg.deinit(gpa);
         return 0;
     };
-
-    std.log.info("Registered LSP: {s} -> {s}", .{ language, command });
+    std.log.info("Registered LSP: {s}{s} -> {s} ({d} arg(s){s}{s})", .{
+        langs[0],
+        if (langs.len > 1) " (+more)" else "",
+        argv[0],
+        argv.len - 1,
+        if (cfg.settings_json != null) ", settings" else "",
+        if (cfg.init_options_json != null) ", init_options" else "",
+    });
     return 0;
+}
+
+/// Read an array-of-strings field of the table at `table_index` into
+/// `gpa`-owned memory. Null when the field is absent, not a table, or
+/// empty (callers fall back to their single-value form).
+fn readTableStringArrayAlloc(lua: *Lua, gpa: std.mem.Allocator, table_index: i32, field: [:0]const u8) ?[]const []const u8 {
+    const tidx = lua.absIndex(table_index);
+    _ = lua.getField(tidx, field);
+    defer lua.pop(1);
+    if (lua.typeOf(-1) != .table) return null;
+    return lua_api.readArgvAlloc(lua, gpa, -1);
 }
 
 /// Read a string field from the Lua table at stack position 1.
@@ -927,9 +1190,18 @@ pub fn loadExtensions(lua: *Lua) void {
     std.Io.Dir.cwd().createDirPath(io, ext_path) catch {};
     createLintExampleTemplate();
     createMarkdownExtensionTemplate();
+    createLspExampleTemplate();
 
     var iter_dir = std.Io.Dir.cwd().openDir(io, ext_path, .{ .iterate = true }) catch return;
     defer iter_dir.close(io);
+
+    // Tag what the extension files register (register_lsp reads this) so
+    // reload_extensions can drop and re-add exactly those configs.
+    const maybe_editor = getEditor(@ptrCast(lua));
+    if (maybe_editor) |ed| ed.loading_extensions = true;
+    defer if (maybe_editor) |ed| {
+        ed.loading_extensions = false;
+    };
 
     var iter = iter_dir.iterate();
     while (iter.next(io) catch null) |entry| {
@@ -1002,6 +1274,110 @@ fn createLintExampleTemplate() void {
         \\--     end
         \\--   end)
         \\-- end)
+        \\
+    ) catch {};
+}
+
+/// Create extensions/example-lsp-servers.lua (fully commented out) if it
+/// doesn't exist — copy-paste language + server registrations for the
+/// common servers. Inert until the user uncomments a block.
+fn createLspExampleTemplate() void {
+    const dir = getConfigDir() orelse return;
+    const io = global_io orelse return;
+    var path_buf: [512]u8 = undefined;
+    const path = std.fmt.bufPrint(&path_buf, "{s}/extensions/example-lsp-servers.lua", .{dir}) catch return;
+    if (path.len >= path_buf.len) return;
+    path_buf[path.len] = 0;
+    const z_path: [:0]const u8 = path_buf[0..path.len :0];
+    if (std.Io.Dir.cwd().access(io, z_path, .{})) |_| return else |_| {}
+    const f = std.Io.Dir.cwd().createFile(io, z_path, .{}) catch return;
+    defer f.close(io);
+    f.writeStreamingAll(io,
+        \\-- ZIDE example extension: language servers for other languages.
+        \\--
+        \\-- ZIDE ships one server registration: `zls` from PATH for Zig. Every
+        \\-- other language is yours to wire up, neovim-style — register the
+        \\-- language (syntax) and point ZIDE at a server. Copy the blocks you
+        \\-- want into this file or init.lua, uncomment them, then run the
+        \\-- `reload_extensions` palette command (Ctrl+P) or restart ZIDE.
+        \\-- Servers start lazily: the first time a file of that language opens.
+        \\--
+        \\-- zide.register_lsp fields:
+        \\--   language / languages  the language name(s) from zide.register_language
+        \\--   command               a string (the program only — never split on spaces)
+        \\--                         or an argv table {"program", "--flag", ...}
+        \\--   language_id           optional LSP languageId (default: the name lowercased);
+        \\--                         a string for one language, or { [language] = id }
+        \\--   settings              optional table → answers workspace/configuration and is
+        \\--                         pushed with workspace/didChangeConfiguration
+        \\--   init_options          optional table → initializationOptions
+        \\-- Windows: npm shims (.cmd) work as-is; PowerShell-only (.ps1) shims do not.
+        \\-- The workspace root sent to servers is the file tree root.
+        \\
+        \\-- C / C++ — clangd (one server, two languages)
+        \\-- zide.register_language({ name = "c", extensions = {"c", "h"},
+        \\--   keywords = {"auto","break","case","char","const","continue","default","do","double","else","enum","extern","float","for","goto","if","inline","int","long","register","return","short","signed","sizeof","static","struct","switch","typedef","union","unsigned","void","volatile","while"},
+        \\--   types = {"size_t","uint8_t","uint16_t","uint32_t","uint64_t","int8_t","int16_t","int32_t","int64_t","bool"},
+        \\--   constants = {"NULL","true","false"},
+        \\--   line_comment = "//", block_comment_start = "/*", block_comment_end = "*/",
+        \\--   has_char_literals = true, preproc_prefix = "#" })
+        \\-- zide.register_language({ name = "cpp", extensions = {"cpp", "cc", "cxx", "hpp", "hh"},
+        \\--   keywords = {"auto","break","case","catch","class","const","constexpr","continue","default","delete","do","else","enum","explicit","export","extern","for","friend","goto","if","inline","namespace","new","noexcept","operator","private","protected","public","return","static","struct","switch","template","this","throw","try","typedef","typename","union","using","virtual","volatile","while"},
+        \\--   types = {"int","char","bool","void","float","double","long","short","unsigned","signed","size_t","string"},
+        \\--   constants = {"nullptr","true","false","NULL"},
+        \\--   line_comment = "//", block_comment_start = "/*", block_comment_end = "*/",
+        \\--   has_char_literals = true, preproc_prefix = "#" })
+        \\-- zide.register_lsp({ languages = {"c", "cpp"}, command = {"clangd", "--background-index"} })
+        \\
+        \\-- Rust — rust-analyzer (the file tree root must be the Cargo project)
+        \\-- zide.register_language({ name = "rust", extensions = {"rs"},
+        \\--   keywords = {"as","async","await","break","const","continue","crate","dyn","else","enum","extern","fn","for","if","impl","in","let","loop","match","mod","move","mut","pub","ref","return","self","Self","static","struct","super","trait","type","unsafe","use","where","while"},
+        \\--   types = {"i8","i16","i32","i64","i128","isize","u8","u16","u32","u64","u128","usize","f32","f64","bool","char","str","String","Vec","Option","Result","Box"},
+        \\--   constants = {"true","false","None","Some","Ok","Err"},
+        \\--   line_comment = "//", block_comment_start = "/*", block_comment_end = "*/", has_char_literals = true })
+        \\-- zide.register_lsp({ language = "rust", command = {"rust-analyzer"},
+        \\--   init_options = { check = { command = "clippy" } } })
+        \\
+        \\-- JavaScript / TypeScript — typescript-language-server (npm i -g typescript typescript-language-server)
+        \\-- zide.register_language({ name = "javascript", extensions = {"js", "mjs", "cjs"},
+        \\--   keywords = {"async","await","break","case","catch","class","const","continue","default","delete","do","else","export","extends","finally","for","function","if","import","in","instanceof","let","new","of","return","static","super","switch","this","throw","try","typeof","var","void","while","with","yield"},
+        \\--   constants = {"true","false","null","undefined","NaN","Infinity"},
+        \\--   line_comment = "//", block_comment_start = "/*", block_comment_end = "*/", string_delimiters = "\"'`" })
+        \\-- zide.register_language({ name = "typescript", extensions = {"ts", "tsx"},
+        \\--   keywords = {"abstract","as","async","await","break","case","catch","class","const","continue","declare","default","delete","do","else","enum","export","extends","finally","for","function","if","implements","import","in","instanceof","interface","let","namespace","new","of","private","protected","public","readonly","return","static","super","switch","this","throw","try","type","typeof","var","void","while","yield"},
+        \\--   types = {"string","number","boolean","any","unknown","never","void","object"},
+        \\--   constants = {"true","false","null","undefined"},
+        \\--   line_comment = "//", block_comment_start = "/*", block_comment_end = "*/", string_delimiters = "\"'`" })
+        \\-- zide.register_lsp({ languages = {"javascript", "typescript"},
+        \\--   command = {"typescript-language-server", "--stdio"} })
+        \\
+        \\-- JSON — vscode-json-language-server (npm i -g vscode-langservers-extracted)
+        \\-- zide.register_language({ name = "json", extensions = {"json", "jsonc"},
+        \\--   keywords = {}, constants = {"true","false","null"}, line_comment = "//",
+        \\--   block_comment_start = "/*", block_comment_end = "*/" })
+        \\-- zide.register_lsp({ language = "json", command = {"vscode-json-language-server", "--stdio"} })
+        \\
+        \\-- Python — pyright (pip install pyright  /  npm i -g pyright)
+        \\-- zide.register_language({ name = "python", extensions = {"py", "pyw"},
+        \\--   keywords = {"and","as","assert","async","await","break","class","continue","def","del","elif","else","except","finally","for","from","global","if","import","in","is","lambda","nonlocal","not","or","pass","raise","return","try","while","with","yield"},
+        \\--   constants = {"True","False","None"},
+        \\--   builtins = {"print","len","range","str","int","float","list","dict","set","tuple","open","isinstance","type","super"},
+        \\--   line_comment = "#", string_delimiters = "\"'" })
+        \\-- zide.register_lsp({ language = "python", command = {"pyright-langserver", "--stdio"},
+        \\--   settings = { python = { analysis = { typeCheckingMode = "basic" } } } })
+        \\
+        \\-- Lua — lua-language-server. The `settings` teach it about ZIDE's `zide`
+        \\-- global so editing init.lua / extensions shows no "undefined global".
+        \\-- zide.register_language({ name = "lua", extensions = {"lua"},
+        \\--   keywords = {"and","break","do","else","elseif","end","for","function","goto","if","in","local","not","or","repeat","return","then","until","while"},
+        \\--   constants = {"true","false","nil"},
+        \\--   builtins = {"print","pairs","ipairs","type","tostring","tonumber","require","pcall","error","assert","select","string","table","math","os","io"},
+        \\--   line_comment = "--", block_comment_start = "--[[", block_comment_end = "]]", string_delimiters = "\"'" })
+        \\-- zide.register_lsp({ language = "lua", command = {"lua-language-server"},
+        \\--   settings = { Lua = { diagnostics = { globals = {"zide"} } } } })
+        \\
+        \\-- Zig — replace the built-in `zls` (from PATH) with a specific binary:
+        \\-- zide.register_lsp({ language = "zig", command = {"C:/path/to/zls.exe"} })
         \\
     ) catch {};
 }

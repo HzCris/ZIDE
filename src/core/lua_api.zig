@@ -14,6 +14,7 @@ const lua_settings = @import("lua_settings.zig");
 const lsp_mod = @import("lsp.zig");
 const filetree_mod = @import("filetree.zig");
 const fileicons = @import("fileicons.zig");
+const syntax = @import("syntax.zig");
 const ThemeColor = @import("theme.zig").ThemeColor;
 
 const Lua = zlua.Lua;
@@ -22,8 +23,15 @@ const Lua = zlua.Lua;
 /// are the enum tag names ("open", "save").
 pub const LuaEvent = enum { open, save };
 
-/// Per-event lists of Lua registry refs (the registered handlers).
-pub const EventRefs = std.EnumArray(LuaEvent, std.ArrayList(i32));
+/// A registered handler: its Lua registry ref plus an optional language
+/// filter (owned, from `zide.on(ev, fn, { language = "zig" })`).
+pub const EventHandler = struct {
+    ref: i32,
+    language: ?[]const u8 = null,
+};
+
+/// Per-event lists of registered handlers.
+pub const EventHandlers = std.EnumArray(LuaEvent, std.ArrayList(EventHandler));
 
 /// Cap on nested event firing (e.g. a save handler that saves again).
 const max_event_depth = 8;
@@ -96,9 +104,15 @@ fn reportLuaError(editor: *Editor, lua: *Lua, what: []const u8) void {
     lua.pop(1);
 }
 
-/// Fire an event to all registered Lua handlers. `path` becomes the
-/// handler's single argument (nil when null). Safe with no Lua state.
-pub fn fireEvent(editor: *Editor, event: LuaEvent, path: ?[]const u8) void {
+/// Fire an event for `doc` to every registered handler whose language
+/// filter matches (or has none). Handlers receive `(path, language)` —
+/// nil for untitled / plain-text documents. Safe with no Lua state.
+///
+/// Path and language are snapshotted BEFORE the loop: a handler may open
+/// or close documents (reallocating the list `doc` lives in, or freeing
+/// its path) or re-register the language (freeing the arena its name
+/// lives in).
+pub fn fireEvent(editor: *Editor, event: LuaEvent, doc: *const Document) void {
     const lua = editor.lua orelse return;
     if (editor.lua_event_depth >= max_event_depth) {
         std.log.warn("zide.on({s}): event recursion too deep, handlers skipped", .{@tagName(event)});
@@ -106,18 +120,38 @@ pub fn fireEvent(editor: *Editor, event: LuaEvent, path: ?[]const u8) void {
     }
     editor.lua_event_depth += 1;
     defer editor.lua_event_depth -= 1;
+
+    const path_copy: ?[]const u8 = if (doc.file_path) |p| (editor.allocator.dupe(u8, p) catch null) else null;
+    defer if (path_copy) |p| editor.allocator.free(p);
+    var lang_buf: [Editor.max_lang_name]u8 = undefined;
+    const lang: ?[]const u8 = if (doc.language) |l| blk: {
+        if (l.name.len > lang_buf.len) break :blk null;
+        @memcpy(lang_buf[0..l.name.len], l.name);
+        break :blk lang_buf[0..l.name.len];
+    } else null;
+
     // Index-based walk: a handler may register more handlers mid-fire,
-    // which can reallocate the list under a held slice.
+    // which can reallocate the list under a held slice. `h` is a copy —
+    // its filter is read before the call, never after.
     var i: usize = 0;
-    while (i < editor.lua_event_refs.getPtr(event).items.len) : (i += 1) {
-        const r = editor.lua_event_refs.getPtr(event).items[i];
-        _ = lua.getIndexRaw(zlua.registry_index, @intCast(r));
-        if (path) |p| {
+    while (i < editor.lua_event_handlers.getPtr(event).items.len) : (i += 1) {
+        const h = editor.lua_event_handlers.getPtr(event).items[i];
+        if (h.language) |want| {
+            const have = lang orelse continue;
+            if (!std.ascii.eqlIgnoreCase(want, have)) continue;
+        }
+        _ = lua.getIndexRaw(zlua.registry_index, @intCast(h.ref));
+        if (path_copy) |p| {
             _ = lua.pushString(p);
         } else {
             lua.pushNil();
         }
-        lua.protectedCall(.{ .args = 1 }) catch reportLuaError(editor, lua, "event handler");
+        if (lang) |l| {
+            _ = lua.pushString(l);
+        } else {
+            lua.pushNil();
+        }
+        lua.protectedCall(.{ .args = 2 }) catch reportLuaError(editor, lua, "event handler");
     }
 }
 
@@ -143,9 +177,10 @@ pub fn cleanupLuaRefs(editor: *Editor) void {
         for (refs.items) |r| lua.unref(zlua.registry_index, r);
     }
     inline for (comptime std.meta.tags(LuaEvent)) |ev| {
-        const list = editor.lua_event_refs.getPtr(ev);
-        if (editor.lua) |lua| {
-            for (list.items) |r| lua.unref(zlua.registry_index, r);
+        const list = editor.lua_event_handlers.getPtr(ev);
+        for (list.items) |h| {
+            if (editor.lua) |lua| lua.unref(zlua.registry_index, h.ref);
+            if (h.language) |l| editor.allocator.free(l);
         }
         list.clearRetainingCapacity();
     }
@@ -158,7 +193,7 @@ pub fn cleanupLuaRefs(editor: *Editor) void {
 pub fn deinitLua(editor: *Editor) void {
     cleanupLuaRefs(editor);
     inline for (comptime std.meta.tags(LuaEvent)) |ev| {
-        editor.lua_event_refs.getPtr(ev).deinit(editor.allocator);
+        editor.lua_event_handlers.getPtr(ev).deinit(editor.allocator);
     }
     // Detach from spawn workers: queued results are dropped (their Lua
     // refs die with the state); in-flight workers free the state when the
@@ -183,7 +218,18 @@ pub fn reloadExtensions(editor: *Editor) void {
         return;
     };
     cleanupLuaRefs(editor);
+    // Server registrations made by extension files are re-created by the
+    // reload; drop the old ones first (init.lua's are kept), then stop any
+    // server whose registration changed or vanished (unchanged ones keep
+    // running — no clangd restart on every reload).
+    editor.dropExtensionLspConfigs();
     lua_settings.loadExtensions(lua);
+    editor.reconcileLspClients();
+    // Extensions may have (re)registered languages: re-detect every open
+    // document so new extension→language mappings apply. In-place
+    // re-registration keeps existing pointers valid, so documents whose
+    // language is unchanged are left alone (no LSP close/open churn).
+    for (editor.documents.items) |*doc| editor.relanguageDoc(doc);
     editor.status_message = "Extensions reloaded";
 }
 
@@ -254,10 +300,22 @@ fn luaOn(state: ?*zlua.LuaState) callconv(.c) c_int {
         std.log.warn("zide.on: second argument must be a function", .{});
         return 0;
     }
+    // Optional third argument: { language = "zig" } fires the handler
+    // only for documents of that language.
+    var language: ?[]const u8 = null;
+    if (lua.typeOf(3) == .table) {
+        _ = lua.getField(3, "language");
+        if (lua.typeOf(-1) == .string) {
+            const s: []const u8 = lua.toString(-1) catch "";
+            language = editor.allocator.dupe(u8, s) catch null;
+        }
+        lua.pop(1);
+    }
     lua.pushValue(2);
     const ref = lua.ref(zlua.registry_index);
-    editor.lua_event_refs.getPtr(event).append(editor.allocator, ref) catch {
+    editor.lua_event_handlers.getPtr(event).append(editor.allocator, .{ .ref = ref, .language = language }) catch {
         lua.unref(zlua.registry_index, ref);
+        if (language) |l| editor.allocator.free(l);
         std.log.err("zide.on: failed to register handler", .{});
     };
     return 0;
@@ -507,7 +565,7 @@ fn freeArgv(allocator: std.mem.Allocator, argv: []const []const u8) void {
 }
 
 /// Read a positional table of strings at `index` into owned slices.
-fn readArgvAlloc(lua: *Lua, allocator: std.mem.Allocator, index: i32) ?[]const []const u8 {
+pub fn readArgvAlloc(lua: *Lua, allocator: std.mem.Allocator, index: i32) ?[]const []const u8 {
     if (lua.typeOf(index) != .table) return null;
     const len = lua.lenRaw(index);
     if (len == 0) return null;
@@ -969,7 +1027,7 @@ test "zide.on rejects unknown event names" {
     lua_settings.registerApi(lua, &editor);
 
     try lua.doString("zide.on('resize', function() end)");
-    const total = editor.lua_event_refs.get(.open).items.len + editor.lua_event_refs.get(.save).items.len;
+    const total = editor.lua_event_handlers.get(.open).items.len + editor.lua_event_handlers.get(.save).items.len;
     try testing.expectEqual(@as(usize, 0), total);
 }
 
@@ -1328,4 +1386,301 @@ test "reload_extensions drops Lua commands and handlers" {
     editor.noteFileSaved(false, editor.activeDoc());
     // Handler is gone — the reload message survives the (non-)event.
     try testing.expectEqualStrings("Extensions reloaded", editor.status_message);
+}
+
+test "register_language re-registration replaces the definition in place" {
+    var lua = try Lua.init(testing.allocator);
+    defer lua.deinit();
+    lua.openLibs();
+    var editor = try Editor.init(testing.allocator, testing.io);
+    defer editor.deinit();
+    lua_settings.registerApi(lua, &editor);
+
+    const before = editor.languages.items.len;
+    try lua.doString("zide.register_language({ name = 'foo', extensions = {'foo'}, keywords = {'alpha'} })");
+    try testing.expectEqual(before + 1, editor.languages.items.len);
+    const ptr = editor.findLanguage("foo").?;
+    try testing.expect(ptr.isKeyword("alpha"));
+
+    // A document using the language has a populated highlight cache
+    const doc = editor.activeDoc();
+    try doc.loadText("alpha beta");
+    doc.language = ptr;
+    _ = doc.ensureLineState(0);
+    try testing.expect(doc.line_states.items.len > 0);
+
+    // Same name (different case), new tables and extensions: same slot,
+    // no growth, cache dropped, new extension resolves to the same def.
+    try lua.doString("zide.register_language({ name = 'FOO', extensions = {'foo', 'bar'}, keywords = {'beta'} })");
+    try testing.expectEqual(before + 1, editor.languages.items.len);
+    try testing.expectEqual(@as(?*const syntax.LanguageDef, ptr), doc.language);
+    try testing.expect(ptr.isKeyword("beta"));
+    try testing.expect(!ptr.isKeyword("alpha"));
+    try testing.expectEqual(@as(usize, 0), doc.line_states.items.len);
+    try testing.expectEqual(@as(?*const syntax.LanguageDef, ptr), editor.findLanguage("bar"));
+    // Still tokenizes fine through the replaced definition
+    _ = doc.ensureLineState(0);
+}
+
+test "findLanguage prefers the latest registration; by-name lookup is case-insensitive" {
+    var lua = try Lua.init(testing.allocator);
+    defer lua.deinit();
+    lua.openLibs();
+    var editor = try Editor.init(testing.allocator, testing.io);
+    defer editor.deinit();
+    lua_settings.registerApi(lua, &editor);
+
+    try testing.expectEqualStrings("zig", editor.findLanguage("zig").?.name);
+    // A user extension claims .zig: it wins over the built-in
+    try lua.doString("zide.register_language({ name = 'myzig', extensions = {'zig'}, keywords = {'fn'} })");
+    try testing.expectEqualStrings("myzig", editor.findLanguage("zig").?.name);
+    // The built-in is still there and reachable by name, any case
+    try testing.expectEqualStrings("zig", editor.findLanguageByName("ZIG").?.name);
+    try testing.expectEqualStrings("myzig", editor.findLanguageByName("MyZig").?.name);
+    try testing.expect(editor.findLanguageByName("nope") == null);
+}
+
+test "re-registering markdown keeps the structural tokenizer only when asked" {
+    var lua = try Lua.init(testing.allocator);
+    defer lua.deinit();
+    lua.openLibs();
+    var editor = try Editor.init(testing.allocator, testing.io);
+    defer editor.deinit();
+    lua_settings.registerApi(lua, &editor);
+
+    const count = editor.languages.items.len;
+    try lua.doString("zide.register_language({ name = 'markdown', extensions = {'md', 'mdx'}, tokenizer = 'markdown' })");
+    const md = editor.findLanguageByName("markdown").?;
+    try testing.expectEqual(syntax.TokenizerKind.markdown, md.tokenizer);
+    try testing.expectEqual(@as(?*const syntax.LanguageDef, md), editor.findLanguage("mdx"));
+    try testing.expectEqual(count, editor.languages.items.len);
+
+    // Omitting `tokenizer` is a full replacement: degrades to generic (warns)
+    testing.log_level = .err;
+    defer testing.log_level = .warn;
+    try lua.doString("zide.register_language({ name = 'Markdown', extensions = {'md'} })");
+    try testing.expectEqual(syntax.TokenizerKind.generic, md.tokenizer);
+    try testing.expectEqual(count, editor.languages.items.len);
+    // Unknown tokenizer names also fall back to generic
+    try lua.doString("zide.register_language({ name = 'weird', extensions = {'wd'}, tokenizer = 'bogus' })");
+    try testing.expectEqual(syntax.TokenizerKind.generic, editor.findLanguageByName("weird").?.tokenizer);
+}
+
+test "reload_extensions keeps open documents on valid definitions" {
+    var lua = try Lua.init(testing.allocator);
+    defer lua.deinit();
+    lua.openLibs();
+    var editor = try Editor.init(testing.allocator, testing.io);
+    defer editor.deinit();
+    lua_settings.registerApi(lua, &editor);
+
+    try lua.doString("zide.register_language({ name = 'foo', extensions = {'foo'}, keywords = {'alpha'} })");
+    const ptr = editor.findLanguage("foo").?;
+    const doc = editor.activeDoc();
+    try doc.loadText("alpha\nbeta\n");
+    doc.language = ptr;
+    const langs_before = editor.languages.items.len;
+
+    // No config dir in tests — loadExtensions no-ops, but the reload path
+    // still walks every document. Untitled docs keep their language.
+    try testing.expect(editor.execCommand("reload_extensions", null));
+    try testing.expectEqual(langs_before, editor.languages.items.len);
+    try testing.expectEqual(@as(?*const syntax.LanguageDef, ptr), doc.language);
+    _ = doc.ensureLineState(1);
+}
+
+test "zide.bind/unbind with a language option use the overlay" {
+    var lua = try Lua.init(testing.allocator);
+    defer lua.deinit();
+    lua.openLibs();
+    var editor = try Editor.init(testing.allocator, testing.io);
+    defer editor.deinit();
+    lua_settings.registerApi(lua, &editor);
+
+    try lua.doString("zide.bind('ctrl+k', 'overlay_cmd', { language = 'zig' })");
+    try lua.doString("zide.bind('ctrl+shift+d', 'global_cmd')");
+    const doc = editor.activeDoc();
+    try testing.expectEqualStrings("delete_line", editor.keybinds.get("ctrl+k").?); // global untouched
+    try testing.expectEqualStrings("global_cmd", editor.keybinds.get("ctrl+shift+d").?);
+    doc.language = editor.findLanguage("zig");
+    try testing.expectEqualStrings("overlay_cmd", editor.lookupKeybind("ctrl+k").?);
+
+    // Scoped unbind removes only the overlay entry (any case)
+    try lua.doString("zide.unbind('ctrl+k', { language = 'ZIG' })");
+    try testing.expectEqualStrings("delete_line", editor.lookupKeybind("ctrl+k").?);
+    // Unbind for a language without a profile is a no-op and creates none
+    try lua.doString("zide.unbind('ctrl+k', { language = 'nope' })");
+    try testing.expect(editor.langProfileNamed("nope") == null);
+    // Plain unbind still hits the global map
+    try lua.doString("zide.unbind('ctrl+shift+d')");
+    try testing.expect(editor.keybinds.get("ctrl+shift+d") == null);
+}
+
+test "zide.on language filter and (path, language) handler arguments" {
+    var lua = try Lua.init(testing.allocator);
+    defer lua.deinit();
+    lua.openLibs();
+    var editor = try Editor.init(testing.allocator, testing.io);
+    defer editor.deinit();
+    lua_settings.registerApi(lua, &editor);
+
+    try lua.doString(
+        \\hits = {}
+        \\zide.on("save", function(p, l) hits[#hits + 1] = "any:" .. tostring(l) end)
+        \\zide.on("save", function(p, l) hits[#hits + 1] = "zig:" .. tostring(l) end, { language = "zig" })
+    );
+    const doc = editor.activeDoc();
+    // Plain-text document: only the unfiltered handler, language nil
+    editor.noteFileSaved(false, doc);
+    try lua.doString("assert(#hits == 1 and hits[1] == 'any:nil', table.concat(hits, ','))");
+    // Zig document: both fire; the language arrives as the second argument
+    doc.language = editor.findLanguage("zig");
+    editor.noteFileSaved(false, doc);
+    try lua.doString("assert(#hits == 3 and hits[2] == 'any:zig' and hits[3] == 'zig:zig', table.concat(hits, ','))");
+    // A markdown document skips the zig-only handler
+    doc.language = editor.findLanguage("md");
+    editor.noteFileSaved(false, doc);
+    try lua.doString("assert(#hits == 4 and hits[4] == 'any:markdown', table.concat(hits, ','))");
+    // reload drops handlers (and frees their filters — leak-checked)
+    try testing.expect(editor.execCommand("reload_extensions", null));
+    editor.noteFileSaved(false, doc);
+    try lua.doString("assert(#hits == 4)");
+}
+
+test "zide.set_language merges and validates; get_language reads back" {
+    var lua = try Lua.init(testing.allocator);
+    defer lua.deinit();
+    lua.openLibs();
+    var editor = try Editor.init(testing.allocator, testing.io);
+    defer editor.deinit();
+    lua_settings.registerApi(lua, &editor);
+
+    try lua.doString("zide.set_language('zig', { tab_width = 2, use_tabs = true })");
+    try lua.doString("zide.set_language('ZIG', { word_wrap = false })"); // merge, any case
+    const doc = editor.activeDoc();
+    doc.language = editor.findLanguage("zig");
+    try testing.expectEqual(@as(usize, 2), editor.tabWidthFor(doc));
+    try testing.expect(editor.useTabsFor(doc));
+    try testing.expect(!editor.wordWrapFor(doc));
+    try testing.expectEqual(editor.auto_close_brackets, editor.autoCloseBracketsFor(doc));
+    // Globals untouched
+    try testing.expectEqual(@as(usize, 4), editor.tab_width);
+    // Read back from Lua
+    try lua.doString("assert(zide.get_language('zig').tab_width == 2)");
+    try lua.doString("assert(zide.get_language('Zig').use_tabs == true)");
+    try lua.doString("assert(zide.get_language('zig').auto_close_brackets == nil)");
+    try lua.doString("assert(zide.get_language('nope') == nil)");
+
+    // Out-of-range tab_width is ignored (warns); the rest still applies
+    testing.log_level = .err;
+    defer testing.log_level = .warn;
+    try lua.doString("zide.set_language('zig', { tab_width = 99, auto_close_brackets = false })");
+    try testing.expectEqual(@as(usize, 2), editor.tabWidthFor(doc));
+    try testing.expect(!editor.autoCloseBracketsFor(doc));
+    // Bad arguments and empty tables create nothing
+    try lua.doString("zide.set_language({}, 'x')");
+    try lua.doString("zide.set_language('markdown', 'x')");
+    try lua.doString("zide.set_language('markdown', {})");
+    try testing.expect(editor.langProfileNamed("markdown") == null);
+}
+
+test "register_language settings sugar; indent uses the language tab width" {
+    var lua = try Lua.init(testing.allocator);
+    defer lua.deinit();
+    lua.openLibs();
+    var editor = try Editor.init(testing.allocator, testing.io);
+    defer editor.deinit();
+    lua_settings.registerApi(lua, &editor);
+
+    try lua.doString("zide.register_language({ name = 'yaml', extensions = {'yml'}, keywords = {}, tab_width = 2, use_tabs = false })");
+    const doc = editor.activeDoc();
+    doc.language = editor.findLanguage("yml");
+    try testing.expectEqual(@as(usize, 2), editor.tabWidthFor(doc));
+    try doc.loadText("");
+    try testing.expect(editor.execCommand("indent", null));
+    try testing.expectEqualStrings("  ", doc.lineContent(0));
+
+    // A language without overrides keeps the global default (4)
+    doc.language = editor.findLanguage("zig");
+    try doc.loadText("");
+    try testing.expect(editor.execCommand("indent", null));
+    try testing.expectEqualStrings("    ", doc.lineContent(0));
+}
+
+test "zide.register_lsp: argv forms, languages, ids, settings" {
+    var lua = try Lua.init(testing.allocator);
+    defer lua.deinit();
+    lua.openLibs();
+    var editor = try Editor.init(testing.allocator, testing.io);
+    defer editor.deinit();
+    lua_settings.registerApi(lua, &editor);
+
+    const base = editor.lsp_configs.items.len; // the built-in zls seed
+
+    // Old form: language + command string (argv[0] only — never split)
+    try lua.doString("zide.register_lsp({ language = 'Zig', command = 'C:/tools with space/zls.exe' })");
+    const zig_cfg = editor.lspConfigFor("zig").?;
+    try testing.expectEqual(@as(usize, 1), zig_cfg.argv.len);
+    try testing.expectEqualStrings("C:/tools with space/zls.exe", zig_cfg.argv[0]);
+    try testing.expectEqualStrings("zig", zig_cfg.languageIdFor("Zig"));
+    try testing.expect(!zig_cfg.from_extension);
+    try testing.expect(zig_cfg.settings_json == null);
+
+    // argv table, several languages, per-language ids, settings + init_options
+    try lua.doString(
+        \\zide.register_lsp({
+        \\  languages = {"c", "C++"},
+        \\  command = {"clangd", "--background-index"},
+        \\  language_id = { ["C++"] = "cpp" },
+        \\  settings = { Lua = { diagnostics = { globals = {"zide"} } } },
+        \\  init_options = { check = { command = "clippy" } },
+        \\})
+    );
+    const c_cfg = editor.lspConfigFor("c++").?;
+    try testing.expectEqual(@as(usize, 2), c_cfg.argv.len);
+    try testing.expectEqualStrings("--background-index", c_cfg.argv[1]);
+    try testing.expectEqualStrings("c", c_cfg.languageIdFor("C"));
+    try testing.expectEqualStrings("cpp", c_cfg.languageIdFor("c++"));
+    try testing.expectEqualStrings("{\"Lua\":{\"diagnostics\":{\"globals\":[\"zide\"]}}}", c_cfg.settings_json.?);
+    try testing.expectEqualStrings("{\"check\":{\"command\":\"clippy\"}}", c_cfg.init_options_json.?);
+    try testing.expectEqualStrings("clangd", c_cfg.displayName());
+
+    // Single language + string language_id
+    try lua.doString("zide.register_lsp({ language = 'JavaScript', command = {'typescript-language-server', '--stdio'}, language_id = 'javascript' })");
+    try testing.expectEqualStrings("javascript", editor.lspConfigFor("javascript").?.languageIdFor("JavaScript"));
+
+    try testing.expectEqual(base + 3, editor.lsp_configs.items.len);
+}
+
+test "zide.register_lsp: rejects bad input, tags extension registrations" {
+    var lua = try Lua.init(testing.allocator);
+    defer lua.deinit();
+    lua.openLibs();
+    var editor = try Editor.init(testing.allocator, testing.io);
+    defer editor.deinit();
+    lua_settings.registerApi(lua, &editor);
+    testing.log_level = .err;
+    defer testing.log_level = .warn;
+
+    const before = editor.lsp_configs.items.len;
+    try lua.doString("zide.register_lsp({ command = 'x' })"); // no language
+    try lua.doString("zide.register_lsp({ language = 'x' })"); // no command
+    try lua.doString("zide.register_lsp({ language = 'x', command = {} })"); // empty argv
+    try lua.doString("zide.register_lsp('nope')"); // not a table
+    try testing.expectEqual(before, editor.lsp_configs.items.len);
+
+    // A string language_id with two languages is ignored (warn); the
+    // registration itself still lands with default ids.
+    try lua.doString("zide.register_lsp({ languages = {'a', 'b'}, command = 'srv', language_id = 'wrong' })");
+    try testing.expectEqualStrings("b", editor.lspConfigFor("b").?.languageIdFor("b"));
+
+    // Extension tagging follows editor.loading_extensions
+    editor.loading_extensions = true;
+    try lua.doString("zide.register_lsp({ language = 'lua', command = 'lua-language-server' })");
+    editor.loading_extensions = false;
+    try testing.expect(editor.lspConfigFor("lua").?.from_extension);
+    try testing.expect(!editor.lspConfigFor("b").?.from_extension);
+    editor.dropExtensionLspConfigs();
+    try testing.expect(editor.lspConfigFor("lua") == null);
+    try testing.expect(editor.lspConfigFor("b") != null);
 }

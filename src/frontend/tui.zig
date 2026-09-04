@@ -237,9 +237,9 @@ pub fn run(allocator: std.mem.Allocator, editor: *Editor) !void {
     // Set up reader-thread wakes (LSP + terminal panes)
     global_loop = &loop;
     defer global_loop = null; // runs before loop.stop()'s defer — no dangling wakes
-    if (editor.lsp) |lsp_client| {
-        lsp_client.tui_wake_fn = &lspWakeFn;
-    }
+    // Language servers start lazily (per opened language) — the editor
+    // copies this into each client before its reader thread exists.
+    editor.lsp_wake_fn = &lspWakeFn;
     editor.terminal_wake_fn = &terminalWakeFn;
     // Search worker results wake the blocking loop the same way.
     editor.search.wake_fn = &terminalWakeFn;
@@ -291,9 +291,9 @@ pub fn run(allocator: std.mem.Allocator, editor: *Editor) !void {
             }
         }
 
-        // Poll LSP messages and sync documents
-        if (editor.lsp) |lsp_client| lsp_client.pollMessages(editor);
-        editor.syncLspDocuments();
+        // Language servers: sweep dead ones, drain messages, sync documents
+        // (starts servers lazily for newly opened languages)
+        editor.lspTick();
 
         // Deliver finished zide.spawn results to their Lua callbacks
         editor.pumpLuaJobs();
@@ -1001,7 +1001,7 @@ fn drawPane(win: Window, editor: *Editor, pane_id: u8, width: u16, height: u16) 
                 editor.text_width = tw;
 
                 if (!scroll_pinned) {
-                    if (editor.word_wrap) {
+                    if (editor.wordWrapFor(doc)) {
                         doc.scroll_left = 0;
                         ensureCursorVisibleWrapped(doc, height, width, editor.gutter_min_digits);
                     } else {
@@ -1010,9 +1010,10 @@ fn drawPane(win: Window, editor: *Editor, pane_id: u8, width: u16, height: u16) 
                 }
             }
 
-            drawContent(win, doc, editor, width, height, editor.word_wrap);
+            const wrap = editor.wordWrapFor(doc);
+            drawContent(win, doc, editor, width, height, wrap);
             if (is_active and doc.cursors.count() > 1) {
-                drawSecondaryCursors(win, doc, editor, width, height, editor.word_wrap);
+                drawSecondaryCursors(win, doc, editor, width, height, wrap);
             }
         },
         .terminal => |term_idx| {
@@ -1253,7 +1254,7 @@ fn moveVisualVertical(editor: *Editor, direction: enum { up, down }, extend_sele
 
 /// Dispatch a keybind action with TUI-specific overrides (visual-row multi-cursor).
 fn execTuiAction(editor: *Editor, action: []const u8) void {
-    if (editor.word_wrap) {
+    if (editor.wordWrapFor(editor.activeDoc())) {
         if (std.mem.eql(u8, action, "add_cursor_above")) {
             tuiAddCursorVisual(editor, .up);
             return;
@@ -1794,8 +1795,10 @@ fn drawStatusBar(win: Window, editor: *Editor, width: u16) void {
     // Right side: cursor position — use writeStr (stack buffer)
     var right_buf: [96]u8 = undefined;
     const cursor_count = doc.cursors.count();
-    // Show the detected language so it's obvious what syntax/LSP applies.
-    const lang_name: []const u8 = if (doc.language) |l| l.name else "plain text";
+    // Show the detected language (and its server once up) so it's obvious
+    // what syntax/LSP applies.
+    var lang_buf: [64]u8 = undefined;
+    const lang_name = editor.languageStatusText(doc, &lang_buf);
     const right = if (cursor_count > 1)
         std.fmt.bufPrint(&right_buf, "{d} cursors | Ln {d}, Col {d} | {s} ", .{ cursor_count, pos.line + 1, pos.col + 1, lang_name }) catch ""
     else
@@ -1867,7 +1870,7 @@ fn positionCursor(win: Window, editor: *Editor, width: u16, height: u16) void {
     const text_start_x = gutter_width + 1;
     const text_width: u16 = if (rect.w > text_start_x) rect.w - text_start_x else 1;
 
-    if (editor.word_wrap) {
+    if (editor.wordWrapFor(doc)) {
         // With wrapping: compute visual row by summing wrapped heights of preceding lines
         var visual_row: u16 = 0;
         var line_idx: usize = doc.scroll_top;
@@ -1924,7 +1927,7 @@ fn screenToOffset(editor: *Editor, screen_x: i16, screen_y: i16) ?usize {
     const text_col: usize = hit.local_x - text_start_x;
     const content_row: usize = hit.local_y;
 
-    if (editor.word_wrap) {
+    if (editor.wordWrapFor(doc)) {
         const text_width = editor.text_width;
         // Walk through visible lines, counting visual rows
         var visual_row: usize = 0;
@@ -2181,7 +2184,7 @@ fn tryKeybindCommand(editor: *Editor, key: Key) bool {
     var kbuf: [64]u8 = undefined;
     const key_str = keyToStr(key, &kbuf);
     if (key_str.len > 0) {
-        if (editor.keybinds.get(key_str)) |action| {
+        if (editor.lookupKeybind(key_str)) |action| {
             execTuiAction(editor, action);
             return true;
         }
@@ -2193,7 +2196,7 @@ fn tryKeybindCommand(editor: *Editor, key: Key) bool {
             fallback_key.mods.shift = false;
             const fallback_str = keyToStr(fallback_key, &kbuf2);
             if (fallback_str.len > 0) {
-                if (editor.keybinds.get(fallback_str)) |action| {
+                if (editor.lookupKeybind(fallback_str)) |action| {
                     execTuiAction(editor, action);
                     return true;
                 }
@@ -2323,7 +2326,7 @@ fn handleKey(editor: *Editor, key_in: Key) void {
     const shift = key.mods.shift;
     switch (key.codepoint) {
         Key.up => {
-            if (editor.word_wrap) {
+            if (editor.wordWrapFor(editor.activeDoc())) {
                 moveVisualVertical(editor, .up, shift);
             } else {
                 _ = editor.execCommand(if (shift) "cursor_up_select" else "cursor_up", null);
@@ -2331,7 +2334,7 @@ fn handleKey(editor: *Editor, key_in: Key) void {
             return;
         },
         Key.down => {
-            if (editor.word_wrap) {
+            if (editor.wordWrapFor(editor.activeDoc())) {
                 moveVisualVertical(editor, .down, shift);
             } else {
                 _ = editor.execCommand(if (shift) "cursor_down_select" else "cursor_down", null);
@@ -3193,11 +3196,11 @@ fn handleSaveAsKey(editor: *Editor, key: Key) void {
     if (key.codepoint == Key.enter) {
         if (editor.open_buf_len > 0) {
             const path = editor.open_buf[0..editor.open_buf_len];
-            editor.activeDoc().saveAs(editor.io, path) catch {
+            // saveDocAs = LSP forget (old uri) → write → re-detect language →
+            // file tree + extension bookkeeping; nothing on failure.
+            editor.saveDocAs(editor.activeDoc(), path) catch {
                 editor.status_message = "Save failed";
             };
-            editor.activeDoc().detectLanguage(editor);
-            editor.noteFileSaved(true, editor.activeDoc());
         }
         editor.mode = .normal;
         return;

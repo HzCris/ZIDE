@@ -110,8 +110,8 @@ pub const Editor = struct {
     click_clears_cursors: bool = true,
     /// Save open files + cursors on quit and restore them on a bare launch.
     session_persistence: bool = false,
-    /// Start the LSP client at launch (off = no language server process;
-    /// takes effect at the next launch).
+    /// Run language servers (off = none are started and running ones are
+    /// stopped on the next frame — takes effect immediately).
     lsp_enabled: bool = true,
     /// Render syntax colors (off = plain-text editor look, instant).
     syntax_highlighting: bool = true,
@@ -176,15 +176,24 @@ pub const Editor = struct {
     settings_num_buf: [16]u8 = undefined,
     settings_num_len: usize = 0,
 
-    /// LSP client (null if not started).
-    lsp: ?*lsp_mod.LspClient = null,
+    /// Running language servers (heap-allocated: pointer-stable while the
+    /// list grows; each client also owns a deep copy of its config). Started
+    /// lazily by lspNotifyOpen / syncLspDocuments, retired by lspTick.
+    lsp_clients: std.ArrayList(*lsp_mod.LspClient) = .empty,
+    /// Wake callback copied into each client's reader thread (the TUI sets
+    /// it before its loop, like terminal_wake_fn; the GUI polls every frame).
+    lsp_wake_fn: ?*const fn () void = null,
+    /// True while extensions/*.lua are being (re)loaded — register_lsp tags
+    /// configs so reload_extensions can drop and re-add exactly those.
+    loading_extensions: bool = false,
 
     /// Lua state for extension callbacks (set by lua_settings.registerApi;
     /// null in tests that don't create one). Owned by main.zig and must
     /// outlive the editor — Editor.deinit releases refs into it.
     lua: ?*zlua.Lua = null,
-    /// Lua registry refs of event handlers per event (zide.on).
-    lua_event_refs: lua_api.EventRefs = lua_api.EventRefs.initFill(.empty),
+    /// Registered event handlers per event (zide.on): registry ref plus an
+    /// optional language filter.
+    lua_event_handlers: lua_api.EventHandlers = lua_api.EventHandlers.initFill(.empty),
     /// Recursion guard for event firing (e.g. a save handler that saves).
     lua_event_depth: u8 = 0,
     /// Shared state for zide.spawn worker threads (created on first use;
@@ -194,11 +203,6 @@ pub const Editor = struct {
     /// terminal_wake_fn; the GUI polls every frame and leaves it null).
     lua_wake_fn: ?*const fn () void = null,
 
-    /// Language served by `lsp`. Documents in any other language are not
-    /// synced to the server — zls would otherwise receive (and squiggle)
-    /// .txt/.md/etc. buffers as if they were Zig source.
-    lsp_language: []const u8 = "zig",
-
     /// Completion items from LSP.
     completion_items: std.ArrayList(EditorCompletionItem),
     /// Whether the completion popup is active.
@@ -206,17 +210,26 @@ pub const Editor = struct {
     /// Currently selected completion item index.
     completion_selected: usize = 0,
 
-    /// Lua-registered LSP server configs (language → command).
+    /// Registered language servers: the built-in zls seed plus every
+    /// zide.register_lsp call. Newest registration wins per language
+    /// (see lspConfigFor); a document's server is looked up by its
+    /// language name at open time.
     lsp_configs: std.ArrayList(LspConfig),
 
     /// Open terminal emulators (null entries are closed/freed terminals).
     terminals: std.ArrayList(?*terminal_mod.Terminal),
 
-    /// Registered languages (Zig built-in + Lua-loaded extensions).
+    /// Registered languages (Zig + Markdown built-in, then Lua extensions).
     /// Each LanguageDef is individually heap-allocated because documents hold
     /// `*const LanguageDef` — pointers must stay stable when extensions
-    /// register new languages. (Was std.SegmentedList; removed in Zig 0.16.)
+    /// register new languages, and re-registering an existing name replaces
+    /// the struct IN PLACE (same slot) so those pointers keep working.
+    /// Lookup by extension is newest-first (see findLanguage).
     languages: std.ArrayList(*syntax.LanguageDef),
+    /// Per-language profiles keyed by LOWERCASED language name (owned
+    /// keys). Independent of LanguageDef lifetime: works for built-ins and
+    /// for names registered later — or never.
+    lang_profiles: std.StringHashMapUnmanaged(LanguageProfile) = .empty,
     /// GUI syntax highlight colors.
     syntax_theme: SyntaxTheme = theme_mod.syn_gui_dark,
     /// TUI syntax highlight colors.
@@ -261,9 +274,26 @@ pub const Editor = struct {
         insert_text: ?[]const u8 = null,
     };
 
-    pub const LspConfig = struct {
-        language: []const u8,
-        command: []const u8,
+    pub const LspConfig = lsp_mod.ServerConfig;
+
+    /// Longest language name that can have a profile (stack-lowercased).
+    pub const max_lang_name = 64;
+
+    /// Per-language overrides of the global editor settings (null = use
+    /// the global value). Set from Lua via zide.set_language or the same
+    /// keys on zide.register_language.
+    pub const LanguageSettings = struct {
+        tab_width: ?usize = null,
+        use_tabs: ?bool = null,
+        word_wrap: ?bool = null,
+        auto_close_brackets: ?bool = null,
+    };
+
+    /// Everything ZIDE keeps per language beyond its syntax definition:
+    /// setting overrides and a keybind overlay (see lookupKeybind).
+    pub const LanguageProfile = struct {
+        settings: LanguageSettings = .{},
+        keybinds: KeybindMap,
     };
 
     pub const LangSyntaxOverride = struct {
@@ -318,6 +348,11 @@ pub const Editor = struct {
         md_lang.* = syntax.lang_markdown;
         errdefer allocator.destroy(md_lang);
         try editor.languages.append(allocator, md_lang);
+        // Default language server: zls from PATH for Zig. A later
+        // zide.register_lsp for "zig" wins (newest registration first).
+        var zls_cfg = try lsp_mod.ServerConfig.fromArgv(allocator, &.{"zig"}, &.{"zls"});
+        errdefer zls_cfg.deinit(allocator);
+        try editor.lsp_configs.append(allocator, zls_cfg);
         // Always have at least one empty document
         var doc = try Document.init(allocator);
         doc.history.max_size = editor.max_undo_history;
@@ -331,7 +366,11 @@ pub const Editor = struct {
     }
 
     pub fn deinit(self: *Editor) void {
-        // Release Lua refs first: touches the command registry and needs
+        // Language servers first: joins their reader threads and resets
+        // document flags while the documents are still alive.
+        self.stopAllLsp();
+        self.lsp_clients.deinit(self.allocator);
+        // Release Lua refs next: touches the command registry and needs
         // the (caller-owned, still-alive) Lua state.
         lua_api.deinitLua(self);
         for (self.documents.items) |*doc| {
@@ -340,6 +379,12 @@ pub const Editor = struct {
         self.documents.deinit(self.allocator);
         self.commands.deinit();
         self.keybinds.deinit();
+        var prof_it = self.lang_profiles.iterator();
+        while (prof_it.next()) |entry| {
+            entry.value_ptr.keybinds.deinit();
+            self.allocator.free(entry.key_ptr.*);
+        }
+        self.lang_profiles.deinit(self.allocator);
         self.layout.deinit();
         // Free Lua-registered languages (built-in Zig has null arena)
         for (self.languages.items) |lang| {
@@ -348,10 +393,7 @@ pub const Editor = struct {
         }
         self.clearCompletionItems();
         self.completion_items.deinit(self.allocator);
-        for (self.lsp_configs.items) |cfg| {
-            self.allocator.free(cfg.language);
-            self.allocator.free(cfg.command);
-        }
+        for (self.lsp_configs.items) |*cfg| cfg.deinit(self.allocator);
         self.lsp_configs.deinit(self.allocator);
         for (self.terminals.items) |maybe_term| {
             if (maybe_term) |term| term.deinit();
@@ -452,7 +494,7 @@ pub const Editor = struct {
         const active = self.activeDoc();
         active.detectLanguage(self);
         self.lspNotifyOpen(active);
-        lua_api.fireEvent(self, .open, active.file_path);
+        lua_api.fireEvent(self, .open, active);
         return active;
     }
 
@@ -465,7 +507,7 @@ pub const Editor = struct {
         try doc.open(self.io, path);
         doc.detectLanguage(self);
         self.lspNotifyOpen(doc);
-        lua_api.fireEvent(self, .open, doc.file_path);
+        lua_api.fireEvent(self, .open, doc);
     }
 
     /// Open `path`, or switch to the tab that already has it open
@@ -683,7 +725,7 @@ pub const Editor = struct {
                 self.active_doc_idx = pidx;
                 self.paneShowDoc(pidx);
                 self.lspNotifyOpen(pdoc);
-                lua_api.fireEvent(self, .open, pdoc.file_path);
+                lua_api.fireEvent(self, .open, pdoc);
                 self.finderClearFiles();
                 return;
             }
@@ -1091,7 +1133,7 @@ pub const Editor = struct {
             if (new_file) ft.refresh() catch {};
             ft.gitRefresh();
         }
-        if (saved) |d| lua_api.fireEvent(self, .save, d.file_path);
+        if (saved) |d| lua_api.fireEvent(self, .save, d);
     }
 
     /// Change the file tree root (settings dialog, root-up). Empty/blank
@@ -1350,7 +1392,7 @@ pub const Editor = struct {
         for (self.documents.items) |*doc| {
             const dp = doc.file_path orelse continue;
             if (filetree_mod.normPathEql(dp, old_abs)) {
-                doc.setFilePath(new_abs) catch {};
+                self.setDocPath(doc, new_abs) catch {};
             } else if (dp.len > old_abs.len and
                 filetree_mod.normPathEql(dp[0..old_abs.len], old_abs) and
                 (dp[old_abs.len] == '/' or dp[old_abs.len] == '\\'))
@@ -1358,7 +1400,7 @@ pub const Editor = struct {
                 // Document inside a renamed directory
                 const joined = std.mem.concat(self.allocator, u8, &.{ new_abs, dp[old_abs.len..] }) catch continue;
                 defer self.allocator.free(joined);
-                doc.setFilePath(joined) catch {};
+                self.setDocPath(doc, joined) catch {};
             }
         }
     }
@@ -1381,7 +1423,7 @@ pub const Editor = struct {
             fresh.history.max_size = self.max_undo_history;
             fresh.loadText("") catch {};
             // Send didClose before resetting
-            self.lspDidClose(&self.documents.items[0]);
+            self.lspForgetDoc(&self.documents.items[0]);
             self.documents.items[0].deinit();
             self.documents.items[0] = fresh;
             self.active_doc_idx = 0;
@@ -1390,7 +1432,7 @@ pub const Editor = struct {
             return false;
         }
         const removed_idx = doc_idx;
-        self.lspDidClose(&self.documents.items[removed_idx]);
+        self.lspForgetDoc(&self.documents.items[removed_idx]);
         self.documents.items[removed_idx].deinit();
         _ = self.documents.orderedRemove(removed_idx);
         if (self.active_doc_idx > removed_idx) {
@@ -1735,7 +1777,7 @@ pub const Editor = struct {
                 saved += 1;
                 // Per-document extension event; the file tree note below
                 // runs once for the whole batch (it shells out to git).
-                lua_api.fireEvent(self, .save, doc.file_path);
+                lua_api.fireEvent(self, .save, doc);
             }
         }
         if (saved > 0) {
@@ -2033,26 +2075,343 @@ pub const Editor = struct {
 
     // ---- Language / syntax theme operations ----
 
-    /// Resolve the command used to start the LSP server for `lsp_language`.
-    /// A `zide.register_lsp{ language, command }` entry from init.lua whose
-    /// language matches (case-insensitive) overrides the default "zls" —
-    /// e.g. a full path to the zls binary matching the active toolchain.
-    /// First matching entry wins. Must be called after the Lua config loaded.
-    pub fn lspServerCommand(self: *const Editor) []const u8 {
-        for (self.lsp_configs.items) |cfg| {
-            if (std.ascii.eqlIgnoreCase(cfg.language, self.lsp_language)) return cfg.command;
+    // ---- Language servers: configs and clients ----
+    //
+    // Any number of servers, each registered from Lua (zide.register_lsp)
+    // and started lazily the first time a document of a language it serves
+    // opens. Documents route to "the running client whose config serves
+    // doc.language" — nothing is cached on Documents or LanguageDefs (their
+    // names die on re-registration).
+
+    /// The registration that would serve `lang_name` — newest first, so a
+    /// later zide.register_lsp overrides an earlier one (and the built-in
+    /// zls seed). Null when nothing serves the language.
+    pub fn lspConfigFor(self: *Editor, lang_name: []const u8) ?*lsp_mod.ServerConfig {
+        var i = self.lsp_configs.items.len;
+        while (i > 0) {
+            i -= 1;
+            const cfg = &self.lsp_configs.items[i];
+            if (cfg.servesLanguage(lang_name)) return cfg;
         }
-        return "zls";
+        return null;
     }
 
-    /// Find a registered language by file extension.
+    /// The running client serving `lang_name` (handshake may still be pending).
+    pub fn lspClientForLanguage(self: *const Editor, lang_name: []const u8) ?*lsp_mod.LspClient {
+        for (self.lsp_clients.items) |client| {
+            const cfg = if (client.config) |*c| c else continue;
+            if (cfg.servesLanguage(lang_name)) return client;
+        }
+        return null;
+    }
+
+    /// The running client for a document's language, if any.
+    pub fn lspClientForDoc(self: *const Editor, doc: *const Document) ?*lsp_mod.LspClient {
+        const lang = doc.language orelse return null;
+        return self.lspClientForLanguage(lang.name);
+    }
+
+    // ---- Per-language profiles (setting overrides + keybind overlays) ----
+
+    /// Lowercase `name` into `buf`; null when it doesn't fit (such names
+    /// simply have no profile).
+    fn langKey(name: []const u8, buf: *[max_lang_name]u8) ?[]const u8 {
+        if (name.len > buf.len) return null;
+        return std.ascii.lowerString(buf, name);
+    }
+
+    /// Get-or-create the profile for a language (any case). The pointer is
+    /// valid until the next profile is created.
+    pub fn langProfile(self: *Editor, name: []const u8) !*LanguageProfile {
+        var buf: [max_lang_name]u8 = undefined;
+        const key = langKey(name, &buf) orelse return error.NameTooLong;
+        if (self.lang_profiles.getPtr(key)) |p| return p;
+        const owned_key = try self.allocator.dupe(u8, key);
+        errdefer self.allocator.free(owned_key);
+        try self.lang_profiles.putNoClobber(self.allocator, owned_key, .{ .keybinds = KeybindMap.init(self.allocator) });
+        return self.lang_profiles.getPtr(owned_key).?;
+    }
+
+    /// The profile for a language name, if one exists (never creates).
+    pub fn langProfileNamed(self: *const Editor, name: []const u8) ?*const LanguageProfile {
+        var buf: [max_lang_name]u8 = undefined;
+        const key = langKey(name, &buf) orelse return null;
+        return self.lang_profiles.getPtr(key);
+    }
+
+    /// The profile for a document's language, if any.
+    pub fn langProfileFor(self: *const Editor, doc: *const Document) ?*const LanguageProfile {
+        const lang = doc.language orelse return null;
+        return self.langProfileNamed(lang.name);
+    }
+
+    /// Effective settings for a document: the language's override when
+    /// set, else the global default. Frontends hoist one call per frame.
+    pub fn tabWidthFor(self: *const Editor, doc: *const Document) usize {
+        if (self.langProfileFor(doc)) |p| {
+            if (p.settings.tab_width) |v| return v;
+        }
+        return self.tab_width;
+    }
+
+    pub fn useTabsFor(self: *const Editor, doc: *const Document) bool {
+        if (self.langProfileFor(doc)) |p| {
+            if (p.settings.use_tabs) |v| return v;
+        }
+        return self.use_tabs;
+    }
+
+    pub fn wordWrapFor(self: *const Editor, doc: *const Document) bool {
+        if (self.langProfileFor(doc)) |p| {
+            if (p.settings.word_wrap) |v| return v;
+        }
+        return self.word_wrap;
+    }
+
+    pub fn autoCloseBracketsFor(self: *const Editor, doc: *const Document) bool {
+        if (self.langProfileFor(doc)) |p| {
+            if (p.settings.auto_close_brackets) |v| return v;
+        }
+        return self.auto_close_brackets;
+    }
+
+    // ---- Keybind lookup (per-language overlay, then the global map) ----
+
+    /// Resolve a key combo: the active document's language overlay first
+    /// (zide.bind with { language = ... }), then the global map. Overlays
+    /// apply only while the editor pane owns the keyboard — tree/search
+    /// chords are global navigation and a terminal pane has no language.
+    /// Frontends try the exact combo, then (for shift chords) the stripped
+    /// one, through this same function: an overlay's exact match beats the
+    /// global exact match, but a global exact match beats an overlay's
+    /// shift-stripped fallback.
+    pub fn lookupKeybind(self: *const Editor, combo: []const u8) ?[]const u8 {
+        if (!self.filetree_focused and !self.search_focused and !self.activePaneIsTerminal()) {
+            if (self.langProfileFor(self.activeDocConst())) |p| {
+                if (p.keybinds.get(combo)) |action| return action;
+            }
+        }
+        return self.keybinds.get(combo);
+    }
+
+    /// Status-bar text for a document's language: the language name plus
+    /// the server name once one is up for it — `c (clangd)`.
+    pub fn languageStatusText(self: *const Editor, doc: *const Document, buf: []u8) []const u8 {
+        const lang = doc.language orelse return "plain text";
+        if (self.lspClientForLanguage(lang.name)) |client| {
+            if (client.isReady()) {
+                return std.fmt.bufPrint(buf, "{s} ({s})", .{ lang.name, client.name() }) catch lang.name;
+            }
+        }
+        return lang.name;
+    }
+
+    /// Absolute workspace root handed to servers: the file tree's root when
+    /// the tree exists (already canonical), else `filetree_root` resolved
+    /// against the cwd. Computed once per server start — re-rooting later
+    /// needs lsp_restart. Caller frees.
+    pub fn lspRootPathAlloc(self: *Editor) ![]u8 {
+        if (self.filetree) |*ft| return self.allocator.dupe(u8, ft.root_path);
+        const configured: []const u8 = self.filetree_root orelse ".";
+        const rel: []const u8 = if (configured.len == 0) "." else configured;
+        var cwd_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+        const cwd_len = std.process.currentPath(self.io, &cwd_buf) catch 0;
+        const cwd: []const u8 = if (cwd_len > 0) cwd_buf[0..cwd_len] else ".";
+        return std.fs.path.resolve(self.allocator, &.{ cwd, rel });
+    }
+
+    /// Start the server described by `cfg`: heap-allocated client, wake fn
+    /// wired before its reader thread exists. On failure the config is
+    /// marked failed so the per-frame lazy start doesn't retry every frame,
+    /// and the status bar says why (the log has the details).
+    fn startLspClient(self: *Editor, cfg: *lsp_mod.ServerConfig) ?*lsp_mod.LspClient {
+        const root = self.lspRootPathAlloc() catch return null;
+        defer self.allocator.free(root);
+        const first_lang: []const u8 = if (cfg.languages.len > 0) cfg.languages[0] else "?";
+
+        const client = self.allocator.create(lsp_mod.LspClient) catch return null;
+        client.* = lsp_mod.LspClient.init(self.allocator, self.io);
+        client.tui_wake_fn = self.lsp_wake_fn;
+        client.start(cfg, root) catch |err| {
+            cfg.failed = true;
+            std.log.warn("LSP[{s}] failed to start for {s} ({s}) — argv[0]: {s}", .{ cfg.displayName(), first_lang, @errorName(err), if (cfg.argv.len > 0) cfg.argv[0] else "" });
+            self.status_message = std.fmt.bufPrint(&self.status_buf, "LSP for {s}: cannot start {s} ({s}) — see zide.log", .{ first_lang, cfg.displayName(), @errorName(err) }) catch "LSP server failed to start — see zide.log";
+            client.deinit();
+            self.allocator.destroy(client);
+            return null;
+        };
+        self.lsp_clients.append(self.allocator, client) catch {
+            client.deinit();
+            self.allocator.destroy(client);
+            return null;
+        };
+        std.log.info("LSP[{s}] started for {s} (root: {s})", .{ client.name(), first_lang, root });
+        return client;
+    }
+
+    /// Stop and free the client at `idx`; documents it served forget they
+    /// were opened so the next sync re-opens them on whatever serves them.
+    fn stopLspClient(self: *Editor, idx: usize) void {
+        const client = self.lsp_clients.items[idx];
+        if (client.config) |*cfg| {
+            for (self.documents.items) |*doc| {
+                if (!doc.lsp_opened) continue;
+                const lang = doc.language orelse continue;
+                if (cfg.servesLanguage(lang.name)) {
+                    doc.lsp_opened = false;
+                    doc.clearDiagnostics();
+                }
+            }
+        }
+        client.deinit();
+        self.allocator.destroy(client);
+        _ = self.lsp_clients.orderedRemove(idx);
+    }
+
+    /// Stop every language server (quit, lsp_enabled=false, lsp_restart).
+    pub fn stopAllLsp(self: *Editor) void {
+        while (self.lsp_clients.items.len > 0) {
+            self.stopLspClient(self.lsp_clients.items.len - 1);
+        }
+    }
+
+    /// Palette `lsp_restart`: stop everything, forgive failures, and let
+    /// the lazy start bring servers back for the open documents.
+    pub fn restartLsp(self: *Editor) void {
+        self.stopAllLsp();
+        for (self.lsp_configs.items) |*cfg| cfg.failed = false;
+        self.status_message = "LSP: restarting language servers";
+    }
+
+    /// reload_extensions, before re-running extensions/*.lua: drop the
+    /// configs those files registered last time (init.lua's persist).
+    pub fn dropExtensionLspConfigs(self: *Editor) void {
+        var i: usize = 0;
+        while (i < self.lsp_configs.items.len) {
+            if (self.lsp_configs.items[i].from_extension) {
+                var cfg = self.lsp_configs.orderedRemove(i);
+                cfg.deinit(self.allocator);
+            } else {
+                i += 1;
+            }
+        }
+    }
+
+    /// reload_extensions, after re-running extensions/*.lua: stop servers
+    /// whose registration vanished or changed. Identical registrations keep
+    /// their server (no clangd restart on every reload).
+    pub fn reconcileLspClients(self: *Editor) void {
+        var i: usize = 0;
+        while (i < self.lsp_clients.items.len) {
+            const client = self.lsp_clients.items[i];
+            const running_cfg = if (client.config) |*c| c else {
+                self.stopLspClient(i);
+                continue;
+            };
+            const first_lang: []const u8 = if (running_cfg.languages.len > 0) running_cfg.languages[0] else "";
+            const current = self.lspConfigFor(first_lang);
+            if (current == null or !current.?.eql(running_cfg)) {
+                std.log.info("LSP[{s}] registration changed or removed — stopping", .{client.name()});
+                self.stopLspClient(i);
+                continue;
+            }
+            i += 1;
+        }
+    }
+
+    /// Per-frame LSP work: honour the enable switch, retire dead servers,
+    /// drain their messages, then sync documents (starting servers lazily).
+    pub fn lspTick(self: *Editor) void {
+        if (!self.lsp_enabled) {
+            if (self.lsp_clients.items.len > 0) self.stopAllLsp();
+            return;
+        }
+        // Dead-server sweep: exited/crashed on its own, or rejected
+        // initialize. Its config is marked failed so the lazy start below
+        // doesn't respawn a crashing server every frame.
+        var i: usize = 0;
+        while (i < self.lsp_clients.items.len) {
+            const client = self.lsp_clients.items[i];
+            if (!client.isDead()) {
+                i += 1;
+                continue;
+            }
+            std.log.warn("LSP[{s}] exited unexpectedly — run lsp_restart to bring it back", .{client.name()});
+            self.status_message = std.fmt.bufPrint(&self.status_buf, "LSP {s} exited — run lsp_restart (see zide.log)", .{client.name()}) catch "LSP server exited — run lsp_restart";
+            if (client.config) |*dead_cfg| {
+                for (self.lsp_configs.items) |*cfg| {
+                    if (cfg.eql(dead_cfg)) cfg.failed = true;
+                }
+            }
+            self.stopLspClient(i);
+        }
+        // Index loop: a definition response can open a file, which may
+        // start a server and grow the list under us.
+        var j: usize = 0;
+        while (j < self.lsp_clients.items.len) : (j += 1) {
+            self.lsp_clients.items[j].pollMessages(self);
+        }
+        self.syncLspDocuments();
+    }
+
+    /// Find a registered language by file extension. Newest registration
+    /// wins: a user extension that claims `.zig` or `.md` overrides the
+    /// built-in, and a later extension overrides an earlier one.
     /// The returned pointer stays valid for the editor's lifetime
-    /// (each LanguageDef is its own heap allocation — appends never relocate).
+    /// (each LanguageDef is its own heap allocation — appends never
+    /// relocate, and re-registering a name replaces the struct in place).
     pub fn findLanguage(self: *const Editor, ext: []const u8) ?*const syntax.LanguageDef {
-        for (self.languages.items) |lang| {
+        var i = self.languages.items.len;
+        while (i > 0) {
+            i -= 1;
+            const lang = self.languages.items[i];
             if (lang.matchesExtension(ext)) return lang;
         }
         return null;
+    }
+
+    /// Find a registered language by name (case-insensitive).
+    pub fn findLanguageByName(self: *const Editor, name: []const u8) ?*syntax.LanguageDef {
+        for (self.languages.items) |lang| {
+            if (std.ascii.eqlIgnoreCase(lang.name, name)) return lang;
+        }
+        return null;
+    }
+
+    /// Re-detect a document's language after its path or the language
+    /// registry changed (rename, save-as, reload_extensions). Untitled
+    /// documents keep whatever language was set on them. When the language
+    /// actually changes the document is forgotten on the LSP side first —
+    /// the didClose goes out under the old language — and the next LSP
+    /// sync re-opens it under the new one. Same pointer = nothing to do
+    /// (in-place re-registration already invalidated the highlight cache).
+    pub fn relanguageDoc(self: *Editor, doc: *Document) void {
+        const ext = doc.fileExtension() orelse return;
+        const new_lang = self.findLanguage(ext);
+        if (new_lang == doc.language) return;
+        self.lspForgetDoc(doc);
+        doc.language = new_lang;
+        doc.invalidateLineStates(0);
+    }
+
+    /// Point a document at a new path (rename on disk): the LSP forget
+    /// happens first so the didClose names the OLD uri, then the language
+    /// is re-detected from the new name.
+    pub fn setDocPath(self: *Editor, doc: *Document, path: []const u8) !void {
+        self.lspForgetDoc(doc);
+        try doc.setFilePath(path);
+        self.relanguageDoc(doc);
+    }
+
+    /// Save As: write `path`, adopt it, re-detect the language, then the
+    /// shared post-save bookkeeping (file tree, extensions). Nothing is
+    /// touched when the write fails except that the document is re-opened
+    /// on the LSP side under its old uri by the next sync (harmless).
+    pub fn saveDocAs(self: *Editor, doc: *Document, path: []const u8) !void {
+        self.lspForgetDoc(doc);
+        try doc.saveAs(self.io, path);
+        self.relanguageDoc(doc);
+        self.noteFileSaved(true, doc);
     }
 
     /// Get the resolved GUI syntax theme for a language (per-lang override or global).
@@ -2079,60 +2438,75 @@ pub const Editor = struct {
 
     // ---- LSP integration ----
 
-    /// Send didOpen notification if LSP is ready, the document has a file
-    /// path, and its language is the one the server understands.
+    /// Send didOpen for a document whose server is ready. When a
+    /// registration serves the document's language but no client runs
+    /// yet, the server is started here — lazily, the moment a file opens —
+    /// and the didOpen lands in a later sync once its handshake completes.
     pub fn lspNotifyOpen(self: *Editor, doc: *Document) void {
-        const lsp_client = self.lsp orelse return;
-        if (!lsp_client.isReady()) return;
+        if (!self.lsp_enabled) return;
+        if (doc.lsp_opened or doc.preview) return;
         const path = doc.file_path orelse return;
-        if (doc.lsp_opened) return;
         const lang = doc.language orelse return;
-        if (!std.ascii.eqlIgnoreCase(lang.name, self.lsp_language)) return;
+
+        const client = self.lspClientForLanguage(lang.name) orelse blk: {
+            const cfg = self.lspConfigFor(lang.name) orelse return;
+            if (cfg.failed) return;
+            break :blk self.startLspClient(cfg) orelse return;
+        };
+        if (!client.isReady()) return;
 
         const uri = lsp_mod.pathToUri(self.allocator, path) catch return;
         defer self.allocator.free(uri);
 
-        const lang_id: []const u8 = lang.name;
+        const cfg = if (client.config) |*c| c else return;
+        const lang_id = cfg.languageIdFor(lang.name);
         const text = doc.buffer.slice(0, doc.buffer.byteLen());
 
-        lsp_client.sendDidOpen(uri, lang_id, doc.lsp_version, text) catch return;
+        client.sendDidOpen(uri, lang_id, doc.lsp_version, text) catch return;
         doc.lsp_opened = true;
         doc.lsp_last_synced = doc.lsp_version;
-        std.log.info("LSP didOpen: {s} (lang={s})", .{ uri, lang_id });
+        std.log.info("LSP[{s}] didOpen: {s} (languageId={s})", .{ client.name(), uri, lang_id });
     }
 
-    /// Send didClose notification if the document was opened with LSP.
-    fn lspDidClose(self: *Editor, doc: *Document) void {
-        const lsp_client = self.lsp orelse return;
+    /// Forget a document on the LSP side: didClose for its CURRENT path,
+    /// `lsp_opened` cleared, the server's diagnostics dropped. Path and
+    /// language are taken as they are at call time, so callers that change
+    /// either (rename, save-as, re-detection) must call this FIRST.
+    /// No-op when the document was never opened with LSP.
+    pub fn lspForgetDoc(self: *Editor, doc: *Document) void {
         if (!doc.lsp_opened) return;
+        doc.lsp_opened = false;
+        doc.clearDiagnostics();
+        const client = self.lspClientForDoc(doc) orelse return;
         const path = doc.file_path orelse return;
 
         const uri = lsp_mod.pathToUri(self.allocator, path) catch return;
         defer self.allocator.free(uri);
 
-        lsp_client.sendDidClose(uri) catch {};
-        doc.lsp_opened = false;
+        client.sendDidClose(uri) catch {};
     }
 
     /// Send didSave notification.
     fn lspDidSave(self: *Editor, doc: *Document) void {
-        const lsp_client = self.lsp orelse return;
         if (!doc.lsp_opened) return;
+        const client = self.lspClientForDoc(doc) orelse return;
         const path = doc.file_path orelse return;
 
         const uri = lsp_mod.pathToUri(self.allocator, path) catch return;
         defer self.allocator.free(uri);
 
-        lsp_client.sendDidSave(uri) catch {};
+        client.sendDidSave(uri) catch {};
     }
 
-    /// Sync dirty documents with the LSP server (send didChange for modified docs).
-    /// Also sends didOpen for documents that were opened before the LSP finished initializing.
+    /// Sync open documents with their servers: didOpen for documents not
+    /// yet registered (starting a server lazily when one is configured for
+    /// their language), didChange for edited ones. Runs every frame.
     pub fn syncLspDocuments(self: *Editor) void {
-        const lsp_client = self.lsp orelse return;
-        if (!lsp_client.isReady()) return;
+        if (!self.lsp_enabled) return;
 
-        for (self.documents.items) |*doc| {
+        var i: usize = 0;
+        while (i < self.documents.items.len) : (i += 1) {
+            const doc = &self.documents.items[i];
             // Transient previews never touch the server (no didOpen churn
             // while the user arrows through the finder).
             if (doc.preview) continue;
@@ -2144,12 +2518,14 @@ pub const Editor = struct {
 
             if (doc.lsp_version == doc.lsp_last_synced) continue;
 
+            const client = self.lspClientForDoc(doc) orelse continue;
+            if (!client.isReady()) continue;
             const path = doc.file_path orelse continue;
             const uri = lsp_mod.pathToUri(self.allocator, path) catch continue;
             defer self.allocator.free(uri);
 
             const text = doc.buffer.slice(0, doc.buffer.byteLen());
-            lsp_client.sendDidChange(uri, doc.lsp_version, text) catch continue;
+            client.sendDidChange(uri, doc.lsp_version, text) catch continue;
             doc.lsp_last_synced = doc.lsp_version;
         }
     }
@@ -2178,9 +2554,9 @@ pub const Editor = struct {
 
     /// Trigger LSP completion at the current cursor position.
     pub fn triggerCompletion(self: *Editor) void {
-        const lsp_client = self.lsp orelse return;
-        if (!lsp_client.isReady()) return;
         const doc = self.activeDoc();
+        const lsp_client = self.lspClientForDoc(doc) orelse return;
+        if (!lsp_client.isReady()) return;
         const path = doc.file_path orelse return;
         if (!doc.lsp_opened) return;
 
@@ -2197,9 +2573,9 @@ pub const Editor = struct {
 
     /// Trigger LSP go-to-definition at the current cursor position.
     pub fn triggerGotoDefinition(self: *Editor) void {
-        const lsp_client = self.lsp orelse return;
-        if (!lsp_client.isReady()) return;
         const doc = self.activeDoc();
+        const lsp_client = self.lspClientForDoc(doc) orelse return;
+        if (!lsp_client.isReady()) return;
         const path = doc.file_path orelse return;
         if (!doc.lsp_opened) return;
 
@@ -2342,27 +2718,135 @@ test "per-language syntax theme override resolution" {
     try std.testing.expectEqual(editor.syntax_theme.keyword.r, fallback.keyword.r);
 }
 
-test "lsp server command resolution" {
+test "per-language settings fall back to globals" {
+    const allocator = std.testing.allocator;
+    var editor = try Editor.init(allocator, std.testing.io);
+    defer editor.deinit();
+    const doc = editor.activeDoc();
+    editor.tab_width = 4;
+    editor.use_tabs = false;
+
+    const prof = try editor.langProfile("Zig");
+    prof.settings.tab_width = 2;
+    doc.language = editor.findLanguage("zig");
+    try std.testing.expectEqual(@as(usize, 2), editor.tabWidthFor(doc));
+    try std.testing.expectEqual(false, editor.useTabsFor(doc)); // not overridden → global
+    try std.testing.expectEqual(editor.word_wrap, editor.wordWrapFor(doc));
+    try std.testing.expectEqual(editor.auto_close_brackets, editor.autoCloseBracketsFor(doc));
+    // Case-insensitive key → the same profile
+    try std.testing.expectEqual(@as(?*const Editor.LanguageProfile, prof), editor.langProfileNamed("ZIG"));
+    try std.testing.expectEqual(@as(?*const Editor.LanguageProfile, prof), editor.langProfileFor(doc));
+    // Plain text and languages without a profile → globals
+    doc.language = null;
+    try std.testing.expectEqual(@as(usize, 4), editor.tabWidthFor(doc));
+    doc.language = editor.findLanguage("md");
+    try std.testing.expectEqual(@as(usize, 4), editor.tabWidthFor(doc));
+    try std.testing.expect(editor.langProfileNamed("markdown") == null);
+}
+
+test "keybind overlay precedence and focus gating" {
+    const allocator = std.testing.allocator;
+    var editor = try Editor.init(allocator, std.testing.io);
+    defer editor.deinit();
+    const doc = editor.activeDoc();
+
+    const prof = try editor.langProfile("Zig");
+    try prof.keybinds.set("ctrl+k", "zig_thing");
+    try prof.keybinds.set("ctrl+shift+j", "zig_shift_thing");
+
+    // No language → global map
+    try std.testing.expectEqualStrings("delete_line", editor.lookupKeybind("ctrl+k").?);
+    // Zig doc → overlay wins for its combos, global map for the rest
+    doc.language = editor.findLanguage("zig");
+    try std.testing.expectEqualStrings("zig_thing", editor.lookupKeybind("ctrl+k").?);
+    try std.testing.expectEqualStrings("undo", editor.lookupKeybind("ctrl+z").?);
+    try std.testing.expectEqualStrings("zig_shift_thing", editor.lookupKeybind("ctrl+shift+j").?);
+    try std.testing.expect(editor.lookupKeybind("ctrl+shift+zz") == null);
+    // Another language → global map
+    doc.language = editor.findLanguage("md");
+    try std.testing.expectEqualStrings("delete_line", editor.lookupKeybind("ctrl+k").?);
+    // Tree / search focus: overlays don't apply
+    doc.language = editor.findLanguage("zig");
+    editor.filetree_focused = true;
+    try std.testing.expectEqualStrings("delete_line", editor.lookupKeybind("ctrl+k").?);
+    editor.filetree_focused = false;
+    editor.search_focused = true;
+    try std.testing.expectEqualStrings("delete_line", editor.lookupKeybind("ctrl+k").?);
+    editor.search_focused = false;
+    try std.testing.expectEqualStrings("zig_thing", editor.lookupKeybind("ctrl+k").?);
+}
+
+test "relanguageDoc and setDocPath follow the document path" {
+    const allocator = std.testing.allocator;
+    var editor = try Editor.init(allocator, std.testing.io);
+    defer editor.deinit();
+    const doc = editor.activeDoc();
+    try std.testing.expect(doc.language == null);
+
+    // Untitled: nothing to detect, manual language (none) is kept
+    editor.relanguageDoc(doc);
+    try std.testing.expect(doc.language == null);
+
+    try doc.setFilePath("notes.md"); // no disk I/O
+    editor.relanguageDoc(doc);
+    try std.testing.expectEqualStrings("markdown", doc.language.?.name);
+
+    // Rename path: forget-on-LSP (no-op here) → new path → re-detect
+    try editor.setDocPath(doc, "main.zig");
+    try std.testing.expectEqualStrings("zig", doc.language.?.name);
+    try std.testing.expectEqualStrings("main.zig", doc.file_path.?);
+    try std.testing.expect(!doc.lsp_opened);
+
+    try editor.setDocPath(doc, "x.txt");
+    try std.testing.expect(doc.language == null);
+}
+
+test "lsp config resolution" {
     const allocator = std.testing.allocator;
     var editor = try Editor.init(allocator, std.testing.io);
     defer editor.deinit();
 
-    // No config registered: default
-    try std.testing.expectEqualStrings("zls", editor.lspServerCommand());
+    // The built-in seed: zls from PATH serves zig (any case), id lowercased
+    const seed = editor.lspConfigFor("Zig").?;
+    try std.testing.expectEqualStrings("zls", seed.argv[0]);
+    try std.testing.expectEqualStrings("zig", seed.languageIdFor("Zig"));
+    try std.testing.expect(editor.lspConfigFor("python") == null);
 
-    // Config for another language doesn't affect the zig server
-    try editor.lsp_configs.append(allocator, .{
-        .language = try allocator.dupe(u8, "Python"),
-        .command = try allocator.dupe(u8, "pyright-langserver"),
-    });
-    try std.testing.expectEqualStrings("zls", editor.lspServerCommand());
+    // A config for another language doesn't affect zig
+    try editor.lsp_configs.append(allocator, try lsp_mod.ServerConfig.fromArgv(allocator, &.{"Python"}, &.{ "pyright-langserver", "--stdio" }));
+    try std.testing.expectEqualStrings("zls", editor.lspConfigFor("zig").?.argv[0]);
+    try std.testing.expectEqualStrings("pyright-langserver", editor.lspConfigFor("PYTHON").?.argv[0]);
 
-    // Case-insensitive match on lsp_language overrides the command
-    try editor.lsp_configs.append(allocator, .{
-        .language = try allocator.dupe(u8, "Zig"),
-        .command = try allocator.dupe(u8, "C:/tools/zls-0.16/zls.exe"),
-    });
-    try std.testing.expectEqualStrings("C:/tools/zls-0.16/zls.exe", editor.lspServerCommand());
+    // A later zig registration wins over the seed (newest first)
+    try editor.lsp_configs.append(allocator, try lsp_mod.ServerConfig.fromArgv(allocator, &.{"zig"}, &.{"C:/tools/zls-0.16/zls.exe"}));
+    try std.testing.expectEqualStrings("C:/tools/zls-0.16/zls.exe", editor.lspConfigFor("Zig").?.argv[0]);
+
+    // One server, several languages, per-language ids
+    try editor.lsp_configs.append(allocator, try lsp_mod.ServerConfig.fromArgv(allocator, &.{ "c", "cpp" }, &.{"clangd"}));
+    try std.testing.expectEqualStrings("clangd", editor.lspConfigFor("cpp").?.argv[0]);
+    try std.testing.expectEqualStrings("cpp", editor.lspConfigFor("c").?.languageIdFor("cpp"));
+
+    // No clients run in tests; document routing is null-safe
+    try std.testing.expect(editor.lspClientForDoc(editor.activeDoc()) == null);
+    try std.testing.expect(editor.lspClientForLanguage("zig") == null);
+
+    // reload bookkeeping: extension-tagged configs are dropped, others stay
+    var ext_cfg = try lsp_mod.ServerConfig.fromArgv(allocator, &.{"lua"}, &.{"lua-language-server"});
+    ext_cfg.from_extension = true;
+    try editor.lsp_configs.append(allocator, ext_cfg);
+    const before = editor.lsp_configs.items.len;
+    editor.dropExtensionLspConfigs();
+    try std.testing.expectEqual(before - 1, editor.lsp_configs.items.len);
+    try std.testing.expect(editor.lspConfigFor("lua") == null);
+    try std.testing.expect(editor.lspConfigFor("cpp") != null);
+
+    // lsp_restart forgives failures; reconcile with no clients is a no-op
+    editor.lspConfigFor("cpp").?.failed = true;
+    editor.restartLsp();
+    try std.testing.expect(!editor.lspConfigFor("cpp").?.failed);
+    editor.reconcileLspClients();
+    editor.lspTick();
+    try std.testing.expectEqual(@as(usize, 0), editor.lsp_clients.items.len);
 }
 
 test "editor undo via command" {

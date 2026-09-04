@@ -324,7 +324,7 @@ pub fn frame(editor: *Editor) bool {
                 var kbuf: [64]u8 = undefined;
                 const key_str = dvuiKeyToStr(key, &kbuf);
                 if (key_str.len > 0) {
-                    if (editor.keybinds.get(key_str)) |action| {
+                    if (editor.lookupKeybind(key_str)) |action| {
                         e.handled = true;
                         scroll_pinned = false;
                         execGuiAction(editor, action);
@@ -335,7 +335,7 @@ pub fn frame(editor: *Editor) bool {
                         var kbuf2: [64]u8 = undefined;
                         const fallback_str = dvuiKeyToStrNoShift(key, &kbuf2);
                         if (fallback_str.len > 0) {
-                            if (editor.keybinds.get(fallback_str)) |action| {
+                            if (editor.lookupKeybind(fallback_str)) |action| {
                                 e.handled = true;
                                 scroll_pinned = false;
                                 execGuiAction(editor, action);
@@ -690,8 +690,10 @@ pub fn frame(editor: *Editor) bool {
         // Left: Ln/Col (+ cursor count if multi-cursor)
         var pos_buf: [96]u8 = undefined;
         const cursor_count = doc.cursors.count();
-        // Show the detected language so it's obvious what syntax/LSP applies.
-        const lang_name: []const u8 = if (doc.language) |l| l.name else "plain text";
+        // Show the detected language (and its server once up) so it's
+        // obvious what syntax/LSP applies.
+        var lang_buf: [64]u8 = undefined;
+        const lang_name = editor.languageStatusText(doc, &lang_buf);
         const pos_str = if (cursor_count > 1)
             std.fmt.bufPrint(&pos_buf, "{d} cursors | Ln {d}, Col {d} | {s}", .{ cursor_count, pos.line + 1, pos.col + 1, lang_name }) catch "?"
         else
@@ -2878,7 +2880,6 @@ fn editorPane(editor: *Editor, pane_id: u8) void {
     // (in unscaled font units, matching what guiWrapAdvanceRow uses)
     const text_area_w_logical = @max(0.0, area.w - gutter_total_width) / scale;
     editor.text_width = if (text_area_w_logical > 0) @intFromFloat(text_area_w_logical) else 80;
-    const do_wrap = editor.word_wrap;
 
     // Take dvui focus back from the file tree panel when keyboard focus
     // returned to the editor (movement/typing below is is_focused-gated).
@@ -2900,6 +2901,9 @@ fn editorPane(editor: *Editor, pane_id: u8) void {
         };
         doc = &editor.documents.items[pane_doc_idx];
     }
+    // Per-language settings, resolved once per pane per frame
+    const do_wrap = editor.wordWrapFor(doc);
+    const tab_width = editor.tabWidthFor(doc);
 
     // --- Handle mouse events ---
     // Block mouse clicks/drags when a modal is active so they don't go to
@@ -2950,7 +2954,7 @@ fn editorPane(editor: *Editor, pane_id: u8) void {
     // --- Ensure cursor visible (unless user is scrolling with wheel or dragging) ---
     if (!scroll_pinned and !drag_active) {
         if (do_wrap) {
-            guiEnsureCursorVisibleWrapped(doc, font, text_area_w_logical, visible_lines, editor.tab_width);
+            guiEnsureCursorVisibleWrapped(doc, font, text_area_w_logical, visible_lines, tab_width);
         } else {
             doc.ensureCursorVisible(visible_lines, visible_cols);
         }
@@ -3047,7 +3051,7 @@ fn editorPane(editor: *Editor, pane_id: u8) void {
         const orig_line = doc.buffer.lineContent(line_idx);
         const line_start_offset = doc.buffer.line_starts.items[line_idx];
         var tab_exp_buf: [16384]u8 = undefined;
-        const line_text = expandTabs(orig_line, editor.tab_width, &tab_exp_buf);
+        const line_text = expandTabs(orig_line, tab_width, &tab_exp_buf);
         const has_tabs = line_text.ptr != orig_line.ptr;
         const needs_wrap = do_wrap and line_text.len > 0 and @as(f32, @floatFromInt(line_text.len)) * char_width > text_area_w;
 
@@ -3070,11 +3074,11 @@ fn editorPane(editor: *Editor, pane_id: u8) void {
             else
                 0;
             const past_eol = sel.end > line_start_offset + orig_line.len;
-            const s_exp = if (has_tabs) bufColToExpCol(orig_line, s_in, editor.tab_width) else s_in;
+            const s_exp = if (has_tabs) bufColToExpCol(orig_line, s_in, tab_width) else s_in;
             const e_exp = if (past_eol)
                 line_text.len + 1
             else if (has_tabs)
-                bufColToExpCol(orig_line, e_in, editor.tab_width)
+                bufColToExpCol(orig_line, e_in, tab_width)
             else
                 e_in;
             line_sels[line_sel_count] = .{ .start = s_exp, .end = e_exp, .to_eol = past_eol };
@@ -3084,7 +3088,7 @@ fn editorPane(editor: *Editor, pane_id: u8) void {
         // Pre-compute expanded column for primary cursor on this line
         const cursor_on_line = focused and cursor_pos.line == line_idx;
         const cursor_exp: usize = if (cursor_on_line)
-            (if (has_tabs) bufColToExpCol(orig_line, cursor_pos.col, editor.tab_width) else cursor_pos.col)
+            (if (has_tabs) bufColToExpCol(orig_line, cursor_pos.col, tab_width) else cursor_pos.col)
         else
             0;
 
@@ -3096,7 +3100,7 @@ fn editorPane(editor: *Editor, pane_id: u8) void {
                 const sc_pos = doc.buffer.offsetToPos(sc.offset);
                 if (sc_pos.line != line_idx) continue;
                 if (sc_count >= 64) break;
-                sc_exp_cols[sc_count] = if (has_tabs) bufColToExpCol(orig_line, sc_pos.col, editor.tab_width) else sc_pos.col;
+                sc_exp_cols[sc_count] = if (has_tabs) bufColToExpCol(orig_line, sc_pos.col, tab_width) else sc_pos.col;
                 sc_count += 1;
             }
         }
@@ -3113,8 +3117,8 @@ fn editorPane(editor: *Editor, pane_id: u8) void {
             const result = syntax.tokenizeLine(orig_line, lang, state, &span_buf);
             span_count = result.count;
             for (0..span_count) |si| {
-                exp_starts[si] = if (has_tabs) bufColToExpCol(orig_line, span_buf[si].start, editor.tab_width) else span_buf[si].start;
-                exp_ends[si] = if (has_tabs) bufColToExpCol(orig_line, span_buf[si].end, editor.tab_width) else span_buf[si].end;
+                exp_starts[si] = if (has_tabs) bufColToExpCol(orig_line, span_buf[si].start, tab_width) else span_buf[si].start;
+                exp_ends[si] = if (has_tabs) bufColToExpCol(orig_line, span_buf[si].end, tab_width) else span_buf[si].end;
             }
         }
 
@@ -3846,8 +3850,8 @@ fn handleMouseEvents(editor: *Editor, pane_id: u8, wd: *dvui.WidgetData, area: d
         .terminal => return,
     };
     const doc = &editor.documents.items[pane_doc_idx];
-    const tab_width = editor.tab_width;
-    const do_wrap = editor.word_wrap;
+    const tab_width = editor.tabWidthFor(doc);
+    const do_wrap = editor.wordWrapFor(doc);
     const double_click_threshold_ms: u64 = 400;
     const double_click_distance: f32 = 5; // pixels
 
@@ -4361,7 +4365,7 @@ fn handleGuiKeyEvents(editor: *Editor, wd: *dvui.WidgetData) bool {
                 switch (key.code) {
                     .up => {
                         e.handle(@src(), wd);
-                        if (editor.word_wrap) {
+                        if (editor.wordWrapFor(editor.activeDoc())) {
                             guiMoveVisualVertical(editor, .up, shift);
                         } else {
                             _ = editor.execCommand(if (shift) "cursor_up_select" else "cursor_up", null);
@@ -4369,7 +4373,7 @@ fn handleGuiKeyEvents(editor: *Editor, wd: *dvui.WidgetData) bool {
                     },
                     .down => {
                         e.handle(@src(), wd);
-                        if (editor.word_wrap) {
+                        if (editor.wordWrapFor(editor.activeDoc())) {
                             guiMoveVisualVertical(editor, .down, shift);
                         } else {
                             _ = editor.execCommand(if (shift) "cursor_down_select" else "cursor_down", null);
@@ -4465,7 +4469,7 @@ fn execGuiAction(editor: *Editor, action: []const u8) void {
         return;
     }
     // Visual-row-aware multi-cursor add when word wrap is on
-    if (editor.word_wrap) {
+    if (editor.wordWrapFor(editor.activeDoc())) {
         if (std.mem.eql(u8, action, "add_cursor_above")) {
             guiAddCursorVisual(editor, .up);
             return;
@@ -4647,12 +4651,12 @@ fn saveAs(editor: *Editor) void {
 
     if (path) |p| {
         defer editor.allocator.free(p);
-        editor.activeDoc().saveAs(editor.io, p) catch |err| {
+        // saveDocAs = LSP forget (old uri) → write → re-detect language →
+        // file tree + extension bookkeeping.
+        editor.saveDocAs(editor.activeDoc(), p) catch |err| {
             editor.status_message = @errorName(err);
             return;
         };
-        editor.activeDoc().detectLanguage(editor);
-        editor.noteFileSaved(true, editor.activeDoc());
         editor.status_message = "Saved";
     }
 }
@@ -4703,7 +4707,7 @@ fn guiMoveVisualVertical(editor: *Editor, direction: enum { up, down }, extend_s
     const buf = &doc.buffer;
     const font = dvui.Font.theme(.mono);
     const total_lines = buf.lineCount();
-    const tw = editor.tab_width;
+    const tw = editor.tabWidthFor(doc);
     const text_w: f32 = @floatFromInt(editor.text_width);
 
     for (doc.cursors.cursors.items) |*c| {
@@ -4764,7 +4768,7 @@ fn guiAddCursorVisual(editor: *Editor, direction: enum { up, down }) void {
     const buf = &doc.buffer;
     const font = dvui.Font.theme(.mono);
     const total_lines = buf.lineCount();
-    const tw = editor.tab_width;
+    const tw = editor.tabWidthFor(doc);
     const text_w: f32 = @floatFromInt(editor.text_width);
 
     // Find the outermost cursor in the given direction
@@ -5329,7 +5333,7 @@ const settings_defs = [_]SettingDef{
     .{ .key = "page_size", .label = "Page Size", .kind = .number, .desc = "Lines to scroll on Page Up/Down (5-200)", .min = 5, .max = 200 },
     .{ .key = "click_clears_cursors", .label = "Click Clears Cursors", .kind = .boolean, .desc = "Left-click clears secondary cursors" },
     .{ .key = "session_persistence", .label = "Session Persistence", .kind = .boolean, .desc = "Reopen last session's files when launched bare" },
-    .{ .key = "lsp_enabled", .label = "LSP Support", .kind = .boolean, .desc = "Start the language server at launch (takes effect next launch)" },
+    .{ .key = "lsp_enabled", .label = "LSP Support", .kind = .boolean, .desc = "Run language servers for open files (off stops them immediately)" },
     .{ .key = "syntax_highlighting", .label = "Syntax Highlighting", .kind = .boolean, .desc = "Color code by language — off = plain text editor" },
     .{ .key = "filetree_git_colors", .label = "File Tree Git Colors", .kind = .boolean, .desc = "Color file tree rows by git status" },
     .{ .key = "filetree_auto_reveal", .label = "File Tree Auto Reveal", .kind = .boolean, .desc = "Select the active file in the tree when switching tabs" },
@@ -5544,7 +5548,7 @@ fn applySettingBool(editor: *Editor, key: []const u8, val: bool) void {
     if (std.mem.eql(u8, key, "auto_save")) editor.auto_save = val;
     if (std.mem.eql(u8, key, "click_clears_cursors")) editor.click_clears_cursors = val;
     if (std.mem.eql(u8, key, "session_persistence")) editor.session_persistence = val;
-    if (std.mem.eql(u8, key, "lsp_enabled")) editor.lsp_enabled = val; // next launch
+    if (std.mem.eql(u8, key, "lsp_enabled")) editor.lsp_enabled = val; // lspTick stops/starts servers next frame
     if (std.mem.eql(u8, key, "syntax_highlighting")) editor.syntax_highlighting = val;
     if (std.mem.eql(u8, key, "filetree_git_colors")) {
         editor.filetree_git_colors = val;
@@ -5901,7 +5905,7 @@ fn drawCompletionPopupGui(editor: *Editor, render_area: dvui.Rect.Physical, font
     const doc = editor.activeDoc();
     const cursor = doc.cursors.primaryConst();
     const cursor_pos = doc.buffer.offsetToPos(cursor.offset);
-    const tab_width = editor.tab_width;
+    const tab_width = editor.tabWidthFor(doc);
 
     // Gutter width
     const line_count = doc.lineCount();

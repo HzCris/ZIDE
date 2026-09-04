@@ -99,6 +99,14 @@ pub const Document = struct {
         }
     }
 
+    /// Drop all LSP diagnostics (frees their messages).
+    pub fn clearDiagnostics(self: *Document) void {
+        for (self.diagnostics.items) |*d| {
+            d.deinit(self.allocator);
+        }
+        self.diagnostics.clearRetainingCapacity();
+    }
+
     /// Drop all extension lint diagnostics (frees their messages).
     pub fn clearLintDiagnostics(self: *Document) void {
         for (self.lint_diagnostics.items) |*d| {
@@ -903,14 +911,20 @@ pub const Document = struct {
         }
     }
 
+    /// File extension of `file_path` without the leading dot — null when the
+    /// document is untitled or its name has no extension.
+    pub fn fileExtension(self: *const Document) ?[]const u8 {
+        const path = self.file_path orelse return null;
+        const ext = std.fs.path.extension(path);
+        const ext_clean = if (ext.len > 0 and ext[0] == '.') ext[1..] else ext;
+        if (ext_clean.len == 0) return null;
+        return ext_clean;
+    }
+
     /// Detect language from the file extension using the editor's language registry.
     pub fn detectLanguage(self: *Document, editor: anytype) void {
-        const path = self.file_path orelse return;
-        const ext = std.fs.path.extension(path);
-        // Strip leading '.' from extension
-        const ext_clean = if (ext.len > 0 and ext[0] == '.') ext[1..] else ext;
-        if (ext_clean.len == 0) return;
-        self.language = editor.findLanguage(ext_clean);
+        const ext = self.fileExtension() orelse return;
+        self.language = editor.findLanguage(ext);
         self.invalidateLineStates(0);
     }
 

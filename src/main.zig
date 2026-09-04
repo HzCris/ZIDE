@@ -92,7 +92,6 @@ const dvui = if (build_options.has_gui) @import("dvui") else struct {};
 const SDLBackend = if (build_options.has_gui) @import("sdl-backend") else struct {};
 
 const Editor = @import("core/editor.zig").Editor;
-const LspClient = @import("core/editor.zig").lsp_mod.LspClient;
 const lua_settings = @import("core/lua_settings.zig");
 const gui = @import("frontend/gui.zig");
 const tui = @import("frontend/tui.zig");
@@ -111,6 +110,7 @@ const welcome_text =
     \\// or press Ctrl+P to browse every command by name.
     \\// Shortcuts below are the defaults; rebind any of them in
     \\// ~/.config/zide/init.lua with  zide.bind("ctrl+s", "save")
+    \\// (add { language = "zig" } as a third argument for one language only)
     \\//
     \\// File
     \\//   Ctrl+N            new file           Ctrl+O           open file
@@ -298,23 +298,9 @@ fn runGui(allocator: std.mem.Allocator, io: std.Io, lua: *zlua.Lua, cli_files: [
     lua_settings.loadExtensions(lua);
     lua_settings.loadLangSyntaxThemes(lua);
 
-    // Start LSP client (zls from PATH unless init.lua registered a command;
-    // lsp_enabled=false skips the server entirely — editor.lsp stays null
-    // and every LSP call site already tolerates that)
-    var lsp_client = LspClient.init(allocator, io);
-    defer lsp_client.deinit();
-    if (editor.lsp_enabled) {
-        const lsp_cmd = editor.lspServerCommand();
-        lsp_client.start(lsp_cmd) catch |err| {
-            std.log.warn("Failed to start LSP server '{s}': {}", .{ lsp_cmd, err });
-            // Surface it in the status bar — the log file is easy to miss.
-            editor.status_message = if (err == error.FileNotFound)
-                "LSP server not found — completions disabled (see zide.log)"
-            else
-                "LSP server failed to start — completions disabled (see zide.log)";
-        };
-        editor.lsp = &lsp_client;
-    }
+    // Language servers start lazily when a document of a registered
+    // language opens (Editor.lspNotifyOpen / lspTick) and are stopped by
+    // editor.deinit — nothing to set up here.
 
     // Open CLI files, or show welcome text
     if (cli_files.len > 0) {
@@ -393,9 +379,9 @@ fn runGui(allocator: std.mem.Allocator, io: std.Io, lua: *zlua.Lua, cli_files: [
         try win.begin(nstime);
         _ = try backend.addAllEvents(&win);
 
-        // Poll LSP messages and sync documents
-        if (editor.lsp) |l| l.pollMessages(&editor);
-        editor.syncLspDocuments();
+        // Language servers: sweep dead ones, drain messages, sync documents
+        // (starts servers lazily for newly opened languages)
+        editor.lspTick();
 
         // Deliver finished zide.spawn results to their Lua callbacks
         editor.pumpLuaJobs();
@@ -431,22 +417,7 @@ fn runTui(allocator: std.mem.Allocator, io: std.Io, lua: *zlua.Lua, cli_files: [
     lua_settings.loadExtensions(lua);
     lua_settings.loadLangSyntaxThemes(lua);
 
-    // Start LSP client (zls from PATH unless init.lua registered a command;
-    // lsp_enabled=false skips the server entirely)
-    var lsp_client = LspClient.init(allocator, io);
-    defer lsp_client.deinit();
-    if (editor.lsp_enabled) {
-        const lsp_cmd = editor.lspServerCommand();
-        lsp_client.start(lsp_cmd) catch |err| {
-            std.log.warn("Failed to start LSP server '{s}': {}", .{ lsp_cmd, err });
-            // Surface it in the status bar — the log file is easy to miss.
-            editor.status_message = if (err == error.FileNotFound)
-                "LSP server not found — completions disabled (see zide.log)"
-            else
-                "LSP server failed to start — completions disabled (see zide.log)";
-        };
-        editor.lsp = &lsp_client;
-    }
+    // Language servers start lazily (see runGui) — nothing to set up here.
 
     // Open CLI files, or show welcome text
     if (cli_files.len > 0) {
@@ -511,6 +482,7 @@ comptime {
     _ = @import("core/theme.zig");
     _ = @import("core/fileicons.zig");
     _ = @import("core/lsp.zig");
+    _ = @import("core/lua_json.zig");
     _ = @import("core/ansi.zig");
     _ = @import("core/terminal.zig");
     _ = @import("core/pty.zig");

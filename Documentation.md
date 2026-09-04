@@ -78,7 +78,7 @@ Windows terminals commonly intercept Alt combos (Windows Terminal binds Alt+arro
 - Line operations: delete (Ctrl+K), duplicate (Ctrl+D), move up/down (Alt+Up/Down)
 - Comment toggle (Ctrl+/): comments/uncomments all selected lines as one undo step, aligned at the block's minimum indent, skipping blank lines; uses `line_comment` from the language definition, falling back to per-line `block_comment_start/end` wrapping (CSS/HTML); works in legacy terminals too (Ctrl+/ arrives as byte 0x1F and is normalized)
 - Smart Home (first non-whitespace or column 0)
-- Indent/Dedent (Tab/Shift+Tab, respects tab_width and use_tabs settings)
+- Indent/Dedent (Tab/Shift+Tab, respects tab_width and use_tabs — the global defaults or the file's language override, see *Per-language settings*)
 - Auto-closing brackets and quotes (skip-over, smart quote detection)
 - UTF-8 aware cursor movement
 - Selection (Shift+arrows, Shift+Home/End, Ctrl+A select all)
@@ -138,7 +138,8 @@ Windows terminals commonly intercept Alt combos (Windows Terminal binds Alt+arro
 **Configuration:**
 - Config folder hierarchy: `~/.config/zide/` with `themes/` and `extensions/` subfolders
 - Lua settings file (`~/.config/zide/init.lua`)
-  - `zide.set(key, value)` — tab_width, use_tabs, word_wrap, auto_close_brackets, page_size, auto_save, auto_save_interval_ms, click_clears_cursors, max_undo_history, session_persistence, filetree_visible, filetree_side ("left"/"right"), filetree_width (GUI px), tui_filetree_width (columns), filetree_root (starting directory, "" = cwd), lsp_enabled (off = no language server, takes effect next launch), syntax_highlighting (off = plain-text look), filetree_git_colors (off = no git status colors/subprocesses)
+  - `zide.set_language(name, { tab_width = 2, use_tabs = false, word_wrap = true, auto_close_brackets = false })` — per-language overrides of those four settings for files of that language (merge: only the keys given change; name matched case-insensitively; works for built-ins and for languages registered later); `zide.get_language(name)` reads the overrides back (nil when none)
+  - `zide.set(key, value)` — tab_width, use_tabs, word_wrap, auto_close_brackets (global defaults — see `zide.set_language`), page_size, auto_save, auto_save_interval_ms, click_clears_cursors, max_undo_history, session_persistence, filetree_visible, filetree_side ("left"/"right"), filetree_width (GUI px), tui_filetree_width (columns), filetree_root (starting directory, "" = cwd), lsp_enabled (off = no language servers; running ones stop on the next frame), syntax_highlighting (off = plain-text look), filetree_git_colors (off = no git status colors/subprocesses)
   - `zide.set("mono_font_path", "/path/to/font.ttf")` — use a custom monospace font (e.g. a Nerd Font for box-drawing and powerline glyphs in the embedded terminal)
   - `zide.set("mono_font_size", 14)` — override the default monospace font size
   - `zide.set("tui_theme", name)` — switch TUI theme ("terminal", "dark", "light", "high_contrast")
@@ -148,9 +149,9 @@ Windows terminals commonly intercept Alt combos (Windows Terminal binds Alt+arro
   - `zide.register_language({...})` — register a language for syntax highlighting (see Syntax Highlighting section)
   - `zide.register_lsp({...})` — register an LSP server for a language (see LSP Support section)
   - `zide.get(key)` — read current settings
-  - `zide.bind(key_combo, command)` — remap keybindings
-  - `zide.unbind(key_combo)` — remove a keybinding
-- Data-driven keybinding map (all Ctrl/Alt shortcuts remappable)
+  - `zide.bind(key_combo, command [, { language = "zig" }])` — remap keybindings; with the `language` option the binding lives in that language's overlay and applies only while editing a file of that language (see *Command System*)
+  - `zide.unbind(key_combo [, { language = "zig" }])` — remove a keybinding (global, or from a language overlay)
+- Data-driven keybinding map (all Ctrl/Alt shortcuts remappable, globally or per language)
 - File tree side panel (Ctrl+B) — dockable left/right column band with mouse + keyboard browsing, create/rename/delete prompts, reveal-current-file (see File Tree section)
 - Auto-save (saves dirty documents with file paths after configurable interval, default 5s)
 - Application icon embedded in exe
@@ -191,7 +192,7 @@ Windows terminals commonly intercept Alt combos (Windows Terminal binds Alt+arro
 - Command palette with fuzzy matching (Ctrl+P)
 - Quick open (Ctrl+E): fuzzy file finder with live preview behind a bottom-anchored panel — same behavior as the TUI (Enter opens a normal tab, Escape restores; previews never appear in the tab bar); PageUp/PageDown and the mouse wheel scroll the preview
 - Workspace search & replace (Ctrl+Shift+F): same engine and behavior as the TUI, with a VS Code-style panel — bordered input boxes with placeholders, clickable `Aa`/`W` toggle chips inside the search box (toggling re-runs the search), results **grouped under file headers** (collapse chevron + type icon + name + directory + match count — click a header to fold/unfold its file; the current file's header stays **pinned at the top** while its matches scroll, VS Code-style) with the match **highlighted inside each excerpt** and long excerpts ellipsis-windowed around the match; click fields to focus, double-click a result to open it, wheel scrolls, F4/Shift+F4 cycle results while editing
-- Keybinding remapping (Lua integration — `zide.bind`/`zide.unbind` via init.lua)
+- Keybinding remapping (Lua integration — `zide.bind`/`zide.unbind` via init.lua, global or per-language with `{ language = "zig" }`)
 - Auto-save (saves dirty documents with file paths after configurable interval, default 5s)
 - Application icon embedded in exe
 - SDL3GPU backend (GPU-accelerated rendering, opt-in via `zig build -Dgpu=true`, default SDL3 for lower memory)
@@ -201,7 +202,7 @@ Windows terminals commonly intercept Alt combos (Windows Terminal binds Alt+arro
 - Mouse selection: double-click selects word, triple-click selects line, drag extends by word/line accordingly, Shift+click extends selection, Alt+click adds cursor, Shift+Alt+drag for block (column) selection (one cursor per line over the dragged column span)
 
 - File tree side panel (Ctrl+B) — dockable left/right, VS Code-style rows (type icons, chevrons, hover, scrollbar, git badges), inline create/rename, `/` search, auto-reveal, multi-select with bulk delete/move, file cut/copy/paste, Explorer drag-in, clickable delete dialog, header buttons, context menu incl. copy path + reveal in Explorer (see File Tree section)
-- Settings dialog (Preferences menu — modal DVUI floating window with native widgets: checkboxes for booleans, validated numeric entries with min/max, dropdown for theme; draggable by header, auto-centered, dims the background; changes apply live and write to init.lua immediately; close via header X or Escape; Tab/Shift+Tab cycles controls)
+- Settings dialog (Preferences menu — modal DVUI floating window with native widgets: checkboxes for booleans, validated numeric entries with min/max, dropdown for theme; draggable by header, auto-centered, dims the background; changes apply live and write to init.lua immediately; close via header X or Escape; Tab/Shift+Tab cycles controls; it edits the global defaults — per-language overrides live in init.lua via `zide.set_language`)
 - Open Settings File (Preferences menu — opens init.lua directly in the editor for power users)
 - Tab character display (expands `\t` to spaces for rendering, cursor, selection, and wrapping)
 - Blinking caret (530ms cycle, resets on cursor movement) — drawn in the theme's `cursor` color (override via `zide.set("color_cursor", "#hex")`) so it stands out from selection highlights; secondary multi-cursor carets use the same color dimmed
@@ -225,7 +226,7 @@ Windows terminals commonly intercept Alt combos (Windows Terminal binds Alt+arro
   - Preferences: Settings, Open Settings File, Theme > (Dark / Light / High Contrast), Open Theme File, Open Theme Folder
   - Help: Documentation, About ZIDE
 - Theme switcher: Preferences > Theme submenu switches themes live (updates editor + DVUI chrome, persists to init.lua)
-- Theme setting in Settings dialog: dropdown (dark/light/high_contrast) — TUI settings panel keeps the cycleable enum (Enter/Space cycles)
+- Theme setting in Settings dialog: dropdown (dark/light/high_contrast)
 - Open Theme File: opens `~/.config/zide/themes/gui-theme.lua` in editor (creates commented template with per-field descriptions if missing)
 - Open Theme Folder: opens `~/.config/zide/themes/` in OS file explorer
 - Help > Documentation: opens Documentation.md in the editor (searches the exe's directory and its ancestors — works from `zig-out/bin` and desktop launches; also available as the `open_documentation` palette command in both frontends)
@@ -249,8 +250,8 @@ Markdown is the one exception to the data-driven model: its grammar is structura
 
 ### How It Works
 
-1. **Startup**: ZIDE scans `~/.config/zide/extensions/*.lua` and executes each file. Extensions call `zide.register_language({...})` to register language definitions.
-2. **File open**: Language is detected from the file extension (e.g., `.zig` → Zig, `.py` → Python if registered).
+1. **Startup**: ZIDE scans `~/.config/zide/extensions/*.lua` and executes each file. Extensions call `zide.register_language({...})` to register language definitions. Registering a **name that already exists** (case-insensitive, including the built-in `zig` and `markdown`) **replaces** that definition in place — it is a full replacement, so restate every field you want to keep (and `tokenizer = "markdown"` when tweaking markdown); open files pick up the new tables immediately.
+2. **File open**: Language is detected from the file extension (e.g., `.zig` → Zig, `.py` → Python if registered). When two definitions claim the same extension the **most recently registered wins**, so an extension can take over `.zig` or `.md` from the built-ins. The language is re-detected after a rename in the file tree, after Save As, and after `reload_extensions`.
 3. **Rendering**: Each visible line is tokenized into spans (keyword, string, comment, etc.), and each span is rendered with its color from the active syntax theme.
 
 ### Token Types
@@ -390,6 +391,31 @@ zide.register_language({
 | `has_char_literals` | bool | no | Whether `'x'` is a char literal (default: false) |
 | `builtin_prefix` | string | no | Single character prefix for builtins (e.g., `"@"` for Zig) |
 | `preproc_prefix` | string | no | Single character prefix for preprocessor (e.g., `"#"` for C) |
+| `tokenizer` | string | no | `"generic"` (default: the table-driven tokenizer above) or `"markdown"` (the structural native tokenizer; the tables are then unused). Needed when re-registering `markdown` — a replacement without it degrades to generic (logged as a warning) |
+
+| `tab_width` / `use_tabs` / `word_wrap` / `auto_close_brackets` | number / bool | no | Per-language overrides of the editor settings for files of this language — sugar for `zide.set_language(name, {...})` below |
+
+Re-registering a `name` replaces the existing definition in place (see *How It Works*); ZIDE
+logs `Re-registered language: <name>`. Definitions are never removed at runtime — a language
+whose extension file was deleted lingers until the next launch.
+
+#### Per-language settings
+
+`tab_width`, `use_tabs`, `word_wrap` and `auto_close_brackets` are global defaults; any
+language can override them, neovim `ftplugin`-style, without touching the others:
+
+```lua
+zide.set("tab_width", 4)                                          -- the default
+zide.set_language("javascript", { tab_width = 2 })                -- JS files indent by 2
+zide.set_language("markdown", { auto_close_brackets = false, word_wrap = true })
+zide.register_language({ name = "yaml", extensions = {"yml", "yaml"}, keywords = {}, tab_width = 2 })  -- same keys inline
+print(zide.get_language("markdown").word_wrap)                    -- true; nil when nothing is overridden
+```
+
+Overrides merge (only the keys you pass change), match the language name case-insensitively,
+and may be set before the language is registered — or for a built-in. `zide.language()` tells
+an extension which language the active file has. The Settings dialog edits the global
+defaults only.
 
 #### Extension Runtime API
 
@@ -408,16 +434,20 @@ end)
 -- Bind it like any built-in (init.lua or here):
 zide.bind("ctrl+shift+d", "insert_date")
 
--- React to editor events. The handler gets the file path (nil = untitled).
-zide.on("save", function(path)
-    zide.status("Saved: " .. (path or "untitled"))
+-- React to editor events. The handler gets the file path (nil = untitled)
+-- and the document's language name (nil = plain text).
+zide.on("save", function(path, language)
+    zide.status("Saved: " .. (path or "untitled") .. " [" .. (language or "text") .. "]")
 end)
+
+-- Only for one language (neovim ftplugin-style):
+zide.on("save", function(path) zide.status("zig file saved") end, { language = "zig" })
 ```
 
 | Call | Description |
 |------|-------------|
 | `zide.command(name, desc, fn)` | Register a command — listed in the palette, runnable via `zide.bind`/`zide.exec`. Re-registering a name replaces it; shadowing a built-in is allowed (logged). `fn` receives the optional args string (usually nil). |
-| `zide.on(event, fn)` | Hook an event. Events: `"open"` (file opened into a tab), `"save"` (file written — fires per document on auto-save too). `fn(path)` gets the file path or nil. |
+| `zide.on(event, fn [, opts])` | Hook an event. Events: `"open"` (file opened into a tab), `"save"` (file written — fires per document on auto-save too). `fn(path, language)` gets the file path (or nil) and the document's language name (or nil for plain text); handlers that only declare `path` keep working. `opts.language = "zig"` fires the handler only for documents of that language (case-insensitive). |
 | `zide.exec(name)` → bool | Run any action or command by name — the same names keybinds use (`"save"`, `"undo"`, `"toggle_filetree"`, other Lua commands, …). Returns whether the name was recognized. |
 | `zide.status(msg)` | Show a transient message in the status bar (both frontends). |
 
@@ -510,6 +540,9 @@ The `reload_extensions` command (palette) drops all Lua-registered commands
 and event handlers and re-runs every `extensions/*.lua` — edit-extension,
 reload, retry without restarting ZIDE. (Lua globals your scripts set persist
 across reloads; top-level state is re-initialized by your script itself.)
+Languages re-registered by the reload are replaced in place, and every open
+document's language is re-detected afterwards, so a new extension→language
+mapping applies to files that are already open.
 
 #### Extension Directory
 
@@ -534,18 +567,54 @@ across reloads; top-level state is re-initialized by your script itself.)
 
 ### Overview
 
-ZIDE includes a built-in LSP (Language Server Protocol) client that communicates with language servers over stdio JSON-RPC. ZLS (Zig Language Server) is started automatically when ZIDE launches — by default `zls` from PATH, overridable from `init.lua` (see *Lua LSP API* below). The user config is loaded **before** the server starts so the override can take effect.
+ZIDE has a built-in LSP (Language Server Protocol) client that talks to language servers over stdio JSON-RPC. It is **server-agnostic**: any language server you can install is wired up from Lua, neovim-style, and any number of them run at once — one process per registration, started **lazily** the first time a file of a language it serves is opened, stopped when ZIDE quits.
 
-Startup feedback appears in the status bar: "LSP ready" once the handshake completes, or "LSP server not found — completions disabled" if it couldn't be started. Details (including the exact command tried) land in the log file (see Logging under Shared / Core). The server's own stderr is discarded, and on Windows the server is spawned with `CREATE_NO_WINDOW` so no console window appears.
+Out of the box exactly one registration exists: `zls` from PATH for Zig. Everything else is a `zide.register_lsp` call in `init.lua` or an extension. The shipped, fully commented `~/.config/zide/extensions/example-lsp-servers.lua` has copy-paste blocks for clangd (C/C++), rust-analyzer, typescript-language-server, the vscode JSON server, pyright and lua-language-server.
 
-Documents are only synced to the server when their detected language matches the server's language (`zig` for the built-in zls client) — a `.txt` or `.md` buffer never reaches zls, so it can't get bogus Zig diagnostics. The status bar shows each document's detected language (e.g. `Ln 1, Col 1 | zig`, or `plain text` when nothing matched), so it's always visible what syntax/LSP applies.
+Documents are routed by **language name**: a document is synced to the server whose registration serves its detected language (the `name` from `zide.register_language`), so a `.txt` or `.md` buffer never reaches zls. The status bar shows each document's language and, once its server is up, the server's name: `Ln 1, Col 1 | c (clangd)` (or `plain text` when nothing matched).
+
+### Registering a server
+
+```lua
+zide.register_lsp({
+    language = "c",                                  -- or languages = {"c", "cpp"}: one server serves all of them
+    command = {"clangd", "--background-index"},      -- table = argv; a plain string is the program only (never split on spaces)
+    language_id = "c",                               -- optional; default = language name lowercased
+    settings = { Lua = { diagnostics = { globals = {"zide"} } } },  -- optional; Lua table → JSON
+    init_options = { check = { command = "clippy" } },              -- optional; → initializationOptions
+})
+```
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| `language` / `languages` | string / string[] | one of them | Language name(s) as given to `zide.register_language` (case-insensitive). One registration can serve several languages with one process (clangd for `c` and `cpp`). |
+| `command` | string or string[] | yes | The server program. A **string is argv[0] only** — paths with spaces work, nothing is split. A **table is the full argv**: `{"pyright-langserver", "--stdio"}`. Resolved on PATH; Windows npm `.cmd` shims work as-is (PowerShell-only `.ps1` shims don't). |
+| `language_id` | string or table | no | The LSP `languageId` sent in `didOpen`. Default: the language name lowercased. A string is accepted only for a single-language registration; otherwise use `{ ["C++"] = "cpp" }`. |
+| `settings` | table | no | Converted to JSON. Answers the server's `workspace/configuration` requests (dotted `section` lookup, e.g. `Lua.diagnostics`) and is pushed once via `workspace/didChangeConfiguration` after the handshake. |
+| `init_options` | table | no | Converted to JSON and sent as `initializationOptions` (rust-analyzer and friends). |
+
+JSON conversion: Lua arrays (keys 1..n) become JSON arrays, other tables become objects, integers stay integers, and an **empty table is `{}`** (an empty JSON array can't be expressed). Functions inside the table are skipped with a warning in the log.
+
+Registration is not checked against the language registry — `init.lua` runs before extensions register their languages; resolution happens by name when a document opens. When several registrations serve the same language the **most recent wins**, so a `register_lsp` for `zig` in your config replaces the built-in `zls` entry (e.g. to pin a toolchain-matched binary).
+
+### Lifecycle
+
+- **Lazy start**: a server is spawned the first time a document of a language it serves is opened (or gains that language through a rename / Save As). Nothing runs for languages without an open file.
+- **Workspace root**: the file tree root (`filetree_root`, canonicalized) is sent as `rootUri` / `rootPath` / `workspaceFolders`. rust-analyzer needs this to be the Cargo project. Re-rooting the tree later does not move running servers — run `lsp_restart`.
+- **Status bar**: `LSP ready: clangd (c, cpp)` on handshake; `LSP for c: cannot start clangd (FileNotFound) — see zide.log` when the program is missing; `LSP clangd exited — run lsp_restart` when a server dies or rejects `initialize`. A failed registration is **not retried every frame** — it stays marked failed until `lsp_restart` or until `reload_extensions` replaces it.
+- **`lsp_restart`** (palette): stops every server, forgets failures, and lets the lazy start bring servers back for the open documents.
+- **`reload_extensions`**: registrations made by `extensions/*.lua` are dropped and re-created; a server whose registration is unchanged keeps running, changed or removed ones are stopped.
+- **`lsp_enabled`** (`zide.set("lsp_enabled", false)` or the Settings dialog): no servers start and running ones stop on the next frame — takes effect immediately.
+- **Quit**: every server gets `shutdown` + `exit`, up to a second to leave on its own, then is killed.
+- Server→client requests are answered: `workspace/configuration` from `settings`, `workspace/workspaceFolders`, capability registrations and progress tokens with `null`, anything else with a JSON-RPC MethodNotFound. `window/logMessage` / `window/showMessage` go to `zide.log` (server errors also to the status bar). Every server's stderr is discarded, and on Windows servers are spawned with `CREATE_NO_WINDOW` so no console window appears.
 
 ### Architecture
 
-- **Background reader thread** reads JSON-RPC messages from the language server's stdout and pushes them onto a thread-safe ring buffer queue
-- **Main thread** polls the queue each frame (GUI) or event loop iteration (TUI) — no blocking
+- **One background reader thread per server** reads JSON-RPC messages from the server's stdout and pushes them onto a thread-safe ring buffer queue
+- **Main thread** (`Editor.lspTick`) sweeps dead servers, polls every queue each frame (GUI) or event loop iteration (TUI) — no blocking — then syncs documents
 - **Full-text document sync** with version coalescing: rapid keystrokes are batched into a single `didChange` notification per frame
-- In the TUI, the reader thread wakes the blocking event loop via `loop.postEvent(.lsp_data)`
+- In the TUI, reader threads wake the blocking event loop via `loop.postEvent(.lsp_data)`; a server's stdout closing wakes it too, so a crash is noticed without a keypress
+- Each client owns a deep copy of its registration (`lsp.ServerConfig`); documents route to "the running client whose registration serves the document's language" — nothing is cached on documents or language definitions
 
 ### Diagnostics (Sprint 1 — Implemented)
 
@@ -571,43 +640,21 @@ Trigger with **Ctrl+Space**. A popup appears near the cursor showing LSP complet
 - Escape to dismiss
 - Any other key dismisses and passes through
 
-**Both GUI and TUI** render the popup near the cursor position with scrolling for long lists. Detail information (type signatures etc.) is shown dimmed next to labels.
+**Both GUI and TUI** render the popup near the cursor position with scrolling for long lists. Detail information (type signatures etc.) is shown dimmed next to labels. Both response shapes are accepted (`CompletionList` and a bare item array); when a server omits `insertText` the `textEdit.newText` is used.
 
 ### Go-to-Definition (Sprint 3 — Implemented)
 
 Press **F12** to jump to the definition of the symbol under the cursor. If the definition is in the same file, the cursor jumps to that line. If it's in a different file, the file is opened in a new tab and the cursor moves to the definition.
 
-### Lua LSP API (Sprint 3 — Implemented)
-
-Configure the language server via `~/.config/zide/init.lua`:
-
-```lua
--- Point the built-in Zig server at a specific zls binary
--- (e.g. the one matching your 0.16 toolchain instead of the PATH zls):
-zide.register_lsp({
-    language = "zig",
-    command = "C:/Users/you/tools/zig-0.16.0/ZLS/zls.exe",
-})
-```
-
-| Field | Type | Required | Description |
-|-------|------|----------|-------------|
-| `language` | string | yes | Language name, case-insensitive (must match a registered language's name) |
-| `command` | string | yes | LSP server executable — a name resolved via PATH or a full path |
-
-At startup ZIDE starts **one** server: the one registered for the active LSP
-language (`zig` by default; first matching entry wins), falling back to plain
-`zls` from PATH when nothing matches. Entries for other languages are stored
-but not yet started — multi-server support is future work.
-
 ### Document Lifecycle
 
 | Event | LSP Notification |
 |-------|-----------------|
-| File opened | `textDocument/didOpen` |
+| File opened | `textDocument/didOpen` (starts the server first if needed) |
 | Text edited | `textDocument/didChange` (full text, coalesced per frame) |
 | File saved | `textDocument/didSave` |
 | Tab closed | `textDocument/didClose` |
+| Renamed in the tree / Save As | `didClose` on the old uri, then `didOpen` on the new one (possibly on a different server when the language changed) |
 
 ---
 
@@ -629,8 +676,10 @@ but not yet started — multi-server support is future work.
 | `src/core/theme.zig` | Theme system (ThemeColor, EditorTheme, TuiTheme, SyntaxTheme, presets) |
 | `src/core/layout.zig` | Split pane layout tree (binary tree of panes + splits) |
 | `src/core/clipboard.zig` | System clipboard (Win32 API, Linux wl-copy/xclip/xsel) |
-| `src/core/lsp.zig` | LSP client (JSON-RPC over stdio, background reader thread) |
-| `src/core/lua_settings.zig` | Lua settings bridge (zide.set/get/bind/unbind) |
+| `src/core/lsp.zig` | LSP client (JSON-RPC over stdio, one reader thread per server) + `ServerConfig` registrations |
+| `src/core/lua_json.zig` | Lua table → JSON (register_lsp `settings` / `init_options`) |
+| `src/core/lua_settings.zig` | Lua settings bridge (zide.set/get/bind/unbind, register_language, register_lsp) |
+| `src/core/lua_api.zig` | Extension runtime API (zide.command/on/exec/status, buffer API, run/spawn, set_diagnostics) |
 | `src/frontend/tui.zig` | TUI frontend (libvaxis) |
 | `src/frontend/gui.zig` | GUI frontend (DVUI + SDL3) |
 
@@ -712,9 +761,9 @@ terminal directly.
 ### Command System
 
 All editing actions go through named commands in `CommandRegistry`. Commands can be invoked by:
-- Keyboard shortcuts (via data-driven keybind map, remappable through Lua)
+- Keyboard shortcuts (via data-driven keybind map, remappable through Lua). Lookup order: the active file's **language overlay** (`zide.bind(key, cmd, { language = "zig" })`) first, then the global map — for shift chords the exact combo is tried in both before the shift-stripped fallback, so a global exact binding always beats an overlay's fallback. Overlays are skipped while the file tree or search panel own the keyboard and in terminal panes
 - Command palette (fuzzy search)
-- Lua scripting: `zide.bind("ctrl+d", "delete_line")`
+- Lua scripting: `zide.bind("ctrl+d", "delete_line")`, or per language: `zide.bind("ctrl+alt+j", "toggle_comment", { language = "zig" })`
 
 50+ registered commands covering cursor movement, editing, selection, clipboard, line operations, and theme switching. Theme commands: `theme_dark`, `theme_light`, `theme_high_contrast`, `theme_terminal` (set both frontends); `gui_theme_dark/light/high_contrast` (GUI only); `tui_theme_dark/light/high_contrast` (TUI only). Additional "actions" (quit, save, find, find_replace, file_open, save_as, command_palette, goto_line, new_document, close_tab) are handled by the frontend but bindable via the keybind map.
 
