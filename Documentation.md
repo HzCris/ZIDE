@@ -728,6 +728,7 @@ The `zide` binary contains **both** frontends and picks one at launch:
 - **Launched from the desktop** (Explorer double-click, Start menu, `start zide`) → opens the **GUI** window
 - **Piped/redirected** (`zide file.zig | ...`) → GUI (a TUI would fight the redirection)
 - `--gui` / `--tui` always override detection; `zide-tui` is TUI-only
+- **`zide <folder>`** (either frontend) opens that folder as the **project**: it becomes the file tree root and the workspace sent to language servers for this launch, overriding `filetree_root` from init.lua. Files may follow: `zide . src/main.zig`. A project launch shows the welcome text instead of restoring the previous session (which may belong to another project). Only one folder is accepted; extra ones are reported and ignored.
 
 On Windows the check uses `GetConsoleProcessList`: a console shared with a
 parent shell means a real terminal launch, while a freshly allocated console
@@ -804,7 +805,7 @@ A toggleable side panel for browsing and managing the project directory, backed 
 - **Ctrl+B** (`toggle_filetree`) cycles: hidden → shown + focused → (from the editor) focus the tree → (from the tree) hidden. Together with Escape this gives a full keyboard round-trip between editor and tree.
 - Docks **left or right** (`filetree_side` setting, default left); width via `filetree_width` (GUI px) / `tui_filetree_width` (TUI columns).
 - Starts **visible** by default — to launch with it closed, uncheck "File Tree Visible" in the settings dialog (persists to init.lua) or `zide.set("filetree_visible", false)`; Ctrl+B at runtime never writes settings.
-- Root = current directory by default. Change it in the Settings dialog ("File Tree Root" — type a path, Enter applies; a bad path keeps the previous root and shows why) or `zide.set("filetree_root", "/path")`; "" resets to cwd. **Backspace / u** (or `filetree_root_up`) re-roots at the parent directory to climb the hierarchy.
+- Root = current directory by default, or the folder given on the command line (`zide path/to/project` — see *Hybrid Launch*). Change it in the Settings dialog ("File Tree Root" — type a path, Enter applies; a bad path keeps the previous root and shows why) or `zide.set("filetree_root", "/path")`; "" resets to cwd. **Backspace / u** (or `filetree_root_up`) re-roots at the parent directory to climb the hierarchy.
 - The panel header shows a clickable **up-button** (level-up icon in the GUI, `^` in the TUI) plus the full root path, truncated from the left (`...\Zig\ZIDE`) so the tail stays readable — click it to go up one folder.
 - Files created, deleted, or renamed **outside ZIDE** (Explorer, a terminal) appear automatically: a cheap directory-mtime probe runs every ~1.5s and triggers the full rescan + git recolor only when something actually changed. (The TUI checks when input arrives, since its loop sleeps between events.)
 - Directories sort first, names case-insensitive; children scan lazily on first expand; everything is listed, dotfiles and `.git` included.

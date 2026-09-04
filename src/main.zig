@@ -182,6 +182,9 @@ pub fn main(init: std.process.Init) !void {
     var mode: ?FrontendMode = null;
     var files: std.ArrayList([]const u8) = .empty;
     defer files.deinit(allocator);
+    // `zide path/to/project`: a folder argument is the workspace for this
+    // launch (file tree root + language-server workspace), not a file.
+    var project_dir: ?[]const u8 = null;
 
     for (argv[1..]) |arg| {
         if (std.mem.eql(u8, arg, "--gui")) {
@@ -196,7 +199,16 @@ pub fn main(init: std.process.Init) !void {
             try stdout.flush();
             return;
         } else if (!std.mem.startsWith(u8, arg, "-")) {
-            try files.append(allocator, arg);
+            if (isDirectory(io, arg)) {
+                if (project_dir != null) {
+                    try stderr.print("Only one project folder can be opened; ignoring {s}\n", .{arg});
+                    try stderr.flush();
+                } else {
+                    project_dir = arg;
+                }
+            } else {
+                try files.append(allocator, arg);
+            }
         } else {
             try stderr.print("Unknown option: {s}\n", .{arg});
             try stderr.flush();
@@ -219,6 +231,9 @@ pub fn main(init: std.process.Init) !void {
     }
 
     std.log.info("ZIDE starting in {s} mode", .{@tagName(frontend)});
+    if (project_dir) |dir| {
+        std.log.info("Project folder: {s}", .{dir});
+    }
     if (files.items.len > 0) {
         std.log.info("Files to open: {d}", .{files.items.len});
     }
@@ -232,14 +247,31 @@ pub fn main(init: std.process.Init) !void {
     switch (frontend) {
         .gui => {
             if (build_options.has_gui) {
-                try runGui(allocator, io, lua, files.items);
+                try runGui(allocator, io, lua, files.items, project_dir);
             } else {
                 // CLI usage error — must reach the terminal (logs go to a file).
                 try stderr.print("GUI not available in this build. Use zide (not zide-tui) for GUI mode.\n", .{});
                 try stderr.flush();
             }
         },
-        .tui => try runTui(allocator, io, lua, files.items),
+        .tui => try runTui(allocator, io, lua, files.items, project_dir),
+    }
+}
+
+/// True when `path` (absolute or cwd-relative) names a directory — the
+/// command line treats such arguments as the project folder, not a file.
+fn isDirectory(io: std.Io, path: []const u8) bool {
+    const st = std.Io.Dir.cwd().statFile(io, path, .{}) catch return false;
+    return st.kind == .directory;
+}
+
+/// `zide <folder>`: make the folder this launch's workspace — file tree
+/// root and language-server workspace — overriding init.lua's
+/// `filetree_root`. Must run after the Lua config is loaded.
+fn applyProjectDir(editor: *Editor, project_dir: ?[]const u8) void {
+    const dir = project_dir orelse return;
+    if (!editor.setFiletreeRoot(dir)) {
+        std.log.warn("Cannot open project folder {s}: {s}", .{ dir, editor.status_message });
     }
 }
 
@@ -275,7 +307,7 @@ fn isConsoleHandle(handle: std.Io.File.Handle) bool {
     return GetConsoleMode(handle, &console_mode) != 0;
 }
 
-fn runGui(allocator: std.mem.Allocator, io: std.Io, lua: *zlua.Lua, cli_files: []const []const u8) !void {
+fn runGui(allocator: std.mem.Allocator, io: std.Io, lua: *zlua.Lua, cli_files: []const []const u8, project_dir: ?[]const u8) !void {
     if (!build_options.has_gui) return;
 
     if (builtin.os.tag == .windows) {
@@ -302,6 +334,8 @@ fn runGui(allocator: std.mem.Allocator, io: std.Io, lua: *zlua.Lua, cli_files: [
     // language opens (Editor.lspNotifyOpen / lspTick) and are stopped by
     // editor.deinit — nothing to set up here.
 
+    applyProjectDir(&editor, project_dir);
+
     // Open CLI files, or show welcome text
     if (cli_files.len > 0) {
         // Replace the default empty document with the first file
@@ -316,11 +350,14 @@ fn runGui(allocator: std.mem.Allocator, io: std.Io, lua: *zlua.Lua, cli_files: [
                 continue;
             };
         }
-    } else {
+    } else if (project_dir == null) {
         // Opt-in session restore (session_persistence); welcome text otherwise
         if (editor.restoreSession() == 0) {
             try editor.activeDoc().loadText(welcome_text);
         }
+    } else {
+        // A project launch never drags another project's session along.
+        try editor.activeDoc().loadText(welcome_text);
     }
 
     // OS file drops (Explorer drag-in) flow through the vendored
@@ -402,7 +439,7 @@ fn runGui(allocator: std.mem.Allocator, io: std.Io, lua: *zlua.Lua, cli_files: [
     editor.saveSession();
 }
 
-fn runTui(allocator: std.mem.Allocator, io: std.Io, lua: *zlua.Lua, cli_files: []const []const u8) !void {
+fn runTui(allocator: std.mem.Allocator, io: std.Io, lua: *zlua.Lua, cli_files: []const []const u8, project_dir: ?[]const u8) !void {
     var editor = try Editor.init(allocator, io);
     defer editor.deinit();
 
@@ -419,6 +456,8 @@ fn runTui(allocator: std.mem.Allocator, io: std.Io, lua: *zlua.Lua, cli_files: [
 
     // Language servers start lazily (see runGui) — nothing to set up here.
 
+    applyProjectDir(&editor, project_dir);
+
     // Open CLI files, or show welcome text
     if (cli_files.len > 0) {
         // openIntoActive: language detect + LSP notify + extension event
@@ -431,11 +470,14 @@ fn runTui(allocator: std.mem.Allocator, io: std.Io, lua: *zlua.Lua, cli_files: [
                 continue;
             };
         }
-    } else {
+    } else if (project_dir == null) {
         // Opt-in session restore (session_persistence); welcome text otherwise
         if (editor.restoreSession() == 0) {
             try editor.activeDoc().loadText(welcome_text);
         }
+    } else {
+        // A project launch never drags another project's session along.
+        try editor.activeDoc().loadText(welcome_text);
     }
 
     try tui.run(allocator, &editor);
@@ -448,13 +490,19 @@ fn printUsage(stdout: *std.Io.Writer) void {
     stdout.print(
         \\ZIDE - A lightweight hybrid IDE
         \\
-        \\Usage: zide [options] [files...]
+        \\Usage: zide [options] [folder] [files...]
         \\
         \\Options:
         \\  --gui          Force GUI mode
         \\  --tui          Force TUI mode
         \\  -h, --help     Show this help
         \\  -v, --version  Show version
+        \\
+        \\A folder argument opens it as the project: it becomes the file tree
+        \\root and the language servers' workspace for this launch.
+        \\  zide .                 this directory
+        \\  zide ~/code/app        that project
+        \\  zide . src/main.zig    project plus a file
         \\
         \\When no mode is specified, ZIDE auto-detects:
         \\  Terminal -> TUI mode
@@ -467,6 +515,24 @@ fn printUsage(stdout: *std.Io.Writer) void {
 test "detect frontend does not crash" {
     const result = detectFrontend(std.testing.io);
     _ = result;
+}
+
+test "isDirectory tells project folders from files" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io, "proj");
+    const f = try tmp.dir.createFile(io, "notes.txt", .{});
+    f.close(io);
+
+    const dir_path = try tmp.dir.realPathFileAlloc(io, "proj", std.testing.allocator);
+    defer std.testing.allocator.free(dir_path);
+    const file_path = try tmp.dir.realPathFileAlloc(io, "notes.txt", std.testing.allocator);
+    defer std.testing.allocator.free(file_path);
+
+    try std.testing.expect(isDirectory(io, dir_path));
+    try std.testing.expect(!isDirectory(io, file_path));
+    try std.testing.expect(!isDirectory(io, "definitely/not/a/real/path"));
 }
 
 // Pull in core module tests
