@@ -377,6 +377,11 @@ pub const Editor = struct {
         /// GUI-owned hint: where to place the OS window on first show
         /// (screen coordinates). Consumed by the GUI.
         spawn_pos: ?Pos = null,
+        /// The documents this window owns, in tab order (indices into
+        /// Editor.documents). A document lives in exactly one window
+        /// (invariant I8): showing it elsewhere moves the tab (adoptDoc),
+        /// closing a window hands its tabs to the primary.
+        tabs: std.ArrayList(usize) = .empty,
     };
 
     pub const WindowError = error{ Unsupported, TooManyWindows, OutOfMemory };
@@ -421,6 +426,7 @@ pub const Editor = struct {
         doc.history.max_size = editor.max_undo_history;
         try doc.loadText("");
         try editor.documents.append(allocator, doc);
+        try primary.tabs.append(allocator, 0);
         // Register built-in commands
         try registerBuiltins(&editor.commands);
         // Load default keybindings
@@ -450,6 +456,7 @@ pub const Editor = struct {
         self.lang_profiles.deinit(self.allocator);
         for (self.windows.items) |win| {
             win.layout.deinit();
+            win.tabs.deinit(self.allocator);
             self.allocator.destroy(win);
         }
         self.windows.deinit(self.allocator);
@@ -569,11 +576,22 @@ pub const Editor = struct {
     }
 
     /// After a document was removed from `documents` (index `removed`),
-    /// repoint every pane in every window: panes that showed the removed
-    /// document now show `replacement`, higher indices shift down by one.
-    /// Shared by closeDocAt and the finder's preview pop.
+    /// fix every window: tab lists drop it and shift the indices above it;
+    /// panes that showed the removed document now show `replacement`,
+    /// higher indices shift down by one. Shared by closeDocAt and the
+    /// finder's preview pop.
     fn retargetDocIndex(self: *Editor, removed: usize, replacement: usize) void {
         for (self.windows.items) |win| {
+            var ti: usize = 0;
+            while (ti < win.tabs.items.len) {
+                const d = &win.tabs.items[ti];
+                if (d.* == removed) {
+                    _ = win.tabs.orderedRemove(ti);
+                    continue;
+                }
+                if (d.* > removed) d.* -= 1;
+                ti += 1;
+            }
             for (win.layout.panes.items) |*pane| {
                 switch (pane.content) {
                     .editor => |*idx| {
@@ -1559,6 +1577,21 @@ pub const Editor = struct {
             return false;
         }
         const removed_idx = doc_idx;
+        // The owning window's neighbouring tab takes over its views (the tab
+        // after it, else the one before); other windows only shift indices.
+        var owner_repl: ?usize = null;
+        var emptied_owner: ?usize = null;
+        if (self.docWindow(removed_idx)) |oi| {
+            const owner = self.windows.items[oi];
+            if (std.mem.indexOfScalar(usize, owner.tabs.items, removed_idx)) |pos| {
+                _ = owner.tabs.orderedRemove(pos);
+                if (owner.tabs.items.len > 0) {
+                    owner_repl = owner.tabs.items[@min(pos, owner.tabs.items.len - 1)];
+                } else {
+                    emptied_owner = oi;
+                }
+            }
+        }
         self.lspForgetDoc(&self.documents.items[removed_idx]);
         self.documents.items[removed_idx].deinit();
         _ = self.documents.orderedRemove(removed_idx);
@@ -1567,29 +1600,43 @@ pub const Editor = struct {
         } else if (self.active_doc_idx >= self.documents.items.len) {
             self.active_doc_idx = self.documents.items.len - 1;
         }
-        // Fix up pane doc indices in every window after document removal:
-        // - Editor panes pointing at the removed doc get reassigned to active_doc_idx
-        // - Editor panes pointing above the removed doc shift down by 1
-        self.retargetDocIndex(removed_idx, self.active_doc_idx);
+        const replacement = if (owner_repl) |r| (if (r > removed_idx) r - 1 else r) else self.active_doc_idx;
+        self.retargetDocIndex(removed_idx, replacement);
+        if (emptied_owner) |oi| {
+            if (oi == 0) {
+                // The main window cannot show nothing: a fresh untitled document.
+                if (self.appendUntitled(0)) |fresh| {
+                    for (self.windows.items[0].layout.panes.items) |*pane| {
+                        if (pane.content == .editor) pane.content = .{ .editor = fresh };
+                    }
+                }
+            } else {
+                // Its last tab closed: the window goes with it (reaped next frame).
+                self.requestCloseWindow(oi);
+            }
+        }
+        self.active_doc_idx = self.windowDocIdx(self.active_window);
         return true;
     }
 
-    /// Switch to the next document tab (in the focused pane).
+    /// Switch to the next tab of the focused window (in its focused pane).
     pub fn nextDoc(self: *Editor) void {
-        if (self.documents.items.len <= 1) return;
-        self.active_doc_idx = (self.active_doc_idx + 1) % self.documents.items.len;
-        self.paneShowDoc(self.active_doc_idx);
+        self.cycleTab(true);
     }
 
-    /// Switch to the previous document tab (in the focused pane).
+    /// Switch to the previous tab of the focused window (in its focused pane).
     pub fn prevDoc(self: *Editor) void {
-        if (self.documents.items.len <= 1) return;
-        if (self.active_doc_idx == 0) {
-            self.active_doc_idx = self.documents.items.len - 1;
-        } else {
-            self.active_doc_idx -= 1;
-        }
-        self.paneShowDoc(self.active_doc_idx);
+        self.cycleTab(false);
+    }
+
+    fn cycleTab(self: *Editor, forward: bool) void {
+        const win = self.activeWindow();
+        const n = win.tabs.items.len;
+        if (n <= 1) return;
+        const shown = self.windowDocIdx(self.active_window);
+        const pos = std.mem.indexOfScalar(usize, win.tabs.items, shown) orelse 0;
+        const next = if (forward) (pos + 1) % n else (pos + n - 1) % n;
+        self.switchToDoc(win.tabs.items[next]);
     }
 
     /// Switch to document at index (in the currently focused pane).
@@ -2167,6 +2214,9 @@ pub const Editor = struct {
         try self.windows.append(self.allocator, win);
         self.next_window_id += 1;
         const idx = self.windows.items.len - 1;
+        // The document's tab moves with its view (the source pane switches
+        // to its neighbouring tab, or the main window gets a fresh untitled).
+        if (content == .editor) self.adoptDoc(idx, content.editor);
         self.focusWindow(idx);
         return idx;
     }
@@ -2180,6 +2230,9 @@ pub const Editor = struct {
         const win = self.windows.items[idx];
         // A Settings dialog open in this window carries on in the primary.
         if (win.id == self.settings_window_id) self.settings_window_id = self.windows.items[0].id;
+        // Its documents stay open: the tabs go back to the main window.
+        self.windows.items[0].tabs.appendSlice(self.allocator, win.tabs.items) catch {};
+        win.tabs.deinit(self.allocator);
         // Recycled pane slots are reset to an editor by closePane, so every
         // .terminal slot is a live view.
         for (win.layout.panes.items) |pane| {
@@ -2227,44 +2280,27 @@ pub const Editor = struct {
         self.showDocInNewWindow(self.active_doc_idx);
     }
 
-    /// Show `doc_idx` in a new window and move the view there: the source
-    /// pane switches to the neighbouring document (releaseDocView). Without
-    /// window support this is a side-by-side split showing the document.
+    /// Move `doc_idx` into a new window — its tab goes with it (newWindow
+    /// repoints the source pane). Without window support this is a
+    /// side-by-side split showing the document.
     pub fn showDocInNewWindow(self: *Editor, doc_idx: usize) void {
         if (doc_idx >= self.documents.items.len) return;
-        const src = self.activeWindow();
         _ = self.newWindow(.{ .editor = doc_idx }) catch |err| {
             if (err == error.Unsupported) {
                 self.splitActive(.horizontal);
                 self.paneShowDoc(doc_idx);
             }
-            return;
         };
-        self.releaseDocView(src, doc_idx);
-    }
-
-    /// The view of `doc_idx` in `win`'s focused pane moved elsewhere (a new
-    /// window, a tab dropped on another window): show the neighbouring
-    /// document there instead — the next one, else the previous — so the
-    /// same buffer is not left mirrored in two windows. With a single
-    /// document the pane keeps it: a pane never shows nothing.
-    pub fn releaseDocView(self: *Editor, win: *EditorWindow, doc_idx: usize) void {
-        if (win.active_pane >= win.layout.panes.items.len) return;
-        const pane = &win.layout.panes.items[win.active_pane];
-        if (pane.content != .editor or pane.content.editor != doc_idx) return;
-        // The finder's preview document rides hidden at the end of the list.
-        const n = self.documents.items.len - @as(usize, @intFromBool(self.finder_preview_appended));
-        const replacement: usize = if (doc_idx + 1 < n) doc_idx + 1 else if (doc_idx > 0) doc_idx - 1 else return;
-        pane.content = .{ .editor = replacement };
-        if (win == self.activeWindow()) self.active_doc_idx = replacement;
     }
 
     /// Move the focused pane into a new window. The source window loses that
-    /// view; when it was the window's only pane an editor view stays behind —
-    /// the neighbouring document (releaseDocView), or the active document in
-    /// place of a terminal (a terminal is never shown twice). Without window
+    /// view: an editor's tab moves along (newWindow gives a pane left behind
+    /// the neighbouring tab); a terminal is never shown twice, so a lone
+    /// terminal pane leaves a fresh untitled document in the main window,
+    /// and a secondary that loses its only pane closes. Without window
     /// support: a split (documents) or a second terminal at the side.
     pub fn movePaneToNewWindow(self: *Editor) void {
+        const src_idx = self.active_window;
         const src = self.activeWindow();
         const src_pane = src.active_pane;
         if (src_pane >= src.layout.panes.items.len) return;
@@ -2283,9 +2319,11 @@ pub const Editor = struct {
             _ = src.layout.closePane(src_pane);
             ensureValidActivePaneIn(src);
         } else if (content == .terminal) {
-            src.layout.panes.items[src_pane].content = .{ .editor = self.active_doc_idx };
-        } else {
-            self.releaseDocView(src, content.editor);
+            if (src_idx == 0) {
+                if (self.appendUntitled(0)) |fresh| src.layout.panes.items[src_pane].content = .{ .editor = fresh };
+            } else {
+                self.requestCloseWindow(src_idx);
+            }
         }
     }
 
@@ -2360,6 +2398,84 @@ pub const Editor = struct {
         }
         win.layout.panes.items[win.active_pane].content = .{ .editor = doc_idx };
         self.active_doc_idx = doc_idx;
+        // A document lives in one window: showing it here moves its tab here.
+        self.adoptDoc(self.active_window, doc_idx);
+    }
+
+    // ---- Per-window tab lists (invariant I8) ----
+
+    /// The window whose tab bar lists `doc_idx`, if any (the finder's
+    /// preview document is listed nowhere).
+    pub fn docWindow(self: *const Editor, doc_idx: usize) ?usize {
+        for (self.windows.items, 0..) |win, wi| {
+            for (win.tabs.items) |d| {
+                if (d == doc_idx) return wi;
+            }
+        }
+        return null;
+    }
+
+    /// The finder's transient preview rides hidden at the end of `documents`.
+    fn isPreviewDoc(self: *const Editor, doc_idx: usize) bool {
+        return self.finder_preview_appended and doc_idx + 1 == self.documents.items.len;
+    }
+
+    /// Make window `target` the owner of `doc_idx`'s tab. The previous
+    /// owner's panes that showed it switch to its neighbouring tab; when it
+    /// was that window's last tab, a secondary window is asked to close and
+    /// the primary gets a fresh untitled document (a pane never shows
+    /// nothing). No-op for the finder's preview, and while the finder is
+    /// peeking at documents (its commit adopts).
+    fn adoptDoc(self: *Editor, target: usize, doc_idx: usize) void {
+        if (target >= self.windows.items.len or doc_idx >= self.documents.items.len) return;
+        if (self.isPreviewDoc(doc_idx) or self.mode == .file_finder) return;
+        const owner_idx = self.docWindow(doc_idx);
+        if (owner_idx == target) return;
+        self.windows.items[target].tabs.append(self.allocator, doc_idx) catch return;
+        const oi = owner_idx orelse return;
+        const owner = self.windows.items[oi];
+        const pos = std.mem.indexOfScalar(usize, owner.tabs.items, doc_idx) orelse return;
+        _ = owner.tabs.orderedRemove(pos);
+        self.repointLostTab(oi, doc_idx, pos);
+    }
+
+    /// Window `owner_idx` just lost the tab of `doc_idx` (it sat at `pos`):
+    /// its panes that showed the document switch to the neighbouring tab —
+    /// the one now at `pos`, else the last one.
+    fn repointLostTab(self: *Editor, owner_idx: usize, doc_idx: usize, pos: usize) void {
+        const owner = self.windows.items[owner_idx];
+        const replacement: usize = if (owner.tabs.items.len > 0)
+            owner.tabs.items[@min(pos, owner.tabs.items.len - 1)]
+        else if (owner_idx == 0)
+            (self.appendUntitled(0) orelse return)
+        else {
+            // The view left with its tab: the window closes (reaped next
+            // frame; it keeps its still-valid view until then).
+            self.requestCloseWindow(owner_idx);
+            return;
+        };
+        for (owner.layout.panes.items) |*pane| {
+            if (pane.content == .editor and pane.content.editor == doc_idx) pane.content = .{ .editor = replacement };
+        }
+        if (owner_idx == self.active_window) self.active_doc_idx = self.windowDocIdx(owner_idx);
+    }
+
+    /// A fresh empty document owned by window `win_idx` (appended to its
+    /// tab list, not shown anywhere yet). Null when allocation fails.
+    fn appendUntitled(self: *Editor, win_idx: usize) ?usize {
+        var doc = Document.init(self.allocator) catch return null;
+        doc.history.max_size = self.max_undo_history;
+        doc.loadText("") catch {
+            doc.deinit();
+            return null;
+        };
+        self.documents.append(self.allocator, doc) catch {
+            doc.deinit();
+            return null;
+        };
+        const idx = self.documents.items.len - 1;
+        self.windows.items[win_idx].tabs.append(self.allocator, idx) catch {};
+        return idx;
     }
 
     // ---- Terminal operations ----
@@ -3433,34 +3549,83 @@ test "windows: open_in_new_window shows the active document in a new window" {
     try t.expect(std.mem.startsWith(u8, editor.windowTitle(1, &buf), "ZIDE — "));
 }
 
-test "windows: a moved view leaves its neighbour behind; the settings dialog keeps its window" {
+test "windows: each window owns its tabs (open, cycle, move, close window)" {
     const t = std.testing;
     var editor = try Editor.init(t.allocator, t.io);
     defer editor.deinit();
     editor.multi_window_supported = true;
-    // A single document: the source pane cannot show nothing, so it keeps it.
+    // The primary owns the initial document.
+    try t.expectEqualSlices(usize, &.{0}, editor.windows.items[0].tabs.items);
+    // Moving the sole document out: its tab goes along; the primary cannot
+    // show nothing and gets a fresh untitled document.
     try t.expect(editor.execAction("open_in_new_window"));
-    try t.expectEqual(@as(usize, 0), editor.windowDocIdx(0));
+    try t.expectEqual(@as(usize, 2), editor.documents.items.len);
+    try t.expectEqualSlices(usize, &.{1}, editor.windows.items[0].tabs.items);
+    try t.expectEqualSlices(usize, &.{0}, editor.windows.items[1].tabs.items);
+    try t.expectEqual(@as(usize, 1), editor.windowDocIdx(0));
     try t.expectEqual(@as(usize, 0), editor.windowDocIdx(1));
-    // Three documents: moving the middle one out shows the next one behind.
+    // New documents join the window they were opened in (the child here).
+    _ = try editor.newDocument(); // 2
+    try t.expectEqualSlices(usize, &.{ 0, 2 }, editor.windows.items[1].tabs.items);
+    try t.expectEqual(@as(?usize, 1), editor.docWindow(2));
+    // Ctrl+Tab cycles within the window only.
+    editor.nextDoc();
+    try t.expectEqual(@as(usize, 0), editor.windowDocIdx(1));
+    editor.nextDoc();
+    try t.expectEqual(@as(usize, 2), editor.windowDocIdx(1));
+    editor.prevDoc();
+    try t.expectEqual(@as(usize, 0), editor.windowDocIdx(1));
     editor.focusWindow(0);
+    editor.nextDoc(); // a single tab: nothing to cycle
+    try t.expectEqual(@as(usize, 1), editor.windowDocIdx(0));
+    // Showing a document in another window moves its tab (a tab drop); the
+    // old owner's pane switches to the neighbouring tab.
+    editor.showDocIn(0, 0);
+    try t.expectEqualSlices(usize, &.{ 1, 0 }, editor.windows.items[0].tabs.items);
+    try t.expectEqualSlices(usize, &.{2}, editor.windows.items[1].tabs.items);
+    try t.expectEqual(@as(usize, 2), editor.windowDocIdx(1));
+    try t.expectEqual(@as(usize, 0), editor.windowDocIdx(0));
+    // Closing a window hands its tabs back to the primary — documents stay.
+    try t.expect(editor.closeWindow(1));
+    try t.expectEqual(@as(usize, 3), editor.documents.items.len);
+    try t.expectEqualSlices(usize, &.{ 1, 0, 2 }, editor.windows.items[0].tabs.items);
+}
+
+test "windows: closing tabs — the owner's neighbour takes over; the last tab closes a secondary" {
+    const t = std.testing;
+    var editor = try Editor.init(t.allocator, t.io);
+    defer editor.deinit();
+    editor.multi_window_supported = true;
     _ = try editor.newDocument(); // 1
     _ = try editor.newDocument(); // 2
-    editor.switchToDoc(1);
-    editor.showDocInNewWindow(1);
-    try t.expectEqual(@as(usize, 3), editor.windows.items.len);
-    try t.expectEqual(@as(usize, 2), editor.windowDocIdx(0));
-    try t.expectEqual(@as(usize, 1), editor.windowDocIdx(2));
-    // The last document moves out: the previous one stays behind.
-    editor.focusWindow(0);
+    _ = try editor.newDocument(); // 3
+    // Move 2 and 3 into a child window: tabs [2, 3]
     editor.showDocInNewWindow(2);
-    try t.expectEqual(@as(usize, 1), editor.windowDocIdx(0));
-    // A tab dropped on another window releases the view the same way.
+    editor.showDocIn(1, 3);
+    try t.expectEqualSlices(usize, &.{ 0, 1 }, editor.windows.items[0].tabs.items);
+    try t.expectEqualSlices(usize, &.{ 2, 3 }, editor.windows.items[1].tabs.items);
+    try t.expectEqual(@as(usize, 3), editor.windowDocIdx(1));
+    // Close 3 (the child's active tab): its neighbour 2 takes over the pane.
+    try t.expect(editor.closeDocAt(3));
+    try t.expectEqual(@as(usize, 2), editor.windowDocIdx(1));
+    try t.expectEqualSlices(usize, &.{2}, editor.windows.items[1].tabs.items);
+    // Close the child's last tab: the window is asked to close.
+    try t.expect(editor.closeDocAt(2));
+    try t.expect(!editor.windows.items[1].open);
+    editor.retireClosedWindows();
+    try t.expectEqual(@as(usize, 1), editor.windows.items.len);
+    try t.expectEqualSlices(usize, &.{ 0, 1 }, editor.windows.items[0].tabs.items);
+    try t.expectEqual(@as(usize, 2), editor.documents.items.len);
+    // Closing the primary's last tab while a child holds the other document:
+    // the primary gets a fresh untitled rather than stealing the child's.
+    editor.showDocInNewWindow(1); // child owns 1; primary [0]
     editor.focusWindow(0);
-    editor.switchToDoc(0);
-    editor.releaseDocView(editor.windows.items[0], 0);
+    try t.expect(editor.closeDocAt(0));
+    try t.expectEqual(@as(usize, 2), editor.documents.items.len); // 0 = the child's (shifted), 1 = fresh
+    try t.expectEqualSlices(usize, &.{1}, editor.windows.items[0].tabs.items);
+    try t.expectEqualSlices(usize, &.{0}, editor.windows.items[1].tabs.items);
     try t.expectEqual(@as(usize, 1), editor.windowDocIdx(0));
-    try t.expectEqual(@as(usize, 1), editor.active_doc_idx);
+    try t.expectEqual(@as(usize, 0), editor.windowDocIdx(1));
     // The Settings dialog belongs to the window it was opened from, survives
     // a window switch, and falls back to the primary when that window closes.
     editor.focusWindow(1);
@@ -3540,7 +3705,10 @@ test "windows: closeWindow keeps focus valid and never reuses ids" {
     try t.expectEqual(@as(u32, 3), editor.windows.items[c].id);
     try t.expect(editor.closeWindow(editor.active_window));
     try t.expectEqual(@as(usize, 0), editor.active_window);
-    try t.expectEqual(@as(usize, 0), editor.active_doc_idx);
+    // The moved document's tab came back to the primary, which kept showing
+    // the untitled document it received when its only tab left.
+    try t.expectEqual(@as(usize, 1), editor.active_doc_idx);
+    try t.expectEqualSlices(usize, &.{ 1, 0 }, editor.windows.items[0].tabs.items);
 }
 
 test "windows: requestCloseWindow defers to the reap; the primary routes to quit" {

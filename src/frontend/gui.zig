@@ -575,7 +575,7 @@ fn dispatchGlobalKeys(editor: *Editor) void {
             const is_input = switch (e.evt) {
                 .mouse => |me| me.action == .press or me.action == .focus,
                 .key => |key| key.action == .down or key.action == .repeat,
-                .text => true,
+                .text => |te| te.action == .value and te.action.value.txt.len > 0,
                 else => false,
             };
             if (is_input) {
@@ -897,12 +897,14 @@ fn modalDialogs(editor: *Editor) void {
     }
 }
 
-/// Tab bar of the current window (every document; the highlight is the
-/// document shown in this window).
+/// Tab bar of the current window: the documents it owns (EditorWindow.tabs);
+/// the highlight is the one shown in its focused pane.
 fn tabBar(editor: *Editor) void {
-    // --- Tab bar (if multiple documents) ---
     const td = &win_ui.tab_drag;
-    if (editor.docCount() <= 1) {
+    const this_win = editor.windows.items[cur_win];
+    // The main window hides the bar with a single document (as always); an
+    // extra window keeps it so its tab can be dragged back.
+    if (cur_win == 0 and this_win.tabs.items.len <= 1) {
         td.state = .idle; // no bar, nothing to drag
         return;
     }
@@ -927,7 +929,9 @@ fn tabBar(editor: *Editor) void {
     td.bar_rect = bar_rs.r;
     const scale = bar_rs.s;
 
-    for (editor.documents.items, 0..) |doc, i| {
+    for (this_win.tabs.items) |i| {
+        if (i >= editor.documents.items.len) continue;
+        const doc = &editor.documents.items[i];
         if (doc.preview) continue; // hidden from the tab bar
         const is_active = (i == editor.windowDocIdx(cur_win));
         var label_buf: [256]u8 = undefined;
@@ -1146,8 +1150,8 @@ fn tabDropAt(editor: *Editor, doc_idx: usize, gx: f32, gy: f32) void {
                 if (w.win_id == win_ui.win_id) return;
                 for (editor.windows.items, 0..) |ew, idx| {
                     if (ew.id == w.win_id) {
-                        // The view moves: the source pane shows its neighbour.
-                        editor.releaseDocView(editor.windows.items[cur_win], doc_idx);
+                        // Showing it there moves its tab (the source pane
+                        // switches to its neighbouring tab).
                         editor.showDocIn(idx, doc_idx);
                         w.refocus_editor = true;
                         _ = c.SDL_RaiseWindow(sw);
@@ -1732,10 +1736,12 @@ fn filetreePanel(editor: *Editor) void {
     if (!build_options.has_gui) return;
     const ft = if (editor.filetree) |*f| f else return;
 
-    // Auto-reveal: when the active document changes (tab click, Ctrl+Tab,
-    // open), select it in the tree — without stealing keyboard focus.
+    // Auto-reveal: when the document shown in this (the main) window
+    // changes (tab click, Ctrl+Tab, open), select it in the tree — without
+    // stealing keyboard focus. Not the focused window's document: a focus
+    // change to another window would jump the tree under the pointer.
     if (editor.filetree_auto_reveal) {
-        const doc = editor.activeDoc();
+        const doc = &editor.documents.items[editor.windowDocIdx(cur_win)];
         if (doc.file_path) |p| {
             const h = std.hash.Fnv1a_64.hash(p);
             if (h != filetree_autoreveal_last) {

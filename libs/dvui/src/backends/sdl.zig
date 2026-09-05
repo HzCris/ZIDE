@@ -496,6 +496,12 @@ pub fn refresh(_: *SDLBackend) void {
 }
 
 pub fn addAllEvents(self: *SDLBackend, win: *dvui.Window) !void {
+    // ZIDE patch: dvui tracks modifiers per window from the key events that
+    // window saw. With several OS windows the key-ups after a chord that
+    // opened (and focused) another window land there, leaving Shift/Ctrl
+    // "held" in this window for every later mouse event. Start each frame
+    // from SDL's actual modifier state in every window instead.
+    syncModifiersRecursive(win);
     //const flags = c.SDL_GetWindowFlags(self.window);
     //if (flags & c.SDL_WINDOW_MOUSE_FOCUS == 0 and flags & c.SDL_WINDOW_INPUT_FOCUS == 0) {
     //std.debug.print("bailing\n", .{});
@@ -520,6 +526,16 @@ pub fn addAllEvents(self: *SDLBackend, win: *dvui.Window) !void {
         //    //},
         //    else => {},
         //}
+    }
+}
+
+/// ZIDE patch (see addAllEvents): every dvui window starts the frame with
+/// SDL's current modifier state.
+fn syncModifiersRecursive(win: *dvui.Window) void {
+    win.modifiers = SDL_keymod_to_dvui(@intCast(c.SDL_GetModState()));
+    var child_win_it = win.child_os_wins.iterator();
+    while (child_win_it.next_peek()) |alive_win| {
+        syncModifiersRecursive(alive_win.value.dvui_win);
     }
 }
 

@@ -375,6 +375,11 @@ fn runGui(allocator: std.mem.Allocator, io: std.Io, lua: *zlua.Lua, cli_files: [
     // sdl3gpu backend (-Dgpu) has no drop hook.
     if (@hasDecl(SDLBackend, "drop_file_fn")) SDLBackend.drop_file_fn = &gui.onSdlDropFile;
 
+    // The click that activates one of our windows is a real click. SDL's
+    // default swallows it, which with several ZIDE windows ate the first
+    // click of every double-click in the file tree after using another one.
+    _ = SDLBackend.c.SDL_SetHint("SDL_MOUSE_FOCUS_CLICKTHROUGH", "1");
+
     // Init SDL backend (creates OS window). The sdl3gpu backend's options
     // additionally want an allocator for its init-time scratch.
     var backend = try SDLBackend.initWindow(if (@hasField(SDLBackend.InitOptions, "allocator")) .{
