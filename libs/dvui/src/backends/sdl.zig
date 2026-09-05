@@ -16,8 +16,10 @@ pub const SDLBackend = @This();
 pub const Context = *SDLBackend;
 
 /// ZIDE patch: surface OS file drops to the app — dvui has no drop
-/// event type. Coordinates are SDL window points (0,0 under SDL2).
-pub var drop_file_fn: ?*const fn (path: []const u8, x: f32, y: f32) void = null;
+/// event type. Coordinates are SDL window points (0,0 under SDL2);
+/// `window_id` is the SDL window the drop landed on (multi-window apps
+/// route it to that window's state).
+pub var drop_file_fn: ?*const fn (path: []const u8, x: f32, y: f32, window_id: u32) void = null;
 
 const log = std.log.scoped(.SDLBackend);
 
@@ -1437,9 +1439,9 @@ pub fn addEvent(self: *SDLBackend, win: *dvui.Window, event: c.SDL_Event) !bool 
             // the app synchronously (SDL frees the string after dispatch).
             if (drop_file_fn) |f| {
                 if (sdl3) {
-                    if (event.drop.data != null) f(std.mem.span(event.drop.data), event.drop.x, event.drop.y);
+                    if (event.drop.data != null) f(std.mem.span(event.drop.data), event.drop.x, event.drop.y, event.drop.windowID);
                 } else {
-                    if (event.drop.file != null) f(std.mem.span(event.drop.file), 0, 0);
+                    if (event.drop.file != null) f(std.mem.span(event.drop.file), 0, 0, event.drop.windowID);
                 }
             }
             return false;

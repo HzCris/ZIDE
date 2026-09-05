@@ -2,6 +2,7 @@ const std = @import("std");
 const vaxis = @import("vaxis");
 const Editor = @import("../core/editor.zig").Editor;
 const Document = @import("../core/document.zig").Document;
+const Layout = @import("../core/layout.zig").Layout;
 const TuiColor = @import("../core/theme.zig").TuiColor;
 const syntax = @import("../core/syntax.zig");
 const lsp = @import("../core/lsp.zig");
@@ -893,6 +894,13 @@ fn openFiletreeFileTui(editor: *Editor, ft: *FileTree, idx: u32) void {
 /// Recursively render the layout tree into the given window.
 /// screen_x / screen_y give the window's absolute top-left on the terminal,
 /// used to record pane rects for mouse hit-testing.
+/// The TUI renders the primary window only — there are no OS windows in a
+/// terminal, `multi_window_supported` stays false, so window 0 is always the
+/// focused one and the window commands fall back to splits.
+fn tuiLayout(editor: *Editor) *Layout {
+    return &editor.windows.items[0].layout;
+}
+
 fn renderPaneLayout(
     win: Window,
     editor: *Editor,
@@ -902,10 +910,10 @@ fn renderPaneLayout(
     width: u16,
     height: u16,
 ) void {
-    if (node_idx >= editor.layout.nodes.items.len) return;
+    if (node_idx >= tuiLayout(editor).nodes.items.len) return;
     if (width == 0 or height == 0) return;
 
-    switch (editor.layout.nodes.items[node_idx]) {
+    switch (tuiLayout(editor).nodes.items[node_idx]) {
         .leaf => |pane_id| {
             pushPaneRect(pane_id, screen_x, screen_y, width, height);
             drawPane(win, editor, pane_id, width, height);
@@ -986,12 +994,12 @@ fn renderPaneLayout(
 
 /// Draw a single pane (editor or terminal) into the given window.
 fn drawPane(win: Window, editor: *Editor, pane_id: u8, width: u16, height: u16) void {
-    const pane = editor.layout.panes.items[pane_id];
+    const pane = tuiLayout(editor).panes.items[pane_id];
     switch (pane.content) {
         .editor => |doc_idx| {
             if (doc_idx >= editor.documents.items.len) return;
             const doc = &editor.documents.items[doc_idx];
-            const is_active = pane_id == editor.active_pane;
+            const is_active = editor.isActivePane(0, pane_id);
 
             // Only the active pane's doc drives editor.text_width and cursor-visible logic
             if (is_active) {
@@ -1827,7 +1835,7 @@ fn positionCursor(win: Window, editor: *Editor, width: u16, height: u16) void {
     _ = height;
     var active_rect: ?PaneRect = null;
     for (pane_rects[0..pane_rect_count]) |pr| {
-        if (pr.pane_id == editor.active_pane) {
+        if (pr.pane_id == editor.activePaneId()) {
             active_rect = pr;
             break;
         }
@@ -1910,7 +1918,7 @@ fn positionCursor(win: Window, editor: *Editor, width: u16, height: u16) void {
 /// Returns null if the position is outside the editor content area.
 fn screenToOffset(editor: *Editor, screen_x: i16, screen_y: i16) ?usize {
     const hit = resolvePaneAt(editor, screen_x, screen_y) orelse return null;
-    const pane = editor.layout.panes.items[hit.pane_id];
+    const pane = tuiLayout(editor).panes.items[hit.pane_id];
     const doc_idx = switch (pane.content) {
         .editor => |idx| idx,
         .terminal => return null,
@@ -1993,12 +2001,8 @@ fn handleMouse(editor: *Editor, mouse: vaxis.Mouse) void {
                 // Route click to the pane it landed in (takes focus back
                 // from the file tree)
                 if (resolvePaneAt(editor, mouse.col, mouse.row)) |hit| {
-                    editor.active_pane = hit.pane_id;
+                    editor.focusPane(hit.pane_id); // also syncs active_doc_idx
                     editor.filetree_focused = false;
-                    const pane = editor.layout.panes.items[hit.pane_id];
-                    if (pane.content == .editor) {
-                        editor.active_doc_idx = pane.content.editor;
-                    }
                 }
 
                 block_drag = false;

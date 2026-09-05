@@ -360,12 +360,29 @@ fn runGui(allocator: std.mem.Allocator, io: std.Io, lua: *zlua.Lua, cli_files: [
         try editor.activeDoc().loadText(welcome_text);
     }
 
-    // OS file drops (Explorer drag-in) flow through the vendored
-    // backend's ZIDE patch into the GUI's staging buffer.
-    SDLBackend.drop_file_fn = &gui.onSdlDropFile;
+    // Per-window GUI state (mono font bytes, per-window pane/drop state).
+    // Declared before the dvui window so it outlives every window's font
+    // database (which references the font bytes).
+    var g = try gui.GuiState.init(allocator);
+    defer g.deinit();
+    gui.active_state = &g;
+    defer gui.active_state = null;
 
-    // Init SDL backend (creates OS window)
-    var backend = try SDLBackend.initWindow(.{
+    // OS file drops (Explorer drag-in) flow through the vendored renderer
+    // backend's ZIDE patch into the GUI's per-window staging buffer. The
+    // sdl3gpu backend (-Dgpu) has no drop hook.
+    if (@hasDecl(SDLBackend, "drop_file_fn")) SDLBackend.drop_file_fn = &gui.onSdlDropFile;
+
+    // Init SDL backend (creates OS window). The sdl3gpu backend's options
+    // additionally want an allocator for its init-time scratch.
+    var backend = try SDLBackend.initWindow(if (@hasField(SDLBackend.InitOptions, "allocator")) .{
+        .io = io,
+        .allocator = allocator,
+        .size = .{ .w = 1024.0, .h = 768.0 },
+        .min_size = .{ .w = 400.0, .h = 300.0 },
+        .vsync = true,
+        .title = "ZIDE",
+    } else .{
         .io = io,
         .size = .{ .w = 1024.0, .h = 768.0 },
         .min_size = .{ .w = 400.0, .h = 300.0 },
@@ -379,31 +396,14 @@ fn runGui(allocator: std.mem.Allocator, io: std.Io, lua: *zlua.Lua, cli_files: [
         .theme = gui.dvuiThemeForPreset(editor.theme_name, false, editor.mono_font_size),
     });
     defer win.deinit();
+    g.primary().sdl_window_id = SDLBackend.c.SDL_GetWindowID(backend.window);
 
-    // Register the mono font under `custom_mono_family`. Prefer the user's path
-    // if set; otherwise fall back to the bundled Fira Code Nerd Font.
-    var mono_loaded = false;
-    if (editor.mono_font_path.len > 0) blk: {
-        const bytes = std.Io.Dir.cwd().readFileAlloc(io, editor.mono_font_path, allocator, .limited(64 * 1024 * 1024)) catch |err| {
-            std.log.warn("Failed to read mono font {s}: {} — falling back to bundled font", .{ editor.mono_font_path, err });
-            break :blk;
-        };
-        win.addFont(gui.custom_mono_family, bytes, allocator) catch |err| {
-            std.log.warn("Failed to register mono font: {} — falling back to bundled font", .{err});
-            allocator.free(bytes);
-            break :blk;
-        };
-        mono_loaded = true;
-    }
-    if (!mono_loaded) {
-        // Bundled font bytes are static (embedded in the executable) — pass null
-        // allocator so DVUI doesn't try to free them.
-        win.addFont(gui.custom_mono_family, gui.bundled_mono_ttf, null) catch |err| {
-            std.log.warn("Failed to register bundled mono font: {}", .{err});
-        };
-    }
-    // Reapply theme so font_mono resolves to the registered family.
-    win.theme = gui.dvuiThemeForPreset(editor.theme_name, true, editor.mono_font_size);
+    // Register the mono font under `custom_mono_family` (the user's file if
+    // set, else the bundled Fira Code Nerd Font) and reapply the theme so
+    // font_mono resolves to the registered family. Child windows repeat
+    // applyWindowFonts on creation — every dvui.Window has its own font database.
+    gui.loadMonoFont(&g, &editor, io);
+    gui.applyWindowFonts(&win, &g, &editor);
 
     // Use SDL3/DVUI native clipboard (works on Wayland where wl-paste subprocess may not).
     editor.clipboard_get_fn = &dvui.clipboardText;
@@ -414,7 +414,13 @@ fn runGui(allocator: std.mem.Allocator, io: std.Io, lua: *zlua.Lua, cli_files: [
     main_loop: while (editor.running) {
         const nstime = win.beginWait(interrupted);
         try win.begin(nstime);
-        _ = try backend.addAllEvents(&win);
+        const events_result = try backend.addAllEvents(&win);
+        // The sdl3gpu backend reports an OS close/quit through its return
+        // value; the renderer backend adds .window/.app events instead,
+        // which gui.frame handles.
+        if (@TypeOf(events_result) == bool) {
+            if (events_result) editor.running = false;
+        }
 
         // Language servers: sweep dead ones, drain messages, sync documents
         // (starts servers lazily for newly opened languages)
@@ -423,13 +429,15 @@ fn runGui(allocator: std.mem.Allocator, io: std.Io, lua: *zlua.Lua, cli_files: [
         // Deliver finished zide.spawn results to their Lua callbacks
         editor.pumpLuaJobs();
 
-        if (!gui.frame(&editor)) break :main_loop;
+        const keep_running = gui.frame(&editor, &g);
 
         // New dvui (0.16 snapshot): win.end(.{}) manages the backend by
         // default — it clears (on begin), renders, PRESENTS, and applies the
         // requested cursor + text-input rect. Repeating any of that here
-        // double-presents and alternates UI/black frames (flicker).
+        // double-presents and alternates UI/black frames (flicker). begin()
+        // is always balanced by end(), even on the last frame.
         const end_micros = try win.end(.{});
+        if (!keep_running) break :main_loop;
 
         const wait_event_micros = win.waitTime(end_micros);
         interrupted = try backend.waitEventTimeout(wait_event_micros);

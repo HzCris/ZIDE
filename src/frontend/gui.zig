@@ -4,6 +4,7 @@ const dvui = if (build_options.has_gui) @import("dvui") else struct {};
 const Editor = @import("../core/editor.zig").Editor;
 const Document = @import("../core/document.zig").Document;
 const LayoutNode = @import("../core/layout.zig").LayoutNode;
+const Layout = @import("../core/layout.zig").Layout;
 const ThemeColor = @import("../core/theme.zig").ThemeColor;
 const theme_mod = @import("../core/theme.zig");
 const syntax = @import("../core/syntax.zig");
@@ -213,140 +214,225 @@ const dvui_high_contrast: dvui.Theme = blk: {
     };
 };
 
-/// Persistent state across frames for mouse drag tracking.
-var drag_active: bool = false;
-var drag_anchor_offset: usize = 0;
-/// Pane that owns the active drag. Every editor pane iterates the global
-/// event list; without ownership the first-rendered pane consumed drags
-/// that started in another pane and moved the wrong document's cursor.
-var drag_pane: u8 = 0;
-
-/// Cached editor area for stable mouse mapping during drag.
-/// Without this, subpixel layout shifts cause the mouse-to-offset mapping
-/// to oscillate, producing visible gyration.
-var drag_area: dvui.Rect.Physical = .{};
-
-/// When true, the user explicitly scrolled (wheel) so ensureCursorVisible is skipped.
-/// Cleared when the cursor moves (key press, click, etc.).
-var scroll_pinned: bool = false;
-
-/// Editor-pane scrollbar state (mirrors the file tree's pill scrollbar).
-/// The band is the mouse hit zone along the pane's right edge; the pill
-/// thumb drags, clicks in the band page toward the click.
+/// Editor-pane scrollbar band: the mouse hit zone along the pane's right
+/// edge (the pill thumb drags, clicks in the band page toward the click).
 const editor_sb_band: f32 = 12;
-var editor_sb_drag: bool = false;
-var editor_sb_pane: u8 = 0;
-var editor_sb_grab_dy: f32 = 0;
-var editor_sb_hover_pane: ?u8 = null;
-
-/// Multi-click detection state (double-click = word, triple-click = line).
-var last_click_time_ns: i128 = 0;
-var last_click_offset: usize = 0;
-var click_count: u8 = 1;
 /// Selection mode for drag after multi-click (extends by word/line) or
 /// Shift+Alt+drag (block/column selection).
 const DragMode = enum { char, word, line, block };
-var drag_mode: DragMode = .char;
-/// Word/line boundaries anchored by double/triple-click for drag extension.
-var drag_word_start: usize = 0;
-var drag_word_end: usize = 0;
-/// Anchor (line, col) for block-selection drags.
-var block_anchor_line: usize = 0;
-var block_anchor_col: usize = 0;
+const blink_interval_ms: i128 = 530;
 
 /// Auto-save timer (nanosecond timestamp of last auto-save check).
 var last_auto_save_ns: i128 = 0;
 
-/// Cursor blink state.
-var blink_time_ns: i128 = 0;
-var blink_last_offset: usize = 0;
-const blink_interval_ms: i128 = 530;
+/// OS drag & drop staging slot (see onSdlDropFile). Fixed slots — a drop
+/// of more than 16 items imports the first 16.
+const DropSlot = struct { path: [1024]u8 = undefined, len: usize = 0, x: f32 = 0, y: f32 = 0 };
 
-/// Render a single frame of the GUI. Returns false to quit.
-pub fn frame(editor: *Editor) bool {
-    if (!build_options.has_gui) return false;
+/// Per-OS-window GUI state. One instance per `Editor.EditorWindow`, keyed
+/// by its id; the pane/mouse/key code reaches the window being rendered
+/// through `win_ui` (set by frame() before each window's widgets — the same
+/// "current window" pattern dvui itself uses). Everything that is per
+/// panel (file tree, search) or per process (timers, memos) stays a
+/// file-level var: those panels only ever render in the primary window.
+pub const WinUi = struct {
+    /// `EditorWindow.id` this state belongs to (primary = 0).
+    win_id: u32,
+    /// SDL window id (SDL_GetWindowID) — routes OS file drops to the
+    /// window they landed on. Primary set in main.zig, children on their
+    /// creation frame.
+    sdl_window_id: u32 = 0,
+    /// Child dvui window exists and has fonts + theme applied.
+    created: bool = false,
+    /// `Editor.theme_revision` this window last applied.
+    theme_gen_applied: u32 = 0,
+    /// Hash of the last window title pushed to SDL.
+    title_hash: u64 = 0,
+    /// dvui.windowNaturalScale() of this window (drop coordinates are
+    /// window points, mouse coordinates physical pixels).
+    natural_scale: f32 = 1,
+    /// One-frame flag: the active pane retakes dvui focus (after a tab click).
+    refocus_editor: bool = false,
 
-    // --- Global keyboard shortcuts (before widgets consume events) ---
-    // Process keybinds here so DVUI widgets (menus, etc.) cannot consume them first.
-    for (dvui.events()) |*e| {
-        if (e.handled) continue;
-        if (e.evt != .key) continue;
-        const key = e.evt.key;
-        if (key.action != .down and key.action != .repeat) continue;
+    // --- Editor-pane mouse interaction ---
+    /// Persistent state across frames for mouse drag tracking.
+    drag_active: bool = false,
+    drag_anchor_offset: usize = 0,
+    /// Pane that owns the active drag. Every editor pane iterates the
+    /// window's event list; without ownership the first-rendered pane
+    /// consumed drags that started in another pane and moved the wrong
+    /// document's cursor.
+    drag_pane: u8 = 0,
+    /// Cached editor area for stable mouse mapping during drag. Without
+    /// this, subpixel layout shifts cause the mouse-to-offset mapping to
+    /// oscillate, producing visible gyration.
+    drag_area: dvui.Rect.Physical = .{},
+    /// When true, the user explicitly scrolled (wheel) so
+    /// ensureCursorVisible is skipped. Cleared when the cursor moves.
+    scroll_pinned: bool = false,
+    /// Editor-pane scrollbar state (mirrors the file tree's pill scrollbar).
+    editor_sb_drag: bool = false,
+    editor_sb_pane: u8 = 0,
+    editor_sb_grab_dy: f32 = 0,
+    editor_sb_hover_pane: ?u8 = null,
+    /// Multi-click detection (double-click = word, triple-click = line).
+    last_click_time_ns: i128 = 0,
+    last_click_offset: usize = 0,
+    click_count: u8 = 1,
+    drag_mode: DragMode = .char,
+    /// Word/line boundaries anchored by double/triple-click for drag extension.
+    drag_word_start: usize = 0,
+    drag_word_end: usize = 0,
+    /// Anchor (line, col) for block-selection drags.
+    block_anchor_line: usize = 0,
+    block_anchor_col: usize = 0,
+    /// Cursor blink state.
+    blink_time_ns: i128 = 0,
+    blink_last_offset: usize = 0,
 
-        // F-keys are never text input, so they go through the keybind map
-        // even unmodified (f12 = goto definition, f6 = focus pane, ...).
-        const is_fkey = switch (key.code) {
-            .f1, .f2, .f3, .f4, .f5, .f6, .f7, .f8, .f9, .f10, .f11, .f12 => true,
-            else => false,
-        };
+    // --- OS file drops staged by the SDL backend between frames ---
+    drop_slots: [16]DropSlot = @splat(.{}),
+    drop_count: usize = 0,
+};
 
-        if (key.mod.control() or key.mod.alt() or is_fkey) {
-            // Tab switching always works (even during modals)
-            if (key.mod.control() and key.code == .tab) {
-                e.handled = true;
-                if (key.mod.shift()) editor.prevDoc() else editor.nextDoc();
-                continue;
-            }
+/// Process-wide GUI state: one WinUi per editor window plus the mono font
+/// bytes every dvui window registers (each dvui.Window owns its own font
+/// database, so child windows re-register the same bytes).
+pub const GuiState = struct {
+    allocator: std.mem.Allocator,
+    /// Heap entries → pointers stay stable while the list grows.
+    wins: std.ArrayList(*WinUi) = .empty,
+    mono_font_bytes: []const u8 = bundled_mono_ttf,
+    /// True when mono_font_bytes was read from the user's font file (owned).
+    mono_font_owned: bool = false,
 
-            // When terminal pane is focused, only handle ctrl+backtick here;
-            // all other keys are routed to the terminal by handleTerminalKeyEvents.
-            if (editor.activePaneIsTerminal()) {
-                continue;
-            }
+    pub fn init(allocator: std.mem.Allocator) !GuiState {
+        var g = GuiState{ .allocator = allocator };
+        errdefer g.deinit();
+        _ = try g.winUi(0);
+        return g;
+    }
 
-            // Keybinds only in normal mode (not during find/replace/palette)
-            if (editor.mode == .normal) {
-                // Skip modifier-only keys
-                if (key.code == .left_shift or key.code == .right_shift or
-                    key.code == .left_control or key.code == .right_control or
-                    key.code == .left_alt or key.code == .right_alt or
-                    key.code == .left_command or key.code == .right_command) continue;
+    /// Call after every dvui.Window using the font bytes is gone.
+    pub fn deinit(self: *GuiState) void {
+        for (self.wins.items) |w| self.allocator.destroy(w);
+        self.wins.deinit(self.allocator);
+        if (self.mono_font_owned) self.allocator.free(self.mono_font_bytes);
+    }
 
-                // Tree-focused Ctrl+C/X/V operate on files, not on the
-                // document behind the panel.
-                if (editor.filetree_focused and key.mod.control() and
-                    !key.mod.alt() and !key.mod.shift())
-                {
-                    const tree_op: ?[]const u8 = switch (key.code) {
-                        .c => "filetree_copy",
-                        .x => "filetree_cut",
-                        .v => "filetree_paste",
-                        else => null,
-                    };
-                    if (tree_op) |op| {
-                        e.handled = true;
-                        _ = editor.execCommand(op, null);
-                        continue;
-                    }
+    pub fn primary(self: *GuiState) *WinUi {
+        return self.wins.items[0];
+    }
+
+    pub fn find(self: *GuiState, win_id: u32) ?*WinUi {
+        for (self.wins.items) |w| {
+            if (w.win_id == win_id) return w;
+        }
+        return null;
+    }
+
+    /// Find-or-create the state for editor window `win_id`.
+    pub fn winUi(self: *GuiState, win_id: u32) !*WinUi {
+        if (self.find(win_id)) |w| return w;
+        const w = try self.allocator.create(WinUi);
+        w.* = .{ .win_id = win_id };
+        try self.wins.append(self.allocator, w);
+        return w;
+    }
+
+    pub fn bySdlWindow(self: *GuiState, sdl_id: u32) ?*WinUi {
+        for (self.wins.items) |w| {
+            if (w.sdl_window_id == sdl_id) return w;
+        }
+        return null;
+    }
+
+    /// State of the editor's focused window.
+    pub fn activeUi(self: *GuiState, editor: *Editor) *WinUi {
+        return self.find(editor.activeWindow().id) orelse self.primary();
+    }
+
+    /// Drop state for windows the core no longer has (never the primary).
+    pub fn retireMissing(self: *GuiState, editor: *Editor) void {
+        var i: usize = self.wins.items.len;
+        while (i > 1) {
+            i -= 1;
+            const w = self.wins.items[i];
+            var alive = false;
+            for (editor.windows.items) |ew| {
+                if (ew.id == w.win_id) {
+                    alive = true;
+                    break;
                 }
-
-                var kbuf: [64]u8 = undefined;
-                const key_str = dvuiKeyToStr(key, &kbuf);
-                if (key_str.len > 0) {
-                    if (editor.lookupKeybind(key_str)) |action| {
-                        e.handled = true;
-                        scroll_pinned = false;
-                        execGuiAction(editor, action);
-                        continue;
-                    }
-                    // Fallback without shift
-                    if (key.mod.shift()) {
-                        var kbuf2: [64]u8 = undefined;
-                        const fallback_str = dvuiKeyToStrNoShift(key, &kbuf2);
-                        if (fallback_str.len > 0) {
-                            if (editor.lookupKeybind(fallback_str)) |action| {
-                                e.handled = true;
-                                scroll_pinned = false;
-                                execGuiAction(editor, action);
-                                continue;
-                            }
-                        }
-                    }
-                }
+            }
+            if (!alive) {
+                _ = self.wins.orderedRemove(i);
+                self.allocator.destroy(w);
             }
         }
     }
+};
+
+/// For the context-less SDL drop callback (set by main.zig for the GUI's lifetime).
+pub var active_state: ?*GuiState = null;
+
+/// The window whose section frame() is currently rendering — set before
+/// any of its widgets run, like dvui.current_window. `cur_win` is its index
+/// in `editor.windows`.
+var win_ui: *WinUi = undefined;
+var cur_win: usize = 0;
+
+/// Layout tree of editor window `win_idx`.
+fn winLayout(editor: *Editor, win_idx: usize) *Layout {
+    return &editor.windows.items[win_idx].layout;
+}
+
+/// Read the user's mono font file (if configured) into `g`; the bundled
+/// Fira Code Nerd Font stays the fallback. Runs once at GUI startup.
+pub fn loadMonoFont(g: *GuiState, editor: *Editor, io: std.Io) void {
+    if (editor.mono_font_path.len == 0) return;
+    const bytes = std.Io.Dir.cwd().readFileAlloc(io, editor.mono_font_path, g.allocator, .limited(64 * 1024 * 1024)) catch |err| {
+        std.log.warn("Failed to read mono font {s}: {} — falling back to bundled font", .{ editor.mono_font_path, err });
+        return;
+    };
+    g.mono_font_bytes = bytes;
+    g.mono_font_owned = true;
+}
+
+/// Register the mono font under `custom_mono_family` in `win`'s font
+/// database and (re)apply the editor theme so font_mono resolves to it.
+/// Every dvui.Window (the primary and each child) needs this once.
+pub fn applyWindowFonts(win: *dvui.Window, g: *GuiState, editor: *Editor) void {
+    // The bytes stay owned by GuiState (shared by every window) — a null
+    // allocator tells dvui not to free them.
+    win.addFont(custom_mono_family, g.mono_font_bytes, null) catch |err| {
+        std.log.warn("Failed to register mono font: {} — falling back to bundled font", .{err});
+        if (g.mono_font_owned) {
+            g.allocator.free(g.mono_font_bytes);
+            g.mono_font_bytes = bundled_mono_ttf;
+            g.mono_font_owned = false;
+            win.addFont(custom_mono_family, g.mono_font_bytes, null) catch |err2| {
+                std.log.warn("Failed to register bundled mono font: {}", .{err2});
+            };
+        }
+    };
+    win.theme = dvuiThemeForPreset(editor.theme_name, true, editor.mono_font_size);
+}
+
+/// Render a single frame of the GUI. Returns false to quit.
+///
+/// Per-process work (polls, auto-save, file-tree focus handback) runs once;
+/// everything window-scoped goes through the section helpers below with
+/// `win_ui`/`cur_win` pointing at the window being drawn.
+pub fn frame(editor: *Editor, g: *GuiState) bool {
+    if (!build_options.has_gui) return false;
+
+    // Primary window section.
+    win_ui = g.primary();
+    cur_win = 0;
+
+    // --- Global keyboard shortcuts (before widgets consume events) ---
+    dispatchGlobalKeys(editor);
 
     // Check if quit was requested via keybind/command
     if (!editor.running) return false;
@@ -411,6 +497,111 @@ pub fn frame(editor: *Editor) bool {
         }
     }
 
+    if (menuBar(editor)) return false;
+    modalDialogs(editor);
+    tabBar(editor);
+    statusBar(editor);
+    editorArea(editor, true);
+
+    // --- Handle window close / quit events ---
+    for (dvui.events()) |*e| {
+        if (e.handled) continue;
+        if (e.evt == .window and e.evt.window.action == .close) return false;
+        if (e.evt == .app and e.evt.app.action == .quit) return false;
+    }
+
+    return true;
+}
+
+/// Keybind chords for the current window, dispatched from the raw event
+/// list before any dvui widget (menus, panels) can consume them.
+fn dispatchGlobalKeys(editor: *Editor) void {
+    // --- Global keyboard shortcuts (before widgets consume events) ---
+    // Process keybinds here so DVUI widgets (menus, etc.) cannot consume them first.
+    for (dvui.events()) |*e| {
+        if (e.handled) continue;
+        if (e.evt != .key) continue;
+        const key = e.evt.key;
+        if (key.action != .down and key.action != .repeat) continue;
+
+        // F-keys are never text input, so they go through the keybind map
+        // even unmodified (f12 = goto definition, f6 = focus pane, ...).
+        const is_fkey = switch (key.code) {
+            .f1, .f2, .f3, .f4, .f5, .f6, .f7, .f8, .f9, .f10, .f11, .f12 => true,
+            else => false,
+        };
+
+        if (key.mod.control() or key.mod.alt() or is_fkey) {
+            // Tab switching always works (even during modals)
+            if (key.mod.control() and key.code == .tab) {
+                e.handled = true;
+                if (key.mod.shift()) editor.prevDoc() else editor.nextDoc();
+                continue;
+            }
+
+            // When terminal pane is focused, only handle ctrl+backtick here;
+            // all other keys are routed to the terminal by handleTerminalKeyEvents.
+            if (editor.activePaneIsTerminal()) {
+                continue;
+            }
+
+            // Keybinds only in normal mode (not during find/replace/palette)
+            if (editor.mode == .normal) {
+                // Skip modifier-only keys
+                if (key.code == .left_shift or key.code == .right_shift or
+                    key.code == .left_control or key.code == .right_control or
+                    key.code == .left_alt or key.code == .right_alt or
+                    key.code == .left_command or key.code == .right_command) continue;
+
+                // Tree-focused Ctrl+C/X/V operate on files, not on the
+                // document behind the panel.
+                if (editor.filetree_focused and key.mod.control() and
+                    !key.mod.alt() and !key.mod.shift())
+                {
+                    const tree_op: ?[]const u8 = switch (key.code) {
+                        .c => "filetree_copy",
+                        .x => "filetree_cut",
+                        .v => "filetree_paste",
+                        else => null,
+                    };
+                    if (tree_op) |op| {
+                        e.handled = true;
+                        _ = editor.execCommand(op, null);
+                        continue;
+                    }
+                }
+
+                var kbuf: [64]u8 = undefined;
+                const key_str = dvuiKeyToStr(key, &kbuf);
+                if (key_str.len > 0) {
+                    if (editor.lookupKeybind(key_str)) |action| {
+                        e.handled = true;
+                        win_ui.scroll_pinned = false;
+                        execGuiAction(editor, action);
+                        continue;
+                    }
+                    // Fallback without shift
+                    if (key.mod.shift()) {
+                        var kbuf2: [64]u8 = undefined;
+                        const fallback_str = dvuiKeyToStrNoShift(key, &kbuf2);
+                        if (fallback_str.len > 0) {
+                            if (editor.lookupKeybind(fallback_str)) |action| {
+                                e.handled = true;
+                                win_ui.scroll_pinned = false;
+                                execGuiAction(editor, action);
+                                continue;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Menu bar of the current window. Returns true when File > Exit was chosen.
+fn menuBar(editor: *Editor) bool {
+    var exit_requested = false;
     // --- Menu bar ---
     {
         var hbox = dvui.box(@src(), .{ .dir = .horizontal }, .{
@@ -449,7 +640,7 @@ pub fn frame(editor: *Editor) bool {
                 m.close();
             }
             if (dvui.menuItemLabel(@src(), "Exit             Ctrl+Q", .{}, .{ .expand = .horizontal }) != null) {
-                return false;
+                exit_requested = true;
             }
         }
 
@@ -587,7 +778,12 @@ pub fn frame(editor: *Editor) bool {
             _ = dvui.menuItemLabel(@src(), "About ZIDE v0.0.1", .{}, .{ .expand = .horizontal });
         }
     }
+    return exit_requested;
+}
 
+/// Settings + delete-confirm dialogs of the current window. Declared before
+/// the panes so their widgets consume their events first.
+fn modalDialogs(editor: *Editor) void {
     // --- Settings dialog (modal floating window) ---
     // Declared before the panes so its widgets consume their events first;
     // the panes' raw event loops only see what the dialog left unhandled.
@@ -603,7 +799,11 @@ pub fn frame(editor: *Editor) bool {
     if (editor.mode == .filetree_prompt and editor.filetree_prompt_kind == .delete_confirm) {
         filetreeDeleteDialog(editor);
     }
+}
 
+/// Tab bar of the current window (every document; the highlight is the
+/// document shown in this window).
+fn tabBar(editor: *Editor) void {
     // --- Tab bar (if multiple documents) ---
     if (editor.docCount() > 1) {
         var close_tab_idx: ?usize = null;
@@ -663,7 +863,10 @@ pub fn frame(editor: *Editor) bool {
             _ = editor.closeDocAt(idx);
         }
     }
+}
 
+/// Status bar of the current window.
+fn statusBar(editor: *Editor) void {
     // --- Status bar (renderText only — no TextLayoutWidgets, no layout instability) ---
     {
         const status_font = dvui.Font.theme(.body);
@@ -755,7 +958,11 @@ pub fn frame(editor: *Editor) bool {
             .color = status_text_color,
         }) catch {};
     }
+}
 
+/// Editor area of the current window: the split-pane tree, plus (primary
+/// window only, side_panels) the docked file tree and search panel.
+fn editorArea(editor: *Editor, side_panels: bool) void {
     // --- Editor area (expand=.both, LAST child) ---
     // The file tree docks left or right of the split tree as a fixed-width
     // sibling in an hbox; the splits expand into the rest. The docked
@@ -766,7 +973,7 @@ pub fn frame(editor: *Editor) bool {
         {
             var content_row = dvui.box(@src(), .{ .dir = .horizontal }, .{ .expand = .both });
             defer content_row.deinit();
-            if (editor.filetree_visible and editor.ensureFiletree() != null) {
+            if (side_panels and editor.filetree_visible and editor.ensureFiletree() != null) {
                 if (editor.filetree_side == .left) {
                     filetreePanel(editor);
                     renderLayout(editor, 0);
@@ -778,29 +985,20 @@ pub fn frame(editor: *Editor) bool {
                 renderLayout(editor, 0);
             }
         }
-        if (editor.search_visible) searchPanelGui(editor);
+        if (side_panels and editor.search_visible) searchPanelGui(editor);
     }
-
-    // --- Handle window close / quit events ---
-    for (dvui.events()) |*e| {
-        if (e.handled) continue;
-        if (e.evt == .window and e.evt.window.action == .close) return false;
-        if (e.evt == .app and e.evt.app.action == .quit) return false;
-    }
-
-    return true;
 }
 
 /// Recursively render the layout tree. Split nodes use dvui.paned() for
 /// draggable dividers; leaf nodes render an editor pane.
 fn renderLayout(editor: *Editor, node_idx: u8) void {
     if (!build_options.has_gui) return;
-    if (node_idx >= editor.layout.nodes.items.len) return;
+    if (node_idx >= winLayout(editor, cur_win).nodes.items.len) return;
 
-    switch (editor.layout.nodes.items[node_idx]) {
+    switch (winLayout(editor, cur_win).nodes.items[node_idx]) {
         .leaf => |pane_id| {
-            if (pane_id < editor.layout.panes.items.len) {
-                const pane = editor.layout.panes.items[pane_id];
+            if (pane_id < winLayout(editor, cur_win).panes.items.len) {
+                const pane = winLayout(editor, cur_win).panes.items[pane_id];
                 switch (pane.content) {
                     .editor => editorPane(editor, pane_id),
                     .terminal => |term_idx| terminalPane(editor, pane_id, term_idx),
@@ -811,7 +1009,7 @@ fn renderLayout(editor: *Editor, node_idx: u8) void {
             var paned = dvui.paned(@src(), .{
                 .direction = if (s.direction == .horizontal) .horizontal else .vertical,
                 .collapsed_size = 100,
-                .split_ratio = editor.layout.ratioPtr(node_idx),
+                .split_ratio = winLayout(editor, cur_win).ratioPtr(node_idx),
                 .handle_size = 4,
                 .handle_dynamic = .{
                     .handle_size_max = 8,
@@ -920,38 +1118,36 @@ var filetree_autoreveal_last: u64 = 0;
 /// map a drop point to a row without re-deriving the layout.
 var filetree_rows_geom: ?struct { rows_y: f32, line_height: f32 } = null;
 
-/// OS drag & drop staging, filled by the SDL backend patch through
-/// onSdlDropFile and consumed once per frame. Fixed slots — a drop of
-/// more than 16 items imports the first 16.
-const DropSlot = struct { path: [1024]u8 = undefined, len: usize = 0, x: f32 = 0, y: f32 = 0 };
-var drop_slots: [16]DropSlot = @splat(.{});
-var drop_count: usize = 0;
-
 /// Registered as the SDL backend's drop_file_fn (main.zig, GUI startup).
-/// Runs synchronously during event pumping — stash and return.
-pub fn onSdlDropFile(path: []const u8, x: f32, y: f32) void {
-    if (drop_count >= drop_slots.len) return;
-    if (path.len == 0 or path.len > drop_slots[0].path.len) return;
-    const s = &drop_slots[drop_count];
+/// Runs synchronously during event pumping — stash into the state of the
+/// window the drop landed on (unknown window → primary) and return; the
+/// slots are consumed once per frame by processFileDrops.
+pub fn onSdlDropFile(path: []const u8, x: f32, y: f32, window_id: u32) void {
+    const st = active_state orelse return;
+    const ui = st.bySdlWindow(window_id) orelse st.primary();
+    if (ui.drop_count >= ui.drop_slots.len) return;
+    if (path.len == 0 or path.len > ui.drop_slots[0].path.len) return;
+    const s = &ui.drop_slots[ui.drop_count];
     @memcpy(s.path[0..path.len], path);
     s.len = path.len;
     s.x = x;
     s.y = y;
-    drop_count += 1;
+    ui.drop_count += 1;
 }
 
-/// Consume staged OS file drops: dropped on the tree panel = import into
-/// the folder under the cursor; dropped on the editor = open the file
-/// (or re-root the tree when a folder was dropped).
+/// Consume the current window's staged OS file drops: dropped on the tree
+/// panel (primary window only) = import into the folder under the cursor;
+/// dropped on the editor = open the file in that window (or re-root the
+/// tree when a folder was dropped).
 fn processFileDrops(editor: *Editor) void {
     if (!build_options.has_gui) return;
-    if (drop_count == 0) return;
-    defer drop_count = 0;
+    if (win_ui.drop_count == 0) return;
+    defer win_ui.drop_count = 0;
     const scale = filetree_panel_scale;
-    for (drop_slots[0..drop_count]) |*s| {
+    for (win_ui.drop_slots[0..win_ui.drop_count]) |*s| {
         const path = s.path[0..s.len];
         var handled = false;
-        if (editor.filetree_visible) {
+        if (cur_win == 0 and editor.filetree_visible) {
             if (filetree_panel_rect) |pr| {
                 const px = s.x * scale;
                 const py = s.y * scale;
@@ -971,7 +1167,9 @@ fn processFileDrops(editor: *Editor) void {
         }
         if (!handled) {
             // Dropped on the editor: folders become the tree root, files
-            // open as tabs (with the usual binary-file guard).
+            // open as tabs in the window they were dropped on (with the
+            // usual binary-file guard).
+            editor.focusWindow(cur_win);
             if (std.Io.Dir.openDirAbsolute(editor.io, path, .{})) |d| {
                 d.close(editor.io);
                 _ = editor.setFiletreeRoot(path);
@@ -2387,7 +2585,7 @@ fn searchPanelGui(editor: *Editor) void {
                                 search_last_click_idx = mi;
                                 if (dbl) {
                                     editor.searchOpenSelected();
-                                    scroll_pinned = false;
+                                    win_ui.scroll_pinned = false;
                                 }
                             },
                         }
@@ -2778,7 +2976,7 @@ fn handleSearchKeysGui(editor: *Editor, wd: *dvui.WidgetData) void {
                             },
                             .results => {
                                 editor.searchOpenSelected();
-                                scroll_pinned = false;
+                                win_ui.scroll_pinned = false;
                             },
                         }
                     },
@@ -2824,10 +3022,10 @@ fn handleSearchKeysGui(editor: *Editor, wd: *dvui.WidgetData) void {
 fn editorPane(editor: *Editor, pane_id: u8) void {
     if (!build_options.has_gui) return;
 
-    const is_active_pane = pane_id == editor.active_pane;
+    const is_active_pane = editor.isActivePane(cur_win, pane_id);
 
     // Get the document for THIS pane (not necessarily the active doc).
-    var pane_doc_idx = switch (editor.layout.panes.items[pane_id].content) {
+    var pane_doc_idx = switch (winLayout(editor, cur_win).panes.items[pane_id].content) {
         .editor => |idx| idx,
         .terminal => return, // terminal panes handled by terminalPane()
     };
@@ -2879,7 +3077,7 @@ fn editorPane(editor: *Editor, pane_id: u8) void {
     // Store logical text area width for visual-row movement calculations
     // (in unscaled font units, matching what guiWrapAdvanceRow uses)
     const text_area_w_logical = @max(0.0, area.w - gutter_total_width) / scale;
-    editor.text_width = if (text_area_w_logical > 0) @intFromFloat(text_area_w_logical) else 80;
+    if (is_active_pane) editor.text_width = if (text_area_w_logical > 0) @intFromFloat(text_area_w_logical) else 80;
 
     // Take dvui focus back from the file tree panel when keyboard focus
     // returned to the editor (movement/typing below is is_focused-gated).
@@ -2895,7 +3093,7 @@ fn editorPane(editor: *Editor, pane_id: u8) void {
         _ = handleGuiKeyEvents(editor, wd);
 
         // Re-fetch doc after key events — close_tab may have changed/freed the active document
-        pane_doc_idx = switch (editor.layout.panes.items[pane_id].content) {
+        pane_doc_idx = switch (winLayout(editor, cur_win).panes.items[pane_id].content) {
             .editor => |idx| idx,
             .terminal => return,
         };
@@ -2921,7 +3119,7 @@ fn editorPane(editor: *Editor, pane_id: u8) void {
                         // live preview behind the finder panel.
                         if (editor.mode == .file_finder) {
                             e.handle(@src(), wd);
-                            scroll_pinned = true;
+                            win_ui.scroll_pinned = true;
                             const scroll_lines: i32 = @intFromFloat(@round(-delta / dvui.scroll_speed * 3));
                             const new_top = @as(i64, @intCast(doc.scroll_top)) + scroll_lines;
                             const max_top: i64 = @intCast(doc.buffer.lineCount() -| 1);
@@ -2935,15 +3133,15 @@ fn editorPane(editor: *Editor, pane_id: u8) void {
     } else {
         // Cache text area (excluding gutter) when not dragging to prevent subpixel
         // layout shifts from causing mouse-to-offset oscillation (gyration fix).
-        if (!drag_active) {
-            drag_area = .{
+        if (!win_ui.drag_active) {
+            win_ui.drag_area = .{
                 .x = area.x + gutter_total_width,
                 .y = area.y,
                 .w = area.w - gutter_total_width,
                 .h = area.h,
             };
         }
-        handleMouseEvents(editor, pane_id, wd, drag_area, font, line_height, scale);
+        handleMouseEvents(editor, pane_id, wd, win_ui.drag_area, font, line_height, scale);
 
         // Right-click context menu — watches the whole pane content area;
         // handleMouseEvents leaves right presses unhandled (after placing
@@ -2952,7 +3150,7 @@ fn editorPane(editor: *Editor, pane_id: u8) void {
     }
 
     // --- Ensure cursor visible (unless user is scrolling with wheel or dragging) ---
-    if (!scroll_pinned and !drag_active) {
+    if (is_active_pane and !win_ui.scroll_pinned and !win_ui.drag_active) {
         if (do_wrap) {
             guiEnsureCursorVisibleWrapped(doc, font, text_area_w_logical, visible_lines, tab_width);
         } else {
@@ -2973,7 +3171,7 @@ fn editorPane(editor: *Editor, pane_id: u8) void {
     }
 
     // Full editor area for rendering (includes gutter).
-    // drag_area is the text-only area (for mouse mapping), but we render
+    // win_ui.drag_area is the text-only area (for mouse mapping), but we render
     // gutter + text across the full area.
     const render_area = area;
     const render_rs: dvui.RectScale = .{ .r = render_area, .s = scale };
@@ -3299,11 +3497,11 @@ fn editorPane(editor: *Editor, pane_id: u8) void {
                         // Blink: reset timer when cursor moves, then toggle visibility
                         const now_ns: i128 = std.Io.Clock.now(.awake, editor.io).nanoseconds;
                         const cur_offset = doc.cursors.primary().offset;
-                        if (cur_offset != blink_last_offset) {
-                            blink_time_ns = now_ns;
-                            blink_last_offset = cur_offset;
+                        if (cur_offset != win_ui.blink_last_offset) {
+                            win_ui.blink_time_ns = now_ns;
+                            win_ui.blink_last_offset = cur_offset;
                         }
-                        const elapsed: i128 = now_ns - blink_time_ns;
+                        const elapsed: i128 = now_ns - win_ui.blink_time_ns;
                         const cycle = @mod(@divFloor(elapsed, std.time.ns_per_ms), blink_interval_ms * 2);
                         const blink_on = cycle < blink_interval_ms;
 
@@ -3372,7 +3570,7 @@ fn editorPane(editor: *Editor, pane_id: u8) void {
     _ = text_cols; // used for future scroll adjustment
 
     // --- Focused pane indicator (subtle border highlight) ---
-    if (is_active_pane and editor.layout.paneCount() > 1) {
+    if (is_active_pane and winLayout(editor, cur_win).paneCount() > 1) {
         const focus_color = toDvui(editor.theme.selection);
         const border_w: f32 = 2 * scale;
         // Top
@@ -3387,8 +3585,8 @@ fn editorPane(editor: *Editor, pane_id: u8) void {
 
     // --- Scrollbar: slim pill over the right edge (matches the file tree) ---
     if (editorSbThumb(doc, render_area, line_height, scale)) |thumb| {
-        const active = (editor_sb_drag and editor_sb_pane == pane_id) or
-            editor_sb_hover_pane == pane_id;
+        const active = (win_ui.editor_sb_drag and win_ui.editor_sb_pane == pane_id) or
+            win_ui.editor_sb_hover_pane == pane_id;
         const sb_color = if (active)
             toDvui(editor.theme.text).opacity(0.55)
         else
@@ -3415,7 +3613,7 @@ fn terminalPane(editor: *Editor, pane_id: u8, term_idx: usize) void {
     if (term_idx >= editor.terminals.items.len) return;
 
     const term = editor.terminals.items[term_idx] orelse return;
-    const is_active_pane = pane_id == editor.active_pane;
+    const is_active_pane = editor.isActivePane(cur_win, pane_id);
 
     // Container box
     var ebox = dvui.box(@src(), .{ .dir = .vertical }, .{
@@ -3463,7 +3661,7 @@ fn terminalPane(editor: *Editor, pane_id: u8, term_idx: usize) void {
                 .focus, .press => {
                     e.handle(@src(), wd);
                     dvui.focusWidget(wd.id, null, e.num);
-                    editor.focusPane(pane_id);
+                    editor.focusPaneIn(cur_win, pane_id);
                 },
                 else => {},
             }
@@ -3635,7 +3833,7 @@ fn terminalPane(editor: *Editor, pane_id: u8, term_idx: usize) void {
     }
 
     // Active pane indicator (same as editor)
-    if (is_active_pane and editor.layout.paneCount() > 1) {
+    if (is_active_pane and winLayout(editor, cur_win).paneCount() > 1) {
         const focus_color: dvui.Color = .{ .r = 0x35, .g = 0x84, .b = 0xe4, .a = 0xFF };
         const border_w: f32 = 2 * scale;
         (dvui.Rect.Physical{ .x = area.x, .y = area.y, .w = border_w, .h = area.h }).fill(.{}, .{ .color = focus_color, .fade = 0.6 });
@@ -3845,7 +4043,7 @@ fn paneContextMenu(editor: *Editor, pane_id: u8, area: dvui.Rect.Physical) void 
 
 /// Handle mouse events for the custom editor pane.
 fn handleMouseEvents(editor: *Editor, pane_id: u8, wd: *dvui.WidgetData, area: dvui.Rect.Physical, font: dvui.Font, line_height: f32, scale: f32) void {
-    const pane_doc_idx = switch (editor.layout.panes.items[pane_id].content) {
+    const pane_doc_idx = switch (winLayout(editor, cur_win).panes.items[pane_id].content) {
         .editor => |idx| idx,
         .terminal => return,
     };
@@ -3862,7 +4060,7 @@ fn handleMouseEvents(editor: *Editor, pane_id: u8, wd: *dvui.WidgetData, area: d
         const me = e.evt.mouse;
 
         // Only match events inside our area (or drag/scrollbar-drag continuation)
-        if (!drag_active and !(editor_sb_drag and editor_sb_pane == pane_id)) {
+        if (!win_ui.drag_active and !(win_ui.editor_sb_drag and win_ui.editor_sb_pane == pane_id)) {
             if (me.p.x < area.x or me.p.x > area.x + area.w or
                 me.p.y < area.y or me.p.y > area.y + area.h)
                 continue;
@@ -3882,7 +4080,7 @@ fn handleMouseEvents(editor: *Editor, pane_id: u8, wd: *dvui.WidgetData, area: d
                     // act on the selection). Deliberately left unhandled: the
                     // pane's ContextWidget (created after this) consumes the
                     // press and opens the context menu.
-                    editor.focusPane(pane_id);
+                    editor.focusPaneIn(cur_win, pane_id);
                     editor.filetree_focused = false;
                     const offset = screenToOffset(doc, area, font, line_height, scale, me.p, tab_width, do_wrap);
                     const c = doc.cursors.primary();
@@ -3901,20 +4099,20 @@ fn handleMouseEvents(editor: *Editor, pane_id: u8, wd: *dvui.WidgetData, area: d
 
                 e.handle(@src(), wd);
                 dvui.focusWidget(wd.id, null, e.num);
-                scroll_pinned = false;
+                win_ui.scroll_pinned = false;
 
                 // Focus this pane on click (and take focus back from the tree)
-                editor.focusPane(pane_id);
+                editor.focusPaneIn(cur_win, pane_id);
                 editor.filetree_focused = false;
 
                 // Scrollbar band: drag the thumb, or page toward the click.
                 if (me.p.x >= area.x + area.w - editor_sb_band * scale) {
                     if (editorSbThumb(doc, area, line_height, scale)) |thumb| {
-                        scroll_pinned = true;
+                        win_ui.scroll_pinned = true;
                         if (me.p.y >= thumb.y and me.p.y < thumb.y + thumb.h) {
-                            editor_sb_drag = true;
-                            editor_sb_pane = pane_id;
-                            editor_sb_grab_dy = me.p.y - thumb.y;
+                            win_ui.editor_sb_drag = true;
+                            win_ui.editor_sb_pane = pane_id;
+                            win_ui.editor_sb_grab_dy = me.p.y - thumb.y;
                         } else {
                             const vis = editorSbVisLines(area, line_height);
                             if (me.p.y < thumb.y) {
@@ -3938,11 +4136,11 @@ fn handleMouseEvents(editor: *Editor, pane_id: u8, wd: *dvui.WidgetData, area: d
                         c.clearSelection();
                         c.offset = offset;
                         c.preferred_col = p.col;
-                        drag_active = true;
-                        drag_pane = pane_id;
-                        drag_mode = .block;
-                        block_anchor_line = p.line;
-                        block_anchor_col = p.col;
+                        win_ui.drag_active = true;
+                        win_ui.drag_pane = pane_id;
+                        win_ui.drag_mode = .block;
+                        win_ui.block_anchor_line = p.line;
+                        win_ui.block_anchor_col = p.col;
                     } else {
                         doc.cursors.addCursor(offset) catch {};
                     }
@@ -3958,78 +4156,78 @@ fn handleMouseEvents(editor: *Editor, pane_id: u8, wd: *dvui.WidgetData, area: d
 
                 // Detect multi-click (double/triple)
                 const now_ns: i128 = std.Io.Clock.now(.awake, editor.io).nanoseconds;
-                const elapsed_ms: u64 = if (now_ns > last_click_time_ns)
-                    @intCast(@divFloor(now_ns - last_click_time_ns, std.time.ns_per_ms))
+                const elapsed_ms: u64 = if (now_ns > win_ui.last_click_time_ns)
+                    @intCast(@divFloor(now_ns - win_ui.last_click_time_ns, std.time.ns_per_ms))
                 else
                     double_click_threshold_ms + 1;
 
                 // Check if click is close in time and position to previous
                 const pos_close = blk: {
                     const click_pos = doc.buffer.offsetToPos(offset);
-                    const last_pos = doc.buffer.offsetToPos(last_click_offset);
+                    const last_pos = doc.buffer.offsetToPos(win_ui.last_click_offset);
                     _ = double_click_distance;
                     break :blk click_pos.line == last_pos.line and
                         (if (click_pos.col > last_pos.col) click_pos.col - last_pos.col else last_pos.col - click_pos.col) < 10;
                 };
 
                 if (elapsed_ms < double_click_threshold_ms and pos_close) {
-                    click_count = if (click_count >= 3) 1 else click_count + 1;
+                    win_ui.click_count = if (win_ui.click_count >= 3) 1 else win_ui.click_count + 1;
                 } else {
-                    click_count = 1;
+                    win_ui.click_count = 1;
                 }
-                last_click_time_ns = now_ns;
-                last_click_offset = offset;
+                win_ui.last_click_time_ns = now_ns;
+                win_ui.last_click_offset = offset;
 
                 if (me.mod.shift()) {
                     // Shift+click extends selection
                     if (c.anchor == null) c.anchor = c.offset;
                     c.offset = offset;
                     c.preferred_col = doc.buffer.offsetToPos(offset).col;
-                } else if (click_count == 2) {
+                } else if (win_ui.click_count == 2) {
                     // Double-click: select word
                     const ws = wordBoundaryAt(doc, offset);
                     c.anchor = ws.start;
                     c.offset = ws.end;
                     c.preferred_col = doc.buffer.offsetToPos(ws.end).col;
-                    drag_active = true;
-                    drag_pane = pane_id;
-                    drag_mode = .word;
-                    drag_word_start = ws.start;
-                    drag_word_end = ws.end;
-                } else if (click_count == 3) {
+                    win_ui.drag_active = true;
+                    win_ui.drag_pane = pane_id;
+                    win_ui.drag_mode = .word;
+                    win_ui.drag_word_start = ws.start;
+                    win_ui.drag_word_end = ws.end;
+                } else if (win_ui.click_count == 3) {
                     // Triple-click: select entire line
                     const ls = lineBoundaryAt(doc, offset);
                     c.anchor = ls.start;
                     c.offset = ls.end;
                     c.preferred_col = doc.buffer.offsetToPos(ls.end).col;
-                    drag_active = true;
-                    drag_pane = pane_id;
-                    drag_mode = .line;
-                    drag_word_start = ls.start;
-                    drag_word_end = ls.end;
+                    win_ui.drag_active = true;
+                    win_ui.drag_pane = pane_id;
+                    win_ui.drag_mode = .line;
+                    win_ui.drag_word_start = ls.start;
+                    win_ui.drag_word_end = ls.end;
                 } else {
                     // Single click: place cursor
                     c.offset = offset;
                     c.preferred_col = doc.buffer.offsetToPos(offset).col;
                     c.clearSelection();
-                    drag_active = true;
-                    drag_pane = pane_id;
-                    drag_mode = .char;
-                    drag_anchor_offset = offset;
+                    win_ui.drag_active = true;
+                    win_ui.drag_pane = pane_id;
+                    win_ui.drag_mode = .char;
+                    win_ui.drag_anchor_offset = offset;
                 }
             },
             .release => {
-                if (editor_sb_drag and editor_sb_pane == pane_id) {
+                if (win_ui.editor_sb_drag and win_ui.editor_sb_pane == pane_id) {
                     e.handle(@src(), wd);
-                    editor_sb_drag = false;
+                    win_ui.editor_sb_drag = false;
                 }
-                if (drag_active and drag_pane == pane_id) {
+                if (win_ui.drag_active and win_ui.drag_pane == pane_id) {
                     e.handle(@src(), wd);
-                    drag_active = false;
+                    win_ui.drag_active = false;
                 }
             },
             .motion => {
-                if (editor_sb_drag and editor_sb_pane == pane_id) {
+                if (win_ui.editor_sb_drag and win_ui.editor_sb_pane == pane_id) {
                     e.handle(@src(), wd);
                     if (editorSbThumb(doc, area, line_height, scale)) |thumb| {
                         const usable = area.h - thumb.h;
@@ -4037,13 +4235,13 @@ fn handleMouseEvents(editor: *Editor, pane_id: u8, wd: *dvui.WidgetData, area: d
                             const vis = editorSbVisLines(area, line_height);
                             const total = doc.buffer.lineCount();
                             const denom: f32 = @floatFromInt(total - vis);
-                            const frac = std.math.clamp((me.p.y - editor_sb_grab_dy - area.y) / usable, 0.0, 1.0);
+                            const frac = std.math.clamp((me.p.y - win_ui.editor_sb_grab_dy - area.y) / usable, 0.0, 1.0);
                             doc.scroll_top = @intFromFloat(@round(frac * denom));
                         }
                     }
                     continue;
                 }
-                if (drag_active and drag_pane == pane_id) {
+                if (win_ui.drag_active and win_ui.drag_pane == pane_id) {
                     e.handle(@src(), wd);
                     // Auto-scroll when dragging past edges
                     const live_area = wd.contentRectScale().r;
@@ -4059,42 +4257,42 @@ fn handleMouseEvents(editor: *Editor, pane_id: u8, wd: *dvui.WidgetData, area: d
                     const offset = screenToOffset(doc, area, font, line_height, scale, me.p, tab_width, do_wrap);
                     const c = doc.cursors.primary();
 
-                    switch (drag_mode) {
+                    switch (win_ui.drag_mode) {
                         .char => {
                             c.offset = offset;
                             c.preferred_col = doc.buffer.offsetToPos(offset).col;
-                            c.anchor = drag_anchor_offset;
+                            c.anchor = win_ui.drag_anchor_offset;
                         },
                         .word => {
                             // Extend selection by word boundaries, always keeping original word selected
                             const ws = wordBoundaryAt(doc, offset);
-                            if (offset < drag_word_start) {
+                            if (offset < win_ui.drag_word_start) {
                                 // Dragging above original word
-                                c.anchor = drag_word_end;
-                                c.offset = @min(ws.start, drag_word_start);
-                            } else if (offset >= drag_word_end) {
+                                c.anchor = win_ui.drag_word_end;
+                                c.offset = @min(ws.start, win_ui.drag_word_start);
+                            } else if (offset >= win_ui.drag_word_end) {
                                 // Dragging below original word
-                                c.anchor = drag_word_start;
-                                c.offset = @max(ws.end, drag_word_end);
+                                c.anchor = win_ui.drag_word_start;
+                                c.offset = @max(ws.end, win_ui.drag_word_end);
                             } else {
                                 // Still within original word
-                                c.anchor = drag_word_start;
-                                c.offset = drag_word_end;
+                                c.anchor = win_ui.drag_word_start;
+                                c.offset = win_ui.drag_word_end;
                             }
                             c.preferred_col = doc.buffer.offsetToPos(c.offset).col;
                         },
                         .line => {
                             // Extend selection by line boundaries, always keeping original line selected
                             const ls = lineBoundaryAt(doc, offset);
-                            if (offset < drag_word_start) {
-                                c.anchor = drag_word_end;
-                                c.offset = @min(ls.start, drag_word_start);
-                            } else if (offset >= drag_word_end) {
-                                c.anchor = drag_word_start;
-                                c.offset = @max(ls.end, drag_word_end);
+                            if (offset < win_ui.drag_word_start) {
+                                c.anchor = win_ui.drag_word_end;
+                                c.offset = @min(ls.start, win_ui.drag_word_start);
+                            } else if (offset >= win_ui.drag_word_end) {
+                                c.anchor = win_ui.drag_word_start;
+                                c.offset = @max(ls.end, win_ui.drag_word_end);
                             } else {
-                                c.anchor = drag_word_start;
-                                c.offset = drag_word_end;
+                                c.anchor = win_ui.drag_word_start;
+                                c.offset = win_ui.drag_word_end;
                             }
                             c.preferred_col = doc.buffer.offsetToPos(c.offset).col;
                         },
@@ -4103,8 +4301,8 @@ fn handleMouseEvents(editor: *Editor, pane_id: u8, wd: *dvui.WidgetData, area: d
                             const p = doc.buffer.offsetToPos(offset);
                             doc.cursors.setBlockSelection(
                                 &doc.buffer,
-                                block_anchor_line,
-                                block_anchor_col,
+                                win_ui.block_anchor_line,
+                                win_ui.block_anchor_col,
                                 p.line,
                                 p.col,
                             ) catch {};
@@ -4114,7 +4312,7 @@ fn handleMouseEvents(editor: *Editor, pane_id: u8, wd: *dvui.WidgetData, area: d
             },
             .wheel_y => |delta| {
                 e.handle(@src(), wd);
-                scroll_pinned = true;
+                win_ui.scroll_pinned = true;
                 const lines_per_notch: f32 = 3;
                 const pixels_per_notch: f32 = dvui.scroll_speed;
                 const scroll_lines: i32 = @intFromFloat(@round(-delta / pixels_per_notch * lines_per_notch));
@@ -4128,7 +4326,7 @@ fn handleMouseEvents(editor: *Editor, pane_id: u8, wd: *dvui.WidgetData, area: d
                 {
                     const in_band = me.p.x >= area.x + area.w - editor_sb_band * scale and
                         editorSbThumb(doc, area, line_height, scale) != null;
-                    editor_sb_hover_pane = if (in_band) pane_id else null;
+                    win_ui.editor_sb_hover_pane = if (in_band) pane_id else null;
                     if (!in_band) dvui.cursorSet(.ibeam);
                 }
             },
@@ -4353,7 +4551,7 @@ fn handleGuiKeyEvents(editor: *Editor, wd: *dvui.WidgetData) bool {
 
                 // Any real key press un-pins scroll (cursor tracking resumes)
                 // and drops the previous transient status message
-                scroll_pinned = false;
+                win_ui.scroll_pinned = false;
                 editor.status_message = "";
 
                 // Ctrl/Alt shortcuts handled by the early event loop in frame()
@@ -5185,11 +5383,11 @@ fn handleFinderKeyGui(editor: *Editor, key: dvui.Event.Key) void {
         .page_down => {
             // Keyboard parity with the wheel: scroll the preview behind
             // the panel (pin so ensureCursorVisible doesn't yank it back).
-            scroll_pinned = true;
+            win_ui.scroll_pinned = true;
             editor.finderScrollPage(true);
         },
         .page_up => {
-            scroll_pinned = true;
+            win_ui.scroll_pinned = true;
             editor.finderScrollPage(false);
         },
         .backspace => {

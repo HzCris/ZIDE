@@ -143,10 +143,34 @@ pub const Editor = struct {
     /// Data-driven keybinding map (populated with CUA defaults, modifiable via Lua).
     keybinds: KeybindMap,
 
-    /// Layout tree for split panes (GUI).
-    layout: Layout = undefined,
-    /// Currently focused pane index.
-    active_pane: u8 = 0,
+    /// Editor windows — each owns a split-pane layout tree and its focused
+    /// pane. `windows.items[0]` is the primary window (created in init,
+    /// never removed); the GUI may add secondaries (newWindow) and the TUI
+    /// only ever renders window 0. Entries are heap-allocated so pointers
+    /// (and `&win.open`, handed to dvui) stay stable while the list grows.
+    ///
+    /// Invariants: I1 `windows.items.len >= 1`, item 0 is the primary;
+    /// I2 `active_window < windows.items.len`; I3 each window's
+    /// `active_pane` is a live leaf of its layout; I4 `active_doc_idx`
+    /// mirrors the active window's active editor pane; I5 every `.editor`
+    /// index in every window is `< documents.items.len`; I6 a terminal index
+    /// is shown by at most one live pane across all windows (terminals are
+    /// moved, never copied); I7 window ids are monotonic and never reused.
+    windows: std.ArrayList(*EditorWindow) = .empty,
+    /// Index into `windows` of the window that has keyboard focus.
+    active_window: usize = 0,
+    /// Next `EditorWindow.id` (0 is the primary).
+    next_window_id: u32 = 1,
+    /// The frontend can host more than one OS window (the GUI sets it from
+    /// its backend; false in the TUI and in tests → window commands fall
+    /// back to splits).
+    multi_window_supported: bool = false,
+    /// Cap on secondary windows (1 primary + 4 = dvui's SDL window limit).
+    max_secondary_windows: usize = 4,
+    /// Secondary windows get a menu bar + status bar (true) or are bare
+    /// pane containers (false). File tree and search panel always stay in
+    /// the primary window.
+    secondary_window_chrome: bool = true,
 
     /// GUI editor theme (colors for editor area, overlays, gutter, etc.).
     theme: EditorTheme = theme_mod.gui_dark,
@@ -324,6 +348,26 @@ pub const Editor = struct {
         filetree_prompt,
     };
 
+    /// One editor window: a layout tree of panes plus its focused pane.
+    /// See the `windows` field for the invariants. (Named EditorWindow
+    /// because both frontends already have a `Window` in scope.)
+    pub const EditorWindow = struct {
+        pub const Pos = struct { x: i32, y: i32 };
+        /// Monotonic id (never reused) — the GUI uses it as the dvui id_extra.
+        id: u32,
+        layout: Layout,
+        active_pane: u8 = 0,
+        /// Cleared when the OS asks to close this window (the GUI hands
+        /// `&open` to dvui as the child window's open_flag);
+        /// retireClosedWindows reaps it at the top of the next frame.
+        open: bool = true,
+        /// GUI-owned hint: where to place the OS window on first show
+        /// (screen coordinates). Consumed by the GUI.
+        spawn_pos: ?Pos = null,
+    };
+
+    pub const WindowError = error{ Unsupported, TooManyWindows, OutOfMemory };
+
     pub fn init(allocator: Allocator, io: std.Io) !Editor {
         var editor = Editor{
             .documents = .empty,
@@ -331,7 +375,6 @@ pub const Editor = struct {
             .allocator = allocator,
             .io = io,
             .keybinds = KeybindMap.init(allocator),
-            .layout = try Layout.init(allocator),
             .completion_items = .empty,
             .lsp_configs = .empty,
             .terminals = .empty,
@@ -339,6 +382,13 @@ pub const Editor = struct {
             .lang_syntax_overrides = .empty,
             .search = .{ .allocator = allocator, .io = io },
         };
+        // The primary window lives as long as the editor (invariant I1).
+        const primary = try allocator.create(EditorWindow);
+        errdefer allocator.destroy(primary);
+        primary.* = .{ .id = 0, .layout = try Layout.init(allocator) };
+        errdefer primary.layout.deinit();
+        try editor.windows.append(allocator, primary);
+        errdefer editor.windows.deinit(allocator);
         // Register built-in languages (heap-allocated: see `languages` doc)
         const zig_lang = try allocator.create(syntax.LanguageDef);
         zig_lang.* = syntax.lang_zig;
@@ -385,7 +435,11 @@ pub const Editor = struct {
             self.allocator.free(entry.key_ptr.*);
         }
         self.lang_profiles.deinit(self.allocator);
-        self.layout.deinit();
+        for (self.windows.items) |win| {
+            win.layout.deinit();
+            self.allocator.destroy(win);
+        }
+        self.windows.deinit(self.allocator);
         // Free Lua-registered languages (built-in Zig has null arena)
         for (self.languages.items) |lang| {
             lang.deinit();
@@ -438,10 +492,36 @@ pub const Editor = struct {
         return &self.documents.items[doc_idx];
     }
 
-    /// Get the document index for the currently focused pane.
-    fn activeDocIdx(self: *const Editor) usize {
-        if (self.active_pane < self.layout.panes.items.len) {
-            return switch (self.layout.panes.items[self.active_pane].content) {
+    // ---- Windows: accessors ----
+
+    /// The window that has keyboard focus (invariant I2 keeps the index valid).
+    pub fn activeWindow(self: *const Editor) *EditorWindow {
+        return self.windows.items[self.active_window];
+    }
+
+    /// Layout tree of the focused window.
+    pub fn activeLayout(self: *const Editor) *Layout {
+        return &self.activeWindow().layout;
+    }
+
+    /// Focused pane id within the focused window.
+    pub fn activePaneId(self: *const Editor) u8 {
+        return self.activeWindow().active_pane;
+    }
+
+    /// True when `pane_id` of window `win_idx` is THE focused pane — the
+    /// frontends gate key input, IME and modal overlays on this.
+    pub fn isActivePane(self: *const Editor, win_idx: usize, pane_id: u8) bool {
+        return win_idx == self.active_window and pane_id == self.activePaneId();
+    }
+
+    /// Document shown by window `win_idx`'s focused pane. A terminal pane
+    /// (or an out-of-range index) reports the editor-wide active document.
+    pub fn windowDocIdx(self: *const Editor, win_idx: usize) usize {
+        if (win_idx >= self.windows.items.len) return self.active_doc_idx;
+        const win = self.windows.items[win_idx];
+        if (win.active_pane < win.layout.panes.items.len) {
+            return switch (win.layout.panes.items[win.active_pane].content) {
                 .editor => |idx| idx,
                 .terminal => self.active_doc_idx,
             };
@@ -449,23 +529,51 @@ pub const Editor = struct {
         return self.active_doc_idx;
     }
 
+    /// Get the document index for the currently focused pane.
+    fn activeDocIdx(self: *const Editor) usize {
+        return self.windowDocIdx(self.active_window);
+    }
+
     /// Check if the currently focused pane is a terminal.
     pub fn activePaneIsTerminal(self: *const Editor) bool {
-        if (self.active_pane < self.layout.panes.items.len) {
-            return self.layout.panes.items[self.active_pane].content == .terminal;
+        const win = self.activeWindow();
+        if (win.active_pane < win.layout.panes.items.len) {
+            return win.layout.panes.items[win.active_pane].content == .terminal;
         }
         return false;
     }
 
     /// Get the terminal index of the active pane (if it's a terminal).
     pub fn activePaneTerminalIdx(self: *const Editor) ?usize {
-        if (self.active_pane < self.layout.panes.items.len) {
-            return switch (self.layout.panes.items[self.active_pane].content) {
+        const win = self.activeWindow();
+        if (win.active_pane < win.layout.panes.items.len) {
+            return switch (win.layout.panes.items[win.active_pane].content) {
                 .terminal => |idx| idx,
                 .editor => null,
             };
         }
         return null;
+    }
+
+    /// After a document was removed from `documents` (index `removed`),
+    /// repoint every pane in every window: panes that showed the removed
+    /// document now show `replacement`, higher indices shift down by one.
+    /// Shared by closeDocAt and the finder's preview pop.
+    fn retargetDocIndex(self: *Editor, removed: usize, replacement: usize) void {
+        for (self.windows.items) |win| {
+            for (win.layout.panes.items) |*pane| {
+                switch (pane.content) {
+                    .editor => |*idx| {
+                        if (idx.* == removed) {
+                            idx.* = replacement;
+                        } else if (idx.* > removed) {
+                            idx.* -= 1;
+                        }
+                    },
+                    .terminal => {},
+                }
+            }
+        }
     }
 
     /// Open a new empty document and make it active (in the focused pane).
@@ -745,6 +853,12 @@ pub const Editor = struct {
         if (self.documents.pop()) |popped| {
             var doc = popped;
             doc.deinit();
+            // Any pane that showed the preview (a split made while the
+            // finder was open, another window) now points past the end —
+            // send it back to the pre-finder document.
+            const popped_idx = self.documents.items.len;
+            const fallback = @min(self.finder_prev_active, self.documents.items.len -| 1);
+            self.retargetDocIndex(popped_idx, fallback);
         }
     }
 
@@ -1440,21 +1554,10 @@ pub const Editor = struct {
         } else if (self.active_doc_idx >= self.documents.items.len) {
             self.active_doc_idx = self.documents.items.len - 1;
         }
-        // Fix up all pane doc indices after document removal:
+        // Fix up pane doc indices in every window after document removal:
         // - Editor panes pointing at the removed doc get reassigned to active_doc_idx
         // - Editor panes pointing above the removed doc shift down by 1
-        for (self.layout.panes.items) |*pane| {
-            switch (pane.content) {
-                .editor => |*idx| {
-                    if (idx.* == removed_idx) {
-                        idx.* = self.active_doc_idx;
-                    } else if (idx.* > removed_idx) {
-                        idx.* -= 1;
-                    }
-                },
-                .terminal => {},
-            }
-        }
+        self.retargetDocIndex(removed_idx, self.active_doc_idx);
         return true;
     }
 
@@ -1895,25 +1998,27 @@ pub const Editor = struct {
 
     /// Split the currently focused pane. The new pane shows the same document.
     pub fn splitActive(self: *Editor, direction: SplitDirection) void {
+        const win = self.activeWindow();
         const current_doc_idx = self.activeDocIdx();
-        const new_pane = self.layout.splitPane(self.active_pane, direction, .{ .editor = current_doc_idx }) catch return;
-        self.active_pane = new_pane;
+        const new_pane = win.layout.splitPane(win.active_pane, direction, .{ .editor = current_doc_idx }) catch return;
+        win.active_pane = new_pane;
         // Keep active_doc_idx in sync for compatibility
         self.active_doc_idx = current_doc_idx;
     }
 
     /// Close the currently focused pane. If it's the last pane, does nothing.
     pub fn closePaneAction(self: *Editor) void {
-        if (self.layout.paneCount() <= 1) {
+        const win = self.activeWindow();
+        if (win.layout.paneCount() <= 1) {
             // Common confusion: panes are splits, not tabs. Say so instead
             // of silently doing nothing.
             self.status_message = "No split panes open — Ctrl+W closes the current tab";
             return;
         }
-        const closed_pane = self.active_pane;
+        const closed_pane = win.active_pane;
         // If closing a terminal pane, clean up the terminal
-        if (closed_pane < self.layout.panes.items.len) {
-            switch (self.layout.panes.items[closed_pane].content) {
+        if (closed_pane < win.layout.panes.items.len) {
+            switch (win.layout.panes.items[closed_pane].content) {
                 .terminal => |idx| {
                     self.closeTerminal(idx);
                     return;
@@ -1922,47 +2027,61 @@ pub const Editor = struct {
             }
         }
         // Move focus to a sibling before closing
-        if (self.layout.nextPane(closed_pane)) |next| {
-            self.active_pane = next;
-        } else {
-            self.active_pane = 0;
-        }
-        _ = self.layout.closePane(closed_pane);
+        win.active_pane = win.layout.nextPane(closed_pane) orelse 0;
+        _ = win.layout.closePane(closed_pane);
         // Update active_doc_idx to match new focused pane
         self.active_doc_idx = self.activeDocIdx();
     }
 
-    /// Focus the next pane in traversal order.
+    /// Focus the next pane in traversal order (within the focused window).
     pub fn focusNextPane(self: *Editor) void {
-        if (self.layout.nextPane(self.active_pane)) |next| {
-            self.active_pane = next;
+        const win = self.activeWindow();
+        if (win.layout.nextPane(win.active_pane)) |next| {
+            win.active_pane = next;
             self.active_doc_idx = self.activeDocIdx();
         }
     }
 
-    /// Focus the previous pane in traversal order.
+    /// Focus the previous pane in traversal order (within the focused window).
     pub fn focusPrevPane(self: *Editor) void {
-        if (self.layout.prevPane(self.active_pane)) |prev| {
-            self.active_pane = prev;
+        const win = self.activeWindow();
+        if (win.layout.prevPane(win.active_pane)) |prev| {
+            win.active_pane = prev;
             self.active_doc_idx = self.activeDocIdx();
         }
     }
 
-    /// Set the active pane by pane ID and update active_doc_idx.
+    /// Set the active pane (of the focused window) by pane ID and update active_doc_idx.
     pub fn focusPane(self: *Editor, pane_id: u8) void {
-        if (pane_id < self.layout.panes.items.len) {
-            self.active_pane = pane_id;
-            switch (self.layout.panes.items[pane_id].content) {
+        const win = self.activeWindow();
+        if (pane_id < win.layout.panes.items.len) {
+            win.active_pane = pane_id;
+            switch (win.layout.panes.items[pane_id].content) {
                 .editor => |idx| self.active_doc_idx = idx,
                 .terminal => {},
             }
         }
     }
 
+    /// Give window `idx` the keyboard focus (no-op for a bad index).
+    pub fn focusWindow(self: *Editor, idx: usize) void {
+        if (idx >= self.windows.items.len) return;
+        self.active_window = idx;
+        self.ensureValidActivePane();
+        self.active_doc_idx = self.windowDocIdx(idx);
+    }
+
+    /// Focus pane `pane_id` of window `win_idx` — the frontends' click path.
+    pub fn focusPaneIn(self: *Editor, win_idx: usize, pane_id: u8) void {
+        self.focusWindow(win_idx);
+        self.focusPane(pane_id);
+    }
+
     /// Switch the active pane to show a specific document.
     pub fn paneShowDoc(self: *Editor, doc_idx: usize) void {
-        if (self.active_pane < self.layout.panes.items.len) {
-            self.layout.panes.items[self.active_pane].content = .{ .editor = doc_idx };
+        const win = self.activeWindow();
+        if (win.active_pane < win.layout.panes.items.len) {
+            win.layout.panes.items[win.active_pane].content = .{ .editor = doc_idx };
             self.active_doc_idx = doc_idx;
         }
     }
@@ -1989,68 +2108,76 @@ pub const Editor = struct {
         term.wake_fn = self.terminal_wake_fn;
         self.terminals.append(self.allocator, term) catch return;
         const term_idx = self.terminals.items.len - 1;
-        const new_pane = self.layout.splitPane(self.active_pane, direction, .{ .terminal = term_idx }) catch return;
-        self.active_pane = new_pane;
+        const win = self.activeWindow();
+        const new_pane = win.layout.splitPane(win.active_pane, direction, .{ .terminal = term_idx }) catch return;
+        win.active_pane = new_pane;
     }
 
     /// Close a terminal by index: stop PTY, close its pane, focus a neighbor.
     /// If it's the last live pane, convert it to an editor instead of closing.
     pub fn closeTerminal(self: *Editor, term_idx: usize) void {
         if (term_idx >= self.terminals.items.len) return;
-        // Find the pane showing this terminal
-        for (self.layout.panes.items, 0..) |pane, i| {
-            if (pane.content == .terminal and pane.content.terminal == term_idx) {
-                const pane_u8: u8 = @intCast(i);
-                if (self.active_pane == pane_u8) {
-                    if (self.layout.nextPane(self.active_pane)) |next| {
-                        self.active_pane = next;
-                    } else {
-                        self.active_pane = 0;
+        // Find the pane showing this terminal (at most one across all
+        // windows — invariant I6)
+        outer: for (self.windows.items) |win| {
+            for (win.layout.panes.items, 0..) |pane, i| {
+                if (pane.content == .terminal and pane.content.terminal == term_idx) {
+                    const pane_u8: u8 = @intCast(i);
+                    if (win.active_pane == pane_u8) {
+                        win.active_pane = win.layout.nextPane(pane_u8) orelse 0;
                     }
+                    const closed = win.layout.closePane(pane_u8);
+                    if (!closed) {
+                        // It's the last live pane — convert to editor so the user isn't stuck on a blank pane.
+                        win.layout.panes.items[i].content = .{ .editor = self.active_doc_idx };
+                        win.active_pane = pane_u8;
+                    }
+                    ensureValidActivePaneIn(win);
+                    break :outer;
                 }
-                const closed = self.layout.closePane(pane_u8);
-                if (!closed) {
-                    // It's the last live pane — convert to editor so the user isn't stuck on a blank pane.
-                    self.layout.panes.items[i].content = .{ .editor = self.active_doc_idx };
-                    self.active_pane = pane_u8;
-                }
-                break;
             }
         }
         // Deinit the terminal and null out the entry
-        if (self.terminals.items[term_idx]) |t| {
-            t.deinit();
-            self.terminals.items[term_idx] = null;
-        }
-        // Ensure active_pane is a valid leaf in the live tree
+        self.destroyTerminal(term_idx);
+        // Ensure the focused pane is a valid leaf in its live tree
         self.ensureValidActivePane();
         self.active_doc_idx = self.activeDocIdx();
     }
 
-    /// Make sure active_pane points to a real leaf in the layout tree.
-    /// If it doesn't, find the first valid leaf (preferring editor panes).
-    fn ensureValidActivePane(self: *Editor) void {
-        // Check if active_pane is actually a leaf in the tree
-        if (self.layout.findLeafNode(self.active_pane) != null) return;
-        // Not found — find first editor leaf, fallback to any leaf
-        if (self.layout.firstLeafPane(0)) |pid| {
-            self.active_pane = pid;
-        } else {
-            self.active_pane = 0;
+    /// Stop and free terminal `term_idx`, leaving a null slot (indices stay stable).
+    fn destroyTerminal(self: *Editor, term_idx: usize) void {
+        if (term_idx >= self.terminals.items.len) return;
+        if (self.terminals.items[term_idx]) |t| {
+            t.deinit();
+            self.terminals.items[term_idx] = null;
         }
+    }
+
+    /// Make sure `win.active_pane` points to a real leaf in its layout tree.
+    /// If it doesn't, fall back to the first leaf.
+    fn ensureValidActivePaneIn(win: *EditorWindow) void {
+        if (win.layout.findLeafNode(win.active_pane) != null) return;
+        win.active_pane = win.layout.firstLeafPane(0) orelse 0;
+    }
+
+    /// ensureValidActivePaneIn for the focused window.
+    fn ensureValidActivePane(self: *Editor) void {
+        ensureValidActivePaneIn(self.activeWindow());
     }
 
     /// Toggle terminal: focus existing terminal, or open one. If already in terminal, go back.
     pub fn toggleTerminal(self: *Editor) void {
-        // If currently in a terminal pane, focus the nearest non-terminal pane
+        // If currently in a terminal pane, focus the nearest non-terminal
+        // pane of the same window
         if (self.activePaneIsTerminal()) {
+            const win = self.activeWindow();
             var leaves: std.ArrayList(u8) = .empty;
             defer leaves.deinit(self.allocator);
-            self.layout.collectLeaves(0, &leaves) catch return;
+            win.layout.collectLeaves(0, &leaves) catch return;
             for (leaves.items) |pid| {
-                if (pid == self.active_pane) continue;
-                if (pid < self.layout.panes.items.len) {
-                    if (self.layout.panes.items[pid].content == .editor) {
+                if (pid == win.active_pane) continue;
+                if (pid < win.layout.panes.items.len) {
+                    if (win.layout.panes.items[pid].content == .editor) {
                         self.focusPane(pid);
                         return;
                     }
@@ -2065,12 +2192,7 @@ pub const Editor = struct {
 
     /// Close the active pane's terminal (if it is one).
     pub fn closeActiveTerminal(self: *Editor) void {
-        if (self.active_pane < self.layout.panes.items.len) {
-            switch (self.layout.panes.items[self.active_pane].content) {
-                .terminal => |idx| self.closeTerminal(idx),
-                .editor => {},
-            }
-        }
+        if (self.activePaneTerminalIdx()) |idx| self.closeTerminal(idx);
     }
 
     // ---- Language / syntax theme operations ----
@@ -2929,6 +3051,61 @@ test "fuzzy finder: filter, preview, commit and cancel" {
     try t.expectEqual(@as(usize, 2), editor.documents.items.len);
     editor.finderCommit();
     try t.expect(std.mem.endsWith(u8, editor.activeDoc().file_path.?, "alpha.zig"));
+}
+
+test "windows: primary only after init, splits stay in the focused window" {
+    const t = std.testing;
+    var editor = try Editor.init(t.allocator, t.io);
+    defer editor.deinit();
+    try t.expectEqual(@as(usize, 1), editor.windows.items.len);
+    try t.expectEqual(@as(u32, 0), editor.windows.items[0].id);
+    try t.expectEqual(@as(usize, 0), editor.active_window);
+    try t.expect(editor.isActivePane(0, 0));
+    try t.expect(!editor.isActivePane(1, 0));
+    try t.expectEqual(@as(usize, 1), editor.activeLayout().paneCount());
+
+    editor.splitActive(.horizontal);
+    try t.expectEqual(@as(usize, 2), editor.windows.items[0].layout.paneCount());
+    try t.expectEqual(editor.windows.items[0].active_pane, editor.activePaneId());
+    try t.expectEqual(@as(usize, 0), editor.windowDocIdx(0));
+    editor.closePaneAction();
+    try t.expectEqual(@as(usize, 1), editor.activeLayout().paneCount());
+    try t.expect(editor.activeLayout().findLeafNode(editor.activePaneId()) != null);
+}
+
+test "finder cancel repoints a pane split while the preview was showing" {
+    const t = std.testing;
+    const root = ".zig-cache/zide-test-finder-split";
+    std.Io.Dir.cwd().createDirPath(t.io, root) catch {};
+    {
+        const f = try std.Io.Dir.cwd().createFile(t.io, root ++ "/beta.zig", .{});
+        defer f.close(t.io);
+        try f.writeStreamingAll(t.io, "const b = 2;\n");
+    }
+    defer std.Io.Dir.cwd().deleteTree(t.io, root) catch {};
+
+    var editor = try Editor.init(t.allocator, t.io);
+    defer editor.deinit();
+    editor.filetree_root = try t.allocator.dupe(u8, root);
+
+    editor.finderOpen();
+    @memcpy(editor.finder_buf[0..4], "beta");
+    editor.finder_buf_len = 4;
+    editor.finderRefresh();
+    try t.expect(editor.finder_preview_appended);
+    const preview_idx = editor.documents.items.len - 1;
+    // A split made while the finder is open shows the preview document too
+    editor.splitActive(.horizontal);
+    for (editor.activeLayout().panes.items) |pane| {
+        try t.expectEqual(preview_idx, pane.content.editor);
+    }
+    // Escape pops the preview — no pane may keep pointing past the end
+    editor.finderCancel();
+    try t.expectEqual(@as(usize, 1), editor.documents.items.len);
+    for (editor.activeLayout().panes.items) |pane| {
+        try t.expect(pane.content.editor < editor.documents.items.len);
+    }
+    try t.expectEqual(@as(usize, 0), editor.active_doc_idx);
 }
 
 /// Test helper: bounded wait for the search worker to finish.

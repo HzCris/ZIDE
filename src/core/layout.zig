@@ -54,6 +54,7 @@ pub const Layout = struct {
             .free_panes = .empty,
             .allocator = allocator,
         };
+        errdefer layout.deinit();
         // Start with a single pane (pane 0) showing document 0
         try layout.panes.append(allocator, .{ .content = .{ .editor = 0 } });
         // Root node is a leaf pointing to pane 0
