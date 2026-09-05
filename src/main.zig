@@ -153,6 +153,7 @@ const welcome_text =
     \\//
     \\// Terminal & code intelligence
     \\//   Ctrl+`            toggle terminal    Ctrl+Shift+`     terminal in split
+    \\//   Ctrl+Alt+`        detach terminal to its own window (GUI)
     \\//   Ctrl+B            toggle file tree   Ctrl+Space       completion (LSP)
     \\//   F12               go to definition
     \\
@@ -415,6 +416,11 @@ fn runGui(allocator: std.mem.Allocator, io: std.Io, lua: *zlua.Lua, cli_files: [
     editor.clipboard_get_fn = &dvui.clipboardText;
     editor.clipboard_set_fn = &dvui.clipboardTextSet;
 
+    // Terminal output arrives on reader threads while the loop sleeps in
+    // waitEventTimeout — wake it so the grid repaints promptly (the TUI does
+    // the same through vaxis).
+    editor.terminal_wake_fn = &guiWake;
+
     var interrupted = false;
 
     main_loop: while (editor.running) {
@@ -451,6 +457,15 @@ fn runGui(allocator: std.mem.Allocator, io: std.Io, lua: *zlua.Lua, cli_files: [
 
     // Record the session for the next bare launch (no-op unless enabled).
     editor.saveSession();
+}
+
+/// Wake the GUI event loop from another thread (terminal reader threads):
+/// SDL_PushEvent is thread-safe and a user event ends waitEventTimeout.
+fn guiWake() void {
+    if (!build_options.has_gui) return;
+    var ue = std.mem.zeroes(SDLBackend.c.SDL_Event);
+    ue.type = SDLBackend.c.SDL_EVENT_USER;
+    _ = SDLBackend.c.SDL_PushEvent(&ue);
 }
 
 fn runTui(allocator: std.mem.Allocator, io: std.Io, lua: *zlua.Lua, cli_files: []const []const u8, project_dir: ?[]const u8) !void {

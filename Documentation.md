@@ -32,6 +32,7 @@
 | F12 | LSP go-to-definition |
 | Ctrl+` | Toggle terminal (bottom split) |
 | Ctrl+Shift+` | Open terminal (side-by-side split) |
+| Ctrl+Alt+` | Detach the focused terminal into its own OS window (GUI; TUI: second terminal at the side) |
 | Ctrl+B | Toggle file tree side panel |
 | Alt+Click | Add cursor at click position |
 | Shift+Alt+Drag (GUI) / Alt+Drag (TUI) | Block (column) selection — one cursor per line over the dragged column span |
@@ -217,7 +218,7 @@ Windows terminals commonly intercept Alt combos (Windows Terminal binds Alt+arro
   - Modal overlays (find/replace, palette, etc.) render in focused pane (with a terminal pane focused they render over the whole editor area instead)
   - Split/close/focus commands available in View menu and command palette
 - Multiple OS windows (View menu, command palette, Ctrl+Shift+N)
-  - `open_in_new_window` shows the current document in a new window (the source pane keeps its view); `move_pane_to_new_window` moves the focused pane there — a window's only pane leaves an editor view behind, and a terminal is never shown twice
+  - `open_in_new_window` shows the current document in a new window (the source pane keeps its view); `move_pane_to_new_window` moves the focused pane there — a window's only pane leaves an editor view behind, and a terminal is never shown twice; `detach_terminal` (Ctrl+Alt+`) is the terminal-pane shortcut for that move
   - Every window has its own split tree and focused pane; the window with OS keyboard focus is the active one (clicking a window's title bar is enough). Keys, IME and modal prompts follow the active pane; switching windows cancels a transient prompt (finder, palette, find bar, confirm) instead of letting it act on another window's document
   - The tab bar is global (all documents) in every window and highlights the document shown in *that* window; the status bar shows that window's document
   - The file tree and the search panel live in the main window only — their commands (Ctrl+B, Ctrl+Shift+F, Reveal in Tree) bring the main window forward
@@ -798,7 +799,11 @@ ZIDE includes a built-in terminal emulator that integrates with the split pane s
 | Command | Keybind | Description |
 |---------|---------|-------------|
 | `toggle_terminal` | `Ctrl+\`` | Open/focus/unfocus terminal |
+| `open_terminal_right` | `Ctrl+Shift+\`` | Open a terminal in a side-by-side split |
 | `close_terminal` | — | Close the active terminal pane |
+| `detach_terminal` | `Ctrl+Alt+\`` | Move the focused terminal into its own OS window (GUI; TUI: a second terminal at the side) |
+
+While a terminal pane is focused, typing goes to the shell — only the pane / window / terminal management chords are let through (toggle, close, detach, focus next/prev pane, close window, open terminal right), in both frontends. A detached terminal window shows just the shell (plus menu/status bar per `secondary_window_chrome`); closing that window ends the shell, and `toggle_terminal` inside it reports "No editor pane in this window" instead of jumping to another window. On Linux, closing a terminal gives the shell ~500 ms after SIGHUP before it is killed, so a stubborn child cannot hang the editor.
 
 ### Architecture
 - **`src/core/pty.zig`** — Cross-platform PTY abstraction (ConPTY on Windows, posix on Linux)

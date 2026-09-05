@@ -240,6 +240,7 @@ pub fn registerBuiltins(registry: *CommandRegistry) !void {
     try registry.register("open_in_new_window", "Show the current document in a new window (TUI: split)", cmdOpenInNewWindow);
     try registry.register("move_pane_to_new_window", "Move the focused pane into a new window (TUI: split)", cmdMovePaneToNewWindow);
     try registry.register("close_window", "Close this window (main window: quit)", cmdCloseWindow);
+    try registry.register("detach_terminal", "Move the focused terminal into its own window (TUI: side split)", cmdDetachTerminal);
     // Theme commands (set both frontends)
     try registry.register("theme_dark", "Switch to dark theme (both frontends)", cmdThemeDark);
     try registry.register("theme_light", "Switch to light theme (both frontends)", cmdThemeLight);
@@ -1158,6 +1159,10 @@ fn cmdMovePaneToNewWindow(editor: *Editor, _: ?[]const u8) void {
 
 fn cmdCloseWindow(editor: *Editor, _: ?[]const u8) void {
     _ = editor.execAction("close_window");
+}
+
+fn cmdDetachTerminal(editor: *Editor, _: ?[]const u8) void {
+    _ = editor.execAction("detach_terminal");
 }
 
 fn isWordCharByte(byte: u8) bool {

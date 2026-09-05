@@ -127,6 +127,7 @@ pub const KeybindMap = struct {
         // Terminal
         try self.set("ctrl+`", "toggle_terminal");
         try self.set("ctrl+shift+`", "open_terminal_right");
+        try self.set("ctrl+alt+`", "detach_terminal");
         // File tree
         try self.set("ctrl+b", "toggle_filetree");
     }
@@ -176,4 +177,5 @@ test "keybind defaults" {
     // Windows
     try std.testing.expectEqualStrings("open_in_new_window", kb.get("ctrl+shift+n").?);
     try std.testing.expectEqualStrings("open_in_new_window", kb.get("ctrl+alt+n").?);
+    try std.testing.expectEqualStrings("detach_terminal", kb.get("ctrl+alt+`").?);
 }

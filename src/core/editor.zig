@@ -1744,6 +1744,10 @@ pub const Editor = struct {
             self.requestCloseWindow(self.active_window);
             return true;
         }
+        if (std.mem.eql(u8, action, "detach_terminal")) {
+            self.detachTerminal();
+            return true;
+        }
         // Terminal actions — work in both frontends. (An old gate claimed the
         // TUI "can't host PTYs"; it can — terminal-in-terminal is how vim's
         // :terminal works, the TUI renders the grid as cells, and the reader
@@ -2256,6 +2260,31 @@ pub const Editor = struct {
         } else if (content == .terminal) {
             src.layout.panes.items[src_pane].content = .{ .editor = self.active_doc_idx };
         }
+    }
+
+    /// Move the focused terminal pane into its own window (Ctrl+Alt+`).
+    /// Without window support (TUI, -Dgpu) a second terminal opens at the side.
+    pub fn detachTerminal(self: *Editor) void {
+        if (!self.activePaneIsTerminal()) {
+            self.status_message = "Focus a terminal pane to detach it";
+            return;
+        }
+        self.movePaneToNewWindow();
+    }
+
+    /// Chords a focused terminal pane must not swallow: the pane / window /
+    /// terminal management bindings (everything else is typed into the
+    /// shell). Returns the bound action for `combo` when it is one of those.
+    pub fn terminalPassthroughAction(self: *Editor, combo: []const u8) ?[]const u8 {
+        const action = self.lookupKeybind(combo) orelse return null;
+        const allowed = [_][]const u8{
+            "toggle_terminal",   "close_terminal", "close_pane",   "detach_terminal",
+            "open_terminal_right", "focus_next_pane", "focus_prev_pane", "close_window",
+        };
+        for (allowed) |a| {
+            if (std.mem.eql(u8, action, a)) return action;
+        }
+        return null;
     }
 
     /// Title for window `win_idx`: "ZIDE — <document>[*]" / "ZIDE — Terminal".
@@ -3548,6 +3577,33 @@ test "windows: switching windows cancels transient prompts; stale completions ar
     editor.acceptCompletion();
     try t.expect(!editor.completion_active);
     try t.expectEqual(@as(usize, 0), editor.completion_items.items.len);
+}
+
+test "windows: detach_terminal guard, move, and terminal passthrough chords" {
+    const t = std.testing;
+    var editor = try Editor.init(t.allocator, t.io);
+    defer editor.deinit();
+    try editor.keybinds.loadDefaults();
+    editor.multi_window_supported = true;
+    try t.expect(editor.execAction("detach_terminal"));
+    try t.expectEqualStrings("Focus a terminal pane to detach it", editor.status_message);
+    try t.expectEqual(@as(usize, 1), editor.windows.items.len);
+
+    try editor.terminals.append(t.allocator, null);
+    editor.windows.items[0].layout.panes.items[0].content = .{ .terminal = 0 };
+    try t.expect(editor.execAction("detach_terminal"));
+    try t.expectEqual(@as(usize, 2), editor.windows.items.len);
+    try t.expectEqual(@as(usize, 1), editor.active_window);
+    try t.expect(editor.activePaneIsTerminal());
+    // The primary kept an editor view — a terminal is never shown twice
+    try t.expect(editor.windows.items[0].layout.panes.items[0].content == .editor);
+
+    // Terminal panes let the management chords through, nothing else
+    try t.expectEqualStrings("toggle_terminal", editor.terminalPassthroughAction("ctrl+`").?);
+    try t.expectEqualStrings("detach_terminal", editor.terminalPassthroughAction("ctrl+alt+`").?);
+    try t.expectEqualStrings("close_pane", editor.terminalPassthroughAction("ctrl+alt+q").?);
+    try t.expect(editor.terminalPassthroughAction("ctrl+s") == null);
+    try t.expect(editor.terminalPassthroughAction("ctrl+c") == null);
 }
 
 /// Test helper: bounded wait for the search worker to finish.

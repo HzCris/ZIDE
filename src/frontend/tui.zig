@@ -490,9 +490,19 @@ fn dispatchKey(editor: *Editor, key: Key) void {
 /// Handle key events when focused on a terminal pane.
 fn handleTerminalKey(editor: *Editor, key: Key) void {
     // ctrl+backtick (`) toggles back to editor
-    if (key.codepoint == '`' and key.mods.ctrl) {
+    if (key.codepoint == '`' and key.mods.ctrl and !key.mods.alt) {
         editor.toggleTerminal();
         return;
+    }
+    // Pane / window / terminal management chords (ctrl+alt+q close,
+    // ctrl+alt+` detach, F6 focus, ...) are not typed into the shell.
+    var kbuf: [64]u8 = undefined;
+    const combo = keyToStr(key, &kbuf);
+    if (combo.len > 0) {
+        if (editor.terminalPassthroughAction(combo)) |action| {
+            _ = editor.execAction(action);
+            return;
+        }
     }
 
     // Get the active terminal

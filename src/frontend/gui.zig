@@ -773,6 +773,10 @@ fn menuBar(editor: *Editor) void {
                 _ = editor.execAction("close_window");
                 m.close();
             }
+            if (dvui.menuItemLabel(@src(), "Detach Terminal  Ctrl+Alt+`", .{}, .{ .expand = .horizontal }) != null) {
+                _ = editor.execAction("detach_terminal");
+                m.close();
+            }
         }
 
         // ---- Preferences ----
@@ -4130,18 +4134,22 @@ fn handleTerminalKeyEvents(editor: *Editor, term: *terminal_mod.Terminal, wd: *d
                     key.code == .left_alt or key.code == .right_alt or
                     key.code == .left_command or key.code == .right_command) continue;
 
-                // ctrl+alt+q → close terminal pane
-                if (key.mod.control() and key.mod.alt() and key.code == .q) {
-                    e.handle(@src(), wd);
-                    editor.closeActiveTerminal();
-                    return true; // terminal is freed, caller must stop
-                }
-
-                // ctrl+backtick → toggle terminal
-                if (key.mod.control() and key.code == .grave) {
-                    e.handle(@src(), wd);
-                    editor.toggleTerminal();
-                    continue;
+                // Pane / window / terminal management chords (ctrl+` toggle,
+                // ctrl+alt+q close, ctrl+alt+` detach, F6 focus, ...) are not
+                // typed into the shell. They mutate the layout, so they run
+                // after the panes finished rendering (deferred_action).
+                if (key.mod.control() or key.mod.alt()) {
+                    var kbuf: [64]u8 = undefined;
+                    var action = editor.terminalPassthroughAction(dvuiKeyToStr(key, &kbuf));
+                    if (action == null and key.mod.shift()) {
+                        var kbuf2: [64]u8 = undefined;
+                        action = editor.terminalPassthroughAction(dvuiKeyToStrNoShift(key, &kbuf2));
+                    }
+                    if (action) |a| {
+                        e.handle(@src(), wd);
+                        deferred_action = a;
+                        continue;
+                    }
                 }
 
                 // Special keys (arrows, enter, backspace, etc.)

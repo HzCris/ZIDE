@@ -335,11 +335,26 @@ pub const Pty = struct {
     fn deinitLinux(self: *Pty) void {
         if (!is_linux) unreachable;
         if (self.child_pid) |pid| {
-            // Send SIGHUP to gracefully terminate
+            // Ask nicely, then give the shell ~500 ms before SIGKILL: a child
+            // that ignores HUP would otherwise park every window in a
+            // blocking waitpid (closing a detached terminal window ends here).
             std.posix.kill(pid, std.posix.SIG.HUP) catch {};
-            // Reap child (std.posix.waitpid was removed in 0.16)
             var status: c_int = 0;
-            _ = std.c.waitpid(pid, &status, 0);
+            var reaped = false;
+            var waited_ms: usize = 0;
+            while (waited_ms < 500) : (waited_ms += 10) {
+                // (std.posix.waitpid was removed in 0.16)
+                if (std.c.waitpid(pid, &status, std.c.W.NOHANG) != 0) {
+                    reaped = true;
+                    break;
+                }
+                const ts: std.c.timespec = .{ .sec = 0, .nsec = 10 * std.time.ns_per_ms };
+                _ = std.c.nanosleep(&ts, null);
+            }
+            if (!reaped) {
+                std.posix.kill(pid, std.posix.SIG.KILL) catch {};
+                _ = std.c.waitpid(pid, &status, 0);
+            }
         }
         if (self.master_fd) |fd| _ = std.c.close(fd);
     }
