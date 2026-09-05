@@ -49,6 +49,7 @@
 | Ctrl+Tab / Ctrl+Shift+Tab | Next / previous document tab |
 | Ctrl+PageDown / Ctrl+PageUp | Next / previous document tab |
 | Alt+Right / Alt+Left | Focus next / previous split pane |
+| Ctrl+Shift+N | Open the current document in a new OS window (GUI; also Ctrl+Alt+N — the TUI splits instead) |
 | Ctrl+Shift+S | Save As |
 | Alt+\ | Split pane vertically (side by side) |
 | Alt+Shift+\ | Split pane horizontally (top/bottom) |
@@ -123,6 +124,7 @@ Windows terminals commonly intercept Alt combos (Windows Terminal binds Alt+arro
 - Nested splits supported (binary layout tree)
 - Pane separators rendered with box-drawing characters
 - Close pane (Ctrl+Alt+Q), focus next/prev (Alt+Right/Alt+Left)
+- One window only: the window commands (`open_in_new_window` / Ctrl+Shift+N, `move_pane_to_new_window`, `close_window`) fall back to splits here
 
 **Documents / File I/O:**
 - Multi-document tabs (Ctrl+N new, Ctrl+W close, open by path)
@@ -133,13 +135,13 @@ Windows terminals commonly intercept Alt combos (Windows Terminal binds Alt+arro
 - External change detection: open files are polled (~1.5s, same cadence as the file tree probe) — clean buffers reload in place with the cursor preserved; dirty buffers are flagged and saving asks `[O]verwrite [R]eload [C]ancel` instead of silently clobbering; auto-save skips flagged files; a file deleted on disk marks its buffer dirty so the content survives and can be re-saved
 - Dirty tracking
 - Unsaved changes prompt on quit (Save/Discard/Cancel)
-- Session persistence (opt-in: `zide.set("session_persistence", true)` or the Settings dialog): on quit the open files, cursor positions, scroll offsets and active tab are written to `~/.config/zide/session`; launching ZIDE without file arguments restores them (missing files are skipped, untitled buffers are not recorded). Applies to both frontends.
+- Session persistence (opt-in: `zide.set("session_persistence", true)` or the Settings dialog): on quit the open files, cursor positions, scroll offsets and active tab are written to `~/.config/zide/session`; launching ZIDE without file arguments restores them (missing files are skipped, untitled buffers are not recorded). Applies to both frontends. Windows and split layouts are not part of the session — everything reopens in the main window.
 
 **Configuration:**
 - Config folder hierarchy: `~/.config/zide/` with `themes/` and `extensions/` subfolders
 - Lua settings file (`~/.config/zide/init.lua`)
   - `zide.set_language(name, { tab_width = 2, use_tabs = false, word_wrap = true, auto_close_brackets = false })` — per-language overrides of those four settings for files of that language (merge: only the keys given change; name matched case-insensitively; works for built-ins and for languages registered later); `zide.get_language(name)` reads the overrides back (nil when none)
-  - `zide.set(key, value)` — tab_width, use_tabs, word_wrap, auto_close_brackets (global defaults — see `zide.set_language`), page_size, auto_save, auto_save_interval_ms, click_clears_cursors, max_undo_history, session_persistence, filetree_visible, filetree_side ("left"/"right"), filetree_width (GUI px), tui_filetree_width (columns), filetree_root (starting directory, "" = cwd), lsp_enabled (off = no language servers; running ones stop on the next frame), syntax_highlighting (off = plain-text look), filetree_git_colors (off = no git status colors/subprocesses)
+  - `zide.set(key, value)` — tab_width, use_tabs, word_wrap, auto_close_brackets (global defaults — see `zide.set_language`), page_size, auto_save, auto_save_interval_ms, click_clears_cursors, max_undo_history, session_persistence, filetree_visible, filetree_side ("left"/"right"), filetree_width (GUI px), tui_filetree_width (columns), filetree_root (starting directory, "" = cwd), lsp_enabled (off = no language servers; running ones stop on the next frame), syntax_highlighting (off = plain-text look), filetree_git_colors (off = no git status colors/subprocesses), secondary_window_chrome (GUI: menu bar + status bar in extra windows; false = bare pane containers)
   - `zide.set("mono_font_path", "/path/to/font.ttf")` — use a custom monospace font (e.g. a Nerd Font for box-drawing and powerline glyphs in the embedded terminal)
   - `zide.set("mono_font_size", 14)` — override the default monospace font size
   - `zide.set("tui_theme", name)` — switch TUI theme ("terminal", "dark", "light", "high_contrast")
@@ -212,8 +214,17 @@ Windows terminals commonly intercept Alt combos (Windows Terminal binds Alt+arro
   - Click to focus pane, focused pane highlighted with border
   - Close pane (Ctrl+Alt+Q), navigate via command palette (`focus_next_pane`, `focus_prev_pane`)
   - Each pane shows its own document independently, keyboard input goes to focused pane only
-  - Modal overlays (find/replace, palette, etc.) render in focused pane
+  - Modal overlays (find/replace, palette, etc.) render in focused pane (with a terminal pane focused they render over the whole editor area instead)
   - Split/close/focus commands available in View menu and command palette
+- Multiple OS windows (View menu, command palette, Ctrl+Shift+N)
+  - `open_in_new_window` shows the current document in a new window (the source pane keeps its view); `move_pane_to_new_window` moves the focused pane there — a window's only pane leaves an editor view behind, and a terminal is never shown twice
+  - Every window has its own split tree and focused pane; the window with OS keyboard focus is the active one (clicking a window's title bar is enough). Keys, IME and modal prompts follow the active pane; switching windows cancels a transient prompt (finder, palette, find bar, confirm) instead of letting it act on another window's document
+  - The tab bar is global (all documents) in every window and highlights the document shown in *that* window; the status bar shows that window's document
+  - The file tree and the search panel live in the main window only — their commands (Ctrl+B, Ctrl+Shift+F, Reveal in Tree) bring the main window forward
+  - `secondary_window_chrome` (Settings dialog / init.lua, default true): menu bar + status bar in extra windows; false = bare pane containers
+  - Closing an extra window (OS close button, `close_window`, closing its last pane) closes only its views — documents stay open; a terminal shown only there is stopped. Closing the main window, File > Exit and Ctrl+Q all go through the unsaved-changes prompt
+  - Up to 4 extra windows (dvui's SDL window limit); a 5th is refused with a status message
+  - Needs the SDL3 renderer backend (the default build) — the `-Dgpu` build has no child windows and the commands split instead, as in the TUI. The vendored dvui carries three ZIDE patches for this (drop hook window id, child teardown order, cursor ownership) — grep `ZIDE patch` in `libs/dvui` and re-apply after refreshing the snapshot
 - Theme system: 3 built-in themes (dark, light, high-contrast) with custom DVUI themes
   - `zide.set("theme", "dark")` / `"light"` / `"high_contrast"` — switch preset
   - `zide.set("color_*", "#RRGGBB")` or `"#RRGGBBAA"` — override individual colors
@@ -222,7 +233,7 @@ Windows terminals commonly intercept Alt combos (Windows Terminal binds Alt+arro
 - Menu bar reorganized:
   - File: New, Open File, Save, Save As, Close Tab, Exit
   - Edit: Undo, Redo, Cut, Copy, Paste, Select All, Find, Replace, Go to Line
-  - View: Command Palette, Next Tab, Prev Tab, Split Vertical, Split Horizontal, Close Pane
+  - View: Command Palette, File Tree, Reveal in Tree, Next Tab, Prev Tab, Split Vertical, Split Horizontal, Close Pane, Open in New Window, Move Pane to New Window, Close Window
   - Preferences: Settings, Open Settings File, Theme > (Dark / Light / High Contrast), Open Theme File, Open Theme Folder
   - Help: Documentation, About ZIDE
 - Theme switcher: Preferences > Theme submenu switches themes live (updates editor + DVUI chrome, persists to init.lua)
@@ -670,7 +681,7 @@ Press **F12** to jump to the definition of the symbol under the cursor. If the d
 | `src/core/cursor.zig` | Cursor and CursorSet (multi-cursor data model) |
 | `src/core/undo.zig` | Undo/redo history |
 | `src/core/commands.zig` | Command registry and all built-in commands |
-| `src/core/editor.zig` | Editor state (documents, mode, settings) |
+| `src/core/editor.zig` | Editor state (documents, windows — each a split layout + focused pane, mode, settings) |
 | `src/core/keybind.zig` | Data-driven keybinding map |
 | `src/core/syntax.zig` | Syntax highlighting engine (tokenizer, LanguageDef, built-in Zig) |
 | `src/core/theme.zig` | Theme system (ThemeColor, EditorTheme, TuiTheme, SyntaxTheme, presets) |

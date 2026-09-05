@@ -309,7 +309,9 @@ fn preventWindowForkBomb() void {
     const too_many_win_msg = "Too many SDL window open. This is preventing fork bombs while hacking on multi os windows, and this limitation will be lifted once stuff are more stable";
     if (sdl3) {
         var count: c_int = 0;
-        _ = c.SDL_GetWindows(&count);
+        // ZIDE patch: SDL_GetWindows hands back an allocated array — free it.
+        const wins = c.SDL_GetWindows(&count);
+        if (wins != null) c.SDL_free(@ptrCast(wins));
         if (count > 5) {
             log.err(too_many_win_msg, .{});
             std.process.exit(1);
@@ -544,9 +546,20 @@ fn addEventWinRecursive(self: *SDLBackend, event: *c.SDL_Event, win: *dvui.Windo
     return false;
 }
 
+/// ZIDE patch: the SDL cursor is process-global while every backend
+/// instance caches its own last cursor — with several windows the primary
+/// (which ends its frame last) would revert a child's hover cursor every
+/// frame. Only the window under the pointer sets the cursor, and the
+/// per-instance cache is synced from this shared value first.
+var cursor_global_last: dvui.enums.Cursor = .arrow;
+
 pub fn setCursor(self: *SDLBackend, cursor: dvui.enums.Cursor) void {
+    const mouse_focus: ?*c.SDL_Window = c.SDL_GetMouseFocus();
+    if (mouse_focus != null and mouse_focus != self.window) return;
+    self.cursor_last = cursor_global_last;
     if (cursor == self.cursor_last) return;
     defer self.cursor_last = cursor;
+    defer cursor_global_last = cursor;
     const new_shown_state = if (cursor == .hidden) false else if (self.cursor_last == .hidden) true else null;
     if (new_shown_state) |new_state| {
         if (self.cursorShow(new_state) == new_state) {

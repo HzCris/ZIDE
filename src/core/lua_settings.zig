@@ -410,6 +410,14 @@ fn luaSet(state: ?*zlua.LuaState) callconv(.c) c_int {
     const key = lua.toString(1) catch return 0;
     const key_str: []const u8 = key;
 
+    // Theme, colors and the mono font feed dvui's per-window theme — every
+    // GUI window re-applies its theme when this revision moves.
+    if (std.mem.eql(u8, key_str, "theme") or std.mem.eql(u8, key_str, "mono_font_size") or
+        std.mem.eql(u8, key_str, "mono_font_path") or std.mem.startsWith(u8, key_str, "color_"))
+    {
+        editor.theme_revision +%= 1;
+    }
+
     if (std.mem.eql(u8, key_str, "tab_width")) {
         const val = lua.toInteger(2) catch return 0;
         if (val >= 1 and val <= 16) {
@@ -442,6 +450,9 @@ fn luaSet(state: ?*zlua.LuaState) callconv(.c) c_int {
         editor.click_clears_cursors = lua.toBoolean(2);
     } else if (std.mem.eql(u8, key_str, "session_persistence")) {
         editor.session_persistence = lua.toBoolean(2);
+    } else if (std.mem.eql(u8, key_str, "secondary_window_chrome")) {
+        // GUI: menu + status bar in extra windows (false = bare pane containers)
+        editor.secondary_window_chrome = lua.toBoolean(2);
     } else if (std.mem.eql(u8, key_str, "lsp_enabled")) {
         // Takes effect on the next frame: servers stop, or may start lazily.
         editor.lsp_enabled = lua.toBoolean(2);
@@ -672,6 +683,9 @@ fn luaGet(state: ?*zlua.LuaState) callconv(.c) c_int {
         return 1;
     } else if (std.mem.eql(u8, key_str, "session_persistence")) {
         lua.pushBoolean(editor.session_persistence);
+        return 1;
+    } else if (std.mem.eql(u8, key_str, "secondary_window_chrome")) {
+        lua.pushBoolean(editor.secondary_window_chrome);
         return 1;
     } else if (std.mem.eql(u8, key_str, "lsp_enabled")) {
         lua.pushBoolean(editor.lsp_enabled);

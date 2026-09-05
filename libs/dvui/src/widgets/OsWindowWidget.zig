@@ -24,8 +24,11 @@ pub const ChildOsWindow = struct {
     has_begin: bool = false,
 
     pub fn deinit(self: ChildOsWindow, alloc: std.mem.Allocator) void {
-        self.backend.deinit();
+        // ZIDE patch: the dvui window frees its textures/fonts THROUGH the
+        // renderer, so it has to go first (upstream destroyed the renderer
+        // before the window and relied on SDL3 validating dead handles).
         self.dvui_win.deinit();
+        self.backend.deinit();
         alloc.destroy(self.backend);
         alloc.destroy(self.dvui_win);
     }

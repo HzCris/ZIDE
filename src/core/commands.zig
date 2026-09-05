@@ -236,6 +236,10 @@ pub fn registerBuiltins(registry: *CommandRegistry) !void {
     try registry.register("close_pane", "Close current pane", cmdClosePane);
     try registry.register("focus_next_pane", "Focus next pane", cmdFocusNextPane);
     try registry.register("focus_prev_pane", "Focus previous pane", cmdFocusPrevPane);
+    // Window commands (GUI; the TUI splits instead)
+    try registry.register("open_in_new_window", "Show the current document in a new window (TUI: split)", cmdOpenInNewWindow);
+    try registry.register("move_pane_to_new_window", "Move the focused pane into a new window (TUI: split)", cmdMovePaneToNewWindow);
+    try registry.register("close_window", "Close this window (main window: quit)", cmdCloseWindow);
     // Theme commands (set both frontends)
     try registry.register("theme_dark", "Switch to dark theme (both frontends)", cmdThemeDark);
     try registry.register("theme_light", "Switch to light theme (both frontends)", cmdThemeLight);
@@ -1144,6 +1148,18 @@ fn cmdFocusPrevPane(editor: *Editor, _: ?[]const u8) void {
     _ = editor.execAction("focus_prev_pane");
 }
 
+fn cmdOpenInNewWindow(editor: *Editor, _: ?[]const u8) void {
+    _ = editor.execAction("open_in_new_window");
+}
+
+fn cmdMovePaneToNewWindow(editor: *Editor, _: ?[]const u8) void {
+    _ = editor.execAction("move_pane_to_new_window");
+}
+
+fn cmdCloseWindow(editor: *Editor, _: ?[]const u8) void {
+    _ = editor.execAction("close_window");
+}
+
 fn isWordCharByte(byte: u8) bool {
     return std.ascii.isAlphanumeric(byte) or byte == '_';
 }
@@ -1156,6 +1172,8 @@ fn setGuiTheme(editor: *Editor, name: []const u8, preset: theme_mod.EditorTheme,
     // them, so live theme switches left a stale syntax palette.
     editor.syntax_theme = syn;
     editor.theme_name = name;
+    // Every GUI window re-applies its dvui chrome theme on the next frame.
+    editor.theme_revision +%= 1;
     var val_buf: [32]u8 = undefined;
     const quoted = std.fmt.bufPrint(&val_buf, "\"{s}\"", .{name}) catch return;
     lua_settings.writeSettingToFile("theme", quoted) catch {};

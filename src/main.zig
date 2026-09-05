@@ -144,6 +144,7 @@ const welcome_text =
     \\//   Ctrl+Shift+Tab    previous tab       (also Ctrl+PgDn / Ctrl+PgUp)
     \\//   Alt+\             split vertical     Alt+Shift+\      split horizontal
     \\//   Alt+Left/Right    focus pane         Ctrl+Alt+Q       close split pane
+    \\//   Ctrl+Shift+N      open in new window (GUI; also Ctrl+Alt+N; TUI: split)
     \\//
     \\// Terminal eats Alt+...? These always work:
     \\//   Ctrl+\            split vertical     Ctrl+Shift+\     split horizontal
@@ -404,6 +405,11 @@ fn runGui(allocator: std.mem.Allocator, io: std.Io, lua: *zlua.Lua, cli_files: [
     // applyWindowFonts on creation — every dvui.Window has its own font database.
     gui.loadMonoFont(&g, &editor, io);
     gui.applyWindowFonts(&win, &g, &editor);
+    g.primary().theme_gen_applied = editor.theme_revision;
+
+    // Extra OS windows need the SDL3 renderer backend (the -Dgpu build has
+    // none — the window commands split instead).
+    editor.multi_window_supported = dvui.Backend.support_child_os_wins;
 
     // Use SDL3/DVUI native clipboard (works on Wayland where wl-paste subprocess may not).
     editor.clipboard_get_fn = &dvui.clipboardText;

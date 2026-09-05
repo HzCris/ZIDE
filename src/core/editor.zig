@@ -186,6 +186,10 @@ pub const Editor = struct {
     mono_font_path: []const u8 = "",
     /// Base size for the monospace font. 0 = DVUI default.
     mono_font_size: f32 = 0,
+    /// Bumped by every change to the GUI theme, colors or mono font (menu,
+    /// palette, Lua zide.set). Each GUI window re-applies its dvui theme
+    /// when its applied revision differs — dvui themes are per window.
+    theme_revision: u32 = 1,
 
     /// Optional wake callback copied onto every spawned Terminal so its
     /// reader thread can unblock a blocking frontend event loop (the TUI
@@ -233,6 +237,12 @@ pub const Editor = struct {
     completion_active: bool = false,
     /// Currently selected completion item index.
     completion_selected: usize = 0,
+    /// Document the completion request was made for — acceptance is refused
+    /// (and the list dropped) when the active document changed meanwhile.
+    completion_doc_idx: usize = 0,
+    /// Document the .confirm_overwrite prompt was opened for (tab clicks and
+    /// window switches must not redirect Overwrite/Reload to another file).
+    confirm_overwrite_doc: usize = 0,
 
     /// Registered language servers: the built-in zls seed plus every
     /// zide.register_lsp call. Newest registration wins per language
@@ -1616,6 +1626,7 @@ pub const Editor = struct {
             // don't clobber it silently; let the user decide.
             if (doc.file_path != null and doc.checkExternalChange(self.io)) {
                 doc.external_changed = true;
+                self.confirm_overwrite_doc = self.activeDocIdx();
                 self.mode = .confirm_overwrite;
                 return true;
             }
@@ -1718,6 +1729,19 @@ pub const Editor = struct {
         }
         if (std.mem.eql(u8, action, "focus_prev_pane")) {
             self.focusPrevPane();
+            return true;
+        }
+        // Window actions (GUI; the TUI and unsupported backends split instead)
+        if (std.mem.eql(u8, action, "open_in_new_window")) {
+            self.openInNewWindow();
+            return true;
+        }
+        if (std.mem.eql(u8, action, "move_pane_to_new_window")) {
+            self.movePaneToNewWindow();
+            return true;
+        }
+        if (std.mem.eql(u8, action, "close_window")) {
+            self.requestCloseWindow(self.active_window);
             return true;
         }
         // Terminal actions — work in both frontends. (An old gate claimed the
@@ -1833,10 +1857,15 @@ pub const Editor = struct {
 
     pub const OverwriteChoice = enum { overwrite, reload, cancel };
 
-    /// Resolve the .confirm_overwrite prompt for the active document.
+    /// Resolve the .confirm_overwrite prompt for the document it was opened
+    /// for (confirm_overwrite_doc), not whatever is active when answered.
     pub fn resolveOverwrite(self: *Editor, choice: OverwriteChoice) void {
-        const doc = self.activeDoc();
         self.mode = .normal;
+        if (self.confirm_overwrite_doc >= self.documents.items.len) {
+            self.status_message = "Save cancelled (the document was closed)";
+            return;
+        }
+        const doc = &self.documents.items[self.confirm_overwrite_doc];
         switch (choice) {
             .overwrite => {
                 doc.save(self.io) catch |err| {
@@ -2010,6 +2039,11 @@ pub const Editor = struct {
     pub fn closePaneAction(self: *Editor) void {
         const win = self.activeWindow();
         if (win.layout.paneCount() <= 1) {
+            // The only pane of a secondary window: closing it closes the window.
+            if (self.active_window != 0) {
+                self.requestCloseWindow(self.active_window);
+                return;
+            }
             // Common confusion: panes are splits, not tabs. Say so instead
             // of silently doing nothing.
             self.status_message = "No split panes open — Ctrl+W closes the current tab";
@@ -2066,6 +2100,16 @@ pub const Editor = struct {
     /// Give window `idx` the keyboard focus (no-op for a bad index).
     pub fn focusWindow(self: *Editor, idx: usize) void {
         if (idx >= self.windows.items.len) return;
+        if (idx != self.active_window) {
+            // A prompt or popup opened in one window must not resolve
+            // against another window's document — leave it on the way out.
+            self.cancelTransientMode();
+            // The file tree and search panel live in the primary window.
+            if (idx != 0) {
+                self.filetree_focused = false;
+                self.search_focused = false;
+            }
+        }
         self.active_window = idx;
         self.ensureValidActivePane();
         self.active_doc_idx = self.windowDocIdx(idx);
@@ -2077,13 +2121,189 @@ pub const Editor = struct {
         self.focusPane(pane_id);
     }
 
-    /// Switch the active pane to show a specific document.
+    /// Show document `doc_idx` in window `win_idx` (a window's tab bar).
+    pub fn showDocIn(self: *Editor, win_idx: usize, doc_idx: usize) void {
+        self.focusWindow(win_idx);
+        self.switchToDoc(doc_idx);
+    }
+
+    /// Leave any transient modal (finder, palette, find bars, prompts) and
+    /// drop a pending completion list. The settings dialog stays open (it
+    /// follows the focused window).
+    pub fn cancelTransientMode(self: *Editor) void {
+        switch (self.mode) {
+            .normal, .settings => {},
+            .file_finder => self.finderCancel(),
+            .filetree_prompt => self.cancelFiletreePrompt(),
+            else => self.mode = .normal,
+        }
+        self.clearCompletionItems();
+    }
+
+    // ---- Windows: create / close ----
+
+    /// Open a new window whose single pane shows `content` and focus it.
+    /// error.Unsupported when the frontend cannot host OS windows (callers
+    /// fall back to a split); error.TooManyWindows at the cap (status set).
+    pub fn newWindow(self: *Editor, content: PaneContent) WindowError!usize {
+        if (!self.multi_window_supported) return error.Unsupported;
+        if (self.windows.items.len - 1 >= self.max_secondary_windows) {
+            self.status_message = std.fmt.bufPrint(&self.status_buf, "Window limit reached ({d} extra windows)", .{self.max_secondary_windows}) catch "Window limit reached";
+            return error.TooManyWindows;
+        }
+        const win = try self.allocator.create(EditorWindow);
+        errdefer self.allocator.destroy(win);
+        win.* = .{ .id = self.next_window_id, .layout = try Layout.init(self.allocator) };
+        errdefer win.layout.deinit();
+        win.layout.panes.items[0].content = content;
+        try self.windows.append(self.allocator, win);
+        self.next_window_id += 1;
+        const idx = self.windows.items.len - 1;
+        self.focusWindow(idx);
+        return idx;
+    }
+
+    /// Close window `idx` now: its views go away, the documents stay open,
+    /// terminals shown there are stopped (invariant I6 — they are shown
+    /// nowhere else). Never closes the primary. Frontends should go through
+    /// requestCloseWindow + retireClosedWindows so a frame is never cut in half.
+    pub fn closeWindow(self: *Editor, idx: usize) bool {
+        if (idx == 0 or idx >= self.windows.items.len) return false;
+        const win = self.windows.items[idx];
+        // Recycled pane slots are reset to an editor by closePane, so every
+        // .terminal slot is a live view.
+        for (win.layout.panes.items) |pane| {
+            if (pane.content == .terminal) self.destroyTerminal(pane.content.terminal);
+        }
+        win.layout.deinit();
+        self.allocator.destroy(win);
+        _ = self.windows.orderedRemove(idx);
+        if (self.active_window == idx) {
+            self.active_window = 0;
+        } else if (self.active_window > idx) {
+            self.active_window -= 1;
+        }
+        self.ensureValidActivePane();
+        self.active_doc_idx = self.windowDocIdx(self.active_window);
+        return true;
+    }
+
+    /// Ask window `idx` to close: the primary goes through the quit flow
+    /// (unsaved-changes prompt); a secondary is flagged and reaped by
+    /// retireClosedWindows at the top of the next frame.
+    pub fn requestCloseWindow(self: *Editor, idx: usize) void {
+        if (idx >= self.windows.items.len) return;
+        if (idx == 0) {
+            self.focusWindow(0);
+            _ = self.execAction("quit");
+            return;
+        }
+        self.windows.items[idx].open = false;
+    }
+
+    /// Close every secondary window whose close was requested (OS close
+    /// button via the GUI's open flag, or requestCloseWindow). Frontends
+    /// call this before drawing any window.
+    pub fn retireClosedWindows(self: *Editor) void {
+        var i: usize = self.windows.items.len;
+        while (i > 1) {
+            i -= 1;
+            if (!self.windows.items[i].open) _ = self.closeWindow(i);
+        }
+    }
+
+    /// Show the active document in a new window (TUI / unsupported: split).
+    pub fn openInNewWindow(self: *Editor) void {
+        self.showDocInNewWindow(self.active_doc_idx);
+    }
+
+    /// Show `doc_idx` in a new window; the source pane keeps its view (splits
+    /// already duplicate views and the tab bar is global). Without window
+    /// support this is a side-by-side split showing the document.
+    pub fn showDocInNewWindow(self: *Editor, doc_idx: usize) void {
+        if (doc_idx >= self.documents.items.len) return;
+        _ = self.newWindow(.{ .editor = doc_idx }) catch |err| switch (err) {
+            error.Unsupported => {
+                self.splitActive(.horizontal);
+                self.paneShowDoc(doc_idx);
+            },
+            else => {},
+        };
+    }
+
+    /// Move the focused pane into a new window. The source window loses that
+    /// view; when it was the window's only pane an editor view stays behind
+    /// (a terminal is never shown twice). Without window support: a split
+    /// (documents) or a second terminal at the side (terminals).
+    pub fn movePaneToNewWindow(self: *Editor) void {
+        const src = self.activeWindow();
+        const src_pane = src.active_pane;
+        if (src_pane >= src.layout.panes.items.len) return;
+        const content = src.layout.panes.items[src_pane].content;
+        _ = self.newWindow(content) catch |err| {
+            if (err == error.Unsupported) {
+                switch (content) {
+                    .terminal => self.openTerminalRight(),
+                    .editor => self.splitActive(.horizontal),
+                }
+            }
+            return;
+        };
+        if (src.layout.paneCount() > 1) {
+            src.active_pane = src.layout.nextPane(src_pane) orelse 0;
+            _ = src.layout.closePane(src_pane);
+            ensureValidActivePaneIn(src);
+        } else if (content == .terminal) {
+            src.layout.panes.items[src_pane].content = .{ .editor = self.active_doc_idx };
+        }
+    }
+
+    /// Title for window `win_idx`: "ZIDE — <document>[*]" / "ZIDE — Terminal".
+    pub fn windowTitle(self: *const Editor, win_idx: usize, buf: []u8) [:0]const u8 {
+        if (win_idx < self.windows.items.len) {
+            const win = self.windows.items[win_idx];
+            if (win.active_pane < win.layout.panes.items.len) {
+                switch (win.layout.panes.items[win.active_pane].content) {
+                    .terminal => return std.fmt.bufPrintZ(buf, "ZIDE — Terminal", .{}) catch "ZIDE",
+                    .editor => |di| if (di < self.documents.items.len) {
+                        const doc = &self.documents.items[di];
+                        const dirty: []const u8 = if (doc.dirty) "*" else "";
+                        return std.fmt.bufPrintZ(buf, "ZIDE — {s}{s}", .{ doc.display_name, dirty }) catch "ZIDE";
+                    },
+                }
+            }
+        }
+        return std.fmt.bufPrintZ(buf, "ZIDE", .{}) catch "ZIDE";
+    }
+
+    /// First editor (non-terminal) leaf of `win`, if any.
+    fn firstEditorPaneIn(self: *Editor, win: *EditorWindow) ?u8 {
+        var leaves: std.ArrayList(u8) = .empty;
+        defer leaves.deinit(self.allocator);
+        win.layout.collectLeaves(0, &leaves) catch return null;
+        for (leaves.items) |pid| {
+            if (pid < win.layout.panes.items.len and win.layout.panes.items[pid].content == .editor) return pid;
+        }
+        return null;
+    }
+
+    /// Switch the active pane to show a specific document. A focused
+    /// terminal pane is never replaced (that would orphan a live shell):
+    /// the document goes to the window's first editor pane, splitting one
+    /// in when the window has none.
     pub fn paneShowDoc(self: *Editor, doc_idx: usize) void {
         const win = self.activeWindow();
-        if (win.active_pane < win.layout.panes.items.len) {
-            win.layout.panes.items[win.active_pane].content = .{ .editor = doc_idx };
-            self.active_doc_idx = doc_idx;
+        if (win.active_pane >= win.layout.panes.items.len) return;
+        if (win.layout.panes.items[win.active_pane].content == .terminal) {
+            if (self.firstEditorPaneIn(win)) |pid| {
+                win.active_pane = pid;
+            } else {
+                const new_pane = win.layout.splitPane(win.active_pane, .horizontal, .{ .editor = doc_idx }) catch return;
+                win.active_pane = new_pane;
+            }
         }
+        win.layout.panes.items[win.active_pane].content = .{ .editor = doc_idx };
+        self.active_doc_idx = doc_idx;
     }
 
     // ---- Terminal operations ----
@@ -2119,16 +2339,23 @@ pub const Editor = struct {
         if (term_idx >= self.terminals.items.len) return;
         // Find the pane showing this terminal (at most one across all
         // windows — invariant I6)
-        outer: for (self.windows.items) |win| {
+        outer: for (self.windows.items, 0..) |win, w| {
             for (win.layout.panes.items, 0..) |pane, i| {
                 if (pane.content == .terminal and pane.content.terminal == term_idx) {
                     const pane_u8: u8 = @intCast(i);
+                    if (w != 0 and win.layout.paneCount() <= 1) {
+                        // Sole pane of a secondary window: the window goes with
+                        // it. Deferred to the reap so the frontend can finish
+                        // the frame; closeWindow stops the terminal then.
+                        self.requestCloseWindow(w);
+                        return;
+                    }
                     if (win.active_pane == pane_u8) {
                         win.active_pane = win.layout.nextPane(pane_u8) orelse 0;
                     }
                     const closed = win.layout.closePane(pane_u8);
                     if (!closed) {
-                        // It's the last live pane — convert to editor so the user isn't stuck on a blank pane.
+                        // Last live pane of the main window — convert to an editor so the user isn't stuck on a blank pane.
                         win.layout.panes.items[i].content = .{ .editor = self.active_doc_idx };
                         win.active_pane = pane_u8;
                     }
@@ -2183,6 +2410,8 @@ pub const Editor = struct {
                     }
                 }
             }
+            // A terminal-only window (a detached terminal): nothing to go back to here.
+            self.status_message = "No editor pane in this window";
             return;
         }
 
@@ -2681,6 +2910,7 @@ pub const Editor = struct {
         if (!lsp_client.isReady()) return;
         const path = doc.file_path orelse return;
         if (!doc.lsp_opened) return;
+        self.completion_doc_idx = self.activeDocIdx();
 
         const uri = lsp_mod.pathToUri(self.allocator, path) catch return;
         defer self.allocator.free(uri);
@@ -2716,6 +2946,12 @@ pub const Editor = struct {
     /// Replaces the word prefix (characters before cursor back to word boundary) with the completion text.
     pub fn acceptCompletion(self: *Editor) void {
         if (!self.completion_active) return;
+        // The list was computed for another document (tab switch, other
+        // window) — never insert it here.
+        if (self.completion_doc_idx != self.activeDocIdx()) {
+            self.clearCompletionItems();
+            return;
+        }
         if (self.completion_selected >= self.completion_items.items.len) {
             self.clearCompletionItems();
             return;
@@ -3106,6 +3342,212 @@ test "finder cancel repoints a pane split while the preview was showing" {
         try t.expect(pane.content.editor < editor.documents.items.len);
     }
     try t.expectEqual(@as(usize, 0), editor.active_doc_idx);
+}
+
+test "windows: unsupported frontend falls back to splits" {
+    const t = std.testing;
+    var editor = try Editor.init(t.allocator, t.io);
+    defer editor.deinit();
+    try t.expectError(error.Unsupported, editor.newWindow(.{ .editor = 0 }));
+    try t.expect(editor.execAction("open_in_new_window"));
+    try t.expectEqual(@as(usize, 1), editor.windows.items.len);
+    try t.expectEqual(@as(usize, 2), editor.activeLayout().paneCount());
+    try t.expect(editor.execAction("move_pane_to_new_window"));
+    try t.expectEqual(@as(usize, 1), editor.windows.items.len);
+    try t.expectEqual(@as(usize, 3), editor.activeLayout().paneCount());
+}
+
+test "windows: open_in_new_window shows the active document in a new window" {
+    const t = std.testing;
+    var editor = try Editor.init(t.allocator, t.io);
+    defer editor.deinit();
+    editor.multi_window_supported = true;
+    _ = try editor.newDocument();
+    try t.expectEqual(@as(usize, 1), editor.active_doc_idx);
+    try t.expect(editor.execAction("open_in_new_window"));
+    try t.expectEqual(@as(usize, 2), editor.windows.items.len);
+    try t.expectEqual(@as(usize, 1), editor.active_window);
+    try t.expectEqual(@as(u32, 1), editor.windows.items[1].id);
+    try t.expectEqual(@as(usize, 1), editor.windowDocIdx(1));
+    // The source pane keeps its view
+    try t.expectEqual(@as(usize, 1), editor.windowDocIdx(0));
+    try t.expect(editor.isActivePane(1, 0));
+    try t.expect(!editor.isActivePane(0, 0));
+    var buf: [64]u8 = undefined;
+    try t.expect(std.mem.startsWith(u8, editor.windowTitle(1, &buf), "ZIDE — "));
+}
+
+test "windows: closeDocAt repoints panes in every window" {
+    const t = std.testing;
+    var editor = try Editor.init(t.allocator, t.io);
+    defer editor.deinit();
+    editor.multi_window_supported = true;
+    _ = try editor.newDocument(); // 1
+    _ = try editor.newDocument(); // 2
+    _ = try editor.newWindow(.{ .editor = 2 });
+    editor.focusWindow(0);
+    editor.switchToDoc(1);
+    try t.expect(editor.closeDocAt(1));
+    try t.expectEqual(@as(usize, 2), editor.documents.items.len);
+    // The secondary showed doc 2 → shifted down to 1
+    try t.expectEqual(@as(usize, 1), editor.windows.items[1].layout.panes.items[0].content.editor);
+    // The primary showed the removed doc → a live index
+    try t.expect(editor.windows.items[0].layout.panes.items[0].content.editor < editor.documents.items.len);
+}
+
+test "windows: movePaneToNewWindow leaves a view behind only for a sole pane" {
+    const t = std.testing;
+    var editor = try Editor.init(t.allocator, t.io);
+    defer editor.deinit();
+    editor.multi_window_supported = true;
+    editor.movePaneToNewWindow();
+    try t.expectEqual(@as(usize, 2), editor.windows.items.len);
+    try t.expectEqual(@as(usize, 1), editor.windows.items[0].layout.paneCount());
+    try t.expectEqual(@as(usize, 1), editor.active_window);
+
+    editor.focusWindow(0);
+    editor.splitActive(.horizontal);
+    try t.expectEqual(@as(usize, 2), editor.windows.items[0].layout.paneCount());
+    editor.movePaneToNewWindow();
+    try t.expectEqual(@as(usize, 3), editor.windows.items.len);
+    try t.expectEqual(@as(usize, 1), editor.windows.items[0].layout.paneCount());
+    const primary = editor.windows.items[0];
+    try t.expect(primary.layout.findLeafNode(primary.active_pane) != null);
+}
+
+test "windows: cap on secondary windows" {
+    const t = std.testing;
+    var editor = try Editor.init(t.allocator, t.io);
+    defer editor.deinit();
+    editor.multi_window_supported = true;
+    editor.max_secondary_windows = 2;
+    _ = try editor.newWindow(.{ .editor = 0 });
+    _ = try editor.newWindow(.{ .editor = 0 });
+    try t.expectError(error.TooManyWindows, editor.newWindow(.{ .editor = 0 }));
+    try t.expect(std.mem.startsWith(u8, editor.status_message, "Window limit reached"));
+    try t.expectEqual(@as(usize, 3), editor.windows.items.len);
+}
+
+test "windows: closeWindow keeps focus valid and never reuses ids" {
+    const t = std.testing;
+    var editor = try Editor.init(t.allocator, t.io);
+    defer editor.deinit();
+    editor.multi_window_supported = true;
+    const a = try editor.newWindow(.{ .editor = 0 }); // id 1
+    const b = try editor.newWindow(.{ .editor = 0 }); // id 2
+    try t.expectEqual(@as(usize, 2), b);
+    try t.expect(!editor.closeWindow(0));
+    try t.expect(editor.closeWindow(a)); // active (b) shifts down
+    try t.expectEqual(@as(usize, 1), editor.active_window);
+    try t.expectEqual(@as(u32, 2), editor.windows.items[1].id);
+    const c = try editor.newWindow(.{ .editor = 0 });
+    try t.expectEqual(@as(u32, 3), editor.windows.items[c].id);
+    try t.expect(editor.closeWindow(editor.active_window));
+    try t.expectEqual(@as(usize, 0), editor.active_window);
+    try t.expectEqual(@as(usize, 0), editor.active_doc_idx);
+}
+
+test "windows: requestCloseWindow defers to the reap; the primary routes to quit" {
+    const t = std.testing;
+    var editor = try Editor.init(t.allocator, t.io);
+    defer editor.deinit();
+    editor.multi_window_supported = true;
+    const w = try editor.newWindow(.{ .editor = 0 });
+    editor.requestCloseWindow(w);
+    try t.expectEqual(@as(usize, 2), editor.windows.items.len);
+    try t.expect(!editor.windows.items[w].open);
+    editor.retireClosedWindows();
+    try t.expectEqual(@as(usize, 1), editor.windows.items.len);
+    try t.expectEqual(@as(usize, 0), editor.active_window);
+
+    editor.requestCloseWindow(0);
+    try t.expect(!editor.running);
+    editor.running = true;
+    editor.activeDoc().dirty = true;
+    editor.requestCloseWindow(0);
+    try t.expect(editor.running);
+    try t.expectEqual(Editor.Mode.confirm_quit, editor.mode);
+    editor.activeDoc().dirty = false;
+}
+
+test "windows: close_pane on the sole pane of a secondary requests its close" {
+    const t = std.testing;
+    var editor = try Editor.init(t.allocator, t.io);
+    defer editor.deinit();
+    editor.multi_window_supported = true;
+    const w = try editor.newWindow(.{ .editor = 0 });
+    try t.expect(editor.execAction("close_pane"));
+    try t.expect(!editor.windows.items[w].open);
+    editor.retireClosedWindows();
+    try t.expectEqual(@as(usize, 1), editor.windows.items.len);
+    // In the primary the sole pane stays and the status bar explains
+    try t.expect(editor.execAction("close_pane"));
+    try t.expectEqual(@as(usize, 1), editor.windows.items.len);
+    try t.expect(editor.status_message.len > 0);
+}
+
+test "windows: a terminal-only secondary closes with its terminal" {
+    const t = std.testing;
+    var editor = try Editor.init(t.allocator, t.io);
+    defer editor.deinit();
+    editor.multi_window_supported = true;
+    // Fake terminal slots — Terminal.init would fork a shell.
+    try editor.terminals.append(t.allocator, null);
+    try editor.terminals.append(t.allocator, null);
+    const w = try editor.newWindow(.{ .terminal = 1 });
+    try t.expect(editor.activePaneIsTerminal());
+    try t.expectEqual(@as(?usize, 1), editor.activePaneTerminalIdx());
+    try t.expect(editor.execAction("toggle_terminal"));
+    try t.expectEqualStrings("No editor pane in this window", editor.status_message);
+    // close_terminal on the sole pane → window requested closed, reaped later
+    try t.expect(editor.execAction("close_terminal"));
+    try t.expect(!editor.windows.items[w].open);
+    try t.expectEqual(@as(usize, 2), editor.windows.items.len);
+    editor.retireClosedWindows();
+    try t.expectEqual(@as(usize, 1), editor.windows.items.len);
+    try t.expectEqual(@as(usize, 2), editor.terminals.items.len);
+}
+
+test "windows: paneShowDoc never replaces a terminal pane" {
+    const t = std.testing;
+    var editor = try Editor.init(t.allocator, t.io);
+    defer editor.deinit();
+    try editor.terminals.append(t.allocator, null);
+    editor.windows.items[0].layout.panes.items[0].content = .{ .terminal = 0 };
+    try t.expect(editor.activePaneIsTerminal());
+    editor.switchToDoc(0);
+    // An editor pane was split in; the terminal view survived
+    try t.expectEqual(@as(usize, 2), editor.activeLayout().paneCount());
+    try t.expect(!editor.activePaneIsTerminal());
+    var terminals: usize = 0;
+    for (editor.activeLayout().panes.items) |pane| {
+        if (pane.content == .terminal) terminals += 1;
+    }
+    try t.expectEqual(@as(usize, 1), terminals);
+    // With an editor pane present the document goes there and focus follows
+    editor.focusPane(0);
+    try t.expect(editor.activePaneIsTerminal());
+    editor.switchToDoc(0);
+    try t.expectEqual(@as(usize, 2), editor.activeLayout().paneCount());
+    try t.expect(!editor.activePaneIsTerminal());
+}
+
+test "windows: switching windows cancels transient prompts; stale completions are refused" {
+    const t = std.testing;
+    var editor = try Editor.init(t.allocator, t.io);
+    defer editor.deinit();
+    editor.multi_window_supported = true;
+    editor.mode = .goto_line;
+    _ = try editor.newWindow(.{ .editor = 0 }); // focusWindow(1) cancels the prompt
+    try t.expectEqual(Editor.Mode.normal, editor.mode);
+
+    _ = try editor.newDocument();
+    editor.completion_doc_idx = 0; // computed for doc 0, doc 1 is active now
+    try editor.addCompletionItem(try t.allocator.dupe(u8, "foo"), null, null);
+    try t.expect(editor.completion_active);
+    editor.acceptCompletion();
+    try t.expect(!editor.completion_active);
+    try t.expectEqual(@as(usize, 0), editor.completion_items.items.len);
 }
 
 /// Test helper: bounded wait for the search worker to finish.

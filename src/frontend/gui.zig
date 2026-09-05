@@ -427,9 +427,21 @@ pub fn applyWindowFonts(win: *dvui.Window, g: *GuiState, editor: *Editor) void {
 pub fn frame(editor: *Editor, g: *GuiState) bool {
     if (!build_options.has_gui) return false;
 
+    // Windows whose close was requested (OS close button via the open flag,
+    // close_window, the last pane closing) go away before anything is drawn;
+    // dvui destroys their child windows in the primary end().
+    editor.retireClosedWindows();
+    g.retireMissing(editor);
+
+    // The focused editor window follows OS keyboard focus — a title-bar
+    // click produces no dvui event, so this is polled once per frame.
+    syncActiveWindowFromOs(editor, g);
+
     // Primary window section.
     win_ui = g.primary();
     cur_win = 0;
+    win_ui.natural_scale = dvui.windowNaturalScale();
+    applyThemeIfStale(editor);
 
     // --- Global keyboard shortcuts (before widgets consume events) ---
     dispatchGlobalKeys(editor);
@@ -497,20 +509,41 @@ pub fn frame(editor: *Editor, g: *GuiState) bool {
         }
     }
 
-    if (menuBar(editor)) return false;
+    menuBar(editor);
     modalDialogs(editor);
     tabBar(editor);
     statusBar(editor);
     editorArea(editor, true);
 
-    // --- Handle window close / quit events ---
+    // --- Primary window close / app quit → the quit flow (unsaved prompt) ---
     for (dvui.events()) |*e| {
         if (e.handled) continue;
-        if (e.evt == .window and e.evt.window.action == .close) return false;
-        if (e.evt == .app and e.evt.app.action == .quit) return false;
+        const wants_quit = (e.evt == .window and e.evt.window.action == .close) or
+            (e.evt == .app and e.evt.app.action == .quit);
+        if (wants_quit) {
+            e.handled = true;
+            editor.focusWindow(0);
+            _ = editor.execAction("quit");
+            dvui.refresh(null, @src(), null);
+        }
     }
 
-    return true;
+    // --- Secondary windows ---
+    childWindows(editor, g);
+
+    // Structural actions raised from inside a pane (palette, terminal key
+    // passthrough) run only now: the split widgets hold pointers into the
+    // layout tree while the panes render.
+    if (deferred_action) |action| {
+        deferred_action = null;
+        execGuiAction(editor, action);
+    }
+
+    // A window to reap or create, or a theme to apply, needs another frame
+    // even without input.
+    if (needsAnotherFrame(editor, g)) dvui.refresh(null, @src(), null);
+
+    return editor.running;
 }
 
 /// Keybind chords for the current window, dispatched from the raw event
@@ -599,9 +632,8 @@ fn dispatchGlobalKeys(editor: *Editor) void {
     }
 }
 
-/// Menu bar of the current window. Returns true when File > Exit was chosen.
-fn menuBar(editor: *Editor) bool {
-    var exit_requested = false;
+/// Menu bar of the current window.
+fn menuBar(editor: *Editor) void {
     // --- Menu bar ---
     {
         var hbox = dvui.box(@src(), .{ .dir = .horizontal }, .{
@@ -640,7 +672,10 @@ fn menuBar(editor: *Editor) bool {
                 m.close();
             }
             if (dvui.menuItemLabel(@src(), "Exit             Ctrl+Q", .{}, .{ .expand = .horizontal }) != null) {
-                exit_requested = true;
+                // Same path as Ctrl+Q and the OS close button: prompt for
+                // unsaved changes instead of dropping them.
+                _ = editor.execAction("quit");
+                m.close();
             }
         }
 
@@ -726,6 +761,18 @@ fn menuBar(editor: *Editor) bool {
                 _ = editor.execAction("close_pane");
                 m.close();
             }
+            if (dvui.menuItemLabel(@src(), "Open in New Window  Ctrl+Shift+N", .{}, .{ .expand = .horizontal }) != null) {
+                _ = editor.execAction("open_in_new_window");
+                m.close();
+            }
+            if (dvui.menuItemLabel(@src(), "Move Pane to New Window", .{}, .{ .expand = .horizontal }) != null) {
+                _ = editor.execAction("move_pane_to_new_window");
+                m.close();
+            }
+            if (dvui.menuItemLabel(@src(), "Close Window", .{}, .{ .expand = .horizontal }) != null) {
+                _ = editor.execAction("close_window");
+                m.close();
+            }
         }
 
         // ---- Preferences ----
@@ -778,7 +825,6 @@ fn menuBar(editor: *Editor) bool {
             _ = dvui.menuItemLabel(@src(), "About ZIDE v0.0.1", .{}, .{ .expand = .horizontal });
         }
     }
-    return exit_requested;
 }
 
 /// Settings + delete-confirm dialogs of the current window. Declared before
@@ -787,8 +833,9 @@ fn modalDialogs(editor: *Editor) void {
     // --- Settings dialog (modal floating window) ---
     // Declared before the panes so its widgets consume their events first;
     // the panes' raw event loops only see what the dialog left unhandled.
+    // Dialogs open in the focused window only.
     if (editor.mode == .settings) {
-        settingsDialog(editor);
+        if (editor.active_window == cur_win) settingsDialog(editor);
     } else {
         // Re-arm the text-setting pre-fill for the next dialog open
         settings_text_prefill = true;
@@ -796,7 +843,7 @@ fn modalDialogs(editor: *Editor) void {
 
     // Delete confirmation dialog (clickable) — same declared-before-panes
     // rule as the settings dialog so its buttons win the event race.
-    if (editor.mode == .filetree_prompt and editor.filetree_prompt_kind == .delete_confirm) {
+    if (editor.mode == .filetree_prompt and editor.filetree_prompt_kind == .delete_confirm and editor.active_window == cur_win) {
         filetreeDeleteDialog(editor);
     }
 }
@@ -818,7 +865,7 @@ fn tabBar(editor: *Editor) void {
 
         for (editor.documents.items, 0..) |doc, i| {
             if (doc.preview) continue; // hidden from the tab bar
-            const is_active = (i == editor.active_doc_idx);
+            const is_active = (i == editor.windowDocIdx(cur_win));
             var label_buf: [256]u8 = undefined;
             const dirty_marker: []const u8 = if (doc.dirty) " *" else "";
             const label = std.fmt.bufPrint(&label_buf, "{s}{s}", .{ doc.display_name, dirty_marker }) catch doc.display_name;
@@ -841,7 +888,8 @@ fn tabBar(editor: *Editor) void {
                 .border = .{ .x = 0, .y = 0, .w = 0, .h = 0 },
                 .margin = .{ .x = 0, .y = 0, .w = 0, .h = 0 },
             })) {
-                editor.switchToDoc(i);
+                editor.showDocIn(cur_win, i);
+                win_ui.refocus_editor = true;
             }
 
             // Close button (x)
@@ -881,7 +929,8 @@ fn statusBar(editor: *Editor) void {
         });
         defer status_box.deinit();
 
-        const doc = editor.activeDoc();
+        // The document shown in THIS window's focused pane.
+        const doc = &editor.documents.items[editor.windowDocIdx(cur_win)];
         const pos = doc.cursorPos();
 
         const swd = status_box.data();
@@ -976,16 +1025,234 @@ fn editorArea(editor: *Editor, side_panels: bool) void {
             if (side_panels and editor.filetree_visible and editor.ensureFiletree() != null) {
                 if (editor.filetree_side == .left) {
                     filetreePanel(editor);
-                    renderLayout(editor, 0);
+                    renderPanes(editor);
                 } else {
-                    renderLayout(editor, 0);
+                    renderPanes(editor);
                     filetreePanel(editor);
                 }
             } else {
-                renderLayout(editor, 0);
+                renderPanes(editor);
             }
         }
         if (side_panels and editor.search_visible) searchPanelGui(editor);
+        // Modal prompts normally live in the focused editor pane. With a
+        // terminal pane focused (a detached terminal window, Ctrl+Q from a
+        // shell) there is none — drive and draw them at window level.
+        if (editor.active_window == cur_win and editor.mode != .normal and editor.mode != .settings and editor.activePaneIsTerminal()) {
+            windowLevelModal(editor, main_col.data());
+        }
+    }
+}
+
+/// The split tree of the current window. `rendering_panes` is set while the
+/// paned widgets hold pointers into the layout — see deferred_action.
+fn renderPanes(editor: *Editor) void {
+    rendering_panes = true;
+    defer rendering_panes = false;
+    renderLayout(editor, 0);
+}
+
+/// Window-level stand-in for editorPane's modal handling when the focused
+/// pane is a terminal: routes key/text events to the modal handlers and
+/// draws the overlay over the whole editor area.
+fn windowLevelModal(editor: *Editor, wd: *dvui.WidgetData) void {
+    for (dvui.events()) |*e| {
+        if (e.handled) continue;
+        switch (e.evt) {
+            .key => |key| {
+                if (key.action != .down and key.action != .repeat) continue;
+                e.handle(@src(), wd);
+                handleModalKey(editor, key);
+            },
+            .text => |te| switch (te.action) {
+                .value => |val| {
+                    if (val.txt.len > 0) {
+                        e.handle(@src(), wd);
+                        handleModalText(editor, val.txt);
+                    }
+                },
+                else => {},
+            },
+            else => {},
+        }
+    }
+    const rs = wd.contentRectScale();
+    dvui.wantTextInput(rs.r.toNatural());
+    if (editor.mode != .normal) drawModalOverlay(editor, rs.r, rs, rs.s);
+}
+
+/// True while renderLayout runs (dvui.paned holds `ratioPtr` pointers into
+/// the layout tree until it deinits; a split/close in between would leave
+/// them dangling).
+var rendering_panes: bool = false;
+/// A structural action raised from inside a pane, executed by frame() after
+/// every window finished rendering.
+var deferred_action: ?[]const u8 = null;
+
+/// Actions that mutate a layout tree (split/close panes, terminals, moving
+/// panes between windows) — never run them while the panes render.
+fn isStructuralAction(action: []const u8) bool {
+    const names = [_][]const u8{
+        "split_vertical",         "split_horizontal", "close_pane",          "toggle_terminal",
+        "close_terminal",         "open_terminal_right", "open_in_new_window", "move_pane_to_new_window",
+        "detach_terminal",        "close_window",
+    };
+    for (names) |n| {
+        if (std.mem.eql(u8, action, n)) return true;
+    }
+    return false;
+}
+
+/// Actions whose UI lives in the primary window only.
+fn isPrimaryPanelAction(action: []const u8) bool {
+    return std.mem.eql(u8, action, "toggle_filetree") or
+        std.mem.eql(u8, action, "filetree_reveal") or
+        std.mem.eql(u8, action, "find_in_files");
+}
+
+/// Re-apply the dvui theme of the current window when the editor's theme
+/// revision moved (dvui themes are per window; dvui.themeSet only touches
+/// the current one).
+fn applyThemeIfStale(editor: *Editor) void {
+    if (win_ui.theme_gen_applied != editor.theme_revision) {
+        dvui.themeSet(dvuiThemeForPreset(editor.theme_name, true, editor.mono_font_size));
+        win_ui.theme_gen_applied = editor.theme_revision;
+    }
+}
+
+/// Some window is waiting to be reaped or created — dvui would otherwise
+/// sleep in waitEventTimeout until the next input event.
+fn needsAnotherFrame(editor: *Editor, g: *GuiState) bool {
+    for (editor.windows.items, 0..) |ew, i| {
+        if (!ew.open) return true;
+        if (i > 0) {
+            const ui = g.find(ew.id) orelse return true;
+            if (!ui.created) return true;
+        }
+    }
+    return false;
+}
+
+/// The focused editor window follows the OS keyboard focus.
+fn syncActiveWindowFromOs(editor: *Editor, g: *GuiState) void {
+    if (comptime dvui.Backend.support_child_os_wins) {
+        if (editor.windows.items.len <= 1) return;
+        const c = dvui.backend.c;
+        const focused = c.SDL_GetKeyboardFocus();
+        if (focused == null) return;
+        const ui = g.bySdlWindow(c.SDL_GetWindowID(focused)) orelse return;
+        for (editor.windows.items, 0..) |ew, idx| {
+            if (ew.id == ui.win_id) {
+                if (idx != editor.active_window) editor.focusWindow(idx);
+                return;
+            }
+        }
+    }
+}
+
+/// Bring the primary OS window forward (its panels were asked for from a
+/// secondary window).
+fn raisePrimaryWindow() void {
+    if (comptime dvui.Backend.support_child_os_wins) {
+        const st = active_state orelse return;
+        const c = dvui.backend.c;
+        const w = c.SDL_GetWindowFromID(st.primary().sdl_window_id);
+        if (w != null) _ = c.SDL_RaiseWindow(w);
+    }
+}
+
+/// First placement of a new child window: at the spawn hint (a tab drop
+/// point, screen coordinates) or cascaded from the primary window.
+/// Wayland ignores window positions — the compositor decides there.
+fn positionNewWindow(editor: *Editor, g: *GuiState, win_idx: usize, window: *dvui.backend.c.SDL_Window) void {
+    const c = dvui.backend.c;
+    if (editor.windows.items[win_idx].spawn_pos) |pos| {
+        _ = c.SDL_SetWindowPosition(window, pos.x - 60, pos.y - 20);
+        return;
+    }
+    const primary = c.SDL_GetWindowFromID(g.primary().sdl_window_id);
+    if (primary == null) return;
+    var px: c_int = 0;
+    var py: c_int = 0;
+    _ = c.SDL_GetWindowPosition(primary, &px, &py);
+    const cascade: usize = @min(win_idx, 8);
+    const step: c_int = @intCast(40 * cascade);
+    _ = c.SDL_SetWindowPosition(window, px + step, py + step);
+}
+
+/// Secondary OS windows: one dvui child window per editor.windows[1..],
+/// drawn one after another inside the primary frame. Children are created
+/// only here, never from inside another child (OsWindowWidget nests them
+/// under the current dvui window).
+fn childWindows(editor: *Editor, g: *GuiState) void {
+    if (comptime dvui.Backend.support_child_os_wins) {
+        const c = dvui.backend.c;
+        var i: usize = 1;
+        while (i < editor.windows.items.len) : (i += 1) {
+            const ew = editor.windows.items[i];
+            const ui = g.winUi(ew.id) catch continue;
+            if (!ui.created) {
+                // dvui destroys a retired child one frame after it stops
+                // being drawn; creating the replacement in that frame would
+                // trip the backend's SDL window-count guard (process exit
+                // past 5 windows). Wait a frame.
+                var n: c_int = 0;
+                const arr = c.SDL_GetWindows(&n);
+                if (arr != null) c.SDL_free(@ptrCast(arr));
+                if (n >= 5) continue;
+            }
+            var tbuf: [256]u8 = undefined;
+            const title_z = editor.windowTitle(i, &tbuf);
+            const os_win = dvui.osWindow(@src(), .{
+                .title = title_z,
+                .size = .{ .w = 900, .h = 600 },
+                .min_size = .{ .w = 400, .h = 300 },
+                .hidden = true,
+            }, .{ .id_extra = ew.id, .open_flag = &ew.open });
+            // Always ends the child frame — never `return` inside this block.
+            defer os_win.deinit();
+            const child_dvui = os_win.inner.dvui_win;
+            const child_backend = os_win.inner.backend;
+            win_ui = ui;
+            cur_win = i;
+            if (!ui.created) {
+                // The child copied the parent's theme before it had the mono
+                // font: register the font and re-theme before any widget.
+                applyWindowFonts(child_dvui, g, editor);
+                ui.theme_gen_applied = editor.theme_revision;
+                ui.sdl_window_id = c.SDL_GetWindowID(child_backend.window);
+                // Every child presents on its own; vsync per child would
+                // divide the frame rate by the window count.
+                _ = c.SDL_SetRenderVSync(child_backend.renderer, 0);
+                positionNewWindow(editor, g, i, child_backend.window);
+                ew.spawn_pos = null;
+                _ = c.SDL_ShowWindow(child_backend.window);
+                _ = c.SDL_RaiseWindow(child_backend.window);
+                ui.created = true;
+                ui.title_hash = std.hash.Wyhash.hash(0, title_z);
+            } else {
+                const th = std.hash.Wyhash.hash(0, title_z);
+                if (th != ui.title_hash) {
+                    ui.title_hash = th;
+                    _ = c.SDL_SetWindowTitle(child_backend.window, title_z.ptr);
+                }
+            }
+            applyThemeIfStale(editor);
+            ui.natural_scale = dvui.windowNaturalScale();
+
+            dispatchGlobalKeys(editor);
+            processFileDrops(editor);
+            if (editor.secondary_window_chrome) menuBar(editor);
+            modalDialogs(editor);
+            if (editor.secondary_window_chrome) {
+                tabBar(editor);
+                statusBar(editor);
+            }
+            editorArea(editor, false);
+        }
+        // Back to the primary context for whatever runs after the windows.
+        win_ui = g.primary();
+        cur_win = 0;
     }
 }
 
@@ -1143,7 +1410,9 @@ fn processFileDrops(editor: *Editor) void {
     if (!build_options.has_gui) return;
     if (win_ui.drop_count == 0) return;
     defer win_ui.drop_count = 0;
-    const scale = filetree_panel_scale;
+    // Drop coordinates are window points; the primary's panel scale and a
+    // child's natural scale are the same physical/logical factor.
+    const scale = if (cur_win == 0) filetree_panel_scale else win_ui.natural_scale;
     for (win_ui.drop_slots[0..win_ui.drop_count]) |*s| {
         const path = s.path[0..s.len];
         var handled = false;
@@ -3081,8 +3350,9 @@ fn editorPane(editor: *Editor, pane_id: u8) void {
 
     // Take dvui focus back from the file tree panel when keyboard focus
     // returned to the editor (movement/typing below is is_focused-gated).
-    if (is_active_pane and filetree_release_focus) {
+    if (is_active_pane and (filetree_release_focus or win_ui.refocus_editor)) {
         filetree_release_focus = false;
+        win_ui.refocus_editor = false;
         dvui.focusWidget(wd.id, null, null);
     }
 
@@ -3570,7 +3840,7 @@ fn editorPane(editor: *Editor, pane_id: u8) void {
     _ = text_cols; // used for future scroll adjustment
 
     // --- Focused pane indicator (subtle border highlight) ---
-    if (is_active_pane and winLayout(editor, cur_win).paneCount() > 1) {
+    if (is_active_pane and (winLayout(editor, cur_win).paneCount() > 1 or editor.windows.items.len > 1)) {
         const focus_color = toDvui(editor.theme.selection);
         const border_w: f32 = 2 * scale;
         // Top
@@ -3602,7 +3872,9 @@ fn editorPane(editor: *Editor, pane_id: u8) void {
     }
 
     // --- Completion popup (renders on top, only in active pane) ---
-    if (is_active_pane and editor.completion_active and editor.completion_items.items.len > 0) {
+    if (is_active_pane and editor.completion_active and editor.completion_items.items.len > 0 and
+        editor.completion_doc_idx == pane_doc_idx)
+    {
         drawCompletionPopupGui(editor, render_area, font, line_height, scale);
     }
 }
@@ -3833,7 +4105,7 @@ fn terminalPane(editor: *Editor, pane_id: u8, term_idx: usize) void {
     }
 
     // Active pane indicator (same as editor)
-    if (is_active_pane and winLayout(editor, cur_win).paneCount() > 1) {
+    if (is_active_pane and (winLayout(editor, cur_win).paneCount() > 1 or editor.windows.items.len > 1)) {
         const focus_color: dvui.Color = .{ .r = 0x35, .g = 0x84, .b = 0xe4, .a = 0xFF };
         const border_w: f32 = 2 * scale;
         (dvui.Rect.Physical{ .x = area.x, .y = area.y, .w = border_w, .h = area.h }).fill(.{}, .{ .color = focus_color, .fade = 0.6 });
@@ -4654,6 +4926,12 @@ fn handleGuiKeyEvents(editor: *Editor, wd: *dvui.WidgetData) bool {
 fn execGuiAction(editor: *Editor, action: []const u8) void {
     // New action — drop the previous transient status message
     editor.status_message = "";
+    // The file tree and search panel live in the primary window: bring it
+    // forward when their actions run from a secondary window.
+    if (editor.active_window != 0 and isPrimaryPanelAction(action)) {
+        editor.focusWindow(0);
+        raisePrimaryWindow();
+    }
     if (std.mem.eql(u8, action, "save")) {
         save(editor);
         return;
@@ -4825,6 +5103,7 @@ fn save(editor: *Editor) void {
         // Disk changed since load/save — prompt instead of clobbering.
         if (doc.checkExternalChange(editor.io)) {
             doc.external_changed = true;
+            editor.confirm_overwrite_doc = editor.active_doc_idx;
             editor.mode = .confirm_overwrite;
             return;
         }
@@ -5419,11 +5698,13 @@ fn handlePaletteKeyGui(editor: *Editor, key: dvui.Event.Key) void {
                 if (idx == editor.palette_selected) {
                     editor.mode = .normal;
                     editor.palette_selected = 0;
-                    const prev_theme = editor.theme_name;
-                    _ = editor.execCommand(name, null);
-                    // If a theme command changed the preset, update DVUI chrome
-                    if (editor.theme_name.ptr != prev_theme.ptr) {
-                        dvui.themeSet(dvuiThemeForPreset(editor.theme_name, true, editor.mono_font_size));
+                    // This runs inside the focused pane: structural commands
+                    // wait until the panes finished rendering. Theme commands
+                    // bump editor.theme_revision themselves.
+                    if (rendering_panes and isStructuralAction(name)) {
+                        deferred_action = name;
+                    } else {
+                        _ = editor.execCommand(name, null);
                     }
                     return;
                 }
@@ -5531,6 +5812,7 @@ const settings_defs = [_]SettingDef{
     .{ .key = "page_size", .label = "Page Size", .kind = .number, .desc = "Lines to scroll on Page Up/Down (5-200)", .min = 5, .max = 200 },
     .{ .key = "click_clears_cursors", .label = "Click Clears Cursors", .kind = .boolean, .desc = "Left-click clears secondary cursors" },
     .{ .key = "session_persistence", .label = "Session Persistence", .kind = .boolean, .desc = "Reopen last session's files when launched bare" },
+    .{ .key = "secondary_window_chrome", .label = "Extra Window Chrome (GUI)", .kind = .boolean, .desc = "Menu and status bars in extra windows (file tree and search stay in the main window)" },
     .{ .key = "lsp_enabled", .label = "LSP Support", .kind = .boolean, .desc = "Run language servers for open files (off stops them immediately)" },
     .{ .key = "syntax_highlighting", .label = "Syntax Highlighting", .kind = .boolean, .desc = "Color code by language — off = plain text editor" },
     .{ .key = "filetree_git_colors", .label = "File Tree Git Colors", .kind = .boolean, .desc = "Color file tree rows by git status" },
@@ -5730,6 +6012,7 @@ fn getSettingBool(editor: *const Editor, key: []const u8) bool {
     if (std.mem.eql(u8, key, "auto_save")) return editor.auto_save;
     if (std.mem.eql(u8, key, "click_clears_cursors")) return editor.click_clears_cursors;
     if (std.mem.eql(u8, key, "session_persistence")) return editor.session_persistence;
+    if (std.mem.eql(u8, key, "secondary_window_chrome")) return editor.secondary_window_chrome;
     if (std.mem.eql(u8, key, "lsp_enabled")) return editor.lsp_enabled;
     if (std.mem.eql(u8, key, "syntax_highlighting")) return editor.syntax_highlighting;
     if (std.mem.eql(u8, key, "filetree_git_colors")) return editor.filetree_git_colors;
@@ -5746,6 +6029,7 @@ fn applySettingBool(editor: *Editor, key: []const u8, val: bool) void {
     if (std.mem.eql(u8, key, "auto_save")) editor.auto_save = val;
     if (std.mem.eql(u8, key, "click_clears_cursors")) editor.click_clears_cursors = val;
     if (std.mem.eql(u8, key, "session_persistence")) editor.session_persistence = val;
+    if (std.mem.eql(u8, key, "secondary_window_chrome")) editor.secondary_window_chrome = val;
     if (std.mem.eql(u8, key, "lsp_enabled")) editor.lsp_enabled = val; // lspTick stops/starts servers next frame
     if (std.mem.eql(u8, key, "syntax_highlighting")) editor.syntax_highlighting = val;
     if (std.mem.eql(u8, key, "filetree_git_colors")) {
@@ -5853,8 +6137,8 @@ fn switchTheme(editor: *Editor, name: []const u8) void {
         editor.theme_name = "high_contrast";
     } else return;
 
-    // Update DVUI chrome (menus, scrollbars, etc.) live
-    dvui.themeSet(dvuiThemeForPreset(editor.theme_name, true, editor.mono_font_size));
+    // Every window re-applies its dvui chrome theme (applyThemeIfStale)
+    editor.theme_revision +%= 1;
 
     // Persist choice to init.lua
     var val_buf: [32]u8 = undefined;

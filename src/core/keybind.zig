@@ -101,6 +101,10 @@ pub const KeybindMap = struct {
         try self.set("alt+backslash", "split_vertical");
         try self.set("alt+shift+backslash", "split_horizontal");
         try self.set("ctrl+alt+q", "close_pane");
+        // Windows (GUI); ctrl+shift+n is the cross-editor convention, the
+        // Alt twin is for terminals that eat Shift chords.
+        try self.set("ctrl+shift+n", "open_in_new_window");
+        try self.set("ctrl+alt+n", "open_in_new_window");
         try self.set("ctrl+page_down", "next_doc");
         try self.set("ctrl+page_up", "prev_doc");
         try self.set("ctrl+tab", "next_doc");
@@ -169,4 +173,7 @@ test "keybind defaults" {
     try std.testing.expectEqualStrings("move_line_up", kb.get("ctrl+shift+page_up").?);
     try std.testing.expectEqualStrings("lsp_goto_definition", kb.get("f12").?);
     try std.testing.expectEqualStrings("toggle_filetree", kb.get("ctrl+b").?);
+    // Windows
+    try std.testing.expectEqualStrings("open_in_new_window", kb.get("ctrl+shift+n").?);
+    try std.testing.expectEqualStrings("open_in_new_window", kb.get("ctrl+alt+n").?);
 }
