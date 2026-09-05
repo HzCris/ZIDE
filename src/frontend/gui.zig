@@ -229,6 +229,20 @@ var last_auto_save_ns: i128 = 0;
 /// of more than 16 items imports the first 16.
 const DropSlot = struct { path: [1024]u8 = undefined, len: usize = 0, x: f32 = 0, y: f32 = 0 };
 
+/// Tab drag-out: a left press on a tab label arms it, motion past the
+/// threshold drags, a release outside the tab bar opens the document in a
+/// new window (or in the ZIDE window under the pointer).
+const TabDrag = struct {
+    state: enum { idle, armed, dragging } = .idle,
+    doc_idx: usize = 0,
+    /// documents.len when the drag armed — a close/open in between shifts
+    /// the indices, so the drag is cancelled then.
+    doc_count: usize = 0,
+    press_pt: dvui.Point.Physical = .{},
+    /// The bar's rect this frame — a release inside it is a cancel.
+    bar_rect: dvui.Rect.Physical = .{},
+};
+
 /// Per-OS-window GUI state. One instance per `Editor.EditorWindow`, keyed
 /// by its id; the pane/mouse/key code reaches the window being rendered
 /// through `win_ui` (set by frame() before each window's widgets — the same
@@ -293,6 +307,9 @@ pub const WinUi = struct {
     // --- OS file drops staged by the SDL backend between frames ---
     drop_slots: [16]DropSlot = @splat(.{}),
     drop_count: usize = 0,
+
+    /// Tab drag-out state (see TabDrag).
+    tab_drag: TabDrag = .{},
 };
 
 /// Process-wide GUI state: one WinUi per editor window plus the mono font
@@ -856,65 +873,274 @@ fn modalDialogs(editor: *Editor) void {
 /// document shown in this window).
 fn tabBar(editor: *Editor) void {
     // --- Tab bar (if multiple documents) ---
-    if (editor.docCount() > 1) {
-        var close_tab_idx: ?usize = null;
+    const td = &win_ui.tab_drag;
+    if (editor.docCount() <= 1) {
+        td.state = .idle; // no bar, nothing to drag
+        return;
+    }
+    // A drag whose document list changed under it (close/open) points at a
+    // different document now — cancel rather than move the wrong one.
+    if (td.state != .idle and (td.doc_idx >= editor.documents.items.len or td.doc_count != editor.documents.items.len)) {
+        td.state = .idle;
+    }
+    tabDragPrePass(editor);
 
-        var tab_box = dvui.box(@src(), .{ .dir = .horizontal }, .{
-            .expand = .horizontal,
+    var close_tab_idx: ?usize = null;
+    var to_new_window_idx: ?usize = null;
+
+    var tab_box = dvui.box(@src(), .{ .dir = .horizontal }, .{
+        .expand = .horizontal,
+        .background = true,
+        .style = .content,
+        .padding = .{ .x = 4, .y = 2, .w = 4, .h = 2 },
+    });
+    defer tab_box.deinit();
+    const bar_rs = tab_box.data().rectScale();
+    td.bar_rect = bar_rs.r;
+    const scale = bar_rs.s;
+
+    for (editor.documents.items, 0..) |doc, i| {
+        if (doc.preview) continue; // hidden from the tab bar
+        const is_active = (i == editor.windowDocIdx(cur_win));
+        var label_buf: [256]u8 = undefined;
+        const dirty_marker: []const u8 = if (doc.dirty) " *" else "";
+        const label = std.fmt.bufPrint(&label_buf, "{s}{s}", .{ doc.display_name, dirty_marker }) catch doc.display_name;
+
+        // Tab container: label + close button
+        var tab = dvui.box(@src(), .{ .dir = .horizontal }, .{
+            .id_extra = @intCast(i),
             .background = true,
-            .style = .content,
-            .padding = .{ .x = 4, .y = 2, .w = 4, .h = 2 },
+            .style = if (is_active) .highlight else .control,
+            .margin = .{ .x = 1, .y = 0, .w = 1, .h = 0 },
+            .border = .{ .x = 1, .y = 1, .w = 1, .h = 1 },
+            .padding = .{ .x = 0, .y = 0, .w = 0, .h = 0 },
         });
-        defer tab_box.deinit();
+        defer tab.deinit();
 
-        for (editor.documents.items, 0..) |doc, i| {
-            if (doc.preview) continue; // hidden from the tab bar
-            const is_active = (i == editor.windowDocIdx(cur_win));
-            var label_buf: [256]u8 = undefined;
-            const dirty_marker: []const u8 = if (doc.dirty) " *" else "";
-            const label = std.fmt.bufPrint(&label_buf, "{s}{s}", .{ doc.display_name, dirty_marker }) catch doc.display_name;
+        // The label sits in a plain box with our own mouse handling: a
+        // dvui.button would capture the press and swallow the release the
+        // drag needs, and its focus handling stole focus from the pane.
+        var lbox = dvui.box(@src(), .{ .dir = .horizontal }, .{
+            .id_extra = @intCast(i),
+            .padding = .{ .x = 6, .y = 2, .w = 6, .h = 2 },
+        });
+        const label_rect = lbox.data().rectScale().r;
+        dvui.labelNoFmt(@src(), label, .{}, .{ .id_extra = @intCast(i), .gravity_y = 0.5 });
+        lbox.deinit();
+        tabHandleMouse(editor, i, label_rect, scale);
 
-            // Tab container: label + close button
-            var tab = dvui.box(@src(), .{ .dir = .horizontal }, .{
-                .id_extra = @intCast(i),
-                .background = true,
-                .style = if (is_active) .highlight else .control,
-                .margin = .{ .x = 1, .y = 0, .w = 1, .h = 0 },
-                .border = .{ .x = 1, .y = 1, .w = 1, .h = 1 },
-                .padding = .{ .x = 0, .y = 0, .w = 0, .h = 0 },
-            });
-            defer tab.deinit();
-
-            // Tab label button (switches to this doc)
-            if (dvui.button(@src(), label, .{}, .{
-                .id_extra = @intCast(i),
-                .background = false,
-                .border = .{ .x = 0, .y = 0, .w = 0, .h = 0 },
-                .margin = .{ .x = 0, .y = 0, .w = 0, .h = 0 },
-            })) {
-                editor.showDocIn(cur_win, i);
-                win_ui.refocus_editor = true;
-            }
-
-            // Close button (x)
-            if (dvui.button(@src(), "\xc3\x97", .{}, .{ // × (multiplication sign)
-                .id_extra = @intCast(i),
-                .background = false,
-                .border = .{ .x = 0, .y = 0, .w = 0, .h = 0 },
-                .margin = .{ .x = 0, .y = 0, .w = 2, .h = 0 },
-                .padding = .{ .x = 2, .y = 0, .w = 2, .h = 0 },
-            })) {
-                close_tab_idx = i;
+        // Right-click menu — the guaranteed path to a new window
+        {
+            const ctext = dvui.context(@src(), .{ .rect = label_rect }, .{ .id_extra = @intCast(i) });
+            defer ctext.deinit();
+            if (ctext.activePoint()) |cp| {
+                var fw = dvui.floatingMenu(@src(), .{ .from = dvui.Rect.Natural.fromPoint(cp) }, .{});
+                defer fw.deinit();
+                if (dvui.menuItemLabel(@src(), "Move to New Window", .{}, .{ .expand = .horizontal }) != null) {
+                    to_new_window_idx = i;
+                    fw.close();
+                }
+                if (dvui.menuItemLabel(@src(), "Close Tab", .{}, .{ .expand = .horizontal }) != null) {
+                    close_tab_idx = i;
+                    fw.close();
+                }
             }
         }
 
-        // Handle deferred tab close (after iteration is complete).
-        // closeDocAt closes by index — switching first would hijack a
-        // focused terminal pane's content.
-        if (close_tab_idx) |idx| {
-            _ = editor.closeDocAt(idx);
+        // Close button (x)
+        if (dvui.button(@src(), "\xc3\x97", .{}, .{ // × (multiplication sign)
+            .id_extra = @intCast(i),
+            .background = false,
+            .border = .{ .x = 0, .y = 0, .w = 0, .h = 0 },
+            .margin = .{ .x = 0, .y = 0, .w = 2, .h = 0 },
+            .padding = .{ .x = 2, .y = 0, .w = 2, .h = 0 },
+        })) {
+            close_tab_idx = i;
         }
     }
+
+    // Deferred until the iteration is complete. closeDocAt closes by index —
+    // switching first would hijack a focused terminal pane's content.
+    if (close_tab_idx) |idx| {
+        _ = editor.closeDocAt(idx);
+    } else if (to_new_window_idx) |idx| {
+        if (editor.multi_window_supported) {
+            editor.showDocInNewWindow(idx);
+        } else {
+            editor.status_message = "This build has no extra windows (SDL3 renderer backend needed)";
+        }
+    }
+}
+
+/// Before the tabs each frame: Escape cancels a drag, and a drag whose
+/// release never reached this window (SDL routes it to the window under the
+/// pointer, or it got lost) drops where the pointer is now.
+fn tabDragPrePass(editor: *Editor) void {
+    const td = &win_ui.tab_drag;
+    if (td.state != .dragging) return;
+    var release_pending = false;
+    for (dvui.events()) |*e| {
+        if (e.handled) continue;
+        switch (e.evt) {
+            .key => |key| {
+                if (key.action == .down and key.code == .escape) {
+                    e.handled = true;
+                    td.state = .idle;
+                    editor.status_message = "";
+                    return;
+                }
+            },
+            .mouse => |me| {
+                if (me.action == .release) release_pending = true;
+            },
+            else => {},
+        }
+    }
+    if (release_pending) return; // tabHandleMouse takes it from here
+    if (comptime dvui.Backend.support_child_os_wins) {
+        const c = dvui.backend.c;
+        var gx: f32 = 0;
+        var gy: f32 = 0;
+        const buttons = c.SDL_GetGlobalMouseState(&gx, &gy);
+        if ((buttons & c.SDL_BUTTON_LMASK) == 0) {
+            td.state = .idle;
+            tabDropAt(editor, td.doc_idx, gx, gy);
+        }
+    }
+}
+
+/// Raw mouse handling for one tab label: press arms, motion drags, release
+/// clicks or drops. One state machine per window (win_ui.tab_drag), in event
+/// order — a press and its release in the same frame both resolve here.
+fn tabHandleMouse(editor: *Editor, doc_idx: usize, r: dvui.Rect.Physical, scale: f32) void {
+    const td = &win_ui.tab_drag;
+    for (dvui.events()) |*e| {
+        if (e.handled) continue;
+        if (e.evt != .mouse) continue;
+        const me = e.evt.mouse;
+        if (me.floating_win != dvui.subwindowCurrentId()) continue;
+        const inside = r.contains(me.p);
+        const mine = td.state != .idle and td.doc_idx == doc_idx;
+        switch (me.action) {
+            .focus => if (inside) {
+                e.handled = true;
+            },
+            .press => if (inside and me.button == .left) {
+                e.handled = true;
+                td.* = .{
+                    .state = .armed,
+                    .doc_idx = doc_idx,
+                    .doc_count = editor.documents.items.len,
+                    .press_pt = me.p,
+                    .bar_rect = td.bar_rect,
+                };
+            },
+            .motion => if (mine) {
+                e.handled = true;
+                if (td.state == .armed) {
+                    const dx = me.p.x - td.press_pt.x;
+                    const dy = me.p.y - td.press_pt.y;
+                    const threshold = 6 * scale;
+                    if (dx * dx + dy * dy > threshold * threshold) {
+                        td.state = .dragging;
+                        editor.status_message = "Drop outside the tab bar to open in a new window (Esc cancels)";
+                    }
+                }
+            },
+            .release => if (mine) {
+                e.handled = true;
+                const was_dragging = td.state == .dragging;
+                td.state = .idle;
+                if (was_dragging) {
+                    tabDrop(editor, doc_idx, me.p);
+                } else {
+                    // A plain click shows the document in this window
+                    editor.showDocIn(cur_win, doc_idx);
+                    win_ui.refocus_editor = true;
+                }
+            },
+            .position => {
+                if (mine and td.state == .dragging) {
+                    dvui.cursorSet(.arrow_all);
+                } else if (inside and td.state == .idle) {
+                    dvui.cursorSet(.hand);
+                }
+            },
+            else => {},
+        }
+    }
+}
+
+/// Release after a drag: back on the bar cancels (no tab reordering);
+/// anywhere else drops at the pointer's screen position.
+fn tabDrop(editor: *Editor, doc_idx: usize, p: dvui.Point.Physical) void {
+    editor.status_message = "";
+    if (win_ui.tab_drag.bar_rect.contains(p)) return;
+    if (comptime dvui.Backend.support_child_os_wins) {
+        const c = dvui.backend.c;
+        var gx: f32 = 0;
+        var gy: f32 = 0;
+        _ = c.SDL_GetGlobalMouseState(&gx, &gy);
+        tabDropAt(editor, doc_idx, gx, gy);
+    } else {
+        editor.status_message = "This build has no extra windows (SDL3 renderer backend needed)";
+    }
+}
+
+/// Drop at a screen position: another ZIDE window there shows the document,
+/// otherwise a new window opens at that spot. Wayland has no global pointer
+/// position and ignores window placement — the compositor decides there.
+fn tabDropAt(editor: *Editor, doc_idx: usize, gx: f32, gy: f32) void {
+    editor.status_message = "";
+    if (doc_idx >= editor.documents.items.len) return;
+    if (!editor.multi_window_supported) {
+        editor.status_message = "This build has no extra windows (SDL3 renderer backend needed)";
+        return;
+    }
+    if (comptime dvui.Backend.support_child_os_wins) {
+        const c = dvui.backend.c;
+        const st = active_state orelse return;
+        const wayland = isWayland();
+        if (!wayland) {
+            const fx: c_int = @intFromFloat(gx);
+            const fy: c_int = @intFromFloat(gy);
+            for (st.wins.items) |w| {
+                if (w.win_id == win_ui.win_id) continue;
+                const sw = c.SDL_GetWindowFromID(w.sdl_window_id);
+                if (sw == null) continue;
+                var wx: c_int = 0;
+                var wy: c_int = 0;
+                var ww: c_int = 0;
+                var wh: c_int = 0;
+                _ = c.SDL_GetWindowPosition(sw, &wx, &wy);
+                _ = c.SDL_GetWindowSize(sw, &ww, &wh);
+                if (fx < wx or fx >= wx + ww or fy < wy or fy >= wy + wh) continue;
+                for (editor.windows.items, 0..) |ew, idx| {
+                    if (ew.id == w.win_id) {
+                        editor.showDocIn(idx, doc_idx);
+                        w.refocus_editor = true;
+                        _ = c.SDL_RaiseWindow(sw);
+                        return;
+                    }
+                }
+            }
+        }
+        const before = editor.windows.items.len;
+        editor.showDocInNewWindow(doc_idx);
+        if (editor.windows.items.len > before and !wayland) {
+            editor.windows.items[before].spawn_pos = .{ .x = @intFromFloat(gx), .y = @intFromFloat(gy) };
+        }
+    }
+}
+
+/// SDL video driver is Wayland (no global pointer position, no window placement).
+fn isWayland() bool {
+    if (comptime dvui.Backend.support_child_os_wins) {
+        const drv = dvui.backend.c.SDL_GetCurrentVideoDriver();
+        if (drv == null) return false;
+        return std.mem.eql(u8, std.mem.span(drv), "wayland");
+    }
+    return false;
 }
 
 /// Status bar of the current window.
