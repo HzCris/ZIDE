@@ -566,6 +566,25 @@ pub fn frame(editor: *Editor, g: *GuiState) bool {
 /// Keybind chords for the current window, dispatched from the raw event
 /// list before any dvui widget (menus, panels) can consume them.
 fn dispatchGlobalKeys(editor: *Editor) void {
+    // Input in this window makes it the active one. SDL's keyboard focus
+    // (syncActiveWindowFromOs) can lag a frame behind a click on an inactive
+    // window — that click would otherwise act on the previously active
+    // window (a file double-clicked in the tree opened in the other window).
+    if (cur_win != editor.active_window) {
+        for (dvui.events()) |*e| {
+            const is_input = switch (e.evt) {
+                .mouse => |me| me.action == .press or me.action == .focus,
+                .key => |key| key.action == .down or key.action == .repeat,
+                .text => true,
+                else => false,
+            };
+            if (is_input) {
+                editor.focusWindow(cur_win);
+                break;
+            }
+        }
+    }
+
     // --- Global keyboard shortcuts (before widgets consume events) ---
     // Process keybinds here so DVUI widgets (menus, etc.) cannot consume them first.
     for (dvui.events()) |*e| {
@@ -596,7 +615,7 @@ fn dispatchGlobalKeys(editor: *Editor) void {
             }
 
             // Keybinds only in normal mode (not during find/replace/palette)
-            if (editor.mode == .normal) {
+            if (guiMode(editor) == .normal) {
                 // Skip modifier-only keys
                 if (key.code == .left_shift or key.code == .right_shift or
                     key.code == .left_control or key.code == .right_control or
@@ -801,7 +820,7 @@ fn menuBar(editor: *Editor) void {
             var fw = dvui.floatingMenu(@src(), .{ .from = r }, .{});
             defer fw.deinit();
             if (dvui.menuItemLabel(@src(), "Settings", .{}, .{ .expand = .horizontal }) != null) {
-                editor.mode = .settings;
+                _ = editor.execAction("settings");
                 m.close();
             }
             if (dvui.menuItemLabel(@src(), "Open Settings File", .{}, .{ .expand = .horizontal }) != null) {
@@ -850,13 +869,22 @@ fn menuBar(editor: *Editor) void {
 
 /// Settings + delete-confirm dialogs of the current window. Declared before
 /// the panes so their widgets consume their events first.
+/// The editor mode as seen by the current window: the Settings dialog is
+/// modal only for the window it is open in — everywhere else the mode reads
+/// as normal so keys, clicks and the shell keep working there.
+fn guiMode(editor: *Editor) Editor.Mode {
+    if (editor.mode == .settings and editor.windows.items[cur_win].id != editor.settings_window_id) return .normal;
+    return editor.mode;
+}
+
 fn modalDialogs(editor: *Editor) void {
     // --- Settings dialog (modal floating window) ---
     // Declared before the panes so its widgets consume their events first;
     // the panes' raw event loops only see what the dialog left unhandled.
-    // Dialogs open in the focused window only.
+    // The dialog stays in the window it was opened from (it does not follow
+    // focus); the other windows keep working meanwhile (guiMode).
     if (editor.mode == .settings) {
-        if (editor.active_window == cur_win) settingsDialog(editor);
+        if (editor.windows.items[cur_win].id == editor.settings_window_id) settingsDialog(editor);
     } else {
         // Re-arm the text-setting pre-fill for the next dialog open
         settings_text_prefill = true;
@@ -1105,7 +1133,6 @@ fn tabDropAt(editor: *Editor, doc_idx: usize, gx: f32, gy: f32) void {
             const fx: c_int = @intFromFloat(gx);
             const fy: c_int = @intFromFloat(gy);
             for (st.wins.items) |w| {
-                if (w.win_id == win_ui.win_id) continue;
                 const sw = c.SDL_GetWindowFromID(w.sdl_window_id);
                 if (sw == null) continue;
                 var wx: c_int = 0;
@@ -1115,8 +1142,12 @@ fn tabDropAt(editor: *Editor, doc_idx: usize, gx: f32, gy: f32) void {
                 _ = c.SDL_GetWindowPosition(sw, &wx, &wy);
                 _ = c.SDL_GetWindowSize(sw, &ww, &wh);
                 if (fx < wx or fx >= wx + ww or fy < wy or fy >= wy + wh) continue;
+                // Back onto the window the drag started from: nothing to do.
+                if (w.win_id == win_ui.win_id) return;
                 for (editor.windows.items, 0..) |ew, idx| {
                     if (ew.id == w.win_id) {
+                        // The view moves: the source pane shows its neighbour.
+                        editor.releaseDocView(editor.windows.items[cur_win], doc_idx);
                         editor.showDocIn(idx, doc_idx);
                         w.refocus_editor = true;
                         _ = c.SDL_RaiseWindow(sw);
@@ -1159,9 +1190,13 @@ fn statusBar(editor: *Editor) void {
         });
         defer status_box.deinit();
 
-        // The document shown in THIS window's focused pane.
+        // The document shown in THIS window's focused pane (a terminal pane
+        // reads "Terminal" instead of the document it falls back to).
         const doc = &editor.documents.items[editor.windowDocIdx(cur_win)];
         const pos = doc.cursorPos();
+        const this_win = editor.windows.items[cur_win];
+        const term_active = this_win.active_pane < this_win.layout.panes.items.len and
+            this_win.layout.panes.items[this_win.active_pane].content == .terminal;
 
         const swd = status_box.data();
         const srs = swd.contentRectScale();
@@ -1176,7 +1211,9 @@ fn statusBar(editor: *Editor) void {
         // obvious what syntax/LSP applies.
         var lang_buf: [64]u8 = undefined;
         const lang_name = editor.languageStatusText(doc, &lang_buf);
-        const pos_str = if (cursor_count > 1)
+        const pos_str: []const u8 = if (term_active)
+            "Terminal"
+        else if (cursor_count > 1)
             std.fmt.bufPrint(&pos_buf, "{d} cursors | Ln {d}, Col {d} | {s}", .{ cursor_count, pos.line + 1, pos.col + 1, lang_name }) catch "?"
         else
             std.fmt.bufPrint(&pos_buf, "Ln {d}, Col {d} | {s}", .{ pos.line + 1, pos.col + 1, lang_name }) catch "?";
@@ -1191,6 +1228,7 @@ fn statusBar(editor: *Editor) void {
         // Center: transient status message ("Saved", "Cannot open: ...",
         // file-tree results) takes priority over the line diagnostic —
         // previously these were never rendered in normal mode at all.
+        const line_diag = if (term_active) null else worstDiagnosticOnLine(doc, pos.line);
         if (editor.status_message.len > 0) {
             const pos_w = status_font.textSize(pos_str).w * sscale;
             dvui.renderText(.{
@@ -1200,7 +1238,7 @@ fn statusBar(editor: *Editor) void {
                 .p = .{ .x = sarea.x + pos_w + 20 * sscale, .y = sarea.y },
                 .color = status_text_color,
             }) catch {};
-        } else if (worstDiagnosticOnLine(doc, pos.line)) |diag| {
+        } else if (line_diag) |diag| {
             const diag_color = diagnosticColor(diag.severity);
             const prefix: []const u8 = switch (diag.severity) {
                 .err => "Error: ",
@@ -1224,18 +1262,20 @@ fn statusBar(editor: *Editor) void {
             }) catch {};
         }
 
-        // Right: filename + dirty marker
-        const dirty_str: []const u8 = if (doc.dirty) " [Modified]" else "";
-        var name_buf: [256]u8 = undefined;
-        const name_str = std.fmt.bufPrint(&name_buf, "{s}{s}", .{ doc.display_name, dirty_str }) catch doc.display_name;
-        const name_w = status_font.textSize(name_str).w * sscale;
-        dvui.renderText(.{
-            .font = status_font,
-            .text = name_str,
-            .rs = srs,
-            .p = .{ .x = sarea.x + sarea.w - name_w, .y = sarea.y },
-            .color = status_text_color,
-        }) catch {};
+        // Right: filename + dirty marker (nothing for a terminal pane)
+        if (!term_active) {
+            const dirty_str: []const u8 = if (doc.dirty) " [Modified]" else "";
+            var name_buf: [256]u8 = undefined;
+            const name_str = std.fmt.bufPrint(&name_buf, "{s}{s}", .{ doc.display_name, dirty_str }) catch doc.display_name;
+            const name_w = status_font.textSize(name_str).w * sscale;
+            dvui.renderText(.{
+                .font = status_font,
+                .text = name_str,
+                .rs = srs,
+                .p = .{ .x = sarea.x + sarea.w - name_w, .y = sarea.y },
+                .color = status_text_color,
+            }) catch {};
+        }
     }
 }
 
@@ -1739,7 +1779,7 @@ fn filetreePanel(editor: *Editor) void {
     // SDL only delivers .text events while someone declares a text-input
     // region, and the editor pane only does that for itself — without
     // this, `/` search never receives its query characters.
-    if (editor.filetree_focused and editor.mode == .normal) {
+    if (editor.filetree_focused and guiMode(editor) == .normal) {
         dvui.wantTextInput(area.toNatural());
     }
 
@@ -1747,7 +1787,7 @@ fn filetreePanel(editor: *Editor) void {
     // count and clamp below must see the post-input state (a stale
     // row_count here was an index-out-of-bounds panic on collapse).
     handleFiletreeMouse(editor, ft, wd, m);
-    if (editor.filetree_focused and editor.mode == .normal and !editor.completion_active) {
+    if (editor.filetree_focused and guiMode(editor) == .normal and !editor.completion_active) {
         handleFiletreeKeys(editor, ft, wd, visible_rows);
     }
 
@@ -2473,7 +2513,7 @@ fn handleFiletreeMouse(editor: *Editor, ft: *FileTree, wd: *dvui.WidgetData, m: 
                 e.handle(@src(), wd);
                 dvui.focusWidget(wd.id, null, e.num);
                 editor.filetree_focused = true;
-                if (editor.mode != .normal) continue;
+                if (guiMode(editor) != .normal) continue;
                 // Scrollbar band: drag the thumb, or page toward the click.
                 if (me.p.y >= rows_y and me.p.x >= m.sb_x) {
                     if (filetreeSbThumb(ft, m)) |thumb| {
@@ -3589,7 +3629,7 @@ fn editorPane(editor: *Editor, pane_id: u8) void {
     // --- Handle keyboard events (before rendering) — only for the focused
     // pane, and not while the file tree owns the keyboard. Modal prompts
     // (mode != .normal) still route through here. ---
-    if (is_active_pane and !((editor.filetree_focused or editor.search_focused) and editor.mode == .normal)) {
+    if (is_active_pane and !((editor.filetree_focused or editor.search_focused) and guiMode(editor) == .normal)) {
         _ = handleGuiKeyEvents(editor, wd);
 
         // Re-fetch doc after key events — close_tab may have changed/freed the active document
@@ -3607,7 +3647,7 @@ fn editorPane(editor: *Editor, pane_id: u8) void {
     // Block mouse clicks/drags when a modal is active so they don't go to
     // editor text. The settings dialog's widgets run before the panes, so
     // anything still unhandled here is a click outside the dialog.
-    if (editor.mode != .normal) {
+    if (guiMode(editor) != .normal) {
         if (is_active_pane) {
             for (dvui.events()) |*e| {
                 if (e.handled) continue;
@@ -4097,7 +4137,7 @@ fn editorPane(editor: *Editor, pane_id: u8) void {
 
     // --- Modal overlays (find, find_replace, command_palette, goto_line, confirm_quit) ---
     // Only render modals in the focused pane.
-    if (is_active_pane and editor.mode != .normal) {
+    if (is_active_pane and guiMode(editor) != .normal) {
         drawModalOverlay(editor, render_area, render_rs, scale);
     }
 
@@ -4146,13 +4186,24 @@ fn terminalPane(editor: *Editor, pane_id: u8, term_idx: usize) void {
     const visible_rows: u16 = @intFromFloat(@max(1.0, area.h / line_height));
 
     if (visible_cols != term.cols or visible_rows != term.rows) {
-        term.resizeGrid(visible_cols, visible_rows);
+        // dvui lays a new window (or a fresh split) out over two frames:
+        // expanding widgets get their min size first and the real rect on
+        // the next frame. Resizing on that first measurement shrank the grid
+        // to one row and dropped the shell's screen (a detached terminal
+        // came up blank) — a new size is applied once it repeats.
+        if (visible_cols == term.pending_cols and visible_rows == term.pending_rows) {
+            term.resizeGrid(visible_cols, visible_rows);
+        } else {
+            term.pending_cols = visible_cols;
+            term.pending_rows = visible_rows;
+            dvui.refresh(null, @src(), null);
+        }
     }
 
     // Handle mouse clicks — focus this pane when clicked.
     // Gated to normal mode so clicks meant for a modal (settings dialog,
     // find bar, ...) don't refocus the terminal behind it.
-    if (editor.mode == .normal) {
+    if (guiMode(editor) == .normal) {
         for (dvui.events()) |*e| {
             if (e.handled) continue;
             if (e.evt != .mouse) continue;
@@ -4172,7 +4223,7 @@ fn terminalPane(editor: *Editor, pane_id: u8, term_idx: usize) void {
 
     // Handle keyboard input for terminal — not while a modal is open,
     // otherwise unconsumed keys would be typed into the shell.
-    if (is_active_pane and editor.mode == .normal) {
+    if (is_active_pane and guiMode(editor) == .normal) {
         if (handleTerminalKeyEvents(editor, term, wd)) return; // terminal was freed
     }
 
@@ -4946,7 +4997,7 @@ fn handleGuiKeyEvents(editor: *Editor, wd: *dvui.WidgetData) bool {
     var handled_any = false;
 
     // --- Modal input handling ---
-    if (editor.mode != .normal) {
+    if (guiMode(editor) != .normal) {
         // Settings uses a real DVUI floating dialog whose widgets already
         // consumed their events (it is declared before the panes). Only
         // catch a leftover Escape to close it — swallowing everything here

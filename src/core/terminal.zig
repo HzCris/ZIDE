@@ -88,6 +88,12 @@ pub const Terminal = struct {
     /// cadence and leaves it null.
     wake_fn: ?*const fn () void = null,
 
+    /// GUI measurement debounce (terminalPane): a pane size seen once is
+    /// remembered here and applied only when the next frame repeats it — a
+    /// window's or split's first frame reports a zero-height layout.
+    pending_cols: u16 = 0,
+    pending_rows: u16 = 0,
+
     pub fn init(allocator: Allocator, io: std.Io, cols: u16, rows: u16, command: []const u8) !*Terminal {
         const total = @as(usize, cols) * @as(usize, rows);
         const cells = try allocator.alloc(Cell, total);
@@ -146,6 +152,7 @@ pub const Terminal = struct {
     pub fn resizeGrid(self: *Terminal, new_cols: u16, new_rows: u16) void {
         if (new_cols == self.cols and new_rows == self.rows) return;
         if (new_cols == 0 or new_rows == 0) return;
+        std.log.info("terminal grid {d}x{d} -> {d}x{d}", .{ self.cols, self.rows, new_cols, new_rows });
 
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);

@@ -243,6 +243,9 @@ pub const Editor = struct {
     /// Document the .confirm_overwrite prompt was opened for (tab clicks and
     /// window switches must not redirect Overwrite/Reload to another file).
     confirm_overwrite_doc: usize = 0,
+    /// Window whose Settings dialog is open (an EditorWindow.id): the dialog
+    /// stays in the window it was opened from instead of following focus.
+    settings_window_id: u32 = 0,
 
     /// Registered language servers: the built-in zls seed plus every
     /// zide.register_lsp call. Newest registration wins per language
@@ -1690,6 +1693,7 @@ pub const Editor = struct {
         }
         if (std.mem.eql(u8, action, "settings")) {
             self.mode = .settings;
+            self.settings_window_id = self.activeWindow().id;
             self.settings_selected = 0;
             self.settings_editing = null;
             return true;
@@ -2174,6 +2178,8 @@ pub const Editor = struct {
     pub fn closeWindow(self: *Editor, idx: usize) bool {
         if (idx == 0 or idx >= self.windows.items.len) return false;
         const win = self.windows.items[idx];
+        // A Settings dialog open in this window carries on in the primary.
+        if (win.id == self.settings_window_id) self.settings_window_id = self.windows.items[0].id;
         // Recycled pane slots are reset to an editor by closePane, so every
         // .terminal slot is a live view.
         for (win.layout.panes.items) |pane| {
@@ -2221,24 +2227,43 @@ pub const Editor = struct {
         self.showDocInNewWindow(self.active_doc_idx);
     }
 
-    /// Show `doc_idx` in a new window; the source pane keeps its view (splits
-    /// already duplicate views and the tab bar is global). Without window
-    /// support this is a side-by-side split showing the document.
+    /// Show `doc_idx` in a new window and move the view there: the source
+    /// pane switches to the neighbouring document (releaseDocView). Without
+    /// window support this is a side-by-side split showing the document.
     pub fn showDocInNewWindow(self: *Editor, doc_idx: usize) void {
         if (doc_idx >= self.documents.items.len) return;
-        _ = self.newWindow(.{ .editor = doc_idx }) catch |err| switch (err) {
-            error.Unsupported => {
+        const src = self.activeWindow();
+        _ = self.newWindow(.{ .editor = doc_idx }) catch |err| {
+            if (err == error.Unsupported) {
                 self.splitActive(.horizontal);
                 self.paneShowDoc(doc_idx);
-            },
-            else => {},
+            }
+            return;
         };
+        self.releaseDocView(src, doc_idx);
+    }
+
+    /// The view of `doc_idx` in `win`'s focused pane moved elsewhere (a new
+    /// window, a tab dropped on another window): show the neighbouring
+    /// document there instead — the next one, else the previous — so the
+    /// same buffer is not left mirrored in two windows. With a single
+    /// document the pane keeps it: a pane never shows nothing.
+    pub fn releaseDocView(self: *Editor, win: *EditorWindow, doc_idx: usize) void {
+        if (win.active_pane >= win.layout.panes.items.len) return;
+        const pane = &win.layout.panes.items[win.active_pane];
+        if (pane.content != .editor or pane.content.editor != doc_idx) return;
+        // The finder's preview document rides hidden at the end of the list.
+        const n = self.documents.items.len - @as(usize, @intFromBool(self.finder_preview_appended));
+        const replacement: usize = if (doc_idx + 1 < n) doc_idx + 1 else if (doc_idx > 0) doc_idx - 1 else return;
+        pane.content = .{ .editor = replacement };
+        if (win == self.activeWindow()) self.active_doc_idx = replacement;
     }
 
     /// Move the focused pane into a new window. The source window loses that
-    /// view; when it was the window's only pane an editor view stays behind
-    /// (a terminal is never shown twice). Without window support: a split
-    /// (documents) or a second terminal at the side (terminals).
+    /// view; when it was the window's only pane an editor view stays behind —
+    /// the neighbouring document (releaseDocView), or the active document in
+    /// place of a terminal (a terminal is never shown twice). Without window
+    /// support: a split (documents) or a second terminal at the side.
     pub fn movePaneToNewWindow(self: *Editor) void {
         const src = self.activeWindow();
         const src_pane = src.active_pane;
@@ -2259,6 +2284,8 @@ pub const Editor = struct {
             ensureValidActivePaneIn(src);
         } else if (content == .terminal) {
             src.layout.panes.items[src_pane].content = .{ .editor = self.active_doc_idx };
+        } else {
+            self.releaseDocView(src, content.editor);
         }
     }
 
@@ -3398,12 +3425,52 @@ test "windows: open_in_new_window shows the active document in a new window" {
     try t.expectEqual(@as(usize, 1), editor.active_window);
     try t.expectEqual(@as(u32, 1), editor.windows.items[1].id);
     try t.expectEqual(@as(usize, 1), editor.windowDocIdx(1));
-    // The source pane keeps its view
-    try t.expectEqual(@as(usize, 1), editor.windowDocIdx(0));
+    // The view moved: the source pane shows the neighbouring document
+    try t.expectEqual(@as(usize, 0), editor.windowDocIdx(0));
     try t.expect(editor.isActivePane(1, 0));
     try t.expect(!editor.isActivePane(0, 0));
     var buf: [64]u8 = undefined;
     try t.expect(std.mem.startsWith(u8, editor.windowTitle(1, &buf), "ZIDE — "));
+}
+
+test "windows: a moved view leaves its neighbour behind; the settings dialog keeps its window" {
+    const t = std.testing;
+    var editor = try Editor.init(t.allocator, t.io);
+    defer editor.deinit();
+    editor.multi_window_supported = true;
+    // A single document: the source pane cannot show nothing, so it keeps it.
+    try t.expect(editor.execAction("open_in_new_window"));
+    try t.expectEqual(@as(usize, 0), editor.windowDocIdx(0));
+    try t.expectEqual(@as(usize, 0), editor.windowDocIdx(1));
+    // Three documents: moving the middle one out shows the next one behind.
+    editor.focusWindow(0);
+    _ = try editor.newDocument(); // 1
+    _ = try editor.newDocument(); // 2
+    editor.switchToDoc(1);
+    editor.showDocInNewWindow(1);
+    try t.expectEqual(@as(usize, 3), editor.windows.items.len);
+    try t.expectEqual(@as(usize, 2), editor.windowDocIdx(0));
+    try t.expectEqual(@as(usize, 1), editor.windowDocIdx(2));
+    // The last document moves out: the previous one stays behind.
+    editor.focusWindow(0);
+    editor.showDocInNewWindow(2);
+    try t.expectEqual(@as(usize, 1), editor.windowDocIdx(0));
+    // A tab dropped on another window releases the view the same way.
+    editor.focusWindow(0);
+    editor.switchToDoc(0);
+    editor.releaseDocView(editor.windows.items[0], 0);
+    try t.expectEqual(@as(usize, 1), editor.windowDocIdx(0));
+    try t.expectEqual(@as(usize, 1), editor.active_doc_idx);
+    // The Settings dialog belongs to the window it was opened from, survives
+    // a window switch, and falls back to the primary when that window closes.
+    editor.focusWindow(1);
+    try t.expect(editor.execAction("settings"));
+    try t.expectEqual(editor.windows.items[1].id, editor.settings_window_id);
+    editor.focusWindow(0);
+    try t.expectEqual(Editor.Mode.settings, editor.mode);
+    try t.expect(editor.closeWindow(1));
+    try t.expectEqual(@as(u32, 0), editor.settings_window_id);
+    editor.mode = .normal;
 }
 
 test "windows: closeDocAt repoints panes in every window" {
