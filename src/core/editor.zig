@@ -243,6 +243,9 @@ pub const Editor = struct {
     /// Document the .confirm_overwrite prompt was opened for (tab clicks and
     /// window switches must not redirect Overwrite/Reload to another file).
     confirm_overwrite_doc: usize = 0,
+    /// Document the .confirm_close prompt (closing a dirty tab) was opened
+    /// for — resolved by index, bounds-checked when answered.
+    confirm_close_doc: usize = 0,
     /// Window whose Settings dialog is open (an EditorWindow.id): the dialog
     /// stays in the window it was opened from instead of following focus.
     settings_window_id: u32 = 0,
@@ -354,6 +357,9 @@ pub const Editor = struct {
         /// Fuzzy file finder (quick_open) with live preview.
         file_finder,
         confirm_quit,
+        /// Closing a tab whose document has unsaved changes — Save /
+        /// Discard / Cancel for that one document (resolveCloseDoc).
+        confirm_close,
         /// Save requested but the file changed on disk since load —
         /// user picks overwrite / reload / cancel (resolveOverwrite).
         confirm_overwrite,
@@ -1556,6 +1562,80 @@ pub const Editor = struct {
         return self.closeDocAt(self.active_doc_idx);
     }
 
+    /// Close the document at `doc_idx`, asking first when it has unsaved
+    /// changes: enters .confirm_close (answered by resolveCloseDoc) and
+    /// returns false; a clean document closes right away (true). Every
+    /// close-tab path (Ctrl+W, the menus, a tab's ×) goes through here.
+    pub fn requestCloseDoc(self: *Editor, doc_idx: usize) bool {
+        if (doc_idx >= self.documents.items.len) return false;
+        if (self.documents.items[doc_idx].dirty) {
+            self.confirm_close_doc = doc_idx;
+            self.mode = .confirm_close;
+            return false;
+        }
+        _ = self.closeDocAt(doc_idx);
+        return true;
+    }
+
+    pub const CloseChoice = enum { save, discard, cancel };
+
+    /// What resolveCloseDoc did: the tab closed, it stays open, or the
+    /// document is untitled — it is active now and the frontend runs its
+    /// Save As flow, closing the tab once that wrote the file.
+    pub const CloseOutcome = enum { closed, kept, needs_path };
+
+    /// Resolve the .confirm_close prompt for the document it was opened for
+    /// (confirm_close_doc), not whatever is active when answered. Save
+    /// writes the file and closes the tab; a file that changed on disk
+    /// meanwhile gets the overwrite prompt instead and the tab stays.
+    pub fn resolveCloseDoc(self: *Editor, choice: CloseChoice) CloseOutcome {
+        self.mode = .normal;
+        const idx = self.confirm_close_doc;
+        if (idx >= self.documents.items.len) {
+            self.status_message = "Close cancelled (the document is gone)";
+            return .kept;
+        }
+        switch (choice) {
+            .cancel => return .kept,
+            .discard => {
+                _ = self.closeDocAt(idx);
+                return .closed;
+            },
+            .save => {
+                const doc = &self.documents.items[idx];
+                if (doc.file_path == null) {
+                    self.switchToDoc(idx);
+                    return .needs_path;
+                }
+                if (doc.checkExternalChange(self.io)) {
+                    doc.external_changed = true;
+                    self.confirm_overwrite_doc = idx;
+                    self.mode = .confirm_overwrite;
+                    return .kept;
+                }
+                doc.save(self.io) catch |err| {
+                    self.status_message = std.fmt.bufPrint(&self.status_buf, "Save failed: {s}", .{@errorName(err)}) catch "Save failed";
+                    return .kept;
+                };
+                self.lspDidSave(doc);
+                self.noteFileSaved(false, doc);
+                // Formatted before the close frees display_name.
+                self.status_message = std.fmt.bufPrint(&self.status_buf, "Saved {s}", .{doc.display_name}) catch "Saved";
+                _ = self.closeDocAt(idx);
+                return .closed;
+            },
+        }
+    }
+
+    /// Text of the .confirm_close prompt (both frontends draw it).
+    pub fn confirmClosePrompt(self: *const Editor, buf: []u8) []const u8 {
+        const name: []const u8 = if (self.confirm_close_doc < self.documents.items.len)
+            self.documents.items[self.confirm_close_doc].display_name
+        else
+            "Document";
+        return std.fmt.bufPrint(buf, "{s} has unsaved changes! [S]ave [D]iscard [C]ancel", .{name}) catch "Unsaved changes! [S]ave [D]iscard [C]ancel";
+    }
+
     /// Close the document at `idx` (e.g. a tab's close button) without
     /// stealing a focused terminal pane. Returns false if it was the last
     /// document (replaced with a fresh empty one in that case).
@@ -1750,7 +1830,7 @@ pub const Editor = struct {
             return true;
         }
         if (std.mem.eql(u8, action, "close_tab")) {
-            _ = self.closeActiveDoc();
+            _ = self.requestCloseDoc(self.active_doc_idx);
             return true;
         }
         if (std.mem.eql(u8, action, "next_doc")) {
@@ -3936,6 +4016,77 @@ test "workspace search and replace end to end" {
     const rewritten = try std.Io.Dir.cwd().readFileAlloc(t.io, root ++ "/sub/c.txt", t.allocator, .limited(4096));
     defer t.allocator.free(rewritten);
     try t.expectEqualStrings("closed dog file\n", rewritten);
+}
+
+test "close tab: a dirty document prompts; discard closes, cancel keeps it" {
+    const t = std.testing;
+    var editor = try Editor.init(t.allocator, t.io);
+    defer editor.deinit();
+    _ = try editor.newDocument(); // index 1, active
+    try t.expectEqual(@as(usize, 2), editor.documents.items.len);
+    // Clean: closes at once
+    try t.expect(editor.execAction("close_tab"));
+    try t.expectEqual(@as(usize, 1), editor.documents.items.len);
+    try t.expectEqual(Editor.Mode.normal, editor.mode);
+    // Dirty: prompts instead
+    const d2 = try editor.newDocument();
+    try d2.insertAtCursor("draft");
+    try t.expect(editor.execAction("close_tab"));
+    try t.expectEqual(Editor.Mode.confirm_close, editor.mode);
+    try t.expectEqual(@as(usize, 1), editor.confirm_close_doc);
+    try t.expectEqual(@as(usize, 2), editor.documents.items.len);
+    // Cancel keeps the tab
+    try t.expectEqual(Editor.CloseOutcome.kept, editor.resolveCloseDoc(.cancel));
+    try t.expectEqual(Editor.Mode.normal, editor.mode);
+    try t.expectEqual(@as(usize, 2), editor.documents.items.len);
+    try t.expect(editor.documents.items[1].dirty);
+    // A tab's × names an index; discard closes it
+    try t.expect(!editor.requestCloseDoc(1));
+    try t.expectEqual(Editor.Mode.confirm_close, editor.mode);
+    try t.expectEqual(Editor.CloseOutcome.closed, editor.resolveCloseDoc(.discard));
+    try t.expectEqual(@as(usize, 1), editor.documents.items.len);
+    try t.expectEqual(Editor.Mode.normal, editor.mode);
+    // Untitled + Save: the frontend must run Save As; the document stays and becomes active
+    const d3 = try editor.newDocument();
+    try d3.insertAtCursor("draft");
+    editor.switchToDoc(0);
+    try t.expect(!editor.requestCloseDoc(1));
+    try t.expectEqual(Editor.CloseOutcome.needs_path, editor.resolveCloseDoc(.save));
+    try t.expectEqual(@as(usize, 2), editor.documents.items.len);
+    try t.expectEqual(@as(usize, 1), editor.active_doc_idx);
+    try t.expectEqual(Editor.Mode.normal, editor.mode);
+    // A prompt whose document vanished resolves to nothing
+    editor.confirm_close_doc = 7;
+    editor.mode = .confirm_close;
+    try t.expectEqual(Editor.CloseOutcome.kept, editor.resolveCloseDoc(.discard));
+    try t.expectEqual(@as(usize, 2), editor.documents.items.len);
+    try t.expectEqual(Editor.Mode.normal, editor.mode);
+}
+
+test "close tab: Save writes the file and closes the tab" {
+    const t = std.testing;
+    const path = ".zig-cache/zide-test-close-save.txt";
+    {
+        const f = try std.Io.Dir.cwd().createFile(t.io, path, .{});
+        defer f.close(t.io);
+        try f.writeStreamingAll(t.io, "one\n");
+    }
+    defer std.Io.Dir.cwd().deleteFile(t.io, path) catch {};
+    var editor = try Editor.init(t.allocator, t.io);
+    defer editor.deinit();
+    const doc = try editor.openFile(path);
+    try doc.insertAtCursor("two ");
+    try t.expect(doc.dirty);
+    try t.expect(!editor.requestCloseDoc(editor.active_doc_idx));
+    try t.expectEqual(Editor.Mode.confirm_close, editor.mode);
+    try t.expectEqual(Editor.CloseOutcome.closed, editor.resolveCloseDoc(.save));
+    try t.expectEqual(Editor.Mode.normal, editor.mode);
+    // Only an untitled buffer remains (the last document is always replaced by one)
+    try t.expectEqual(@as(usize, 1), editor.documents.items.len);
+    try t.expect(editor.documents.items[0].file_path == null);
+    const written = try std.Io.Dir.cwd().readFileAlloc(t.io, path, t.allocator, .limited(4096));
+    defer t.allocator.free(written);
+    try t.expectEqualStrings("two one\n", written);
 }
 
 test "editor external-change poll and save guard" {

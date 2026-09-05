@@ -45,7 +45,7 @@
 | Ctrl+Delete | Delete word forward |
 | Ctrl+Home/End | Jump to file start/end |
 | Ctrl+Shift+Home/End | Select to file start/end |
-| Ctrl+W | Close tab |
+| Ctrl+W | Close tab (prompts if unsaved) |
 | Ctrl+Alt+Q | Close pane (also closes the focused terminal pane) |
 | Ctrl+Tab / Ctrl+Shift+Tab | Next / previous document tab |
 | Ctrl+PageDown / Ctrl+PageUp | Next / previous document tab |
@@ -135,7 +135,7 @@ Windows terminals commonly intercept Alt combos (Windows Terminal binds Alt+arro
 - Line ending detection (LF / CRLF)
 - External change detection: open files are polled (~1.5s, same cadence as the file tree probe) — clean buffers reload in place with the cursor preserved; dirty buffers are flagged and saving asks `[O]verwrite [R]eload [C]ancel` instead of silently clobbering; auto-save skips flagged files; a file deleted on disk marks its buffer dirty so the content survives and can be re-saved
 - Dirty tracking
-- Unsaved changes prompt on quit (Save/Discard/Cancel)
+- Unsaved changes prompts (Save/Discard/Cancel): on quit for every document, and when closing a dirty tab — Ctrl+W, File > Close Tab, a tab's × and its right-click Close Tab all ask about that one document. Save on an untitled tab goes through Save As and closes the tab once the file is written; a file that changed on disk meanwhile gets the overwrite prompt instead and the tab stays open
 - Session persistence (opt-in: `zide.set("session_persistence", true)` or the Settings dialog): on quit the open files, cursor positions, scroll offsets and active tab are written to `~/.config/zide/session`; launching ZIDE without file arguments restores them (missing files are skipped, untitled buffers are not recorded). Applies to both frontends. Windows and split layouts are not part of the session — everything reopens in the main window.
 
 **Configuration:**
@@ -221,7 +221,7 @@ Windows terminals commonly intercept Alt combos (Windows Terminal binds Alt+arro
   - `open_in_new_window` moves the current document into a new window — its tab goes with it and the source pane switches to the neighbouring tab (the main window gets a fresh untitled document when that was its last tab); `move_pane_to_new_window` moves the focused pane there the same way — a terminal is never shown twice, so a lone terminal pane leaves a fresh untitled document behind in the main window, and an extra window that loses its only pane closes; `detach_terminal` (Ctrl+Alt+`) is the terminal-pane shortcut for that move
   - Every window has its own split tree and focused pane; the window with OS keyboard focus is the active one (clicking a window's title bar is enough). Keys, IME and modal prompts follow the active pane; switching windows cancels a transient prompt (finder, palette, find bar, confirm) instead of letting it act on another window's document; the Settings dialog instead stays in the window it was opened from while the other windows keep working
   - Each window owns its tabs: a document is listed in exactly one window. Files you open or create join the window you are working in, Ctrl+Tab / Ctrl+Shift+Tab cycle that window's tabs, and showing a document in another window (tab drop, Open in New Window, a file-tree double-click while that window is active) moves its tab there. Closing the last tab of an extra window closes the window; the main window gets a fresh untitled document instead. The status bar shows that window's document (`Terminal` for a terminal pane)
-  - Drag a tab out of the tab bar to move that document into a new window under the pointer; drop it on another ZIDE window to move it there; release anywhere on the same window or press Escape to cancel. Right-click a tab → Move to New Window / Close Tab. The main window hides its tab bar with a single document — use Ctrl+Shift+N there; extra windows always show the bar so a tab can be dragged back. Wayland has no global pointer position: the drop always opens a new window where the compositor puts it
+  - Drag a tab out of the tab bar to move that document into a new window under the pointer; drop it on another ZIDE window to move it there; release anywhere on the same window or press Escape to cancel. Right-click a tab → Move to New Window / Close Tab (a tab with unsaved changes asks first). The main window hides its tab bar with a single document — use Ctrl+Shift+N there; extra windows always show the bar so a tab can be dragged back. Wayland has no global pointer position: the drop always opens a new window where the compositor puts it
   - The file tree and the search panel live in the main window only — their commands (Ctrl+B, Ctrl+Shift+F, Reveal in Tree) bring the main window forward
   - `secondary_window_chrome` (Settings dialog / init.lua, default true): menu bar + status bar in extra windows; false = bare pane containers
   - Closing an extra window (OS close button, `close_window`, closing its last pane or tab) closes only its views — its tabs return to the main window and the documents stay open; a terminal shown only there is stopped. Closing the main window, File > Exit and Ctrl+Q all go through the unsaved-changes prompt
@@ -753,6 +753,7 @@ both stdin and stdout must be a TTY.
 - `Ctrl+S` on a buffer **with** a file path saves it; failures show in the status bar
 - `Ctrl+S` on an **untitled** buffer opens Save As (native dialog in the GUI, path prompt in the TUI)
 - Quit-with-unsaved-changes (`[S]ave`) only quits if **every** dirty document saved; otherwise it cancels and reports how many failed
+- Closing a dirty tab (Ctrl+W, the tab's ×, Close Tab in the File or tab menu) asks `[S]ave [D]iscard [C]ancel` for that document. `[S]ave` on an untitled buffer opens Save As (native dialog in the GUI, path prompt in the TUI) and closes the tab once the file is written — cancelling Save As keeps the tab. A file that changed on disk meanwhile gets the `[O]verwrite [R]eload [C]ancel` prompt instead and the tab stays open
 
 ### Welcome Screen
 

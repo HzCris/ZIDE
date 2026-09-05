@@ -402,6 +402,10 @@ pub fn run(allocator: std.mem.Allocator, editor: *Editor) !void {
             .confirm_quit => {
                 drawOverlay(win, editor, "Unsaved changes! [S]ave [D]iscard [C]ancel: ", "", width, height);
             },
+            .confirm_close => {
+                var msg_buf: [320]u8 = undefined;
+                drawOverlay(win, editor, editor.confirmClosePrompt(&msg_buf), "", width, height);
+            },
             .confirm_overwrite => {
                 drawOverlay(win, editor, "File changed on disk! [O]verwrite [R]eload [C]ancel: ", "", width, height);
             },
@@ -453,6 +457,8 @@ pub fn run(allocator: std.mem.Allocator, editor: *Editor) !void {
 
 /// Dispatch key based on current editor mode.
 fn dispatchKey(editor: *Editor, key: Key) void {
+    // The close-after-Save-As hand-off only spans one Save As prompt.
+    if (editor.mode != .save_as) close_tab_after_save_as = false;
     // Terminal pane: route keys to PTY (except ctrl+backtick for toggle)
     if (editor.activePaneIsTerminal()) {
         handleTerminalKey(editor, key);
@@ -478,6 +484,7 @@ fn dispatchKey(editor: *Editor, key: Key) void {
         .file_finder => handleFinderKey(editor, key),
         .goto_line => handleGotoLineKey(editor, key),
         .confirm_quit => handleConfirmQuitKey(editor, key),
+        .confirm_close => handleConfirmCloseKey(editor, key),
         .confirm_overwrite => handleConfirmOverwriteKey(editor, key),
         .settings => {
             // Settings panel is GUI-only; Escape returns to normal
@@ -3067,6 +3074,31 @@ fn handleConfirmOverwriteKey(editor: *Editor, key: Key) void {
     }
 }
 
+/// Set when [S]ave in the close-tab prompt met an untitled document: the
+/// Save As prompt that follows closes the tab once the file is written.
+var close_tab_after_save_as = false;
+
+/// Close-tab prompt ([S]ave [D]iscard [C]ancel for one document).
+fn handleConfirmCloseKey(editor: *Editor, key: Key) void {
+    if (key.isModifier()) return;
+    switch (key.codepoint) {
+        's', 'S' => {
+            if (editor.resolveCloseDoc(.save) == .needs_path) {
+                // Untitled: ask for a name first; handleSaveAsKey closes it.
+                _ = editor.execAction("save_as");
+                close_tab_after_save_as = true;
+            }
+        },
+        'd', 'D' => {
+            _ = editor.resolveCloseDoc(.discard);
+        },
+        'c', 'C', Key.escape => {
+            _ = editor.resolveCloseDoc(.cancel);
+        },
+        else => {},
+    }
+}
+
 /// Handle keys in Confirm Quit mode.
 fn handleConfirmQuitKey(editor: *Editor, key: Key) void {
     if (key.isModifier()) return;
@@ -3205,9 +3237,11 @@ fn handleSaveAsKey(editor: *Editor, key: Key) void {
 
     if (key.codepoint == Key.escape) {
         editor.mode = .normal;
+        close_tab_after_save_as = false;
         return;
     }
     if (key.codepoint == Key.enter) {
+        var saved = false;
         if (editor.open_buf_len > 0) {
             const path = editor.open_buf[0..editor.open_buf_len];
             // saveDocAs = LSP forget (old uri) → write → re-detect language →
@@ -3215,8 +3249,14 @@ fn handleSaveAsKey(editor: *Editor, key: Key) void {
             editor.saveDocAs(editor.activeDoc(), path) catch {
                 editor.status_message = "Save failed";
             };
+            saved = !editor.activeDoc().dirty;
         }
         editor.mode = .normal;
+        // [S]ave from the close-tab prompt: the file has a name now, close its tab.
+        if (close_tab_after_save_as) {
+            close_tab_after_save_as = false;
+            if (saved) _ = editor.closeActiveDoc();
+        }
         return;
     }
     if (key.codepoint == Key.backspace) {

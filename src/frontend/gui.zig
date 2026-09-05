@@ -704,7 +704,7 @@ fn menuBar(editor: *Editor) void {
                 m.close();
             }
             if (dvui.menuItemLabel(@src(), "Close Tab        Ctrl+W", .{}, .{ .expand = .horizontal }) != null) {
-                _ = editor.closeActiveDoc();
+                _ = editor.execAction("close_tab"); // asks about unsaved changes
                 m.close();
             }
             if (dvui.menuItemLabel(@src(), "Exit             Ctrl+Q", .{}, .{ .expand = .horizontal }) != null) {
@@ -991,10 +991,11 @@ fn tabBar(editor: *Editor) void {
         }
     }
 
-    // Deferred until the iteration is complete. closeDocAt closes by index —
-    // switching first would hijack a focused terminal pane's content.
+    // Deferred until the iteration is complete. Closing goes by index —
+    // switching first would hijack a focused terminal pane's content — and a
+    // document with unsaved changes gets the Save / Discard / Cancel prompt.
     if (close_tab_idx) |idx| {
-        _ = editor.closeDocAt(idx);
+        _ = editor.requestCloseDoc(idx);
     } else if (to_new_window_idx) |idx| {
         if (editor.multi_window_supported) {
             editor.showDocInNewWindow(idx);
@@ -5805,6 +5806,7 @@ fn handleModalKey(editor: *Editor, key: dvui.Event.Key) void {
         .command_palette => handlePaletteKeyGui(editor, key),
         .file_finder => handleFinderKeyGui(editor, key),
         .confirm_quit => handleConfirmQuitKeyGui(editor, key),
+        .confirm_close => handleConfirmCloseKeyGui(editor, key),
         .confirm_overwrite => handleConfirmOverwriteKeyGui(editor, key),
         .settings => {}, // DVUI dialog handles its own input (settingsDialog)
         .file_open, .save_as => {}, // handled by native dialogs in GUI
@@ -6047,6 +6049,29 @@ fn handleConfirmOverwriteKeyGui(editor: *Editor, key: dvui.Event.Key) void {
         .o => editor.resolveOverwrite(.overwrite),
         .r => editor.resolveOverwrite(.reload),
         .c, .escape => editor.resolveOverwrite(.cancel),
+        else => {},
+    }
+}
+
+/// Close-tab prompt ([S]ave [D]iscard [C]ancel for one document). Save on
+/// an untitled document runs the native Save As dialog and closes the tab
+/// only if that wrote the file.
+fn handleConfirmCloseKeyGui(editor: *Editor, key: dvui.Event.Key) void {
+    switch (key.code) {
+        .s => {
+            if (editor.resolveCloseDoc(.save) != .needs_path) return;
+            const idx = editor.confirm_close_doc; // active now (resolveCloseDoc switched to it)
+            saveAs(editor);
+            if (idx < editor.documents.items.len and !editor.documents.items[idx].dirty) {
+                _ = editor.closeDocAt(idx);
+            }
+        },
+        .d => {
+            _ = editor.resolveCloseDoc(.discard);
+        },
+        .c, .escape => {
+            _ = editor.resolveCloseDoc(.cancel);
+        },
         else => {},
     }
 }
@@ -6985,6 +7010,12 @@ fn drawModalOverlay(editor: *Editor, render_area: dvui.Rect.Physical, render_rs:
             const h = lh + pad * 2;
             fillBar(render_area, 0, h, bg);
             renderOverlayText(font, "Unsaved changes! [S]ave [D]iscard [C]ancel", render_area.x + pad, render_area.y + pad, render_rs, fg);
+        },
+        .confirm_close => {
+            const h = lh + pad * 2;
+            fillBar(render_area, 0, h, bg);
+            var msg_buf: [320]u8 = undefined;
+            renderOverlayText(font, editor.confirmClosePrompt(&msg_buf), render_area.x + pad, render_area.y + pad, render_rs, fg);
         },
         .confirm_overwrite => {
             const h = lh + pad * 2;
