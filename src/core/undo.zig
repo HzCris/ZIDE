@@ -1,67 +1,60 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const Buffer = @import("buffer.zig").Buffer;
+const Cursor = @import("cursor.zig").Cursor;
+const CursorSet = @import("cursor.zig").CursorSet;
 
-/// Type of edit operation recorded for undo/redo.
-pub const OpType = enum {
-    insert,
-    delete,
-};
+pub const OpType = enum { insert, delete };
 
-/// A single undo operation recording what was inserted or deleted.
+/// Owned primitive edit. Only the first/last operation of a group owns its
+/// before/after cursor snapshot, respectively.
 pub const UndoOp = struct {
     op_type: OpType,
-    /// Byte offset where the operation occurred.
     offset: usize,
-    /// The text that was inserted (for insert) or deleted (for delete).
-    /// Owned by the UndoHistory allocator.
     text: []const u8,
-    /// Cursor offset before the operation.
     cursor_before: usize,
-    /// Cursor offset after the operation.
     cursor_after: usize,
-    /// Group ID for merging adjacent operations.
-    group_id: u32,
+    group_id: u64 = 0,
+    revision_before: u64 = 0,
+    revision_after: u64 = 0,
+    cursors_before: ?[]Cursor = null,
+    cursors_after: ?struct { storage: []Cursor, len: usize } = null,
 };
 
-/// Undo/redo history for a document.
 pub const UndoHistory = struct {
-    undo_stack: std.ArrayList(UndoOp),
-    redo_stack: std.ArrayList(UndoOp),
+    undo_stack: std.ArrayList(UndoOp) = .empty,
+    redo_stack: std.ArrayList(UndoOp) = .empty,
     allocator: Allocator,
-    next_group_id: u32 = 1,
-    /// Whether we're currently replaying (undo/redo in progress).
+    next_group_id: u64 = 1,
     recording: bool = true,
-    /// Maximum number of undo operations to keep (0 = unlimited).
     max_size: usize = 100,
-    /// Explicit group nesting depth (beginGroup/endGroup). While > 0, all
-    /// recorded ops share `active_group` so one undo reverts them together.
     group_depth: u32 = 0,
-    /// Forced group id while group_depth > 0.
-    active_group: u32 = 0,
+    active_group: u64 = 0,
+    current_revision: u64 = 0,
+    next_revision: u64 = 1,
+    saved_revision: ?u64 = 0,
+    merge_allowed: bool = false,
 
     pub fn init(allocator: Allocator) UndoHistory {
-        return .{
-            .undo_stack = .empty,
-            .redo_stack = .empty,
-            .allocator = allocator,
-        };
+        return .{ .allocator = allocator };
     }
-
     pub fn deinit(self: *UndoHistory) void {
-        for (self.undo_stack.items) |op| {
-            self.allocator.free(op.text);
-        }
+        self.clear();
         self.undo_stack.deinit(self.allocator);
-        for (self.redo_stack.items) |op| {
-            self.allocator.free(op.text);
-        }
         self.redo_stack.deinit(self.allocator);
     }
-
-    /// Begin an explicit undo group: every operation recorded until the
-    /// matching endGroup shares one group id (single undo step).
-    /// Re-entrant — nested begin/end pairs join the outermost group.
+    fn freeOp(self: *UndoHistory, op: UndoOp) void {
+        self.allocator.free(op.text);
+        if (op.cursors_before) |s| self.allocator.free(s);
+        if (op.cursors_after) |s| self.allocator.free(s.storage);
+    }
+    pub fn markSaved(self: *UndoHistory) void {
+        self.saved_revision = self.current_revision;
+        self.merge_allowed = false;
+    }
+    pub fn isSaved(self: *const UndoHistory) bool {
+        return self.saved_revision == self.current_revision;
+    }
     pub fn beginGroup(self: *UndoHistory) void {
         if (self.group_depth == 0) {
             self.active_group = self.next_group_id;
@@ -69,225 +62,155 @@ pub const UndoHistory = struct {
         }
         self.group_depth += 1;
     }
-
-    /// End an explicit undo group started with beginGroup.
     pub fn endGroup(self: *UndoHistory) void {
         if (self.group_depth > 0) self.group_depth -= 1;
-        // Oversized groups are exempt from trimming while open; enforce the
-        // cap once the group is complete (may evict the whole group).
-        if (self.group_depth == 0) self.trimOldest();
+        if (self.group_depth == 0) {
+            self.merge_allowed = false;
+            self.trimOldest();
+        }
     }
-
-    /// Record an insert operation.
-    pub fn recordInsert(self: *UndoHistory, offset: usize, text: []const u8, cursor_before: usize, cursor_after: usize) !void {
-        if (!self.recording) return;
+    pub fn recordInsert(self: *UndoHistory, offset: usize, text: []const u8, before: usize, after: usize) !void {
+        try self.record(.insert, offset, text, before, after);
+    }
+    pub fn recordDelete(self: *UndoHistory, offset: usize, text: []const u8, before: usize, after: usize) !void {
+        try self.record(.delete, offset, text, before, after);
+    }
+    fn record(self: *UndoHistory, kind: OpType, offset: usize, text: []const u8, before: usize, after: usize) !void {
+        if (!self.recording or text.len == 0) return;
+        const owned = try self.allocator.dupe(u8, text);
+        errdefer self.allocator.free(owned);
+        try self.undo_stack.ensureUnusedCapacity(self.allocator, 1);
+        self.appendPrepared(.{ .op_type = kind, .offset = offset, .text = owned, .cursor_before = before, .cursor_after = after });
+    }
+    /// Takes ownership; caller reserves stack space and all buffer allocations first.
+    pub fn appendPrepared(self: *UndoHistory, prepared: UndoOp) void {
+        var op = prepared;
         self.clearRedoStack();
-        const group_id = self.resolveGroupId(.insert, offset, text);
-        const owned_text = try self.allocator.dupe(u8, text);
-        try self.undo_stack.append(self.allocator, .{
-            .op_type = .insert,
-            .offset = offset,
-            .text = owned_text,
-            .cursor_before = cursor_before,
-            .cursor_after = cursor_after,
-            .group_id = group_id,
-        });
+        op.group_id = self.resolveGroupId(op.op_type, op.offset, op.text);
+        op.revision_before = self.current_revision;
+        op.revision_after = self.next_revision;
+        self.next_revision += 1;
+        self.current_revision = op.revision_after;
+        self.undo_stack.appendAssumeCapacity(op);
+        self.merge_allowed = true;
         self.trimOldest();
     }
-
-    /// Record a delete operation.
-    pub fn recordDelete(self: *UndoHistory, offset: usize, deleted_text: []const u8, cursor_before: usize, cursor_after: usize) !void {
-        if (!self.recording) return;
-        self.clearRedoStack();
-        const group_id = self.resolveGroupId(.delete, offset, deleted_text);
-        const owned_text = try self.allocator.dupe(u8, deleted_text);
-        try self.undo_stack.append(self.allocator, .{
-            .op_type = .delete,
-            .offset = offset,
-            .text = owned_text,
-            .cursor_before = cursor_before,
-            .cursor_after = cursor_after,
-            .group_id = group_id,
-        });
-        self.trimOldest();
+    /// Takes ownership of snapshots allocated before the edit. Coalesced typing
+    /// retains the original before-state and replaces only its after-state.
+    pub fn attachCursors(self: *UndoHistory, before: []Cursor, after: []Cursor, count: usize) void {
+        const last = self.undo_stack.items.len - 1;
+        const gid = self.undo_stack.items[last].group_id;
+        var first = last;
+        while (first > 0 and self.undo_stack.items[first - 1].group_id == gid) first -= 1;
+        if (self.undo_stack.items[first].cursors_before == null) {
+            self.undo_stack.items[first].cursors_before = before;
+        } else self.allocator.free(before);
+        for (self.undo_stack.items[first..]) |*op| {
+            if (op.cursors_after) |s| self.allocator.free(s.storage);
+            op.cursors_after = null;
+        }
+        self.undo_stack.items[last].cursors_after = .{ .storage = after, .len = count };
     }
-
-    /// Undo one group of operations. Returns the cursor position to restore, or null if nothing to undo.
     pub fn undo(self: *UndoHistory, buffer: *Buffer) !?usize {
-        if (self.undo_stack.items.len == 0) return null;
-
-        self.recording = false;
-        defer self.recording = true;
-
-        const group_id = self.undo_stack.items[self.undo_stack.items.len - 1].group_id;
-        var cursor_pos: usize = 0;
-
-        // Undo all ops in this group (they're in order, undo in reverse)
-        while (self.undo_stack.items.len > 0) {
-            const top = &self.undo_stack.items[self.undo_stack.items.len - 1];
-            if (top.group_id != group_id) break;
-
-            const op = self.undo_stack.pop().?;
-            cursor_pos = op.cursor_before;
-            // If re-applying or re-stacking fails, the op is already popped —
-            // free its text instead of leaking it.
-            errdefer self.allocator.free(op.text);
-
-            // Reverse the operation
-            switch (op.op_type) {
-                .insert => {
-                    // Undo insert = delete
-                    _ = buffer.delete(op.offset, op.text.len);
-                },
-                .delete => {
-                    // Undo delete = insert
-                    _ = try buffer.insert(op.offset, op.text);
-                },
-            }
-
-            // Move to redo stack
-            try self.redo_stack.append(self.allocator, op);
-        }
-
-        return cursor_pos;
+        return self.replay(buffer, null, false);
     }
-
-    /// Redo one group of operations. Returns the cursor position to restore, or null if nothing to redo.
     pub fn redo(self: *UndoHistory, buffer: *Buffer) !?usize {
-        if (self.redo_stack.items.len == 0) return null;
-
-        self.recording = false;
-        defer self.recording = true;
-
-        const group_id = self.redo_stack.items[self.redo_stack.items.len - 1].group_id;
-        var cursor_pos: usize = 0;
-
-        while (self.redo_stack.items.len > 0) {
-            const top = &self.redo_stack.items[self.redo_stack.items.len - 1];
-            if (top.group_id != group_id) break;
-
-            const op = self.redo_stack.pop().?;
-            cursor_pos = op.cursor_after;
-            errdefer self.allocator.free(op.text);
-
-            // Re-apply the operation
-            switch (op.op_type) {
-                .insert => {
-                    _ = try buffer.insert(op.offset, op.text);
-                },
-                .delete => {
-                    _ = buffer.delete(op.offset, op.text.len);
-                },
+        return self.replay(buffer, null, true);
+    }
+    pub fn undoCursors(self: *UndoHistory, buffer: *Buffer, cursors: *CursorSet) !bool {
+        return (try self.replay(buffer, cursors, false)) != null;
+    }
+    pub fn redoCursors(self: *UndoHistory, buffer: *Buffer, cursors: *CursorSet) !bool {
+        return (try self.replay(buffer, cursors, true)) != null;
+    }
+    fn replay(self: *UndoHistory, buffer: *Buffer, cursors: ?*CursorSet, forward: bool) !?usize {
+        const source = if (forward) &self.redo_stack else &self.undo_stack;
+        const target = if (forward) &self.undo_stack else &self.redo_stack;
+        if (source.items.len == 0) return null;
+        const gid = source.items[source.items.len - 1].group_id;
+        var first = source.items.len - 1;
+        while (first > 0 and source.items[first - 1].group_id == gid) first -= 1;
+        var bytes: usize = 0;
+        var lines: usize = 0;
+        var snapshot: ?[]Cursor = null;
+        for (source.items[first..]) |op| {
+            if ((op.op_type == .insert) == forward) {
+                bytes += op.text.len;
+                lines += std.mem.count(u8, op.text, "\n");
             }
-
-            // Move back to undo stack
-            try self.undo_stack.append(self.allocator, op);
+            if (forward) {
+                if (op.cursors_after) |s| snapshot = s.storage[0..s.len];
+            } else if (op.cursors_before) |s| {
+                snapshot = s;
+            }
         }
-
+        try target.ensureUnusedCapacity(self.allocator, source.items.len - first);
+        try buffer.reserveInsert(bytes, lines);
+        if (cursors) |cs| if (snapshot) |s| {
+            try cs.cursors.ensureTotalCapacity(cs.allocator, s.len);
+        };
+        var cursor_pos: usize = 0;
+        while (source.items.len > first) {
+            const op = source.pop().?;
+            if ((op.op_type == .insert) == forward) {
+                _ = buffer.insert(op.offset, op.text) catch unreachable; // reserved above
+            } else _ = buffer.delete(op.offset, op.text.len);
+            cursor_pos = if (forward) op.cursor_after else op.cursor_before;
+            self.current_revision = if (forward) op.revision_after else op.revision_before;
+            target.appendAssumeCapacity(op);
+        }
+        if (cursors) |cs| {
+            if (snapshot) |s| {
+                cs.cursors.items.len = s.len;
+                @memcpy(cs.cursors.items, s);
+            } else {
+                cs.clearSecondary();
+                cs.primary().* = .{ .offset = cursor_pos, .preferred_col = buffer.offsetToPos(cursor_pos).col };
+            }
+        }
+        self.merge_allowed = false;
+        if (forward) self.trimOldest();
         return cursor_pos;
     }
-
-    /// Check if there are operations to undo.
     pub fn canUndo(self: *const UndoHistory) bool {
         return self.undo_stack.items.len > 0;
     }
-
-    /// Check if there are operations to redo.
     pub fn canRedo(self: *const UndoHistory) bool {
         return self.redo_stack.items.len > 0;
     }
-
-    /// Clear all history (e.g., after loading a new file).
     pub fn clear(self: *UndoHistory) void {
-        for (self.undo_stack.items) |op| {
-            self.allocator.free(op.text);
-        }
-        self.undo_stack.items.len = 0;
+        for (self.undo_stack.items) |op| self.freeOp(op);
+        self.undo_stack.clearRetainingCapacity();
         self.clearRedoStack();
-        self.next_group_id = 1;
         self.group_depth = 0;
+        self.current_revision = self.next_revision;
+        self.next_revision += 1;
+        self.markSaved();
     }
-
-    // --- Internal ---
-
-    /// Evict oldest undo operations if the stack exceeds max_size.
-    /// Always evicts whole groups — a partially trimmed group would apply a
-    /// partial undo and corrupt the buffer. The currently open group (if any)
-    /// is exempt until endGroup, so the stack may transiently exceed max_size.
     fn trimOldest(self: *UndoHistory) void {
-        if (self.max_size == 0) return; // unlimited
-        if (self.undo_stack.items.len <= self.max_size) return;
-        var evict_to: usize = 0;
-        while (self.undo_stack.items.len - evict_to > self.max_size) {
-            const gid = self.undo_stack.items[evict_to].group_id;
-            if (self.group_depth > 0 and gid == self.active_group) break;
-            while (evict_to < self.undo_stack.items.len and self.undo_stack.items[evict_to].group_id == gid) {
-                self.allocator.free(self.undo_stack.items[evict_to].text);
-                evict_to += 1;
+        if (self.max_size == 0 or self.undo_stack.items.len <= self.max_size) return;
+        const newest = self.undo_stack.items[self.undo_stack.items.len - 1].group_id;
+        var n: usize = 0;
+        while (self.undo_stack.items.len - n > self.max_size) {
+            const gid = self.undo_stack.items[n].group_id;
+            if (gid == newest) break;
+            while (n < self.undo_stack.items.len and self.undo_stack.items[n].group_id == gid) : (n += 1) self.freeOp(self.undo_stack.items[n]);
+        }
+        std.mem.copyForwards(UndoOp, self.undo_stack.items[0..], self.undo_stack.items[n..]);
+        self.undo_stack.items.len -= n;
+    }
+    fn clearRedoStack(self: *UndoHistory) void {
+        for (self.redo_stack.items) |op| self.freeOp(op);
+        self.redo_stack.clearRetainingCapacity();
+    }
+    fn resolveGroupId(self: *UndoHistory, kind: OpType, offset: usize, text: []const u8) u64 {
+        if (self.group_depth > 0) return self.active_group;
+        if (self.merge_allowed and self.undo_stack.items.len > 0) {
+            const prev = self.undo_stack.items[self.undo_stack.items.len - 1];
+            if (text.len == 1 and prev.text.len == 1 and text[0] != '\n' and prev.text[0] != '\n' and kind == prev.op_type) {
+                if ((kind == .insert and offset == prev.offset + 1) or (kind == .delete and (offset == prev.offset -| 1 or offset == prev.offset))) return prev.group_id;
             }
         }
-        if (evict_to > 0) {
-            const remaining = self.undo_stack.items.len - evict_to;
-            std.mem.copyForwards(UndoOp, self.undo_stack.items[0..remaining], self.undo_stack.items[evict_to..]);
-            self.undo_stack.items.len = remaining;
-        }
-    }
-
-    fn clearRedoStack(self: *UndoHistory) void {
-        for (self.redo_stack.items) |op| {
-            self.allocator.free(op.text);
-        }
-        self.redo_stack.items.len = 0;
-    }
-
-    /// Determine group ID based on adjacency with previous operation.
-    /// Adjacent same-type single-char operations on the same logical action get merged.
-    fn resolveGroupId(self: *UndoHistory, op_type: OpType, offset: usize, text: []const u8) u32 {
-        // Explicit group open — everything joins it.
-        if (self.group_depth > 0) return self.active_group;
-
-        if (self.undo_stack.items.len == 0) {
-            defer self.next_group_id += 1;
-            return self.next_group_id;
-        }
-
-        const prev = &self.undo_stack.items[self.undo_stack.items.len - 1];
-
-        // Multi-char operations always start a new group
-        if (text.len != 1 or prev.text.len != 1) {
-            defer self.next_group_id += 1;
-            return self.next_group_id;
-        }
-
-        // Newlines always start a new group
-        if (text[0] == '\n' or prev.text[0] == '\n') {
-            defer self.next_group_id += 1;
-            return self.next_group_id;
-        }
-
-        // Different operation types start a new group
-        if (op_type != prev.op_type) {
-            defer self.next_group_id += 1;
-            return self.next_group_id;
-        }
-
-        // Check adjacency
-        switch (op_type) {
-            .insert => {
-                // Typing forward: new offset = prev offset + 1
-                if (offset == prev.offset + prev.text.len) {
-                    return prev.group_id;
-                }
-            },
-            .delete => {
-                // Backspace: new offset = prev offset - 1
-                // Delete key: same offset
-                if (offset == prev.offset -| 1 or offset == prev.offset) {
-                    return prev.group_id;
-                }
-            },
-        }
-
         defer self.next_group_id += 1;
         return self.next_group_id;
     }
@@ -518,8 +441,10 @@ test "open group exempt from trim until endGroup" {
     // Open group may exceed the cap without being split
     try std.testing.expectEqual(@as(usize, 5), hist.undo_stack.items.len);
     hist.endGroup();
-    // Whole oversized group evicted at endGroup — empty, but never partial
-    try std.testing.expectEqual(@as(usize, 0), hist.undo_stack.items.len);
+    // Retain the complete newest group above the limit.
+    try std.testing.expectEqual(@as(usize, 5), hist.undo_stack.items.len);
+    _ = try hist.undo(&buf);
+    try std.testing.expectEqualStrings("", buf.slice(0, buf.byteLen()));
 }
 
 test "new edit clears redo" {

@@ -170,16 +170,13 @@ pub const Buffer = struct {
     pub fn insert(self: *Buffer, offset: usize, text: []const u8) !usize {
         if (text.len == 0) return 0;
         const pos = @min(offset, self.content_len);
-        // Ensure gap is large enough
-        if (text.len > self.gapLen()) {
-            try self.grow(text.len);
-        }
+        try self.reserveInsert(text.len, std.mem.count(u8, text, "\n"));
         self.moveGap(pos);
         @memcpy(self.data[self.gap_start .. self.gap_start + text.len], text);
         self.gap_start += text.len;
         self.content_len += text.len;
         self.version +%= 1;
-        try self.updateLineIndexAfterInsert(pos, text);
+        self.updateLineIndexAfterInsert(pos, text);
         return text.len;
     }
 
@@ -301,41 +298,26 @@ pub const Buffer = struct {
         }
     }
 
-    /// Incrementally update line index after inserting text at `pos`.
-    /// A swallowed failure here would silently corrupt the line index, so
-    /// errors propagate to the caller.
-    fn updateLineIndexAfterInsert(self: *Buffer, pos: usize, text: []const u8) !void {
-        // Count newlines in inserted text and collect their positions
-        var new_lines: std.ArrayList(usize) = .empty;
-        defer new_lines.deinit(self.allocator);
-        for (text, 0..) |byte, i| {
-            if (byte == '\n') {
-                try new_lines.append(self.allocator, pos + i + 1);
-            }
-        }
+    /// Reserve buffer and line-index storage before an edit or undo replay.
+    pub fn reserveInsert(self: *Buffer, bytes: usize, lines: usize) !void {
+        try self.line_starts.ensureUnusedCapacity(self.allocator, lines);
+        if (bytes > self.gapLen()) try self.grow(bytes);
+    }
 
-        // Shift all line starts after pos by text.len
-        for (self.line_starts.items) |*ls| {
-            if (ls.* > pos) {
-                ls.* += text.len;
-            }
-        }
-
-        // Insert new line starts
-        if (new_lines.items.len > 0) {
-            // Binary search for insertion point in line_starts (sorted by offset)
-            var lo: usize = 0;
-            var hi: usize = self.line_starts.items.len;
-            while (lo < hi) {
-                const mid = lo + (hi - lo) / 2;
-                if (self.line_starts.items[mid] <= pos) {
-                    lo = mid + 1;
-                } else {
-                    hi = mid;
-                }
-            }
-            try self.line_starts.insertSlice(self.allocator, lo, new_lines.items);
-        }
+    /// Update the index without allocating; insert() reserved its capacity.
+    fn updateLineIndexAfterInsert(self: *Buffer, pos: usize, text: []const u8) void {
+        const n = std.mem.count(u8, text, "\n");
+        var at: usize = 0;
+        while (at < self.line_starts.items.len and self.line_starts.items[at] <= pos) : (at += 1) {}
+        for (self.line_starts.items[at..]) |*ls| ls.* += text.len;
+        const old_len = self.line_starts.items.len;
+        self.line_starts.items.len += n;
+        std.mem.copyBackwards(usize, self.line_starts.items[at + n ..], self.line_starts.items[at..old_len]);
+        var write = at;
+        for (text, 0..) |byte, i| if (byte == '\n') {
+            self.line_starts.items[write] = pos + i + 1;
+            write += 1;
+        };
     }
 
     /// Incrementally update line index after deleting text that was at `pos`.

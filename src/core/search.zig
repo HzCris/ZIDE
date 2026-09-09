@@ -466,11 +466,11 @@ pub fn filterMatch(rel: []const u8, filt: []const u8) bool {
 /// Undoable replace-all inside an open document (one undo group).
 /// Mirrors the per-buffer Ctrl+H replace-all mechanics.
 fn replaceAllInDoc(doc: *Document, needle: []const u8, repl: []const u8, case_sensitive: bool, whole_word: bool) usize {
+    doc.beginEdit() catch return 0;
+    defer doc.endEdit();
     doc.cursors.clearSecondary();
     doc.cursors.primary().clearSelection();
     doc.cursors.primary().offset = 0;
-    doc.history.beginGroup();
-    defer doc.history.endGroup();
     var count: usize = 0;
     while (count < 100_000) {
         const content = doc.buffer.slice(0, doc.buffer.byteLen());

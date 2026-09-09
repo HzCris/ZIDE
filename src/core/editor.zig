@@ -240,6 +240,8 @@ pub const Editor = struct {
     /// Document the completion request was made for — acceptance is refused
     /// (and the list dropped) when the active document changed meanwhile.
     completion_doc_idx: usize = 0,
+    completion_context: ?CompletionContext = null,
+    completion_generation: u64 = 0,
     /// Document the .confirm_overwrite prompt was opened for (tab clicks and
     /// window switches must not redirect Overwrite/Reload to another file).
     confirm_overwrite_doc: usize = 0,
@@ -308,11 +310,15 @@ pub const Editor = struct {
     filetree_clip_paths: std.ArrayList([]u8) = .empty,
     filetree_clip_cut: bool = false,
 
-    pub const EditorCompletionItem = struct {
-        label: []const u8,
-        detail: ?[]const u8 = null,
-        insert_text: ?[]const u8 = null,
+    pub const CompletionContext = struct {
+        doc_id: u64,
+        version: u64,
+        cursor_offset: usize,
+        client: ?*lsp_mod.LspClient = null,
+        request_id: ?i64 = null,
+        generation: u64,
     };
+    pub const EditorCompletionItem = lsp_mod.CompletionEntry;
 
     pub const LspConfig = lsp_mod.ServerConfig;
 
@@ -1602,27 +1608,17 @@ pub const Editor = struct {
                 return .closed;
             },
             .save => {
-                const doc = &self.documents.items[idx];
-                if (doc.file_path == null) {
-                    self.switchToDoc(idx);
-                    return .needs_path;
+                const id = self.documents.items[idx].id;
+                switch (self.saveDocument(id, .{})) {
+                    .needs_path => return .needs_path,
+                    .saved => {
+                        const current = self.docIndexForId(id) orelse return .closed;
+                        if (self.documents.items[current].dirty) return .kept;
+                        _ = self.closeDocAt(current);
+                        return .closed;
+                    },
+                    else => return .kept,
                 }
-                if (doc.checkExternalChange(self.io)) {
-                    doc.external_changed = true;
-                    self.confirm_overwrite_doc = idx;
-                    self.mode = .confirm_overwrite;
-                    return .kept;
-                }
-                doc.save(self.io) catch |err| {
-                    self.status_message = std.fmt.bufPrint(&self.status_buf, "Save failed: {s}", .{@errorName(err)}) catch "Save failed";
-                    return .kept;
-                };
-                self.lspDidSave(doc);
-                self.noteFileSaved(false, doc);
-                // Formatted before the close frees display_name.
-                self.status_message = std.fmt.bufPrint(&self.status_buf, "Saved {s}", .{doc.display_name}) catch "Saved";
-                _ = self.closeDocAt(idx);
-                return .closed;
             },
         }
     }
@@ -1751,29 +1747,10 @@ pub const Editor = struct {
             return true;
         }
         if (std.mem.eql(u8, action, "save")) {
-            const doc = self.activeDoc();
-            // Disk changed since load/save (external edit or delete) —
-            // don't clobber it silently; let the user decide.
-            if (doc.file_path != null and doc.checkExternalChange(self.io)) {
-                doc.external_changed = true;
-                self.confirm_overwrite_doc = self.activeDocIdx();
-                self.mode = .confirm_overwrite;
-                return true;
+            switch (self.saveDocument(self.activeDoc().id, .{})) {
+                .needs_path => return self.execAction("save_as"),
+                else => {},
             }
-            doc.save(self.io) catch |err| {
-                if (err == error.NoFilePath) {
-                    // Untitled buffer — route to Save As instead of silently
-                    // dropping the save.
-                    return self.execAction("save_as");
-                }
-                const msg = std.fmt.bufPrint(&self.status_buf, "Save failed: {s}", .{@errorName(err)}) catch "Save failed";
-                self.status_message = msg;
-                return true;
-            };
-            self.lspDidSave(doc);
-            self.noteFileSaved(false, doc);
-            const msg = std.fmt.bufPrint(&self.status_buf, "Saved {s}", .{doc.display_name}) catch "Saved";
-            self.status_message = msg;
             return true;
         }
         if (std.mem.eql(u8, action, "find")) {
@@ -1969,6 +1946,7 @@ pub const Editor = struct {
             if (doc.disk_mtime == null) continue; // no stamp to compare
             const st = std.Io.Dir.cwd().statFile(self.io, path, .{}) catch {
                 doc.external_changed = true;
+                doc.history.saved_revision = null;
                 doc.dirty = true;
                 const msg = std.fmt.bufPrint(&self.status_buf, "{s}: file deleted on disk (buffer kept)", .{doc.display_name}) catch "File deleted on disk (buffer kept)";
                 self.status_message = msg;
@@ -1990,6 +1968,92 @@ pub const Editor = struct {
         }
     }
 
+    pub const SaveOutcome = union(enum) { saved, needs_path, conflict, failed: anyerror };
+    pub const SaveOptions = struct { overwrite: bool = false, interactive: bool = true, refresh_tree: bool = true };
+
+    pub fn docIndexForId(self: *const Editor, id: u64) ?usize {
+        for (self.documents.items, 0..) |doc, i| if (doc.id == id) return i;
+        return null;
+    }
+    fn saveBlocker(self: *Editor, idx: usize) ?SaveOutcome {
+        const doc = &self.documents.items[idx];
+        if (doc.file_path == null) return .needs_path;
+        if (doc.external_changed or doc.checkExternalChange(self.io)) {
+            doc.external_changed = true;
+            return .conflict;
+        }
+        return null;
+    }
+    fn showSaveBlocker(self: *Editor, idx: usize, result: SaveOutcome) void {
+        self.switchToDoc(idx);
+        self.mode = .normal;
+        switch (result) {
+            .conflict => {
+                self.confirm_overwrite_doc = idx;
+                self.mode = .confirm_overwrite;
+                self.status_message = "File changed on disk; save cancelled";
+            },
+            .needs_path => self.status_message = "Use Save As for the untitled document, then quit again",
+            .failed => |err| self.status_message = std.fmt.bufPrint(&self.status_buf, "Save failed: {s}", .{@errorName(err)}) catch "Save failed",
+            .saved => {},
+        }
+    }
+    /// Stable IDs survive save hooks opening or closing tabs. Do not hold a
+    /// document pointer across the extension notification at the end.
+    pub fn saveDocument(self: *Editor, id: u64, options: SaveOptions) SaveOutcome {
+        const idx = self.docIndexForId(id) orelse return .{ .failed = error.DocumentClosed };
+        if (!options.overwrite) if (self.saveBlocker(idx)) |blocker| {
+            if (options.interactive) self.showSaveBlocker(idx, blocker);
+            return blocker;
+        };
+        const doc = &self.documents.items[idx];
+        doc.save(self.io) catch |err| {
+            const result: SaveOutcome = .{ .failed = err };
+            if (options.interactive) self.showSaveBlocker(idx, result);
+            return result;
+        };
+        self.status_message = std.fmt.bufPrint(&self.status_buf, "Saved {s}", .{doc.display_name}) catch "Saved";
+        self.lspDidSave(doc);
+        if (options.refresh_tree) self.noteFileSaved(false, doc) else lua_api.fireEvent(self, .save, doc);
+        return .saved;
+    }
+    fn dirtyDocumentIds(self: *Editor) ![]u64 {
+        var ids: std.ArrayList(u64) = .empty;
+        errdefer ids.deinit(self.allocator);
+        for (self.documents.items) |doc| if (doc.dirty) {
+            try ids.append(self.allocator, doc.id);
+        };
+        return ids.toOwnedSlice(self.allocator);
+    }
+    pub fn saveAllAndQuit(self: *Editor) void {
+        self.mode = .normal;
+        const ids = self.dirtyDocumentIds() catch {
+            self.status_message = "Save failed: out of memory";
+            return;
+        };
+        defer self.allocator.free(ids);
+        // Preflight the whole batch before writing any document.
+        for (ids) |id| {
+            const idx = self.docIndexForId(id) orelse continue;
+            if (self.saveBlocker(idx)) |blocker| {
+                self.showSaveBlocker(idx, blocker);
+                return;
+            }
+        }
+        var saved: usize = 0;
+        defer if (saved > 0) self.noteFileSaved(false, null);
+        for (ids) |id| {
+            const idx = self.docIndexForId(id) orelse continue;
+            if (!self.documents.items[idx].dirty) continue;
+            switch (self.saveDocument(id, .{ .refresh_tree = false })) {
+                .saved => saved += 1,
+                else => return,
+            }
+        }
+        // Save hooks can create new dirty content; never discard it on exit.
+        if (!self.hasUnsavedChanges()) self.running = false else self.status_message = "Unsaved changes remain; quit cancelled";
+    }
+
     pub const OverwriteChoice = enum { overwrite, reload, cancel };
 
     /// Resolve the .confirm_overwrite prompt for the document it was opened
@@ -2003,15 +2067,7 @@ pub const Editor = struct {
         const doc = &self.documents.items[self.confirm_overwrite_doc];
         switch (choice) {
             .overwrite => {
-                doc.save(self.io) catch |err| {
-                    const msg = std.fmt.bufPrint(&self.status_buf, "Save failed: {s}", .{@errorName(err)}) catch "Save failed";
-                    self.status_message = msg;
-                    return;
-                };
-                self.lspDidSave(doc);
-                self.noteFileSaved(false, doc);
-                const msg = std.fmt.bufPrint(&self.status_buf, "Saved {s} (overwrote external change)", .{doc.display_name}) catch "Saved";
-                self.status_message = msg;
+                _ = self.saveDocument(doc.id, .{ .overwrite = true });
             },
             .reload => {
                 doc.reloadFromDisk(self.io) catch |err| {
@@ -2031,26 +2087,20 @@ pub const Editor = struct {
     /// Auto-save all dirty documents that have a file path.
     /// Returns the number of documents saved.
     pub fn autoSaveAll(self: *Editor) usize {
+        const ids = self.dirtyDocumentIds() catch return 0;
+        defer self.allocator.free(ids);
         var saved: usize = 0;
-        for (self.documents.items) |*doc| {
-            if (doc.dirty and doc.file_path != null) {
-                // Never auto-clobber an external change — a timer can't
-                // ask; flag it and let the explicit save path prompt.
-                if (doc.external_changed or doc.checkExternalChange(self.io)) {
-                    doc.external_changed = true;
-                    continue;
-                }
-                doc.save(self.io) catch continue;
-                saved += 1;
-                // Per-document extension event; the file tree note below
-                // runs once for the whole batch (it shells out to git).
-                lua_api.fireEvent(self, .save, doc);
+        for (ids) |id| {
+            const idx = self.docIndexForId(id) orelse continue;
+            if (!self.documents.items[idx].dirty) continue;
+            switch (self.saveDocument(id, .{ .interactive = false, .refresh_tree = false })) {
+                .saved => saved += 1,
+                else => {},
             }
         }
         if (saved > 0) {
             self.noteFileSaved(false, null);
-            const msg = std.fmt.bufPrint(&self.status_buf, "Auto-saved {d} file(s)", .{saved}) catch "Auto-saved";
-            self.status_message = msg;
+            self.status_message = std.fmt.bufPrint(&self.status_buf, "Auto-saved {d} file(s)", .{saved}) catch "Auto-saved";
         }
         return saved;
     }
@@ -2423,7 +2473,7 @@ pub const Editor = struct {
     pub fn terminalPassthroughAction(self: *Editor, combo: []const u8) ?[]const u8 {
         const action = self.lookupKeybind(combo) orelse return null;
         const allowed = [_][]const u8{
-            "toggle_terminal",   "close_terminal", "close_pane",   "detach_terminal",
+            "toggle_terminal",     "close_terminal",  "close_pane",      "detach_terminal",
             "open_terminal_right", "focus_next_pane", "focus_prev_pane", "close_window",
         };
         for (allowed) |a| {
@@ -2856,6 +2906,9 @@ pub const Editor = struct {
     /// were opened so the next sync re-opens them on whatever serves them.
     fn stopLspClient(self: *Editor, idx: usize) void {
         const client = self.lsp_clients.items[idx];
+        if (self.completion_context) |ctx| {
+            if (ctx.client == client) self.clearCompletionItems();
+        }
         if (client.config) |*cfg| {
             for (self.documents.items) |*doc| {
                 if (!doc.lsp_opened) continue;
@@ -3105,6 +3158,7 @@ pub const Editor = struct {
     /// yet registered (starting a server lazily when one is configured for
     /// their language), didChange for edited ones. Runs every frame.
     pub fn syncLspDocuments(self: *Editor) void {
+        if (self.completion_context != null and !self.completionCurrent()) self.clearCompletionItems();
         if (!self.lsp_enabled) return;
 
         var i: usize = 0;
@@ -3135,6 +3189,8 @@ pub const Editor = struct {
 
     /// Clear all completion items (frees memory).
     pub fn clearCompletionItems(self: *Editor) void {
+        self.completion_context = null;
+        self.completion_generation +%= 1;
         for (self.completion_items.items) |*item| {
             self.allocator.free(item.label);
             if (item.detail) |d| self.allocator.free(d);
@@ -3147,16 +3203,33 @@ pub const Editor = struct {
 
     /// Add a completion item (called from LSP response handler).
     pub fn addCompletionItem(self: *Editor, label: []const u8, detail: ?[]const u8, insert_text: ?[]const u8) !void {
-        try self.completion_items.append(self.allocator, .{
-            .label = label,
-            .detail = detail,
-            .insert_text = insert_text,
-        });
+        try self.addCompletionEntry(.{ .label = label, .detail = detail, .insert_text = insert_text });
+    }
+    pub fn addCompletionEntry(self: *Editor, item: EditorCompletionItem) !void {
+        try self.completion_items.append(self.allocator, item);
+        if (self.completion_context == null) self.completion_context = .{
+            .doc_id = self.activeDoc().id,
+            .version = self.activeDoc().buffer.version,
+            .cursor_offset = self.activeDoc().cursors.primaryConst().offset,
+            .generation = self.completion_generation,
+        };
         self.completion_active = true;
+    }
+    fn completionCurrent(self: *const Editor) bool {
+        const ctx = self.completion_context orelse return false;
+        const idx = self.docIndexForId(ctx.doc_id) orelse return false;
+        if (idx != self.activeDocIdx() or ctx.generation != self.completion_generation) return false;
+        const doc = &self.documents.items[idx];
+        return doc.buffer.version == ctx.version and doc.cursors.primaryConst().offset == ctx.cursor_offset;
+    }
+    pub fn completionResponseCurrent(self: *const Editor, client: ?*lsp_mod.LspClient, id: i64) bool {
+        const ctx = self.completion_context orelse return false;
+        return ctx.client == client and ctx.request_id == id and self.completionCurrent();
     }
 
     /// Trigger LSP completion at the current cursor position.
     pub fn triggerCompletion(self: *Editor) void {
+        self.clearCompletionItems();
         const doc = self.activeDoc();
         const lsp_client = self.lspClientForDoc(doc) orelse return;
         if (!lsp_client.isReady()) return;
@@ -3172,7 +3245,20 @@ pub const Editor = struct {
         // LSP positions are UTF-16 code units, not bytes
         const utf16_col = lsp_mod.byteColToUtf16(doc.buffer.lineContent(pos.line), pos.col);
 
-        _ = lsp_client.sendCompletion(uri, @intCast(pos.line), utf16_col) catch return;
+        // The server must see edits made since the preceding frame first.
+        if (doc.lsp_version != doc.lsp_last_synced) {
+            lsp_client.sendDidChange(uri, doc.lsp_version, doc.buffer.slice(0, doc.buffer.byteLen())) catch return;
+            doc.lsp_last_synced = doc.lsp_version;
+        }
+        const request_id = lsp_client.sendCompletion(uri, @intCast(pos.line), utf16_col) catch return;
+        self.completion_context = .{
+            .doc_id = doc.id,
+            .version = doc.buffer.version,
+            .cursor_offset = cursor.offset,
+            .client = lsp_client,
+            .request_id = request_id,
+            .generation = self.completion_generation,
+        };
     }
 
     /// Trigger LSP go-to-definition at the current cursor position.
@@ -3194,55 +3280,62 @@ pub const Editor = struct {
         _ = lsp_client.sendGotoDefinition(uri, @intCast(pos.line), utf16_col) catch return;
     }
 
-    /// Accept the currently selected completion item.
-    /// Replaces the word prefix (characters before cursor back to word boundary) with the completion text.
+    /// Validate the completion's single-line UTF-16 range against this document.
+    fn completionByteRange(doc: *Document, range: lsp_mod.LspRange, cursor_offset: usize) !struct { start: usize, end: usize } {
+        if (range.start.line != range.end.line or range.start.line >= doc.lineCount() or range.start.character > range.end.character) return error.InvalidCompletionEdit;
+        const line = doc.lineContent(range.start.line);
+        const start_col = try lsp_mod.checkedUtf16ColToByte(line, range.start.character);
+        const end_col = try lsp_mod.checkedUtf16ColToByte(line, range.end.character);
+        const start = doc.buffer.posToOffset(range.start.line, start_col);
+        const end = doc.buffer.posToOffset(range.start.line, end_col);
+        if (cursor_offset < start or cursor_offset > end) return error.InvalidCompletionEdit;
+        return .{ .start = start, .end = end };
+    }
     pub fn acceptCompletion(self: *Editor) void {
         if (!self.completion_active) return;
-        // The list was computed for another document (tab switch, other
-        // window) — never insert it here.
-        if (self.completion_doc_idx != self.activeDocIdx()) {
-            self.clearCompletionItems();
-            return;
-        }
-        if (self.completion_selected >= self.completion_items.items.len) {
-            self.clearCompletionItems();
-            return;
-        }
-
+        defer self.clearCompletionItems();
+        if (!self.completionCurrent() or self.completion_doc_idx != self.activeDocIdx() or self.completion_selected >= self.completion_items.items.len) return;
         const item = self.completion_items.items[self.completion_selected];
-        const text = item.insert_text orelse item.label;
-
         const doc = self.activeDoc();
-        const cursor = doc.cursors.primary();
-        // Prefix replacement must not be diverted into deleting a selection,
-        // and the delete+insert pair should undo as one step.
-        cursor.clearSelection();
-        doc.history.beginGroup();
-        defer doc.history.endGroup();
-
-        // Find the start of the word prefix (scan back from cursor)
-        var prefix_start = cursor.offset;
-        while (prefix_start > 0) {
-            const prev = doc.buffer.byteAt(prefix_start - 1) orelse break;
-            if (isIdentChar(prev)) {
-                prefix_start -= 1;
-            } else {
-                break;
-            }
+        const offset = doc.cursors.primaryConst().offset;
+        var start = offset;
+        var end = offset;
+        if (item.edit) |edit| {
+            const range = switch (edit) {
+                .replace => |r| r,
+                .insert_replace => |r| blk: {
+                    const insert = completionByteRange(doc, r.insert, offset) catch {
+                        self.status_message = "Invalid completion range";
+                        return;
+                    };
+                    const replace = completionByteRange(doc, r.replace, offset) catch {
+                        self.status_message = "Invalid completion range";
+                        return;
+                    };
+                    if (insert.start != replace.start or insert.end > replace.end) {
+                        self.status_message = "Invalid completion range";
+                        return;
+                    }
+                    break :blk r.replace;
+                },
+            };
+            const bytes = completionByteRange(doc, range, offset) catch {
+                self.status_message = "Invalid completion range";
+                return;
+            };
+            start = bytes.start;
+            end = bytes.end;
+        } else {
+            while (start > 0 and isIdentChar(doc.buffer.byteAt(start - 1) orelse 0)) start -= 1;
         }
-
-        // Delete the prefix
-        const prefix_len = cursor.offset - prefix_start;
-        if (prefix_len > 0) {
-            // Move cursor to start of prefix, then delete forward
-            doc.cursors.primary().offset = prefix_start;
-            doc.deleteForward(prefix_len) catch {};
-        }
-
-        // Insert completion text
-        doc.insertAtCursor(text) catch {};
-
-        self.clearCompletionItems();
+        doc.beginEdit() catch {
+            self.status_message = "Completion failed: out of memory";
+            return;
+        };
+        defer doc.endEdit();
+        doc.replaceRange(start, end, item.insert_text orelse item.label) catch {
+            self.status_message = "Completion failed: out of memory";
+        };
     }
 
     fn isIdentChar(c: u8) bool {
@@ -4154,4 +4247,194 @@ test "editor external-change poll and save guard" {
     try t.expectEqual(Editor.Mode.normal, editor.mode);
     try t.expect(!doc.dirty);
     try t.expect(!doc.checkExternalChange(t.io)); // mtime re-stamped
+}
+
+fn testWriteFile(dir: std.Io.Dir, path: []const u8, text: []const u8) !void {
+    const file = try dir.createFile(std.testing.io, path, .{});
+    defer file.close(std.testing.io);
+    try file.writeStreamingAll(std.testing.io, text);
+}
+
+test "save and quit preflights all files and conflict resolution never resumes quit" {
+    const t = std.testing;
+    for ([_]Editor.OverwriteChoice{ .cancel, .reload, .overwrite }) |choice| {
+        var tmp = t.tmpDir(.{});
+        defer tmp.cleanup();
+        const root = try std.Io.Dir.realPathFileAlloc(tmp.dir, t.io, ".", t.allocator);
+        defer t.allocator.free(root);
+        const a = try std.fs.path.join(t.allocator, &.{ root, "a.txt" });
+        defer t.allocator.free(a);
+        const b = try std.fs.path.join(t.allocator, &.{ root, "b.txt" });
+        defer t.allocator.free(b);
+        var editor = try Editor.init(t.allocator, t.io);
+        defer editor.deinit();
+        try editor.activeDoc().loadText("a");
+        try editor.activeDoc().saveAs(t.io, a);
+        try editor.activeDoc().insertAtCursor("local ");
+        _ = try editor.newDocument();
+        try editor.activeDoc().loadText("b");
+        try editor.activeDoc().saveAs(t.io, b);
+        try editor.activeDoc().insertAtCursor("local ");
+        try testWriteFile(tmp.dir, "b.txt", "external");
+        // Guarantee a stale stamp independent of filesystem timestamp precision.
+        editor.activeDoc().disk_mtime = -1;
+        editor.switchToDoc(0);
+        editor.saveAllAndQuit();
+        try t.expect(editor.running);
+        try t.expectEqual(Editor.Mode.confirm_overwrite, editor.mode);
+        try t.expectEqual(@as(usize, 1), editor.confirm_overwrite_doc);
+        const first = try tmp.dir.readFileAlloc(t.io, "a.txt", t.allocator, .limited(100));
+        defer t.allocator.free(first);
+        try t.expectEqualStrings("a", first);
+        const second = try tmp.dir.readFileAlloc(t.io, "b.txt", t.allocator, .limited(100));
+        defer t.allocator.free(second);
+        try t.expectEqualStrings("external", second);
+        editor.resolveOverwrite(choice);
+        try t.expect(editor.running);
+        try t.expectEqual(Editor.Mode.normal, editor.mode);
+        if (choice != .cancel) {
+            editor.saveAllAndQuit();
+            try t.expect(!editor.running);
+            try t.expect(!editor.hasUnsavedChanges());
+        } else {
+            try t.expectEqual(@as(usize, 1), editor.autoSaveAll());
+            try t.expect(editor.documents.items[1].dirty);
+            try t.expect(editor.documents.items[1].external_changed);
+        }
+    }
+}
+
+test "save and quit keeps untitled files and survives a failed write after a successful one" {
+    const t = std.testing;
+    var editor = try Editor.init(t.allocator, t.io);
+    defer editor.deinit();
+    try editor.activeDoc().insertAtCursor("draft");
+    editor.saveAllAndQuit();
+    try t.expect(editor.running);
+    try t.expect(editor.activeDoc().dirty);
+    var tmp = t.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try std.Io.Dir.realPathFileAlloc(tmp.dir, t.io, ".", t.allocator);
+    defer t.allocator.free(root);
+    const path = try std.fs.path.join(t.allocator, &.{ root, "a.txt" });
+    defer t.allocator.free(path);
+    try editor.activeDoc().saveAs(t.io, path);
+    try editor.activeDoc().insertAtCursor("local ");
+    _ = try editor.newDocument();
+    try editor.activeDoc().insertAtCursor("unsaved");
+    try editor.activeDoc().setFilePath(root); // an existing directory cannot be written as a file
+    editor.saveAllAndQuit();
+    try t.expect(editor.running);
+    try t.expect(!editor.documents.items[0].dirty);
+    try t.expect(editor.documents.items[1].dirty);
+}
+
+test "externally deleted buffers stay dirty after undo returns to the old checkpoint" {
+    const t = std.testing;
+    var tmp = t.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try std.Io.Dir.realPathFileAlloc(tmp.dir, t.io, ".", t.allocator);
+    defer t.allocator.free(root);
+    const path = try std.fs.path.join(t.allocator, &.{ root, "deleted.txt" });
+    defer t.allocator.free(path);
+    var editor = try Editor.init(t.allocator, t.io);
+    defer editor.deinit();
+    const doc = editor.activeDoc();
+    try doc.loadText("a");
+    try doc.saveAs(t.io, path);
+    try doc.insertAtCursor("x");
+    try tmp.dir.deleteFile(t.io, "deleted.txt");
+    editor.pollExternalChanges();
+    _ = try doc.undoAction();
+    try t.expect(doc.dirty);
+    editor.saveAllAndQuit();
+    try t.expect(editor.running);
+    try t.expectEqual(Editor.Mode.confirm_overwrite, editor.mode);
+}
+
+fn testLoadCompletion(editor: *Editor, json: []const u8) !void {
+    editor.clearCompletionItems();
+    editor.completion_doc_idx = editor.activeDocIdx();
+    const items = try lsp_mod.parseCompletionItems(std.testing.allocator, json);
+    defer std.testing.allocator.free(items);
+    for (items) |item| try editor.addCompletionEntry(item);
+}
+
+test "completion applies textEdit range and newText as one reversible edit" {
+    const t = std.testing;
+    var editor = try Editor.init(t.allocator, t.io);
+    defer editor.deinit();
+    const doc = editor.activeDoc();
+    try doc.loadText("foobar");
+    doc.cursors.primary().offset = 3;
+    try testLoadCompletion(&editor,
+        \\{"result":[{"label":"foobaz","insertText":"wrong","textEdit":{"newText":"foobaz","range":{"start":{"line":0,"character":0},"end":{"line":0,"character":6}}}}]}
+    );
+    editor.acceptCompletion();
+    try t.expectEqualStrings("foobaz", doc.buffer.slice(0, doc.buffer.byteLen()));
+    try t.expectEqual(@as(usize, 6), doc.cursors.primary().offset);
+    _ = try doc.undoAction();
+    try t.expectEqualStrings("foobar", doc.buffer.slice(0, doc.buffer.byteLen()));
+    try t.expectEqual(@as(usize, 3), doc.cursors.primary().offset);
+    try t.expect(!doc.history.canUndo());
+    _ = try doc.redoAction();
+    try t.expectEqualStrings("foobaz", doc.buffer.slice(0, doc.buffer.byteLen()));
+}
+
+test "completion supports UTF-16 insert-replace edits and rejects invalid positions" {
+    const t = std.testing;
+    var editor = try Editor.init(t.allocator, t.io);
+    defer editor.deinit();
+    const doc = editor.activeDoc();
+    const original = "\xf0\x9f\x98\x80foobar";
+    try doc.loadText(original);
+    doc.cursors.primary().offset = 7;
+    try testLoadCompletion(&editor,
+        \\{"result":[{"label":"foobaz","textEdit":{"newText":"foobaz","insert":{"start":{"line":0,"character":2},"end":{"line":0,"character":5}},"replace":{"start":{"line":0,"character":2},"end":{"line":0,"character":8}}}}]}
+    );
+    editor.acceptCompletion();
+    try t.expectEqualStrings("\xf0\x9f\x98\x80foobaz", doc.buffer.slice(0, doc.buffer.byteLen()));
+    _ = try doc.undoAction();
+    const invalid = [_][]const u8{
+        \\{"result":[{"label":"bad","textEdit":{"newText":"bad","range":{"start":{"line":0,"character":1},"end":{"line":0,"character":8}}}}]}
+        ,
+        \\{"result":[{"label":"bad","textEdit":{"newText":"bad","range":{"start":{"line":0,"character":2},"end":{"line":0,"character":90}}}}]}
+        ,
+        \\{"result":[{"label":"bad","textEdit":{"newText":"bad","range":{"start":{"line":0,"character":8},"end":{"line":0,"character":2}}}}]}
+        ,
+    };
+    for (invalid) |json| {
+        try testLoadCompletion(&editor, json);
+        editor.acceptCompletion();
+        try t.expectEqualStrings(original, doc.buffer.slice(0, doc.buffer.byteLen()));
+        try t.expect(!doc.history.canUndo());
+    }
+}
+
+test "completion fallback works and stale responses cannot target reused tabs" {
+    const t = std.testing;
+    var editor = try Editor.init(t.allocator, t.io);
+    defer editor.deinit();
+    try editor.activeDoc().loadText("foo");
+    editor.activeDoc().cursors.primary().offset = 3;
+    try testLoadCompletion(&editor, "{\"result\":[{\"label\":\"foobaz\"}]}");
+    editor.acceptCompletion();
+    try t.expectEqualStrings("foobaz", editor.activeDoc().buffer.slice(0, editor.activeDoc().buffer.byteLen()));
+    _ = try editor.activeDoc().undoAction();
+    try testLoadCompletion(&editor, "{\"result\":[{\"label\":\"foobaz\"}]}");
+    editor.completion_context.?.request_id = 2;
+    try t.expect(!editor.completionResponseCurrent(null, 1));
+    try t.expect(editor.completionResponseCurrent(null, 2));
+    try editor.activeDoc().insertAtCursor("x");
+    try t.expect(!editor.completionResponseCurrent(null, 2));
+    editor.acceptCompletion();
+    try t.expectEqualStrings("foox", editor.activeDoc().buffer.slice(0, editor.activeDoc().buffer.byteLen()));
+    try testLoadCompletion(&editor, "{\"result\":[{\"label\":\"foobaz\"}]}");
+    editor.activeDoc().cursors.primary().moveLeft(&editor.activeDoc().buffer);
+    editor.acceptCompletion();
+    try t.expectEqualStrings("foox", editor.activeDoc().buffer.slice(0, editor.activeDoc().buffer.byteLen()));
+    try testLoadCompletion(&editor, "{\"result\":[{\"label\":\"foobaz\"}]}");
+    _ = editor.closeDocAt(0); // replace the last tab with a different document ID
+    editor.acceptCompletion();
+    try t.expectEqual(@as(usize, 0), editor.activeDoc().buffer.byteLen());
 }

@@ -2,6 +2,31 @@ const std = @import("std");
 const Buffer = @import("buffer.zig").Buffer;
 const Allocator = std.mem.Allocator;
 
+/// Round down to a code-point boundary; the middle of CRLF is not a caret stop.
+pub fn floorBoundary(buf: *const Buffer, offset: usize) usize {
+    var off = @min(offset, buf.byteLen());
+    while (off > 0 and ((buf.byteAt(off) orelse 0) & 0xc0) == 0x80) off -= 1;
+    if (off > 0 and buf.byteAt(off) == '\n' and buf.byteAt(off - 1) == '\r') off -= 1;
+    return off;
+}
+pub fn previousBoundary(buf: *const Buffer, offset: usize) usize {
+    if (offset == 0) return 0;
+    return floorBoundary(buf, @min(offset, buf.byteLen()) - 1);
+}
+pub fn nextBoundary(buf: *const Buffer, offset: usize) usize {
+    const off = floorBoundary(buf, offset);
+    if (off >= buf.byteLen()) return buf.byteLen();
+    if (buf.byteAt(off) == '\r' and buf.byteAt(off + 1) == '\n') return off + 2;
+    return @min(buf.byteLen(), off + utf8ByteLen(buf.byteAt(off).?));
+}
+pub fn lineOffset(buf: *const Buffer, line: usize, col: usize) usize {
+    if (line >= buf.lineCount()) return buf.byteLen();
+    const start = buf.line_starts.items[line];
+    var end = if (line + 1 < buf.lineCount()) buf.line_starts.items[line + 1] - 1 else buf.byteLen();
+    if (end > start and buf.byteAt(end - 1) == '\r') end -= 1;
+    return floorBoundary(buf, start + @min(col, end - start));
+}
+
 /// A cursor position in the buffer.
 pub const Cursor = struct {
     /// Byte offset into the buffer content.
@@ -22,26 +47,19 @@ pub const Cursor = struct {
 
     /// Move cursor to a specific (line, col).
     pub fn gotoPos(self: *Cursor, buf: *const Buffer, line: usize, col: usize) void {
-        self.offset = buf.posToOffset(line, col);
+        self.offset = lineOffset(buf, line, col);
         self.preferred_col = col;
     }
 
-    /// Move right by one byte (UTF-8 aware: skip continuation bytes).
+    /// Move right by one code point, treating CRLF as a single newline.
     pub fn moveRight(self: *Cursor, buf: *const Buffer) void {
-        if (self.offset >= buf.byteLen()) return;
-        self.offset += utf8ByteLen(buf.byteAt(self.offset) orelse return);
-        self.offset = @min(self.offset, buf.byteLen());
+        self.offset = nextBoundary(buf, self.offset);
         self.preferred_col = buf.offsetToPos(self.offset).col;
     }
 
-    /// Move left by one byte (UTF-8 aware: skip back over continuation bytes).
+    /// Move left by one code point, treating CRLF as a single newline.
     pub fn moveLeft(self: *Cursor, buf: *const Buffer) void {
-        if (self.offset == 0) return;
-        self.offset -= 1;
-        // Skip UTF-8 continuation bytes (10xxxxxx)
-        while (self.offset > 0 and ((buf.byteAt(self.offset) orelse 0) & 0xC0) == 0x80) {
-            self.offset -= 1;
-        }
+        self.offset = previousBoundary(buf, self.offset);
         self.preferred_col = buf.offsetToPos(self.offset).col;
     }
 
@@ -49,24 +67,14 @@ pub const Cursor = struct {
     pub fn moveUp(self: *Cursor, buf: *Buffer) void {
         const p = buf.offsetToPos(self.offset);
         if (p.line == 0) return;
-        self.offset = buf.posToOffset(p.line - 1, self.preferred_col);
-        // Clamp to end of target line
-        const target_line_len = buf.lineContent(p.line - 1).len;
-        if (self.preferred_col > target_line_len) {
-            self.offset = buf.posToOffset(p.line - 1, target_line_len);
-        }
+        self.offset = lineOffset(buf, p.line - 1, self.preferred_col);
     }
 
     /// Move down one line, preserving preferred column.
     pub fn moveDown(self: *Cursor, buf: *Buffer) void {
         const p = buf.offsetToPos(self.offset);
         if (p.line + 1 >= buf.lineCount()) return;
-        self.offset = buf.posToOffset(p.line + 1, self.preferred_col);
-        // Clamp to end of target line
-        const target_line_len = buf.lineContent(p.line + 1).len;
-        if (self.preferred_col > target_line_len) {
-            self.offset = buf.posToOffset(p.line + 1, target_line_len);
-        }
+        self.offset = lineOffset(buf, p.line + 1, self.preferred_col);
     }
 
     /// Move to beginning of current line.
@@ -80,11 +88,7 @@ pub const Cursor = struct {
     pub fn moveUpN(self: *Cursor, buf: *Buffer, n: usize) void {
         const p = buf.offsetToPos(self.offset);
         const target_line = p.line -| n;
-        self.offset = buf.posToOffset(target_line, self.preferred_col);
-        const target_line_len = buf.lineContent(target_line).len;
-        if (self.preferred_col > target_line_len) {
-            self.offset = buf.posToOffset(target_line, target_line_len);
-        }
+        self.offset = lineOffset(buf, target_line, self.preferred_col);
     }
 
     /// Move down N lines (for Page Down).
@@ -92,11 +96,7 @@ pub const Cursor = struct {
         const p = buf.offsetToPos(self.offset);
         const max_line = buf.lineCount() -| 1;
         const target_line = @min(p.line + n, max_line);
-        self.offset = buf.posToOffset(target_line, self.preferred_col);
-        const target_line_len = buf.lineContent(target_line).len;
-        if (self.preferred_col > target_line_len) {
-            self.offset = buf.posToOffset(target_line, target_line_len);
-        }
+        self.offset = lineOffset(buf, target_line, self.preferred_col);
     }
 
     /// Move right by one word. Walks bytes via byteAt — a full-buffer slice()
@@ -113,7 +113,7 @@ pub const Cursor = struct {
             if (isWordChar(b) or b == '\n') break;
             off += 1;
         }
-        self.offset = off;
+        self.offset = floorBoundary(buf, off);
         self.preferred_col = buf.offsetToPos(off).col;
     }
 
@@ -125,7 +125,7 @@ pub const Cursor = struct {
         while (off > 0 and !isWordChar(buf.byteAt(off) orelse 0)) off -= 1;
         // Skip word chars backwards to start of word
         while (off > 0 and isWordChar(buf.byteAt(off - 1) orelse 0)) off -= 1;
-        self.offset = off;
+        self.offset = floorBoundary(buf, off);
         self.preferred_col = buf.offsetToPos(off).col;
     }
 
@@ -269,6 +269,7 @@ pub const CursorSet = struct {
         const lo = @min(@min(anchor_line, head_line), last_line);
         const hi = @min(@max(anchor_line, head_line), last_line);
 
+        try self.cursors.ensureTotalCapacity(self.allocator, hi - lo + 1);
         self.cursors.clearRetainingCapacity();
         // Never leave the set empty — primary() indexes [0] unconditionally.
         // Capacity for one cursor is guaranteed: init() appended one.
@@ -280,10 +281,10 @@ pub const CursorSet = struct {
             const a = @min(anchor_col, line_len);
             const h = @min(head_col, line_len);
             var cur = Cursor{
-                .offset = buffer.posToOffset(line, h),
+                .offset = lineOffset(buffer, line, h),
                 .preferred_col = head_col,
             };
-            if (a != h) cur.anchor = buffer.posToOffset(line, a);
+            if (a != h) cur.anchor = lineOffset(buffer, line, a);
             try self.cursors.append(self.allocator, cur);
         }
 
@@ -329,7 +330,8 @@ pub const CursorSet = struct {
     /// Fill `buf` with cursor indices sorted by offset descending (highest first).
     /// Returns the filled slice. Caller provides buffer of at least `count()` entries.
     pub fn sortedDescending(self: *const CursorSet, buf: []usize) []usize {
-        const n = @min(self.cursors.items.len, buf.len);
+        const n = self.cursors.items.len;
+        std.debug.assert(buf.len >= n);
         for (0..n) |i| buf[i] = i;
         const items = self.cursors.items;
         std.mem.sort(usize, buf[0..n], items, struct {
@@ -566,4 +568,37 @@ test "cursor set adjust after insert" {
     cs.adjustAfterInsert(5, 3);
     try std.testing.expectEqual(@as(usize, 13), cs.cursors.items[0].offset);
     try std.testing.expectEqual(@as(usize, 23), cs.cursors.items[1].offset);
+}
+
+test "vertical page block and direct positions stay on UTF-8 boundaries" {
+    const t = std.testing;
+    var buf = try Buffer.init(t.allocator);
+    defer buf.deinit();
+    try buf.loadText("x\n\xc3\xa9\r\n\xf0\x9f\x98\x80\nabc");
+    var c = Cursor{};
+    c.gotoPos(&buf, 0, 1);
+    c.moveDown(&buf);
+    try t.expectEqual(@as(usize, 2), c.offset);
+    try t.expectEqual(@as(usize, 1), c.preferred_col);
+    c.moveDownN(&buf, 1);
+    try t.expectEqual(@as(usize, 6), c.offset);
+    c.moveDown(&buf);
+    try t.expectEqual(@as(usize, 12), c.offset);
+    c.moveUpN(&buf, 2);
+    try t.expectEqual(@as(usize, 2), c.offset);
+    c.gotoPos(&buf, 2, 3);
+    try t.expectEqual(@as(usize, 6), c.offset);
+    c.gotoPos(&buf, 1, 99);
+    try t.expectEqual(@as(usize, 4), c.offset);
+    c.moveRight(&buf);
+    try t.expectEqual(@as(usize, 6), c.offset);
+    c.moveLeft(&buf);
+    try t.expectEqual(@as(usize, 4), c.offset);
+    var cs = try CursorSet.init(t.allocator);
+    defer cs.deinit();
+    try cs.setBlockSelection(&buf, 0, 1, 2, 3);
+    for (cs.cursors.items) |cur| {
+        try t.expectEqual(cur.offset, floorBoundary(&buf, cur.offset));
+        if (cur.anchor) |a| try t.expectEqual(a, floorBoundary(&buf, a));
+    }
 }

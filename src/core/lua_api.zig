@@ -491,10 +491,10 @@ fn luaSetLine(state: ?*zlua.LuaState) callconv(.c) c_int {
     const start = doc.buffer.posToOffset(line, 0);
     const old_len = doc.lineContent(line).len;
 
+    doc.beginEdit() catch return 0;
+    defer doc.endEdit();
     doc.cursors.clearSecondary();
     const c = doc.cursors.primary();
-    doc.history.beginGroup();
-    defer doc.history.endGroup();
     if (old_len > 0) {
         c.anchor = start;
         c.offset = start + old_len;
@@ -1090,7 +1090,7 @@ test "buffer API: insert replaces an active selection in one undo step" {
     try testing.expectEqualStrings("goodbye world", doc.buffer.slice(0, doc.buffer.byteLen()));
     _ = try doc.undoAction();
     try testing.expectEqualStrings("hello world", doc.buffer.slice(0, doc.buffer.byteLen()));
-    try lua.doString("assert(zide.selection() == nil)");
+    try lua.doString("assert(zide.selection() == 'hello')");
 }
 
 test "buffer API: set_line swap via a Lua command, undo restores" {
@@ -1683,4 +1683,36 @@ test "zide.register_lsp: rejects bad input, tags extension registrations" {
     editor.dropExtensionLspConfigs();
     try testing.expect(editor.lspConfigFor("lua") == null);
     try testing.expect(editor.lspConfigFor("b") != null);
+}
+
+test "save batches tolerate hooks creating dirty tabs and closing the saved tab" {
+    const t = std.testing;
+    for ([_]bool{ false, true }) |close_saved| {
+        var lua = try Lua.init(t.allocator);
+        defer lua.deinit();
+        lua.openLibs();
+        var editor = try Editor.init(t.allocator, t.io);
+        defer editor.deinit();
+        lua_settings.registerApi(lua, &editor);
+        var tmp = t.tmpDir(.{});
+        defer tmp.cleanup();
+        const root = try std.Io.Dir.realPathFileAlloc(tmp.dir, t.io, ".", t.allocator);
+        defer t.allocator.free(root);
+        const path = try std.fs.path.join(t.allocator, &.{ root, "saved.txt" });
+        defer t.allocator.free(path);
+        try editor.activeDoc().saveAs(t.io, path);
+        try editor.activeDoc().insertAtCursor("saved text");
+        if (close_saved) {
+            try lua.doString("zide.on('save', function() zide.exec('close_tab'); zide.insert('new work') end)");
+        } else {
+            try lua.doString("zide.on('save', function() for i=1,20 do zide.exec('new_document') end; zide.insert('new work') end)");
+        }
+        editor.saveAllAndQuit();
+        try t.expect(editor.running);
+        try t.expect(editor.hasUnsavedChanges());
+        try t.expectEqualStrings("new work", editor.activeDoc().buffer.slice(0, editor.activeDoc().buffer.byteLen()));
+        const saved = try tmp.dir.readFileAlloc(t.io, "saved.txt", t.allocator, .limited(100));
+        defer t.allocator.free(saved);
+        try t.expectEqualStrings("saved text", saved);
+    }
 }

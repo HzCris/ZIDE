@@ -1368,9 +1368,9 @@ var deferred_action: ?[]const u8 = null;
 /// panes between windows) — never run them while the panes render.
 fn isStructuralAction(action: []const u8) bool {
     const names = [_][]const u8{
-        "split_vertical",         "split_horizontal", "close_pane",          "toggle_terminal",
-        "close_terminal",         "open_terminal_right", "open_in_new_window", "move_pane_to_new_window",
-        "detach_terminal",        "close_window",
+        "split_vertical",  "split_horizontal",    "close_pane",         "toggle_terminal",
+        "close_terminal",  "open_terminal_right", "open_in_new_window", "move_pane_to_new_window",
+        "detach_terminal", "close_window",
     };
     for (names) |n| {
         if (std.mem.eql(u8, action, n)) return true;
@@ -3341,7 +3341,6 @@ fn searchPanelGui(editor: *Editor) void {
             },
         }
     }
-
 }
 
 /// Move the result selection over VISIBLE matches only — matches inside
@@ -4976,7 +4975,7 @@ fn screenToOffset(doc: *Document, area: dvui.Rect.Physical, font: dvui.Font, lin
                 const rel_x = p.x - area.x + scroll_x_px;
                 if (rel_x <= 0 or segment.len == 0) {
                     const buf_col = expColToBufCol(orig_line, row_start, tab_width);
-                    return doc.buffer.posToOffset(line_idx, buf_col);
+                    return @import("../core/cursor.zig").lineOffset(&doc.buffer, line_idx, buf_col);
                 }
 
                 const target_x = rel_x / scale;
@@ -4984,7 +4983,7 @@ fn screenToOffset(doc: *Document, area: dvui.Rect.Physical, font: dvui.Font, lin
                 _ = font.textSizeEx(segment, .{ .max_width = target_x, .end_idx = &end_idx, .end_metric = .nearest });
                 // Convert expanded position back to buffer position
                 const buf_col = expColToBufCol(orig_line, row_start + end_idx, tab_width);
-                return doc.buffer.posToOffset(line_idx, buf_col);
+                return @import("../core/cursor.zig").lineOffset(&doc.buffer, line_idx, buf_col);
             }
 
             visual_rows_consumed += 1;
@@ -5289,14 +5288,44 @@ fn dvuiKeyToStr(key: dvui.Event.Key, buf: *[64]u8) []const u8 {
         .space => "space",
         .comma => ",",
         .grave => "`",
-        .a => "a", .b => "b", .c => "c", .d => "d", .e => "e", .f => "f",
-        .g => "g", .h => "h", .i => "i", .j => "j", .k => "k", .l => "l",
-        .m => "m", .n => "n", .o => "o", .p => "p", .q => "q", .r => "r",
-        .s => "s", .t => "t", .u => "u", .v => "v", .w => "w", .x => "x",
-        .y => "y", .z => "z",
-        .f1 => "f1", .f2 => "f2", .f3 => "f3", .f4 => "f4",
-        .f5 => "f5", .f6 => "f6", .f7 => "f7", .f8 => "f8",
-        .f9 => "f9", .f10 => "f10", .f11 => "f11", .f12 => "f12",
+        .a => "a",
+        .b => "b",
+        .c => "c",
+        .d => "d",
+        .e => "e",
+        .f => "f",
+        .g => "g",
+        .h => "h",
+        .i => "i",
+        .j => "j",
+        .k => "k",
+        .l => "l",
+        .m => "m",
+        .n => "n",
+        .o => "o",
+        .p => "p",
+        .q => "q",
+        .r => "r",
+        .s => "s",
+        .t => "t",
+        .u => "u",
+        .v => "v",
+        .w => "w",
+        .x => "x",
+        .y => "y",
+        .z => "z",
+        .f1 => "f1",
+        .f2 => "f2",
+        .f3 => "f3",
+        .f4 => "f4",
+        .f5 => "f5",
+        .f6 => "f6",
+        .f7 => "f7",
+        .f8 => "f8",
+        .f9 => "f9",
+        .f10 => "f10",
+        .f11 => "f11",
+        .f12 => "f12",
         else => null,
     };
 
@@ -5346,14 +5375,44 @@ fn dvuiKeyToStrNoShift(key: dvui.Event.Key, buf: *[64]u8) []const u8 {
         .space => "space",
         .comma => ",",
         .grave => "`",
-        .a => "a", .b => "b", .c => "c", .d => "d", .e => "e", .f => "f",
-        .g => "g", .h => "h", .i => "i", .j => "j", .k => "k", .l => "l",
-        .m => "m", .n => "n", .o => "o", .p => "p", .q => "q", .r => "r",
-        .s => "s", .t => "t", .u => "u", .v => "v", .w => "w", .x => "x",
-        .y => "y", .z => "z",
-        .f1 => "f1", .f2 => "f2", .f3 => "f3", .f4 => "f4",
-        .f5 => "f5", .f6 => "f6", .f7 => "f7", .f8 => "f8",
-        .f9 => "f9", .f10 => "f10", .f11 => "f11", .f12 => "f12",
+        .a => "a",
+        .b => "b",
+        .c => "c",
+        .d => "d",
+        .e => "e",
+        .f => "f",
+        .g => "g",
+        .h => "h",
+        .i => "i",
+        .j => "j",
+        .k => "k",
+        .l => "l",
+        .m => "m",
+        .n => "n",
+        .o => "o",
+        .p => "p",
+        .q => "q",
+        .r => "r",
+        .s => "s",
+        .t => "t",
+        .u => "u",
+        .v => "v",
+        .w => "w",
+        .x => "x",
+        .y => "y",
+        .z => "z",
+        .f1 => "f1",
+        .f2 => "f2",
+        .f3 => "f3",
+        .f4 => "f4",
+        .f5 => "f5",
+        .f6 => "f6",
+        .f7 => "f7",
+        .f8 => "f8",
+        .f9 => "f9",
+        .f10 => "f10",
+        .f11 => "f11",
+        .f12 => "f12",
         else => null,
     };
 
@@ -5390,23 +5449,9 @@ fn openFileDialog(editor: *Editor) void {
 
 /// Save the current document (or prompt Save As if no path).
 fn save(editor: *Editor) void {
-    const doc = editor.activeDoc();
-    if (doc.file_path != null) {
-        // Disk changed since load/save — prompt instead of clobbering.
-        if (doc.checkExternalChange(editor.io)) {
-            doc.external_changed = true;
-            editor.confirm_overwrite_doc = editor.active_doc_idx;
-            editor.mode = .confirm_overwrite;
-            return;
-        }
-        doc.save(editor.io) catch |err| {
-            editor.status_message = @errorName(err);
-            return;
-        };
-        editor.noteFileSaved(false, doc);
-        editor.status_message = "Saved";
-    } else {
-        saveAs(editor);
+    switch (editor.saveDocument(editor.activeDoc().id, .{})) {
+        .needs_path => saveAs(editor),
+        else => {},
     }
 }
 
@@ -5502,26 +5547,26 @@ fn guiMoveVisualVertical(editor: *Editor, direction: enum { up, down }, extend_s
             .up => {
                 if (wrap_info.row > 0) {
                     const target_exp = guiWrapVisualToCol(cur_line, font, text_w, wrap_info.row - 1, preferred_px);
-                    c.offset = buf.posToOffset(pos.line, expColToBufCol(orig_cur, target_exp, tw));
+                    c.offset = @import("../core/cursor.zig").lineOffset(buf, pos.line, expColToBufCol(orig_cur, target_exp, tw));
                 } else if (pos.line > 0) {
                     const orig_prev = buf.lineContent(pos.line - 1);
                     var exp_buf2: [16384]u8 = undefined;
                     const prev_line = expandTabs(orig_prev, tw, &exp_buf2);
                     const prev_rows = guiWrapLineRows(prev_line, font, text_w);
                     const target_exp = guiWrapVisualToCol(prev_line, font, text_w, prev_rows - 1, preferred_px);
-                    c.offset = buf.posToOffset(pos.line - 1, expColToBufCol(orig_prev, target_exp, tw));
+                    c.offset = @import("../core/cursor.zig").lineOffset(buf, pos.line - 1, expColToBufCol(orig_prev, target_exp, tw));
                 }
             },
             .down => {
                 if (wrap_info.row + 1 < cur_rows) {
                     const target_exp = guiWrapVisualToCol(cur_line, font, text_w, wrap_info.row + 1, preferred_px);
-                    c.offset = buf.posToOffset(pos.line, expColToBufCol(orig_cur, target_exp, tw));
+                    c.offset = @import("../core/cursor.zig").lineOffset(buf, pos.line, expColToBufCol(orig_cur, target_exp, tw));
                 } else if (pos.line + 1 < total_lines) {
                     const orig_next = buf.lineContent(pos.line + 1);
                     var exp_buf2: [16384]u8 = undefined;
                     const next_line = expandTabs(orig_next, tw, &exp_buf2);
                     const target_exp = guiWrapVisualToCol(next_line, font, text_w, 0, preferred_px);
-                    c.offset = buf.posToOffset(pos.line + 1, expColToBufCol(orig_next, target_exp, tw));
+                    c.offset = @import("../core/cursor.zig").lineOffset(buf, pos.line + 1, expColToBufCol(orig_next, target_exp, tw));
                 }
             },
         }
@@ -6078,26 +6123,7 @@ fn handleConfirmCloseKeyGui(editor: *Editor, key: dvui.Event.Key) void {
 
 fn handleConfirmQuitKeyGui(editor: *Editor, key: dvui.Event.Key) void {
     switch (key.code) {
-        .s => {
-            // Only quit when every dirty document actually saved — silently
-            // discarding on save failure (e.g. untitled buffers) loses work.
-            var failures: usize = 0;
-            for (editor.documents.items) |*doc| {
-                if (doc.dirty) {
-                    doc.save(editor.io) catch {
-                        failures += 1;
-                        continue;
-                    };
-                }
-            }
-            if (failures == 0) {
-                editor.running = false;
-            } else {
-                editor.mode = .normal;
-                const msg = std.fmt.bufPrint(&editor.status_buf, "{d} file(s) not saved — use Save As for untitled buffers", .{failures}) catch "Save failed";
-                editor.status_message = msg;
-            }
-        },
+        .s => editor.saveAllAndQuit(),
         .d => editor.running = false,
         .c, .escape => editor.mode = .normal,
         else => {},
@@ -6588,12 +6614,10 @@ fn guiReplaceAll(editor: *Editor) void {
     const needle = editor.find_buf[0..editor.find_buf_len];
     const replacement = editor.replace_buf[0..editor.replace_buf_len];
     if (needle.len == 0) return;
+    doc.beginEdit() catch return;
+    defer doc.endEdit();
     doc.cursors.primary().offset = 0;
     doc.cursors.primary().clearSelection();
-
-    // The whole replace-all is one undo step.
-    doc.history.beginGroup();
-    defer doc.history.endGroup();
 
     var count: usize = 0;
     while (count < 100_000) {

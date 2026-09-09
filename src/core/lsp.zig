@@ -34,12 +34,12 @@ const LspDiagnostic = struct {
     source: ?[]const u8 = null,
 };
 
-const LspRange = struct {
+pub const LspRange = struct {
     start: LspPosition,
     end: LspPosition,
 };
 
-const LspPosition = struct {
+pub const LspPosition = struct {
     line: u32,
     character: u32,
 };
@@ -49,9 +49,12 @@ const CompletionItem = struct {
     detail: ?[]const u8 = null,
     insertText: ?[]const u8 = null,
     kind: ?u32 = null,
-    /// TextEdit or InsertReplaceEdit — both carry `newText`; used as the
-    /// insert text when `insertText` is absent (vscode servers, clangd).
-    textEdit: ?struct { newText: []const u8 } = null,
+    textEdit: ?struct {
+        newText: []const u8,
+        range: ?LspRange = null,
+        insert: ?LspRange = null,
+        replace: ?LspRange = null,
+    } = null,
 };
 
 /// Definition response.
@@ -502,13 +505,13 @@ pub const LspClient = struct {
         var body: std.ArrayList(u8) = .empty;
         defer body.deinit(self.allocator);
 
-        try body.appendSlice(self.allocator,"{\"jsonrpc\":\"2.0\",\"id\":");
+        try body.appendSlice(self.allocator, "{\"jsonrpc\":\"2.0\",\"id\":");
         try body.print(self.allocator, "{d}", .{id});
-        try body.appendSlice(self.allocator,",\"method\":\"");
-        try body.appendSlice(self.allocator,method);
-        try body.appendSlice(self.allocator,"\",\"params\":");
-        try body.appendSlice(self.allocator,params_json);
-        try body.append(self.allocator,'}');
+        try body.appendSlice(self.allocator, ",\"method\":\"");
+        try body.appendSlice(self.allocator, method);
+        try body.appendSlice(self.allocator, "\",\"params\":");
+        try body.appendSlice(self.allocator, params_json);
+        try body.append(self.allocator, '}');
 
         try self.writeMessage(body.items);
         return id;
@@ -518,11 +521,11 @@ pub const LspClient = struct {
         var body: std.ArrayList(u8) = .empty;
         defer body.deinit(self.allocator);
 
-        try body.appendSlice(self.allocator,"{\"jsonrpc\":\"2.0\",\"method\":\"");
-        try body.appendSlice(self.allocator,method);
-        try body.appendSlice(self.allocator,"\",\"params\":");
-        try body.appendSlice(self.allocator,params_json);
-        try body.append(self.allocator,'}');
+        try body.appendSlice(self.allocator, "{\"jsonrpc\":\"2.0\",\"method\":\"");
+        try body.appendSlice(self.allocator, method);
+        try body.appendSlice(self.allocator, "\",\"params\":");
+        try body.appendSlice(self.allocator, params_json);
+        try body.append(self.allocator, '}');
 
         try self.writeMessage(body.items);
     }
@@ -573,16 +576,16 @@ pub const LspClient = struct {
         var params: std.ArrayList(u8) = .empty;
         defer params.deinit(self.allocator);
 
-        try params.appendSlice(self.allocator,"{\"textDocument\":{\"uri\":\"");
-        try params.appendSlice(self.allocator,uri);
-        try params.appendSlice(self.allocator,"\",\"languageId\":\"");
-        try params.appendSlice(self.allocator,language_id);
-        try params.appendSlice(self.allocator,"\",\"version\":");
+        try params.appendSlice(self.allocator, "{\"textDocument\":{\"uri\":\"");
+        try params.appendSlice(self.allocator, uri);
+        try params.appendSlice(self.allocator, "\",\"languageId\":\"");
+        try params.appendSlice(self.allocator, language_id);
+        try params.appendSlice(self.allocator, "\",\"version\":");
         try params.print(self.allocator, "{d}", .{version});
-        try params.appendSlice(self.allocator,",\"text\":");
+        try params.appendSlice(self.allocator, ",\"text\":");
         // JSON-escape the text
         try writeJsonString(&params, self.allocator, text);
-        try params.appendSlice(self.allocator,"}}");
+        try params.appendSlice(self.allocator, "}}");
 
         try self.sendNotification("textDocument/didOpen", params.items);
     }
@@ -593,13 +596,13 @@ pub const LspClient = struct {
         var params: std.ArrayList(u8) = .empty;
         defer params.deinit(self.allocator);
 
-        try params.appendSlice(self.allocator,"{\"textDocument\":{\"uri\":\"");
-        try params.appendSlice(self.allocator,uri);
-        try params.appendSlice(self.allocator,"\",\"version\":");
+        try params.appendSlice(self.allocator, "{\"textDocument\":{\"uri\":\"");
+        try params.appendSlice(self.allocator, uri);
+        try params.appendSlice(self.allocator, "\",\"version\":");
         try params.print(self.allocator, "{d}", .{version});
-        try params.appendSlice(self.allocator,"},\"contentChanges\":[{\"text\":");
+        try params.appendSlice(self.allocator, "},\"contentChanges\":[{\"text\":");
         try writeJsonString(&params, self.allocator, text);
-        try params.appendSlice(self.allocator,"}]}");
+        try params.appendSlice(self.allocator, "}]}");
 
         try self.sendNotification("textDocument/didChange", params.items);
     }
@@ -610,9 +613,9 @@ pub const LspClient = struct {
         var params: std.ArrayList(u8) = .empty;
         defer params.deinit(self.allocator);
 
-        try params.appendSlice(self.allocator,"{\"textDocument\":{\"uri\":\"");
-        try params.appendSlice(self.allocator,uri);
-        try params.appendSlice(self.allocator,"\"}}");
+        try params.appendSlice(self.allocator, "{\"textDocument\":{\"uri\":\"");
+        try params.appendSlice(self.allocator, uri);
+        try params.appendSlice(self.allocator, "\"}}");
 
         try self.sendNotification("textDocument/didClose", params.items);
     }
@@ -623,9 +626,9 @@ pub const LspClient = struct {
         var params: std.ArrayList(u8) = .empty;
         defer params.deinit(self.allocator);
 
-        try params.appendSlice(self.allocator,"{\"textDocument\":{\"uri\":\"");
-        try params.appendSlice(self.allocator,uri);
-        try params.appendSlice(self.allocator,"\"}}");
+        try params.appendSlice(self.allocator, "{\"textDocument\":{\"uri\":\"");
+        try params.appendSlice(self.allocator, uri);
+        try params.appendSlice(self.allocator, "\"}}");
 
         try self.sendNotification("textDocument/didSave", params.items);
     }
@@ -636,13 +639,13 @@ pub const LspClient = struct {
         var params: std.ArrayList(u8) = .empty;
         defer params.deinit(self.allocator);
 
-        try params.appendSlice(self.allocator,"{\"textDocument\":{\"uri\":\"");
-        try params.appendSlice(self.allocator,uri);
-        try params.appendSlice(self.allocator,"\"},\"position\":{\"line\":");
+        try params.appendSlice(self.allocator, "{\"textDocument\":{\"uri\":\"");
+        try params.appendSlice(self.allocator, uri);
+        try params.appendSlice(self.allocator, "\"},\"position\":{\"line\":");
         try params.print(self.allocator, "{d}", .{line});
-        try params.appendSlice(self.allocator,",\"character\":");
+        try params.appendSlice(self.allocator, ",\"character\":");
         try params.print(self.allocator, "{d}", .{col});
-        try params.appendSlice(self.allocator,"}}");
+        try params.appendSlice(self.allocator, "}}");
 
         const id = try self.sendRequest("textDocument/completion", params.items);
         self.pending.put(id, .completion) catch {};
@@ -655,13 +658,13 @@ pub const LspClient = struct {
         var params: std.ArrayList(u8) = .empty;
         defer params.deinit(self.allocator);
 
-        try params.appendSlice(self.allocator,"{\"textDocument\":{\"uri\":\"");
-        try params.appendSlice(self.allocator,uri);
-        try params.appendSlice(self.allocator,"\"},\"position\":{\"line\":");
+        try params.appendSlice(self.allocator, "{\"textDocument\":{\"uri\":\"");
+        try params.appendSlice(self.allocator, uri);
+        try params.appendSlice(self.allocator, "\"},\"position\":{\"line\":");
         try params.print(self.allocator, "{d}", .{line});
-        try params.appendSlice(self.allocator,",\"character\":");
+        try params.appendSlice(self.allocator, ",\"character\":");
         try params.print(self.allocator, "{d}", .{col});
-        try params.appendSlice(self.allocator,"}}");
+        try params.appendSlice(self.allocator, "}}");
 
         const id = try self.sendRequest("textDocument/definition", params.items);
         self.pending.put(id, .goto_definition) catch {};
@@ -729,7 +732,7 @@ pub const LspClient = struct {
                 editor.status_message = std.fmt.bufPrint(&editor.status_buf, "LSP ready: {s} ({s})", .{ self.name(), langs }) catch "LSP ready";
             },
             .completion => {
-                self.handleCompletionResponse(json_bytes, editor);
+                if (editor.completionResponseCurrent(self, id)) self.handleCompletionResponse(json_bytes, editor);
             },
             .goto_definition => {
                 self.handleDefinitionResponse(json_bytes, editor);
@@ -898,9 +901,12 @@ pub const LspClient = struct {
         defer self.allocator.free(items);
 
         // Store in editor completion state (the editor owns the strings now)
+        const context = editor.completion_context;
         editor.clearCompletionItems();
+        editor.completion_context = context;
+        if (editor.completion_context) |*ctx| ctx.generation = editor.completion_generation;
         for (items) |item| {
-            editor.addCompletionItem(item.label, item.detail, item.insert_text) catch {
+            editor.addCompletionEntry(item) catch {
                 freeCompletionEntry(self.allocator, item);
             };
         }
@@ -1110,15 +1116,15 @@ pub fn pathToUri(allocator: Allocator, path: []const u8) ![]const u8 {
     var result: std.ArrayList(u8) = .empty;
     errdefer result.deinit(allocator);
 
-    try result.appendSlice(allocator,"file:///");
+    try result.appendSlice(allocator, "file:///");
 
     for (path) |ch| {
         if (ch == '\\') {
-            try result.append(allocator,'/');
+            try result.append(allocator, '/');
         } else if (ch == ' ') {
-            try result.appendSlice(allocator,"%20");
+            try result.appendSlice(allocator, "%20");
         } else {
-            try result.append(allocator,ch);
+            try result.append(allocator, ch);
         }
     }
 
@@ -1140,22 +1146,22 @@ pub fn uriToPath(allocator: Allocator, uri: []const u8) ![]const u8 {
     while (i < path_part.len) {
         if (path_part[i] == '%' and i + 2 < path_part.len) {
             const high = std.fmt.charToDigit(path_part[i + 1], 16) catch {
-                try result.append(allocator,path_part[i]);
+                try result.append(allocator, path_part[i]);
                 i += 1;
                 continue;
             };
             const low = std.fmt.charToDigit(path_part[i + 2], 16) catch {
-                try result.append(allocator,path_part[i]);
+                try result.append(allocator, path_part[i]);
                 i += 1;
                 continue;
             };
-            try result.append(allocator,@as(u8, high) * 16 + low);
+            try result.append(allocator, @as(u8, high) * 16 + low);
             i += 3;
         } else if (builtin.os.tag == .windows and path_part[i] == '/') {
-            try result.append(allocator,'\\');
+            try result.append(allocator, '\\');
             i += 1;
         } else {
-            try result.append(allocator,path_part[i]);
+            try result.append(allocator, path_part[i]);
             i += 1;
         }
     }
@@ -1222,6 +1228,23 @@ pub fn utf16ColToByte(line: []const u8, utf16_col: u32) usize {
         i += len;
     }
     return i;
+}
+
+/// Checked conversion for edits: never clamp an invalid server position.
+pub fn checkedUtf16ColToByte(line: []const u8, column: u32) !usize {
+    var units: u32 = 0;
+    var off: usize = 0;
+    while (units < column) {
+        if (off >= line.len) return error.InvalidCompletionEdit;
+        const len = std.unicode.utf8ByteSequenceLength(line[off]) catch return error.InvalidCompletionEdit;
+        if (len > line.len - off) return error.InvalidCompletionEdit;
+        const cp = std.unicode.utf8Decode(line[off..][0..len]) catch return error.InvalidCompletionEdit;
+        const width: u32 = if (cp >= 0x10000) 2 else 1;
+        if (width > column - units) return error.InvalidCompletionEdit;
+        units += width;
+        off += len;
+    }
+    return off;
 }
 
 // ---------------------------------------------------------------------------
@@ -1338,7 +1361,7 @@ pub fn buildInitializeParams(gpa: Allocator, root_path: []const u8, init_options
     try p.appendSlice(gpa, "}],\"capabilities\":{");
     try p.appendSlice(gpa, "\"textDocument\":{");
     try p.appendSlice(gpa, "\"synchronization\":{\"didSave\":true,\"didOpen\":true,\"didClose\":true},");
-    try p.appendSlice(gpa, "\"completion\":{\"completionItem\":{}},");
+    try p.appendSlice(gpa, "\"completion\":{\"completionItem\":{\"insertReplaceSupport\":true}},");
     try p.appendSlice(gpa, "\"publishDiagnostics\":{},");
     try p.appendSlice(gpa, "\"definition\":{}},");
     try p.appendSlice(gpa, "\"workspace\":{\"workspaceFolders\":true,\"configuration\":true,\"didChangeConfiguration\":{\"dynamicRegistration\":false}}");
@@ -1355,10 +1378,16 @@ pub fn buildInitializeParams(gpa: Allocator, root_path: []const u8, init_options
 // Completion response parsing
 // ---------------------------------------------------------------------------
 
+pub const CompletionEdit = union(enum) {
+    replace: LspRange,
+    insert_replace: struct { insert: LspRange, replace: LspRange },
+};
+
 pub const CompletionEntry = struct {
     label: []const u8,
     detail: ?[]const u8 = null,
     insert_text: ?[]const u8 = null,
+    edit: ?CompletionEdit = null,
 };
 
 /// Parse a completion response in either shape — `CompletionList{items}`
@@ -1394,10 +1423,22 @@ fn appendCompletionEntry(gpa: Allocator, out: *std.ArrayList(CompletionEntry), i
     errdefer gpa.free(label);
     const detail: ?[]const u8 = if (item.detail) |d| try gpa.dupe(u8, d) else null;
     errdefer if (detail) |d| gpa.free(d);
-    const insert_src: ?[]const u8 = item.insertText orelse (if (item.textEdit) |te| te.newText else null);
+    var edit: ?CompletionEdit = null;
+    if (item.textEdit) |te| {
+        if (te.range) |range| {
+            if (te.insert != null or te.replace != null) return error.InvalidCompletionEdit;
+            edit = .{ .replace = range };
+        } else {
+            edit = .{ .insert_replace = .{
+                .insert = te.insert orelse return error.InvalidCompletionEdit,
+                .replace = te.replace orelse return error.InvalidCompletionEdit,
+            } };
+        }
+    }
+    const insert_src: ?[]const u8 = if (item.textEdit) |te| te.newText else item.insertText;
     const insert_text: ?[]const u8 = if (insert_src) |t| try gpa.dupe(u8, t) else null;
     errdefer if (insert_text) |t| gpa.free(t);
-    try out.append(gpa, .{ .label = label, .detail = detail, .insert_text = insert_text });
+    try out.append(gpa, .{ .label = label, .detail = detail, .insert_text = insert_text, .edit = edit });
 }
 
 pub fn freeCompletionEntry(gpa: Allocator, e: CompletionEntry) void {
@@ -1590,7 +1631,7 @@ test "buildInitializeParams carries root, folders and init options" {
 
 test "parseCompletionItems handles list and array forms" {
     const alloc = std.testing.allocator;
-    const list = try parseCompletionItems(alloc, "{\"id\":1,\"result\":{\"isIncomplete\":false,\"items\":[{\"label\":\"foo\",\"detail\":\"fn\"},{\"label\":\"bar\",\"textEdit\":{\"range\":{},\"newText\":\"bar()\"}}]}}");
+    const list = try parseCompletionItems(alloc, "{\"id\":1,\"result\":{\"isIncomplete\":false,\"items\":[{\"label\":\"foo\",\"detail\":\"fn\"},{\"label\":\"bar\",\"textEdit\":{\"range\":{\"start\":{\"line\":0,\"character\":0},\"end\":{\"line\":0,\"character\":3}},\"newText\":\"bar()\"}}]}}");
     defer {
         for (list) |e| freeCompletionEntry(alloc, e);
         alloc.free(list);
@@ -1631,4 +1672,10 @@ test "MessageQueue overflow frees dropped messages" {
         popped += 1;
     }
     try std.testing.expectEqual(@as(usize, QUEUE_CAP), popped);
+}
+
+test "completion parser rejects an edit with no usable range" {
+    try std.testing.expectError(error.InvalidCompletionEdit, parseCompletionItems(std.testing.allocator,
+        \\{"result":[{"label":"bad","textEdit":{"newText":"bad"}}]}
+    ));
 }

@@ -659,6 +659,18 @@ pub const FileTree = struct {
         }
     }
 
+    /// Resolve both existing paths before any output is created, including
+    /// junction/symlink aliases. The destination parent must be outside source.
+    fn checkCopyDestination(self: *FileTree, src_dir: std.Io.Dir, src_path: []const u8, dest_parent: []const u8) !void {
+        const stat = try src_dir.statFile(self.io, src_path, .{});
+        if (stat.kind != .directory) return;
+        const source = try std.Io.Dir.realPathFileAlloc(src_dir, self.io, src_path, self.allocator);
+        defer self.allocator.free(source);
+        const parent = try std.Io.Dir.realPathFileAlloc(self.root_dir, self.io, if (dest_parent.len == 0) "." else dest_parent, self.allocator);
+        defer self.allocator.free(parent);
+        if (pathWithin(source, parent)) return error.InvalidCopy;
+    }
+
     /// Recursively copy `src_rel` into directory node `dest_dir_idx`,
     /// keeping its basename. No-clobber (error.PathAlreadyExists) —
     /// which also covers pasting into the source's own parent. Returns
@@ -667,14 +679,7 @@ pub const FileTree = struct {
         if (src_rel.len == 0) return error.InvalidCopy;
         const dest = self.nodes.items[dest_dir_idx];
         if (dest.kind != .dir) return error.InvalidCopy;
-        // Copying a dir into its own subtree would recurse forever.
-        if (std.mem.eql(u8, dest.rel_path, src_rel) or
-            (dest.rel_path.len > src_rel.len and
-                std.mem.startsWith(u8, dest.rel_path, src_rel) and
-                dest.rel_path[src_rel.len] == '/'))
-        {
-            return error.InvalidCopy;
-        }
+        try self.checkCopyDestination(self.root_dir, src_rel, dest.rel_path);
         const base = std.fs.path.basenamePosix(src_rel);
         const new_rel = if (dest.rel_path.len == 0)
             try allocator.dupe(u8, base)
@@ -703,11 +708,12 @@ pub const FileTree = struct {
             try std.mem.concat(allocator, u8, &.{ dest.rel_path, "/", base });
         errdefer allocator.free(new_rel);
         normalizeSeps(new_rel);
+        var pdir = try std.Io.Dir.openDirAbsolute(self.io, parent, .{});
+        defer pdir.close(self.io);
+        try self.checkCopyDestination(pdir, base, dest.rel_path);
         if (self.root_dir.access(self.io, new_rel, .{})) |_| {
             return error.PathAlreadyExists;
         } else |_| {}
-        var pdir = try std.Io.Dir.openDirAbsolute(self.io, parent, .{});
-        defer pdir.close(self.io);
         try self.copyIntoRoot(pdir, base, new_rel);
         return new_rel;
     }
@@ -902,6 +908,12 @@ pub fn normPathEql(a: []const u8, b: []const u8) bool {
         if (normPathChar(ca) != normPathChar(cb)) return false;
     }
     return true;
+}
+
+fn pathWithin(source: []const u8, candidate: []const u8) bool {
+    const root = std.mem.trimEnd(u8, source, "/\\");
+    if (candidate.len < root.len or !normPathEql(root, candidate[0..root.len])) return false;
+    return candidate.len == root.len or normPathChar(candidate[root.len]) == '/';
 }
 
 // ---- Tests ----
@@ -1470,4 +1482,54 @@ test "filetree: path helpers" {
     var buf = "a\\b\\c".*;
     normalizeSeps(&buf);
     try t.expectEqualStrings("a/b/c", &buf);
+}
+
+test "directory imports reject self descendants and lexical aliases before copying" {
+    var tmp = t.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(t.io, "source/target");
+    try tmp.dir.createDirPath(t.io, "source2");
+    try touch(t.io, tmp.dir, "source/file.txt");
+    var ft = try testTree(&tmp);
+    defer ft.deinit();
+    _ = try ft.expandToPath("source/target");
+    const source = try std.Io.Dir.realPathFileAlloc(tmp.dir, t.io, "source", t.allocator);
+    defer t.allocator.free(source);
+    const target = ft.findByPath("source/target").?;
+    try t.expectError(error.InvalidCopy, ft.importAbsPath(t.allocator, source, target));
+    try t.expectError(error.InvalidCopy, ft.importAbsPath(t.allocator, source, ft.findByPath("source").?));
+    try t.expectError(error.FileNotFound, tmp.dir.access(t.io, "source/target/source", .{}));
+    const alias = try std.fs.path.join(t.allocator, &.{ source, "target", ".." });
+    defer t.allocator.free(alias);
+    try t.expectError(error.InvalidCopy, ft.importAbsPath(t.allocator, alias, target));
+    const copied = try ft.importAbsPath(t.allocator, source, ft.findByPath("source2").?);
+    defer t.allocator.free(copied);
+    try tmp.dir.access(t.io, "source2/source/file.txt", .{});
+    try t.expectError(error.PathAlreadyExists, ft.importAbsPath(t.allocator, source, ft.findByPath("source2").?));
+    try t.expect(!pathWithin("/source", "/source2"));
+    try t.expect(pathWithin("/source/", "/source/target"));
+    if (builtin.os.tag == .windows) try t.expect(pathWithin("C:\\SOURCE", "c:/source/target"));
+}
+
+test "directory import resolves symlink aliases before checking ancestry" {
+    var tmp = t.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(t.io, "source/target");
+    const source = try std.Io.Dir.realPathFileAlloc(tmp.dir, t.io, "source", t.allocator);
+    defer t.allocator.free(source);
+    tmp.dir.symLink(t.io, source, "alias", .{ .is_directory = true }) catch |err| switch (err) {
+        error.AccessDenied, error.PermissionDenied => return error.SkipZigTest,
+        else => return err,
+    };
+    // Explicitly remove the link before temporary-directory recursive cleanup.
+    defer tmp.dir.deleteFile(t.io, "alias") catch {};
+    var ft = try testTree(&tmp);
+    defer ft.deinit();
+    _ = try ft.expandToPath("source/target");
+    const root = try std.Io.Dir.realPathFileAlloc(tmp.dir, t.io, ".", t.allocator);
+    defer t.allocator.free(root);
+    const alias = try std.fs.path.join(t.allocator, &.{ root, "alias" });
+    defer t.allocator.free(alias);
+    try t.expectError(error.InvalidCopy, ft.importAbsPath(t.allocator, alias, ft.findByPath("source/target").?));
+    try t.expectError(error.FileNotFound, tmp.dir.access(t.io, "source/target/alias", .{}));
 }

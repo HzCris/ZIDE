@@ -1253,23 +1253,23 @@ fn moveVisualVertical(editor: *Editor, direction: enum { up, down }, extend_sele
             .up => {
                 if (wrap_pos.row > 0) {
                     const target_col = wrapVisualToCol(cur_line, text_width, wrap_pos.row - 1, target_dcol);
-                    c.offset = buf.posToOffset(pos.line, target_col);
+                    c.offset = @import("../core/cursor.zig").lineOffset(buf, pos.line, target_col);
                 } else if (pos.line > 0) {
                     const prev_line = doc.lineContent(pos.line - 1);
                     const prev_rows = wrapLineRows(prev_line, text_width);
                     const target_col = wrapVisualToCol(prev_line, text_width, prev_rows - 1, target_dcol);
-                    c.offset = buf.posToOffset(pos.line - 1, target_col);
+                    c.offset = @import("../core/cursor.zig").lineOffset(buf, pos.line - 1, target_col);
                 }
             },
             .down => {
                 const cur_rows = wrapLineRows(cur_line, text_width);
                 if (wrap_pos.row + 1 < cur_rows) {
                     const target_col = wrapVisualToCol(cur_line, text_width, wrap_pos.row + 1, target_dcol);
-                    c.offset = buf.posToOffset(pos.line, target_col);
+                    c.offset = @import("../core/cursor.zig").lineOffset(buf, pos.line, target_col);
                 } else if (pos.line + 1 < total_lines) {
                     const next_line = doc.lineContent(pos.line + 1);
                     const target_col = wrapVisualToCol(next_line, text_width, 0, target_dcol);
-                    c.offset = buf.posToOffset(pos.line + 1, target_col);
+                    c.offset = @import("../core/cursor.zig").lineOffset(buf, pos.line + 1, target_col);
                 }
             },
         }
@@ -1964,7 +1964,7 @@ fn screenToOffset(editor: *Editor, screen_x: i16, screen_y: i16) ?usize {
                 // Click is on this logical line, in visual row (content_row - visual_row)
                 const wrap_row: u16 = @intCast(content_row - visual_row);
                 const byte_col = wrapVisualToCol(line, text_width, wrap_row, text_col);
-                return doc.buffer.posToOffset(line_idx, byte_col);
+                return @import("../core/cursor.zig").lineOffset(&doc.buffer, line_idx, byte_col);
             }
             visual_row += rows;
         }
@@ -1975,7 +1975,7 @@ fn screenToOffset(editor: *Editor, screen_x: i16, screen_y: i16) ?usize {
         if (target_line >= total_lines) return doc.buffer.byteLen();
         const col = doc.scroll_left + text_col;
         const line_len = doc.lineContent(target_line).len;
-        return doc.buffer.posToOffset(target_line, @min(col, line_len));
+        return @import("../core/cursor.zig").lineOffset(&doc.buffer, target_line, @min(col, line_len));
     }
 }
 
@@ -3030,12 +3030,10 @@ fn replaceAll(editor: *Editor) void {
     if (needle.len == 0) return;
 
     // Start from beginning
+    doc.beginEdit() catch return;
+    defer doc.endEdit();
     doc.cursors.primary().offset = 0;
     doc.cursors.primary().clearSelection();
-
-    // The whole replace-all is one undo step.
-    doc.history.beginGroup();
-    defer doc.history.endGroup();
 
     var count: usize = 0;
     while (count < 100_000) { // safety limit
@@ -3104,26 +3102,7 @@ fn handleConfirmQuitKey(editor: *Editor, key: Key) void {
     if (key.isModifier()) return;
 
     switch (key.codepoint) {
-        's', 'S' => {
-            // Save all dirty documents, then quit — but only if every save
-            // succeeded (silently discarding on failure loses work).
-            var failures: usize = 0;
-            for (editor.documents.items) |*doc| {
-                if (doc.dirty) {
-                    doc.save(editor.io) catch {
-                        failures += 1;
-                        continue;
-                    };
-                }
-            }
-            if (failures == 0) {
-                editor.running = false;
-            } else {
-                editor.mode = .normal;
-                const msg = std.fmt.bufPrint(&editor.status_buf, "{d} file(s) not saved — use Save As for untitled buffers", .{failures}) catch "Save failed";
-                editor.status_message = msg;
-            }
-        },
+        's', 'S' => editor.saveAllAndQuit(),
         'd', 'D' => {
             // Discard and quit
             editor.running = false;

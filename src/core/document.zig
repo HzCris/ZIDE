@@ -5,17 +5,25 @@ const cursor_mod = @import("cursor.zig");
 const Cursor = cursor_mod.Cursor;
 const CursorSet = cursor_mod.CursorSet;
 const UndoHistory = @import("undo.zig").UndoHistory;
+const UndoOp = @import("undo.zig").UndoOp;
 const syntax = @import("syntax.zig");
 const lsp = @import("lsp.zig");
 
 /// Default display name. Ownership is tracked by pointer identity — a file
 /// literally named "untitled" must still get its heap name freed.
+var next_document_id = std.atomic.Value(u64).init(1);
+
 const default_display_name: []const u8 = "untitled";
 
 /// A document represents an open file (or unsaved buffer) being edited.
 /// It owns the text buffer, cursor state, file metadata, and undo history.
 pub const Document = struct {
     buffer: Buffer,
+    id: u64 = 0,
+    edit_depth: usize = 0,
+    edit_before: []Cursor = &.{},
+    edit_after: []Cursor = &.{},
+    edit_revision: u64 = 0,
     cursors: CursorSet,
     history: UndoHistory,
     allocator: Allocator,
@@ -69,6 +77,7 @@ pub const Document = struct {
         const cursors = try CursorSet.init(allocator);
         return .{
             .buffer = buffer,
+            .id = next_document_id.fetchAdd(1, .monotonic),
             .cursors = cursors,
             .history = UndoHistory.init(allocator),
             .allocator = allocator,
@@ -199,6 +208,7 @@ pub const Document = struct {
     pub fn save(self: *Document, io: std.Io) !void {
         const path = self.file_path orelse return error.NoFilePath;
         try self.buffer.saveFile(io, path);
+        self.history.markSaved();
         self.dirty = false;
         self.external_changed = false;
         self.refreshDiskMtime(io);
@@ -206,12 +216,15 @@ pub const Document = struct {
 
     /// Save to a new path (Save As).
     pub fn saveAs(self: *Document, io: std.Io, path: []const u8) !void {
+        const owned_path = try self.allocator.dupe(u8, path);
+        errdefer self.allocator.free(owned_path);
         try self.buffer.saveFile(io, path);
         if (self.file_path) |old| {
             self.allocator.free(old);
         }
-        self.file_path = try self.allocator.dupe(u8, path);
+        self.file_path = owned_path;
         self.setDisplayNameFromPath(path);
+        self.history.markSaved();
         self.dirty = false;
         self.external_changed = false;
         self.refreshDiskMtime(io);
@@ -257,224 +270,199 @@ pub const Document = struct {
         self.detectLineEndings();
         // Content changed: bump so syncLspDocuments pushes a fresh didChange.
         self.lsp_version +%= 1;
-        self.cursors.primary().offset = @min(cursor_offset, self.buffer.byteLen());
+        self.cursors.primary().offset = cursor_mod.floorBoundary(&self.buffer, cursor_offset);
         self.scroll_top = @min(scroll, self.buffer.lineCount() -| 1);
         self.refreshDiskMtime(io);
     }
 
-    /// Insert text at the primary cursor position.
-    /// Replaces the active selection (if any) as a single undo step.
-    pub fn insertAtCursor(self: *Document, text: []const u8) !void {
-        if (self.cursors.primary().hasSelection()) {
-            self.history.beginGroup();
-            defer self.history.endGroup();
-            try self.deleteSelection();
-            return self.insertAtCursorRaw(text);
+    /// Explicit composite edit. Capture cursors before callers reposition them.
+    pub fn beginEdit(self: *Document) !void {
+        try self.beginImplicitEdit();
+        self.history.beginGroup();
+    }
+    pub fn endEdit(self: *Document) void {
+        self.history.endGroup();
+        self.endImplicitEdit();
+    }
+    fn beginImplicitEdit(self: *Document) !void {
+        if (self.edit_depth == 0) {
+            const before = try self.allocator.dupe(Cursor, self.cursors.cursors.items);
+            errdefer self.allocator.free(before);
+            self.edit_after = try self.allocator.alloc(Cursor, before.len);
+            self.edit_before = before;
+            self.edit_revision = self.history.current_revision;
         }
-        try self.insertAtCursorRaw(text);
+        self.edit_depth += 1;
+    }
+    fn endImplicitEdit(self: *Document) void {
+        self.edit_depth -= 1;
+        if (self.edit_depth != 0) return;
+        if (self.history.current_revision != self.edit_revision) {
+            const count = self.cursors.count();
+            std.debug.assert(count <= self.edit_after.len);
+            @memcpy(self.edit_after[0..count], self.cursors.cursors.items);
+            self.history.attachCursors(self.edit_before, self.edit_after, count);
+            self.dirty = !self.history.isSaved();
+        } else {
+            self.allocator.free(self.edit_before);
+            self.allocator.free(self.edit_after);
+        }
+        self.edit_before = &.{};
+        self.edit_after = &.{};
     }
 
-    /// Insert at the primary cursor without selection handling (internal).
-    fn insertAtCursorRaw(self: *Document, text: []const u8) !void {
-        const c = self.cursors.primary();
-        const cursor_before = c.offset;
-        const len = try self.buffer.insert(c.offset, text);
-        self.cursors.adjustAfterInsert(cursor_before, len);
-        try self.history.recordInsert(cursor_before, text, cursor_before, c.offset);
+    pub const RangeEdit = struct { start: usize, end: usize, text: []const u8 };
+
+    /// All allocations precede content/history mutation. Ranges use original
+    /// byte offsets and must be disjoint, in descending order.
+    fn applyRanges(self: *Document, ranges: []const RangeEdit) !void {
+        var ops: std.ArrayList(UndoOp) = .empty;
+        defer ops.deinit(self.allocator);
+        var transferred = false;
+        defer if (!transferred) {
+            for (ops.items) |op| self.allocator.free(op.text);
+        };
+        var bytes: usize = 0;
+        var lines: usize = 0;
+        var previous = self.buffer.byteLen();
+        for (ranges) |r| {
+            if (r.start > r.end or r.end > previous) return error.InvalidRange;
+            previous = r.start;
+            try ops.ensureUnusedCapacity(self.allocator, 2);
+            if (r.end > r.start) {
+                const deleted = try self.allocator.alloc(u8, r.end - r.start);
+                for (deleted, 0..) |*byte, i| byte.* = self.buffer.byteAt(r.start + i).?;
+                ops.appendAssumeCapacity(.{ .op_type = .delete, .offset = r.start, .text = deleted, .cursor_before = self.cursors.primary().offset, .cursor_after = r.start });
+            }
+            if (r.text.len > 0) {
+                const inserted = try self.allocator.dupe(u8, r.text);
+                ops.appendAssumeCapacity(.{ .op_type = .insert, .offset = r.start, .text = inserted, .cursor_before = r.start, .cursor_after = r.start + inserted.len });
+                bytes += inserted.len;
+                lines += std.mem.count(u8, inserted, "\n");
+            }
+        }
+        if (ops.items.len == 0) return;
+        try self.history.undo_stack.ensureUnusedCapacity(self.allocator, ops.items.len);
+        try self.buffer.reserveInsert(bytes, lines);
+        try self.beginImplicitEdit();
+        defer self.endImplicitEdit();
+        const grouped = ops.items.len > 1;
+        if (grouped) self.history.beginGroup();
+        defer if (grouped) self.history.endGroup();
+        for (ops.items) |op| {
+            switch (op.op_type) {
+                .insert => {
+                    _ = self.buffer.insert(op.offset, op.text) catch unreachable;
+                    self.cursors.adjustAfterInsert(op.offset, op.text.len);
+                },
+                .delete => {
+                    _ = self.buffer.delete(op.offset, op.text.len);
+                    self.cursors.adjustAfterDelete(op.offset, op.text.len);
+                },
+            }
+            self.history.appendPrepared(op);
+        }
+        transferred = true;
         self.markDirty();
-        self.invalidateLineStates(self.buffer.offsetToPos(cursor_before).line);
+        self.invalidateLineStates(self.buffer.offsetToPos(ranges[ranges.len - 1].start).line);
     }
 
-    /// Delete `count` bytes forward from the primary cursor (like pressing Delete).
-    /// With an active selection, deletes the selection instead.
-    pub fn deleteForward(self: *Document, count: usize) !void {
+    /// Replace one byte range and put the primary cursor after its replacement.
+    pub fn replaceRange(self: *Document, start: usize, end: usize, text: []const u8) !void {
+        try self.beginImplicitEdit();
+        defer self.endImplicitEdit();
+        try self.applyRanges(&.{.{ .start = start, .end = end, .text = text }});
         const c = self.cursors.primary();
-        if (c.hasSelection()) return self.deleteSelection();
-        if (c.offset >= self.buffer.byteLen()) return;
-        const cursor_before = c.offset;
-        const actual_count = @min(count, self.buffer.byteLen() - c.offset);
-        if (actual_count == 0) return;
-        const deleted_text = self.buffer.slice(c.offset, c.offset + actual_count);
-        // Record before delete — recordDelete dupes the text internally
-        try self.history.recordDelete(cursor_before, deleted_text, cursor_before, cursor_before);
-        _ = self.buffer.delete(c.offset, actual_count);
-        self.cursors.adjustAfterDelete(cursor_before, actual_count);
-        self.markDirty();
-        self.invalidateLineStates(self.buffer.offsetToPos(cursor_before).line);
-    }
-
-    /// Delete `count` bytes backward from the primary cursor (like pressing Backspace).
-    /// With an active selection, deletes the selection instead.
-    pub fn deleteBackward(self: *Document, count: usize) !void {
-        const c = self.cursors.primary();
-        if (c.hasSelection()) return self.deleteSelection();
-        if (c.offset == 0) return;
-        const cursor_before = c.offset;
-        const del_count = @min(count, c.offset);
-        const del_pos = c.offset - del_count;
-        const deleted_text = self.buffer.slice(del_pos, del_pos + del_count);
-        // Record before delete — recordDelete dupes the text internally
-        try self.history.recordDelete(del_pos, deleted_text, cursor_before, del_pos);
-        _ = self.buffer.delete(del_pos, del_count);
-        self.cursors.adjustAfterDelete(del_pos, del_count);
-        self.markDirty();
-        self.invalidateLineStates(self.buffer.offsetToPos(del_pos).line);
-    }
-
-    /// Delete the current selection (if any) for the primary cursor.
-    pub fn deleteSelection(self: *Document) !void {
-        const c = self.cursors.primary();
-        const range = c.selectionRange() orelse return;
-        const cursor_before = c.offset;
-        const del_len = range.end - range.start;
-        const deleted_text = self.buffer.slice(range.start, range.end);
-        // Record before delete — recordDelete dupes the text internally
-        try self.history.recordDelete(range.start, deleted_text, cursor_before, range.start);
-        _ = self.buffer.delete(range.start, del_len);
-        self.cursors.adjustAfterDelete(range.start, del_len);
-        c.offset = range.start;
+        c.offset = start + text.len;
+        c.preferred_col = self.buffer.offsetToPos(c.offset).col;
         c.clearSelection();
-        self.markDirty();
-        self.invalidateLineStates(self.buffer.offsetToPos(range.start).line);
     }
-
-    // ======================================================================
-    // Multi-cursor editing — process all cursors (highest offset first)
-    // ======================================================================
-
-    /// Insert `text` at every cursor position. One undo step for the whole edit.
+    pub fn insertAtCursor(self: *Document, text: []const u8) !void {
+        if (text.len == 0) return;
+        const c = self.cursors.primaryConst();
+        if (c.selectionRange()) |r| return self.replaceRange(r.start, r.end, text);
+        try self.replaceRange(c.offset, c.offset, text);
+    }
+    pub fn deleteSelection(self: *Document) !void {
+        const r = self.cursors.primaryConst().selectionRange() orelse return;
+        try self.replaceRange(r.start, r.end, "");
+    }
+    /// Explicit byte-count APIs; keyboard character deletion uses boundaries.
+    pub fn deleteForward(self: *Document, count: usize) !void {
+        const c = self.cursors.primaryConst();
+        if (c.hasSelection()) return self.deleteSelection();
+        try self.replaceRange(c.offset, c.offset + @min(count, self.buffer.byteLen() - c.offset), "");
+    }
+    pub fn deleteBackward(self: *Document, count: usize) !void {
+        const c = self.cursors.primaryConst();
+        if (c.hasSelection()) return self.deleteSelection();
+        try self.replaceRange(c.offset -| count, c.offset, "");
+    }
     pub fn insertAtAllCursors(self: *Document, text: []const u8) !void {
+        if (text.len == 0) return;
         if (self.cursors.count() == 1) return self.insertAtCursor(text);
-        self.history.beginGroup();
-        defer self.history.endGroup();
-        var min_edit: usize = std.math.maxInt(usize);
-        var idx_buf: [256]usize = undefined;
-        const order = self.cursors.sortedDescending(&idx_buf);
-        for (order) |idx| {
-            const c = &self.cursors.cursors.items[idx];
-            if (c.hasSelection()) {
-                const range = c.selectionRange().?;
-                const del_len = range.end - range.start;
-                const deleted = self.buffer.slice(range.start, range.end);
-                try self.history.recordDelete(range.start, deleted, range.end, range.start);
-                const actual = self.buffer.delete(range.start, del_len);
-                c.offset = range.start;
-                c.clearSelection();
-                self.cursors.adjustOthersAfterDelete(idx, range.start, actual);
+        try self.editAll(text, 0, false, false);
+    }
+    pub fn deleteForwardAll(self: *Document, count: usize) !void {
+        try self.editAll("", count, false, false);
+    }
+    pub fn deleteBackwardAll(self: *Document, count: usize) !void {
+        try self.editAll("", count, true, false);
+    }
+    pub fn deleteCharacterAll(self: *Document, backward: bool) !void {
+        try self.editAll("", 0, backward, true);
+    }
+
+    fn editAll(self: *Document, text: []const u8, count: usize, backward: bool, character: bool) !void {
+        const ranges = try self.allocator.alloc(RangeEdit, self.cursors.count());
+        defer self.allocator.free(ranges);
+        for (self.cursors.cursors.items, ranges) |c, *r| {
+            r.* = .{ .start = c.offset, .end = c.offset, .text = text };
+            if (c.selectionRange()) |sel| {
+                r.start = sel.start;
+                r.end = sel.end;
+            } else if (text.len == 0) {
+                if (backward) {
+                    r.start = if (character) cursor_mod.previousBoundary(&self.buffer, c.offset) else c.offset -| count;
+                } else r.end = if (character) cursor_mod.nextBoundary(&self.buffer, c.offset) else c.offset + @min(count, self.buffer.byteLen() - c.offset);
             }
-            const pos = c.offset;
-            const len = try self.buffer.insert(pos, text);
-            c.offset = pos + len;
+        }
+        std.mem.sort(RangeEdit, ranges, {}, struct {
+            fn less(_: void, a: RangeEdit, b: RangeEdit) bool {
+                return if (a.start == b.start) a.end > b.end else a.start > b.start;
+            }
+        }.less);
+        // Union overlapping selections so the same original bytes are edited once.
+        var n: usize = 0;
+        for (ranges) |r| {
+            if (n > 0 and (r.end > ranges[n - 1].start or r.start == ranges[n - 1].start)) {
+                ranges[n - 1].start = r.start;
+                ranges[n - 1].end = @max(r.end, ranges[n - 1].end);
+            } else {
+                ranges[n] = r;
+                n += 1;
+            }
+        }
+        try self.beginImplicitEdit();
+        defer self.endImplicitEdit();
+        try self.applyRanges(ranges[0..n]);
+        for (self.cursors.cursors.items) |*c| {
+            c.clearSelection();
             c.preferred_col = self.buffer.offsetToPos(c.offset).col;
-            self.cursors.adjustOthersAfterInsert(idx, pos, len);
-            try self.history.recordInsert(pos, text, pos, c.offset);
-            min_edit = @min(min_edit, pos);
         }
         self.cursors.mergeCursors();
-        self.markDirty();
-        if (min_edit != std.math.maxInt(usize)) {
-            self.invalidateLineStates(self.buffer.offsetToPos(min_edit).line);
-        }
     }
-
-    /// Delete one unit forward from every cursor. One undo step for the whole edit.
-    pub fn deleteForwardAll(self: *Document, count_arg: usize) !void {
-        if (self.cursors.count() == 1) return self.deleteForward(count_arg);
-        self.history.beginGroup();
-        defer self.history.endGroup();
-        var min_edit: usize = std.math.maxInt(usize);
-        var idx_buf: [256]usize = undefined;
-        const order = self.cursors.sortedDescending(&idx_buf);
-        for (order) |idx| {
-            const c = &self.cursors.cursors.items[idx];
-            if (c.hasSelection()) {
-                const range = c.selectionRange().?;
-                const del_len = range.end - range.start;
-                const deleted = self.buffer.slice(range.start, range.end);
-                const before = c.offset;
-                try self.history.recordDelete(range.start, deleted, before, range.start);
-                const actual = self.buffer.delete(range.start, del_len);
-                c.offset = range.start;
-                c.clearSelection();
-                self.cursors.adjustOthersAfterDelete(idx, range.start, actual);
-                min_edit = @min(min_edit, range.start);
-            } else {
-                if (c.offset >= self.buffer.byteLen()) continue;
-                const pos = c.offset;
-                const actual_count = @min(count_arg, self.buffer.byteLen() - pos);
-                if (actual_count == 0) continue;
-                const deleted = self.buffer.slice(pos, pos + actual_count);
-                try self.history.recordDelete(pos, deleted, pos, pos);
-                const actual = self.buffer.delete(pos, actual_count);
-                self.cursors.adjustOthersAfterDelete(idx, pos, actual);
-                min_edit = @min(min_edit, pos);
-            }
-        }
-        self.cursors.mergeCursors();
-        self.markDirty();
-        if (min_edit != std.math.maxInt(usize)) {
-            self.invalidateLineStates(self.buffer.offsetToPos(min_edit).line);
-        }
+    pub fn lineEnding(self: *const Document) []const u8 {
+        return if (self.crlf) "\r\n" else "\n";
     }
-
-    /// Delete one unit backward from every cursor. One undo step for the whole edit.
-    pub fn deleteBackwardAll(self: *Document, count_arg: usize) !void {
-        if (self.cursors.count() == 1) return self.deleteBackward(count_arg);
-        self.history.beginGroup();
-        defer self.history.endGroup();
-        var min_edit: usize = std.math.maxInt(usize);
-        var idx_buf: [256]usize = undefined;
-        const order = self.cursors.sortedDescending(&idx_buf);
-        for (order) |idx| {
-            const c = &self.cursors.cursors.items[idx];
-            if (c.hasSelection()) {
-                const range = c.selectionRange().?;
-                const del_len = range.end - range.start;
-                const deleted = self.buffer.slice(range.start, range.end);
-                const before = c.offset;
-                try self.history.recordDelete(range.start, deleted, before, range.start);
-                const actual = self.buffer.delete(range.start, del_len);
-                c.offset = range.start;
-                c.clearSelection();
-                self.cursors.adjustOthersAfterDelete(idx, range.start, actual);
-                min_edit = @min(min_edit, range.start);
-            } else {
-                if (c.offset == 0) continue;
-                const del_count = @min(count_arg, c.offset);
-                const del_pos = c.offset - del_count;
-                const deleted = self.buffer.slice(del_pos, del_pos + del_count);
-                const before = c.offset;
-                try self.history.recordDelete(del_pos, deleted, before, del_pos);
-                const actual = self.buffer.delete(del_pos, del_count);
-                c.offset = del_pos;
-                c.preferred_col = self.buffer.offsetToPos(c.offset).col;
-                self.cursors.adjustOthersAfterDelete(idx, del_pos, actual);
-                min_edit = @min(min_edit, del_pos);
-            }
-        }
-        self.cursors.mergeCursors();
-        self.markDirty();
-        if (min_edit != std.math.maxInt(usize)) {
-            self.invalidateLineStates(self.buffer.offsetToPos(min_edit).line);
-        }
-    }
-
-    /// Undo the last edit group. Returns true if something was undone.
     pub fn undoAction(self: *Document) !bool {
-        const cursor_pos = try self.history.undo(&self.buffer) orelse return false;
-        self.cursors.primary().offset = cursor_pos;
-        self.cursors.primary().preferred_col = self.buffer.offsetToPos(cursor_pos).col;
-        self.dirty = self.history.canUndo();
-        self.lsp_version +%= 1;
+        if (!try self.history.undoCursors(&self.buffer, &self.cursors)) return false;
+        self.markDirty();
         self.invalidateLineStates(0);
         return true;
     }
-
-    /// Redo the last undone edit group. Returns true if something was redone.
     pub fn redoAction(self: *Document) !bool {
-        const cursor_pos = try self.history.redo(&self.buffer) orelse return false;
-        self.cursors.primary().offset = cursor_pos;
-        self.cursors.primary().preferred_col = self.buffer.offsetToPos(cursor_pos).col;
+        if (!try self.history.redoCursors(&self.buffer, &self.cursors)) return false;
         self.markDirty();
         self.invalidateLineStates(0);
         return true;
@@ -523,6 +511,8 @@ pub const Document = struct {
 
     /// Delete the entire line the cursor is on.
     pub fn deleteLine(self: *Document) !void {
+        try self.beginEdit();
+        defer self.endEdit();
         const pos = self.cursorPos();
         const line_start = self.buffer.posToOffset(pos.line, 0);
         const line_end = if (pos.line + 1 < self.buffer.lineCount())
@@ -532,12 +522,7 @@ pub const Document = struct {
         const len = line_end - line_start;
         if (len == 0) return;
         const c = self.cursors.primary();
-        const cursor_before = c.offset;
-        const deleted = self.buffer.slice(line_start, line_end);
-        const new_cursor = @min(line_start, self.buffer.byteLen() - len);
-        try self.history.recordDelete(line_start, deleted, cursor_before, new_cursor);
-        _ = self.buffer.delete(line_start, len);
-        self.cursors.adjustAfterDelete(line_start, len);
+        try self.applyRanges(&.{.{ .start = line_start, .end = line_end, .text = "" }});
         c.offset = @min(line_start, self.buffer.byteLen());
         c.preferred_col = self.buffer.offsetToPos(c.offset).col;
         c.clearSelection();
@@ -547,6 +532,8 @@ pub const Document = struct {
 
     /// Duplicate the current line below.
     pub fn duplicateLine(self: *Document) !void {
+        try self.beginEdit();
+        defer self.endEdit();
         const pos = self.cursorPos();
         const line = self.lineContent(pos.line);
         // Build: line terminator + line content (match the document's endings)
@@ -557,11 +544,7 @@ pub const Document = struct {
         @memcpy(dup[term.len..], line);
         // Insert at end of current line
         const line_end = self.buffer.posToOffset(pos.line, line.len);
-        const c = self.cursors.primary();
-        const cursor_before = c.offset;
-        const len = try self.buffer.insert(line_end, dup);
-        self.cursors.adjustAfterInsert(line_end, len);
-        try self.history.recordInsert(line_end, dup, cursor_before, c.offset);
+        try self.applyRanges(&.{.{ .start = line_end, .end = line_end, .text = dup }});
         self.markDirty();
         self.invalidateLineStates(pos.line);
     }
@@ -597,9 +580,13 @@ pub const Document = struct {
         // Snapshot (line, col) of cursors/anchors inside the region; total
         // length is unchanged, so offsets outside the region stay valid.
         const LineCol = struct { line: usize, col: usize };
-        var cur_remap = [_]?LineCol{null} ** 256;
-        var anc_remap = [_]?LineCol{null} ** 256;
-        const n_cursors = @min(self.cursors.cursors.items.len, cur_remap.len);
+        const n_cursors = self.cursors.count();
+        const cur_remap = try self.allocator.alloc(?LineCol, n_cursors);
+        defer self.allocator.free(cur_remap);
+        const anc_remap = try self.allocator.alloc(?LineCol, n_cursors);
+        defer self.allocator.free(anc_remap);
+        @memset(cur_remap, null);
+        @memset(anc_remap, null);
         for (self.cursors.cursors.items[0..n_cursors], 0..) |c, i| {
             if (c.offset >= a_start and c.offset < b_end) {
                 const p = self.buffer.offsetToPos(c.offset);
@@ -613,12 +600,8 @@ pub const Document = struct {
             }
         }
 
-        const cursor_before = self.cursors.primary().offset;
-        self.history.beginGroup();
-        defer self.history.endGroup();
-
-        // Record the removal before mutating (recordDelete dupes internally).
-        try self.history.recordDelete(a_start, self.buffer.slice(a_start, b_end), cursor_before, cursor_before);
+        try self.beginEdit();
+        defer self.endEdit();
 
         // Dupe both spans — slice() may return the shared scratch buffer,
         // which the delete/insert below would invalidate.
@@ -643,38 +626,34 @@ pub const Document = struct {
             @memcpy(new_text[b_full.len + term_len ..], a_full[0 .. a_full.len - term_len]);
         }
 
-        _ = self.buffer.delete(a_start, region_len);
-        _ = try self.buffer.insert(a_start, new_text);
+        try self.applyRanges(&.{.{ .start = a_start, .end = b_end, .text = new_text }});
 
         // Remap cursors onto their moved lines.
         for (self.cursors.cursors.items[0..n_cursors], 0..) |*c, i| {
             if (cur_remap[i]) |p| {
-                c.offset = self.buffer.posToOffset(p.line, p.col);
+                c.offset = cursor_mod.lineOffset(&self.buffer, p.line, p.col);
                 c.preferred_col = p.col;
             }
             if (anc_remap[i]) |p| {
-                c.anchor = self.buffer.posToOffset(p.line, p.col);
+                c.anchor = cursor_mod.lineOffset(&self.buffer, p.line, p.col);
             }
         }
 
-        try self.history.recordInsert(a_start, new_text, cursor_before, self.cursors.primary().offset);
         self.markDirty();
         self.invalidateLineStates(line_a);
     }
 
     /// Delete a word forward from cursor (Ctrl+Delete).
     pub fn deleteWordForward(self: *Document) !void {
+        try self.beginEdit();
+        defer self.endEdit();
         const c = self.cursors.primary();
         const start = c.offset;
         var tmp = c.*;
         tmp.moveWordRight(&self.buffer);
         const end = tmp.offset;
         if (end > start) {
-            const del_len = end - start;
-            const deleted = self.buffer.slice(start, end);
-            try self.history.recordDelete(start, deleted, start, start);
-            _ = self.buffer.delete(start, del_len);
-            self.cursors.adjustAfterDelete(start, del_len);
+            try self.applyRanges(&.{.{ .start = start, .end = end, .text = "" }});
             self.markDirty();
             self.invalidateLineStates(self.buffer.offsetToPos(start).line);
         }
@@ -682,6 +661,8 @@ pub const Document = struct {
 
     /// Delete a word backward from cursor (Ctrl+Backspace).
     pub fn deleteWordBackward(self: *Document) !void {
+        try self.beginEdit();
+        defer self.endEdit();
         const c = self.cursors.primary();
         const end = c.offset;
         if (end == 0) return;
@@ -689,11 +670,7 @@ pub const Document = struct {
         tmp.moveWordLeft(&self.buffer);
         const start = tmp.offset;
         if (end > start) {
-            const del_len = end - start;
-            const deleted = self.buffer.slice(start, end);
-            try self.history.recordDelete(start, deleted, end, start);
-            _ = self.buffer.delete(start, del_len);
-            self.cursors.adjustAfterDelete(start, del_len);
+            try self.applyRanges(&.{.{ .start = start, .end = end, .text = "" }});
             self.markDirty();
             self.invalidateLineStates(self.buffer.offsetToPos(start).line);
         }
@@ -701,6 +678,8 @@ pub const Document = struct {
 
     /// Dedent the current line (remove leading spaces/tab).
     pub fn dedentLine(self: *Document, tab_width: usize) !void {
+        try self.beginEdit();
+        defer self.endEdit();
         const pos = self.cursorPos();
         const line = self.lineContent(pos.line);
         const line_start = self.buffer.posToOffset(pos.line, 0);
@@ -716,13 +695,7 @@ pub const Document = struct {
             }
         }
         if (remove == 0) return;
-        const c = self.cursors.primary();
-        const cursor_before = c.offset;
-        const deleted = self.buffer.slice(line_start, line_start + remove);
-        const cursor_after = if (cursor_before >= line_start + remove) cursor_before - remove else if (cursor_before > line_start) line_start else cursor_before;
-        try self.history.recordDelete(line_start, deleted, cursor_before, cursor_after);
-        _ = self.buffer.delete(line_start, remove);
-        self.cursors.adjustAfterDelete(line_start, remove);
+        try self.applyRanges(&.{.{ .start = line_start, .end = line_start + remove, .text = "" }});
         self.markDirty();
         self.invalidateLineStates(pos.line);
     }
@@ -765,9 +738,11 @@ pub const Document = struct {
             if (!lineIsCommented(content[ws..], prefix, suffix)) all_commented = false;
         }
 
-        const cursor_before = c.offset;
-        self.history.beginGroup();
-        defer self.history.endGroup();
+        try self.beginEdit();
+        defer self.endEdit();
+
+        var edits: std.ArrayList(RangeEdit) = .empty;
+        defer edits.deinit(self.allocator);
 
         // Process bottom-up so earlier lines' offsets stay valid; within a
         // line, the higher-offset edit (suffix) goes first for the same reason.
@@ -807,17 +782,12 @@ pub const Document = struct {
                 }
 
                 if (suf_at) |sa| {
-                    const deleted = self.buffer.slice(sa, sa + suf_len);
-                    try self.history.recordDelete(sa, deleted, cursor_before, cursor_before);
-                    _ = self.buffer.delete(sa, suf_len);
-                    self.cursors.adjustAfterDelete(sa, suf_len);
+                    try edits.append(self.allocator, .{ .start = sa, .end = sa + suf_len, .text = "" });
                 }
                 const pre_at = line_start + ws;
-                const deleted = self.buffer.slice(pre_at, pre_at + pre_len);
-                try self.history.recordDelete(pre_at, deleted, cursor_before, cursor_before);
-                _ = self.buffer.delete(pre_at, pre_len);
-                self.cursors.adjustAfterDelete(pre_at, pre_len);
+                try edits.append(self.allocator, .{ .start = pre_at, .end = pre_at + pre_len, .text = "" });
             }
+            try self.applyRanges(edits.items);
         } else {
             // --- Comment ---
             const lead = try std.mem.concat(self.allocator, u8, &.{ prefix, " " });
@@ -841,19 +811,15 @@ pub const Document = struct {
 
                 if (trail) |t| {
                     const at = line_start + line_len;
-                    const len = try self.buffer.insert(at, t);
-                    self.cursors.adjustAfterInsert(at, len);
-                    try self.history.recordInsert(at, t, cursor_before, cursor_before);
+                    try edits.append(self.allocator, .{ .start = at, .end = at, .text = t });
                 }
                 const indent = if (any_nonblank) @min(min_indent, ws) else ws;
                 const at = line_start + indent;
-                const len = try self.buffer.insert(at, lead);
-                self.cursors.adjustAfterInsert(at, len);
-                try self.history.recordInsert(at, lead, cursor_before, cursor_before);
+                try edits.append(self.allocator, .{ .start = at, .end = at, .text = lead });
             }
+            try self.applyRanges(edits.items);
         }
 
-        self.markDirty();
         self.invalidateLineStates(first_line);
     }
 
@@ -871,7 +837,7 @@ pub const Document = struct {
 
     /// Mark the document as dirty and increment LSP version.
     fn markDirty(self: *Document) void {
-        self.dirty = true;
+        self.dirty = !self.history.isSaved();
         self.lsp_version +%= 1;
     }
 
@@ -1456,4 +1422,215 @@ test "document external change detection and reload" {
     // A vanished file counts as changed
     try std.Io.Dir.cwd().deleteFile(t.io, path);
     try t.expect(doc.checkExternalChange(t.io));
+}
+
+test "saved checkpoint survives undo redo branching and trimming" {
+    const t = std.testing;
+    var doc = try Document.init(t.allocator);
+    defer doc.deinit();
+    var tmp = t.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try std.Io.Dir.realPathFileAlloc(tmp.dir, t.io, ".", t.allocator);
+    defer t.allocator.free(root);
+    const path = try std.fs.path.join(t.allocator, &.{ root, "saved.txt" });
+    defer t.allocator.free(path);
+    try doc.loadText("a");
+    doc.cursors.primary().moveToEnd(&doc.buffer);
+    try doc.insertAtCursor("b");
+    try doc.saveAs(t.io, path);
+    try t.expect(!doc.dirty);
+    _ = try doc.undoAction();
+    try t.expectEqualStrings("a", doc.buffer.slice(0, doc.buffer.byteLen()));
+    try t.expect(doc.dirty);
+    _ = try doc.redoAction();
+    try t.expect(!doc.dirty);
+    try doc.insertAtCursor("c"); // saving split adjacent typing into a new group
+    _ = try doc.undoAction();
+    try t.expectEqualStrings("ab", doc.buffer.slice(0, doc.buffer.byteLen()));
+    try t.expect(!doc.dirty);
+    _ = try doc.undoAction();
+    try doc.save(t.io); // save an earlier history state
+    try t.expect(!doc.dirty);
+    try doc.insertAtCursor("x"); // branch cannot inherit the discarded revision
+    try t.expect(doc.dirty);
+    try t.expect(!doc.history.canRedo());
+    doc.history.max_size = 1;
+    try doc.insertAtCursor("yz");
+    _ = try doc.undoAction();
+    try t.expectEqualStrings("ax", doc.buffer.slice(0, doc.buffer.byteLen()));
+    try t.expect(doc.dirty);
+    const old_checkpoint = doc.history.saved_revision;
+    try t.expectError(error.NoFilePath, blk: {
+        const old_path = doc.file_path;
+        doc.file_path = null;
+        defer doc.file_path = old_path;
+        break :blk doc.save(t.io);
+    });
+    try t.expectEqual(old_checkpoint, doc.history.saved_revision);
+}
+
+test "multi-cursor history restores positions selections and primary identity" {
+    const t = std.testing;
+    var doc = try Document.init(t.allocator);
+    defer doc.deinit();
+    try doc.loadText("a\na");
+    doc.cursors.primary().* = .{ .offset = 1, .anchor = 0, .preferred_col = 7 };
+    try doc.cursors.addCursor(3);
+    doc.cursors.cursors.items[1].anchor = 2;
+    const before = try t.allocator.dupe(Cursor, doc.cursors.cursors.items);
+    defer t.allocator.free(before);
+    try doc.insertAtAllCursors("long");
+    const after = try t.allocator.dupe(Cursor, doc.cursors.cursors.items);
+    defer t.allocator.free(after);
+    _ = try doc.undoAction();
+    try t.expectEqualStrings("a\na", doc.buffer.slice(0, doc.buffer.byteLen()));
+    try t.expectEqualSlices(Cursor, before, doc.cursors.cursors.items);
+    _ = try doc.redoAction();
+    try t.expectEqualStrings("long\nlong", doc.buffer.slice(0, doc.buffer.byteLen()));
+    try t.expectEqualSlices(Cursor, after, doc.cursors.cursors.items);
+}
+
+test "large block edits include every cursor and retain one complete undo group" {
+    const t = std.testing;
+    var doc = try Document.init(t.allocator);
+    defer doc.deinit();
+    for ([_]usize{ 257, 300, 1000 }) |count| {
+        const text = try t.allocator.alloc(u8, count * 2);
+        defer t.allocator.free(text);
+        for (0..count) |i| @memcpy(text[i * 2 ..][0..2], "a\n");
+        try doc.loadText(text);
+        try doc.cursors.setBlockSelection(&doc.buffer, 0, 0, count - 1, 0);
+        try doc.insertAtAllCursors("!");
+        try t.expectEqual(count, std.mem.count(u8, doc.buffer.slice(0, doc.buffer.byteLen()), "!"));
+        _ = try doc.undoAction();
+        try t.expectEqualStrings(text, doc.buffer.slice(0, doc.buffer.byteLen()));
+        try t.expectEqual(count, doc.cursors.count());
+        try doc.deleteCharacterAll(false);
+        try t.expectEqual(count, doc.buffer.byteLen());
+        _ = try doc.undoAction();
+        try doc.cursors.setBlockSelection(&doc.buffer, 0, 1, count - 1, 1);
+        try doc.deleteCharacterAll(true);
+        try t.expectEqual(count, doc.buffer.byteLen());
+        _ = try doc.undoAction();
+        try doc.cursors.setBlockSelection(&doc.buffer, 0, 0, count - 1, 1);
+        try doc.insertAtAllCursors("xyz");
+        try t.expectEqual(count, std.mem.count(u8, doc.buffer.slice(0, doc.buffer.byteLen()), "xyz"));
+        _ = try doc.undoAction();
+        try t.expectEqualStrings(text, doc.buffer.slice(0, doc.buffer.byteLen()));
+    }
+}
+
+test "line movement remaps more than 256 cursors and undoes all of them" {
+    const t = std.testing;
+    var doc = try Document.init(t.allocator);
+    defer doc.deinit();
+    try doc.loadText("a" ** 300 ++ "\nbb");
+    for (1..300) |i| try doc.cursors.addCursor(i);
+    try doc.moveLineDown();
+    for (doc.cursors.cursors.items, 0..) |c, i| try t.expectEqual(i + 3, c.offset);
+    _ = try doc.undoAction();
+    for (doc.cursors.cursors.items, 0..) |c, i| try t.expectEqual(i, c.offset);
+}
+
+test "character deletion uses each cursor's UTF-8 width and CRLF boundary" {
+    const t = std.testing;
+    var doc = try Document.init(t.allocator);
+    defer doc.deinit();
+    const text = "\xc3\xa9\n\xe7\x95\x8c\n\xf0\x9f\x98\x80\r\nx";
+    try doc.loadText(text);
+    try doc.cursors.addCursor(3);
+    try doc.cursors.addCursor(7);
+    try doc.deleteCharacterAll(false);
+    try t.expectEqualStrings("\n\n\r\nx", doc.buffer.slice(0, doc.buffer.byteLen()));
+    _ = try doc.undoAction();
+    for (doc.cursors.cursors.items) |*c| c.moveRight(&doc.buffer);
+    try doc.deleteCharacterAll(true);
+    try t.expectEqualStrings("\n\n\r\nx", doc.buffer.slice(0, doc.buffer.byteLen()));
+    _ = try doc.undoAction();
+    doc.cursors.clearSecondary();
+    doc.cursors.primary().offset = 11;
+    try doc.deleteCharacterAll(false);
+    try t.expectEqualStrings("\xc3\xa9\n\xe7\x95\x8c\n\xf0\x9f\x98\x80x", doc.buffer.slice(0, doc.buffer.byteLen()));
+    _ = try doc.undoAction();
+    doc.cursors.primary().offset = 13;
+    try doc.deleteCharacterAll(true);
+    try t.expectEqualStrings("\xc3\xa9\n\xe7\x95\x8c\n\xf0\x9f\x98\x80x", doc.buffer.slice(0, doc.buffer.byteLen()));
+}
+
+fn checkAtomicMultiEdit(allocator: Allocator) !void {
+    const t = std.testing;
+    var doc = try Document.init(t.allocator);
+    defer doc.deinit();
+    try doc.loadText("a\na");
+    try doc.cursors.addCursor(2);
+    // Fail only allocations in the edit, after building a valid initial document.
+    doc.allocator = allocator;
+    doc.buffer.allocator = allocator;
+    doc.history.allocator = allocator;
+    doc.cursors.allocator = allocator;
+    doc.insertAtAllCursors("long\n") catch |err| {
+        try t.expectEqualStrings("a\na", doc.buffer.slice(0, doc.buffer.byteLen()));
+        try t.expectEqual(@as(usize, 2), doc.cursors.cursors.items[1].offset);
+        try t.expect(!doc.history.canUndo());
+        try t.expect(!doc.dirty);
+        return err;
+    };
+    doc.buffer.allocator = t.allocator; // verification must not consume the next injected failure
+    try t.expectEqualStrings("long\na\nlong\na", doc.buffer.slice(0, doc.buffer.byteLen()));
+}
+
+test "allocation failure never partially applies a multi-cursor edit" {
+    for (0..64) |fail_index| {
+        var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = fail_index });
+        checkAtomicMultiEdit(failing.allocator()) catch |err| {
+            try std.testing.expectEqual(error.OutOfMemory, err);
+            try std.testing.expect(failing.has_induced_failure);
+            continue;
+        };
+        try std.testing.expect(!failing.has_induced_failure);
+        return;
+    }
+    return error.TestUnexpectedResult;
+}
+
+fn checkAtomicUndo(allocator: Allocator) !void {
+    const t = std.testing;
+    var doc = try Document.init(t.allocator);
+    defer doc.deinit();
+    try doc.loadText("a\nb");
+    try doc.cursors.addCursor(2);
+    try doc.insertAtAllCursors("xyz\n");
+    const before = try t.allocator.dupe(u8, doc.buffer.slice(0, doc.buffer.byteLen()));
+    defer t.allocator.free(before);
+    const cursors = try t.allocator.dupe(Cursor, doc.cursors.cursors.items);
+    defer t.allocator.free(cursors);
+    doc.allocator = allocator;
+    doc.history.allocator = allocator;
+    doc.buffer.allocator = allocator;
+    doc.cursors.allocator = allocator;
+    _ = doc.undoAction() catch |err| {
+        doc.buffer.allocator = t.allocator;
+        try t.expectEqualStrings(before, doc.buffer.slice(0, doc.buffer.byteLen()));
+        try t.expectEqualSlices(Cursor, cursors, doc.cursors.cursors.items);
+        try t.expect(doc.history.canUndo());
+        try t.expect(!doc.history.canRedo());
+        try t.expect(doc.dirty);
+        return err;
+    };
+    doc.buffer.allocator = t.allocator;
+    try t.expectEqualStrings("a\nb", doc.buffer.slice(0, doc.buffer.byteLen()));
+}
+
+test "undo allocation failure preserves buffer cursors and history" {
+    for (0..32) |fail_index| {
+        var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = fail_index });
+        checkAtomicUndo(failing.allocator()) catch |err| {
+            try std.testing.expectEqual(error.OutOfMemory, err);
+            try std.testing.expect(failing.has_induced_failure);
+            continue;
+        };
+        try std.testing.expect(!failing.has_induced_failure);
+        return;
+    }
+    return error.TestUnexpectedResult;
 }

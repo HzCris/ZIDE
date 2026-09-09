@@ -314,21 +314,20 @@ fn cmdCursorEnd(editor: *Editor, _: ?[]const u8) void {
 
 fn cmdInsertChar(editor: *Editor, args: ?[]const u8) void {
     const text = args orelse return;
+    if (text.len == 0) return;
     const doc = editor.activeDoc();
     const auto_close = editor.autoCloseBracketsFor(doc);
 
     // Multi-cursor: simple insert at all cursors, skip auto-close complexity
     if (doc.cursors.count() > 1) {
-        doc.insertAtAllCursors(text) catch {};
+        doc.insertAtAllCursors(text) catch {
+            editor.status_message = "Edit failed: out of memory";
+        };
         return;
     }
 
-    if (doc.cursors.primary().hasSelection()) {
-        doc.deleteSelection() catch {};
-    }
-
     // Skip-over: if typing a closing bracket and cursor is on that same char, just move right
-    if (auto_close and text.len == 1) {
+    if (auto_close and text.len == 1 and !doc.cursors.primary().hasSelection()) {
         const ch = text[0];
         if (ch == ')' or ch == ']' or ch == '}' or ch == '\'' or ch == '"' or ch == '`') {
             const offset = doc.cursors.primary().offset;
@@ -342,48 +341,57 @@ fn cmdInsertChar(editor: *Editor, args: ?[]const u8) void {
         }
     }
 
-    doc.insertAtCursor(text) catch {};
-
-    // Auto-close brackets/quotes
-    if (auto_close and text.len == 1) {
-        const closing: ?[]const u8 = switch (text[0]) {
-            '(' => ")",
-            '[' => "]",
-            '{' => "}",
-            '\'' => "'",
-            '"' => "\"",
-            '`' => "`",
-            else => null,
-        };
-        if (closing) |close| {
-            // For quotes, don't auto-close if char before cursor is alphanumeric
-            // (likely a contraction like "don't" or end of a word)
-            if (text[0] == '\'' or text[0] == '"' or text[0] == '`') {
-                const offset = doc.cursors.primary().offset;
-                if (offset >= 2) {
-                    const before = doc.buffer.slice(offset - 2, offset - 1);
-                    if (before.len > 0 and (std.ascii.isAlphanumeric(before[0]) or before[0] == '_')) {
-                        return;
-                    }
-                }
+    const closing: ?u8 = if (auto_close and text.len == 1) switch (text[0]) {
+        '(' => ')',
+        '[' => ']',
+        '{' => '}',
+        '\'' => '\'',
+        '"' => '"',
+        '`' => '`',
+        else => null,
+    } else null;
+    if (closing) |close| pair: {
+        if (text[0] == '\'' or text[0] == '"' or text[0] == '`') {
+            const c = doc.cursors.primaryConst();
+            const start = if (c.selectionRange()) |r| r.start else c.offset;
+            if (start > 0) {
+                const before = doc.buffer.byteAt(start - 1).?;
+                if (std.ascii.isAlphanumeric(before) or before == '_') break :pair;
             }
-            doc.insertAtCursor(close) catch return;
-            // Move cursor back between the pair
-            doc.cursors.primary().moveLeft(&doc.buffer);
         }
+        doc.beginEdit() catch {
+            editor.status_message = "Edit failed: out of memory";
+            return;
+        };
+        defer doc.endEdit();
+        doc.insertAtCursor(&.{ text[0], close }) catch {
+            editor.status_message = "Edit failed: out of memory";
+            return;
+        };
+        doc.cursors.primary().moveLeft(&doc.buffer);
+        return;
     }
+    doc.insertAtCursor(text) catch {
+        editor.status_message = "Edit failed: out of memory";
+    };
 }
 
 fn cmdDeleteForward(editor: *Editor, _: ?[]const u8) void {
-    editor.activeDoc().deleteForwardAll(1) catch {};
+    editor.activeDoc().deleteCharacterAll(false) catch {
+        editor.status_message = "Edit failed: out of memory";
+    };
 }
 
 fn cmdDeleteBackward(editor: *Editor, _: ?[]const u8) void {
-    editor.activeDoc().deleteBackwardAll(1) catch {};
+    editor.activeDoc().deleteCharacterAll(true) catch {
+        editor.status_message = "Edit failed: out of memory";
+    };
 }
 
 fn cmdInsertNewline(editor: *Editor, _: ?[]const u8) void {
-    editor.activeDoc().insertAtAllCursors("\n") catch {};
+    editor.activeDoc().insertAtAllCursors(editor.activeDoc().lineEnding()) catch {
+        editor.status_message = "Edit failed: out of memory";
+    };
 }
 
 fn cmdUndo(editor: *Editor, _: ?[]const u8) void {
@@ -489,7 +497,9 @@ fn cmdCut(editor: *Editor, _: ?[]const u8) void {
 fn cmdPaste(editor: *Editor, _: ?[]const u8) void {
     const text = editor.getClipboard();
     if (text.len == 0) return;
-    editor.activeDoc().insertAtAllCursors(text) catch {};
+    editor.activeDoc().insertAtAllCursors(text) catch {
+        editor.status_message = "Edit failed: out of memory";
+    };
 }
 
 // --- Word movement ---
@@ -549,11 +559,15 @@ fn cmdDuplicateLine(editor: *Editor, _: ?[]const u8) void {
 }
 
 fn cmdMoveLineUp(editor: *Editor, _: ?[]const u8) void {
-    editor.activeDoc().moveLineUp() catch {};
+    editor.activeDoc().moveLineUp() catch {
+        editor.status_message = "Edit failed: out of memory";
+    };
 }
 
 fn cmdMoveLineDown(editor: *Editor, _: ?[]const u8) void {
-    editor.activeDoc().moveLineDown() catch {};
+    editor.activeDoc().moveLineDown() catch {
+        editor.status_message = "Edit failed: out of memory";
+    };
 }
 
 // --- Smart Home ---
@@ -580,11 +594,15 @@ fn cmdSmartHomeSelect(editor: *Editor, _: ?[]const u8) void {
 fn cmdIndent(editor: *Editor, _: ?[]const u8) void {
     const doc = editor.activeDoc();
     if (editor.useTabsFor(doc)) {
-        doc.insertAtAllCursors("\t") catch {};
+        doc.insertAtAllCursors("\t") catch {
+            editor.status_message = "Edit failed: out of memory";
+        };
     } else {
         const spaces = "                "; // 16 spaces max
         const width = @min(editor.tabWidthFor(doc), 16);
-        doc.insertAtAllCursors(spaces[0..width]) catch {};
+        doc.insertAtAllCursors(spaces[0..width]) catch {
+            editor.status_message = "Edit failed: out of memory";
+        };
     }
 }
 
@@ -949,7 +967,9 @@ fn cmdInsertNewlineAuto(editor: *Editor, _: ?[]const u8) void {
 
     // Multi-cursor: just insert plain newline (auto-indent per cursor is complex)
     if (doc.cursors.count() > 1) {
-        doc.insertAtAllCursors("\n") catch {};
+        doc.insertAtAllCursors(doc.lineEnding()) catch {
+            editor.status_message = "Edit failed: out of memory";
+        };
         return;
     }
 
@@ -978,8 +998,9 @@ fn cmdInsertNewlineAuto(editor: *Editor, _: ?[]const u8) void {
         }
         var mbuf: [256]u8 = undefined;
         var w: usize = 0;
-        mbuf[w] = '\n';
-        w += 1;
+        const term = doc.lineEnding();
+        @memcpy(mbuf[0..term.len], term);
+        w += term.len;
         const ind = @min(indent_len, 128);
         @memcpy(mbuf[w .. w + ind], line[0..ind]);
         w += ind;
@@ -1012,12 +1033,13 @@ fn cmdInsertNewlineAuto(editor: *Editor, _: ?[]const u8) void {
 
     // Build newline + indent string
     var buf: [256]u8 = undefined;
-    buf[0] = '\n';
-    const copy_len = @min(indent_len, buf.len - 1);
+    const term = doc.lineEnding();
+    @memcpy(buf[0..term.len], term);
+    const copy_len = @min(indent_len, buf.len - term.len);
     if (copy_len > 0) {
-        @memcpy(buf[1 .. 1 + copy_len], line[0..copy_len]);
+        @memcpy(buf[term.len .. term.len + copy_len], line[0..copy_len]);
     }
-    doc.insertAtCursor(buf[0 .. 1 + copy_len]) catch {};
+    doc.insertAtCursor(buf[0 .. term.len + copy_len]) catch {};
 }
 
 // --- Multi-cursor commands ---
@@ -1037,7 +1059,7 @@ fn cmdAddCursorBelow(editor: *Editor, _: ?[]const u8) void {
     if (max_line + 1 >= doc.buffer.lineCount()) return;
     const target_line_len = doc.buffer.lineContent(max_line + 1).len;
     const col = @min(ref_col, target_line_len);
-    const new_offset = doc.buffer.posToOffset(max_line + 1, col);
+    const new_offset = @import("cursor.zig").lineOffset(&doc.buffer, max_line + 1, col);
     doc.cursors.addCursor(new_offset) catch {};
 }
 
@@ -1056,7 +1078,7 @@ fn cmdAddCursorAbove(editor: *Editor, _: ?[]const u8) void {
     if (min_line == 0) return;
     const target_line_len = doc.buffer.lineContent(min_line - 1).len;
     const col = @min(ref_col, target_line_len);
-    const new_offset = doc.buffer.posToOffset(min_line - 1, col);
+    const new_offset = @import("cursor.zig").lineOffset(&doc.buffer, min_line - 1, col);
     doc.cursors.addCursor(new_offset) catch {};
 }
 
@@ -1351,4 +1373,81 @@ test "non-markdown Enter keeps plain auto-indent" {
     doc.cursors.primary().offset = 6;
     cmdInsertNewlineAuto(&editor, null);
     try std.testing.expectEqualStrings("- item\n", doc.buffer.slice(0, doc.buffer.byteLen()));
+}
+
+test "typing over a selection including paired brackets is one undo step" {
+    const t = std.testing;
+    var editor = try Editor.init(t.allocator, t.io);
+    defer editor.deinit();
+    const doc = editor.activeDoc();
+    for ([_][]const u8{ "x", "(", "\"", ")" }) |text| {
+        try doc.loadText("hello");
+        doc.cursors.primary().* = .{ .anchor = 0, .offset = 5 };
+        cmdInsertChar(&editor, text);
+        try t.expect(try doc.undoAction());
+        try t.expectEqualStrings("hello", doc.buffer.slice(0, doc.buffer.byteLen()));
+        try t.expectEqual(@as(?usize, 0), doc.cursors.primary().anchor);
+        try t.expect(!doc.history.canUndo());
+        _ = try doc.redoAction();
+        try t.expect(doc.cursors.primary().anchor == null);
+    }
+    try doc.loadText("");
+    cmdInsertChar(&editor, "a");
+    cmdInsertChar(&editor, "b");
+    _ = try doc.undoAction();
+    try t.expectEqualStrings("", doc.buffer.slice(0, doc.buffer.byteLen()));
+    try doc.loadText("hello");
+    doc.cursors.primary().* = .{ .anchor = 0, .offset = 5 };
+    cmdInsertChar(&editor, "");
+    try t.expectEqualStrings("hello", doc.buffer.slice(0, doc.buffer.byteLen()));
+}
+
+test "all Enter commands preserve document line endings" {
+    const t = std.testing;
+    var editor = try Editor.init(t.allocator, t.io);
+    defer editor.deinit();
+    const doc = editor.activeDoc();
+    for ([_][]const u8{ "\n", "\r\n" }) |term| {
+        const original = try std.mem.concat(t.allocator, u8, &.{ "a", term, "  b" });
+        defer t.allocator.free(original);
+        try doc.loadText(original);
+        doc.cursors.primary().moveToEnd(&doc.buffer);
+        cmdInsertNewlineAuto(&editor, null);
+        const expected = try std.mem.concat(t.allocator, u8, &.{ original, term, "  " });
+        defer t.allocator.free(expected);
+        try t.expectEqualStrings(expected, doc.buffer.slice(0, doc.buffer.byteLen()));
+        _ = try doc.undoAction();
+        cmdInsertNewline(&editor, null);
+        try t.expect(std.mem.endsWith(u8, doc.buffer.slice(0, doc.buffer.byteLen()), term));
+        _ = try doc.undoAction();
+        try doc.cursors.addCursor(0);
+        cmdInsertNewlineAuto(&editor, null);
+        try t.expectEqual(@as(usize, 3), std.mem.count(u8, doc.buffer.slice(0, doc.buffer.byteLen()), term));
+        _ = try doc.undoAction();
+        doc.cursors.clearSecondary();
+        const markdown = try std.mem.concat(t.allocator, u8, &.{ "a", term, "- item" });
+        defer t.allocator.free(markdown);
+        try doc.loadText(markdown);
+        doc.language = editor.findLanguage("md");
+        doc.cursors.primary().moveToEnd(&doc.buffer);
+        cmdInsertNewlineAuto(&editor, null);
+        const md_expected = try std.mem.concat(t.allocator, u8, &.{ markdown, term, "- " });
+        defer t.allocator.free(md_expected);
+        try t.expectEqualStrings(md_expected, doc.buffer.slice(0, doc.buffer.byteLen()));
+    }
+}
+
+test "keyboard delete commands remove complete characters" {
+    const t = std.testing;
+    var editor = try Editor.init(t.allocator, t.io);
+    defer editor.deinit();
+    const doc = editor.activeDoc();
+    try doc.loadText("\xc3\xa9");
+    doc.cursors.primary().moveToEnd(&doc.buffer);
+    cmdDeleteBackward(&editor, null);
+    try t.expectEqual(@as(usize, 0), doc.buffer.byteLen());
+    _ = try doc.undoAction();
+    doc.cursors.primary().moveToStart();
+    cmdDeleteForward(&editor, null);
+    try t.expectEqual(@as(usize, 0), doc.buffer.byteLen());
 }
