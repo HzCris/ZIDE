@@ -5,6 +5,14 @@ const RenderBackend = enums_backend.RenderBackend;
 const Pkg = std.Build.Pkg;
 const Compile = std.Build.Step.Compile;
 
+// ZIDE patch: Zig 0.16 translates MinGW's fortified wchar inline wrappers
+// into invalid Zig in ReleaseSafe. Request plain declarations for bindings;
+// the separately compiled C libraries retain their normal fortification.
+fn windowsBindingCompatibility(translation: *std.Build.Step.TranslateC) void {
+    if (translation.target.result.os.tag == .windows)
+        translation.defineCMacro("_FORTIFY_SOURCE", "0");
+}
+
 // NOTE: Keep in-sync with raylib's definition
 pub const LinuxDisplayBackend = enum {
     X11,
@@ -424,6 +432,7 @@ pub fn buildBackend(backend: Backend, test_dvui_and_app: bool, dvui_opts_in: Dvu
                 .target = target,
                 .optimize = optimize,
             });
+            windowsBindingCompatibility(sdl_translate_c);
             const sdl_mod = b.addModule("sdl2", .{
                 .root_source_file = b.path("src/backends/sdl.zig"),
                 .target = target,
@@ -525,6 +534,7 @@ pub fn buildBackend(backend: Backend, test_dvui_and_app: bool, dvui_opts_in: Dvu
                 .target = target,
                 .optimize = optimize,
             });
+            windowsBindingCompatibility(sdl_translate_c);
             const sdl_mod = b.addModule("sdl3", .{
                 .root_source_file = b.path("src/backends/sdl3gpu.zig"),
                 .target = target,
@@ -575,6 +585,7 @@ pub fn buildBackend(backend: Backend, test_dvui_and_app: bool, dvui_opts_in: Dvu
                 .target = target,
                 .optimize = optimize,
             });
+            windowsBindingCompatibility(sdl_translate_c);
 
             const sdl_mod = b.addModule("sdl3", .{
                 .root_source_file = b.path("src/backends/sdl.zig"),
@@ -1153,6 +1164,7 @@ pub fn addDvuiModule(
         .optimize = optimize,
         .link_libc = libc,
     });
+    windowsBindingCompatibility(dvui_translate_c);
     if (libc) dvui_translate_c.defineCMacro("DVUI_USE_LIBC", "1");
 
     const dvui_mod = b.addModule(name, .{

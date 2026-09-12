@@ -11,6 +11,8 @@
 //! one file read).
 
 const std = @import("std");
+const text_file = @import("text_file.zig");
+const input = @import("text_input.zig");
 const Document = @import("document.zig").Document;
 const filetree_mod = @import("filetree.zig");
 
@@ -67,6 +69,8 @@ pub const SearchPanel = struct {
     scroll: usize = 0,
     capped: bool = false,
     files_searched: usize = 0,
+    files_skipped: usize = 0,
+    pending_skipped: usize = 0,
     /// Open-doc portion of files_searched (worker counts disk files).
     files_searched_open: usize = 0,
     /// Worker in flight (display "searching…").
@@ -119,12 +123,7 @@ pub const SearchPanel = struct {
             .exclude => .{ .buf = &self.exclude_buf, .len = &self.exclude_len },
             .results => return,
         };
-        for (txt) |ch| {
-            if (ch >= 32 and ch < 127 and dest.len.* < dest.buf.len) {
-                dest.buf[dest.len.*] = ch;
-                dest.len.* += 1;
-            }
-        }
+        input.append(dest.buf, dest.len, txt);
         self.confirm_armed = false;
     }
 
@@ -137,7 +136,14 @@ pub const SearchPanel = struct {
             .exclude => &self.exclude_len,
             .results => return,
         };
-        if (len.* > 0) len.* -= 1;
+        const buf: []const u8 = switch (self.field) {
+            .query => &self.query_buf,
+            .replace => &self.replace_buf,
+            .filter => &self.filter_buf,
+            .exclude => &self.exclude_buf,
+            .results => return,
+        };
+        input.backspace(buf, len);
         self.confirm_armed = false;
     }
 
@@ -211,6 +217,17 @@ pub const SearchPanel = struct {
             if (ch.* == '\\') ch.* = '/';
         }
 
+        for (editor.encoding_choices.items) |choice| {
+            const path = self.allocator.dupe(u8, choice.path) catch {
+                ok = false;
+                break;
+            };
+            ctx.encodings.append(self.allocator, .{ .path = path, .encoding = choice.encoding }) catch {
+                self.allocator.free(path);
+                ok = false;
+                break;
+            };
+        }
         // Open documents: search buffers on the main thread, and have the
         // worker skip their paths so they aren't double-counted from disk.
         for (editor.documents.items) |*doc| {
@@ -268,6 +285,10 @@ pub const SearchPanel = struct {
             self.matches.append(self.allocator, m) catch self.allocator.free(m.excerpt);
         }
         self.pending_matches.clearRetainingCapacity();
+        if (self.files_skipped != self.pending_skipped) {
+            self.files_skipped = self.pending_skipped;
+            changed = true;
+        }
         const total_files = self.files_searched_open + self.pending_files;
         if (total_files != self.files_searched) {
             self.files_searched = total_files;
@@ -304,6 +325,8 @@ pub const SearchPanel = struct {
         self.scroll = 0;
         self.capped = false;
         self.files_searched = 0;
+        self.files_skipped = 0;
+        self.pending_skipped = 0;
         self.files_searched_open = 0;
         self.pending_files = 0;
         self.pending_capped = false;
@@ -348,13 +371,14 @@ pub const SearchPanel = struct {
     /// Execute Replace All over the current result set. Open documents get
     /// one undoable edit group each (buffers stay dirty, user saves);
     /// closed files are rewritten on disk when scope == .all.
-    pub fn executeReplace(self: *SearchPanel, editor: anytype, scope: ReplaceScope) struct { files: usize, count: usize } {
+    pub fn executeReplace(self: *SearchPanel, editor: anytype, scope: ReplaceScope) struct { files: usize, count: usize, failed: usize } {
         self.confirm_armed = false;
         const needle = self.query();
         const repl = self.replacement();
         var files: usize = 0;
         var total: usize = 0;
-        if (needle.len == 0) return .{ .files = 0, .count = 0 };
+        var failed: usize = 0;
+        if (needle.len == 0) return .{ .files = 0, .count = 0, .failed = 0 };
         for (self.paths.items) |p| {
             var open_doc: ?*Document = null;
             for (editor.documents.items) |*doc| {
@@ -367,16 +391,22 @@ pub const SearchPanel = struct {
             }
             var n: usize = 0;
             if (open_doc) |doc| {
-                n = replaceAllInDoc(doc, needle, repl, self.case_sensitive, self.whole_word);
+                n = replaceAllInDoc(doc, needle, repl, self.case_sensitive, self.whole_word) catch {
+                    failed += 1;
+                    continue;
+                };
             } else if (scope == .all) {
-                n = replaceAllInFile(self.allocator, self.io, p, needle, repl, self.case_sensitive, self.whole_word) catch 0;
+                n = replaceAllInFile(self.allocator, self.io, p, needle, repl, self.case_sensitive, self.whole_word, editor.knownEncoding(p)) catch {
+                    failed += 1;
+                    continue;
+                };
             }
             if (n > 0) {
                 files += 1;
                 total += n;
             }
         }
-        return .{ .files = files, .count = total };
+        return .{ .files = files, .count = total, .failed = failed };
     }
 
     /// How many result files are open docs vs on disk (for the confirm row).
@@ -465,37 +495,29 @@ pub fn filterMatch(rel: []const u8, filt: []const u8) bool {
 
 /// Undoable replace-all inside an open document (one undo group).
 /// Mirrors the per-buffer Ctrl+H replace-all mechanics.
-fn replaceAllInDoc(doc: *Document, needle: []const u8, repl: []const u8, case_sensitive: bool, whole_word: bool) usize {
-    doc.beginEdit() catch return 0;
-    defer doc.endEdit();
-    doc.cursors.clearSecondary();
-    doc.cursors.primary().clearSelection();
-    doc.cursors.primary().offset = 0;
-    var count: usize = 0;
-    while (count < 100_000) {
-        const content = doc.buffer.slice(0, doc.buffer.byteLen());
-        const start = doc.cursors.primary().offset;
-        const at = findInText(content, needle, case_sensitive, whole_word, start) orelse break;
-        doc.cursors.primary().offset = at;
-        doc.cursors.primary().anchor = at;
-        doc.cursors.primary().offset = at + needle.len;
-        doc.deleteSelection() catch break;
-        doc.insertAtCursor(repl) catch break;
-        count += 1;
+pub fn replaceAllInDoc(doc: *Document, needle: []const u8, repl: []const u8, case_sensitive: bool, whole_word: bool) !usize {
+    const content = try doc.buffer.textAlloc(doc.allocator);
+    defer doc.allocator.free(content);
+    var ranges: std.ArrayList(Document.RangeEdit) = .empty;
+    defer ranges.deinit(doc.allocator);
+    var from: usize = 0;
+    while (findInText(content, needle, case_sensitive, whole_word, from)) |at| {
+        try ranges.append(doc.allocator, .{ .start = at, .end = at + needle.len, .text = repl });
+        from = at + needle.len;
     }
-    return count;
+    std.mem.reverse(Document.RangeEdit, ranges.items);
+    try doc.applyRanges(ranges.items);
+    return ranges.items.len;
 }
 
-/// Replace-all in a closed file: read, transform, rewrite. NOT undoable.
-fn replaceAllInFile(allocator: std.mem.Allocator, io: std.Io, path: []const u8, needle: []const u8, repl: []const u8, case_sensitive: bool, whole_word: bool) !usize {
-    const bytes = try std.Io.Dir.cwd().readFileAlloc(io, path, allocator, .limited(max_file_bytes));
-    defer allocator.free(bytes);
-    const res = try replaceInText(allocator, bytes, needle, repl, case_sensitive, whole_word);
+/// Closed-file edits retain the source encoding and commit atomically.
+pub fn replaceAllInFile(allocator: std.mem.Allocator, io: std.Io, path: []const u8, needle: []const u8, repl: []const u8, case_sensitive: bool, whole_word: bool, encoding: ?text_file.TextEncoding) !usize {
+    const decoded = try text_file.read(allocator, io, path, encoding, max_file_bytes);
+    defer allocator.free(decoded.text);
+    const res = try replaceInText(allocator, decoded.text, needle, repl, case_sensitive, whole_word);
     defer allocator.free(res.out);
     if (res.count == 0) return 0;
-    const f = try std.Io.Dir.cwd().createFile(io, path, .{});
-    defer f.close(io);
-    try f.writeStreamingAll(io, res.out);
+    try text_file.write(allocator, io, path, res.out, decoded.format);
     return res.count;
 }
 
@@ -545,6 +567,7 @@ const WorkerCtx = struct {
     case_sensitive: bool,
     whole_word: bool,
     open_paths: std.ArrayList([]u8) = .empty,
+    encodings: std.ArrayList(struct { path: []u8, encoding: text_file.TextEncoding }) = .empty,
     /// Matches already in the display lists when the worker started
     /// (open-doc hits) — the cap covers the combined total.
     base_matches: usize = 0,
@@ -562,6 +585,8 @@ const WorkerCtx = struct {
         a.free(self.exclude);
         for (self.open_paths.items) |p| a.free(p);
         self.open_paths.deinit(a);
+        for (self.encodings.items) |entry| a.free(entry.path);
+        self.encodings.deinit(a);
         a.destroy(self);
     }
 };
@@ -628,14 +653,25 @@ fn searchDiskFile(ctx: *WorkerCtx, dir: std.Io.Dir, prefix: []const u8, name: []
         if (filetree_mod.normPathEql(op, full)) return;
     }
 
-    const bytes = dir.readFileAlloc(ctx.io, name, ctx.allocator, .limited(max_file_bytes)) catch return;
-    defer ctx.allocator.free(bytes);
-    // Binary probe (same as Document.open)
-    const probe = @min(bytes.len, 8192);
-    if (std.mem.indexOfScalar(u8, bytes[0..probe], 0) != null) {
-        bumpFiles(sp);
-        return;
+    _ = dir;
+    const key = text_file.pathKey(ctx.allocator, ctx.io, full) catch return;
+    defer ctx.allocator.free(key);
+    var encoding: ?text_file.TextEncoding = null;
+    for (ctx.encodings.items) |entry| {
+        if (filetree_mod.normPathEql(key, entry.path)) {
+            encoding = entry.encoding;
+            break;
+        }
     }
+    const decoded = text_file.read(ctx.allocator, ctx.io, full, encoding, max_file_bytes) catch {
+        sp.mutex.lockUncancelable(sp.io);
+        sp.pending_skipped += 1;
+        sp.pending_files += 1;
+        sp.mutex.unlock(sp.io);
+        return;
+    };
+    defer ctx.allocator.free(decoded.text);
+    const bytes = decoded.text;
 
     var file_matches: std.ArrayList(Match) = .empty;
     defer file_matches.deinit(ctx.allocator);
@@ -753,4 +789,64 @@ test "filterMatch extension and substring" {
     try t.expect(filterMatch("src/core/editor.zig", "core"));
     try t.expect(filterMatch("SRC/Core/Editor.ZIG", "*.zig"));
     try t.expect(!filterMatch("docs/readme.md", "src/"));
+}
+
+test "replace all is one transaction and restores every cursor snapshot" {
+    const t = std.testing;
+    const Cursor = @import("cursor.zig").Cursor;
+    var doc = try Document.init(t.allocator);
+    defer doc.deinit();
+    try doc.loadText("éé é");
+    doc.cursors.primary().offset = 2;
+    doc.cursors.primary().anchor = 0;
+    try doc.cursors.addCursor(7);
+    doc.cursors.cursors.items[1].anchor = 5;
+    const before = try t.allocator.dupe(Cursor, doc.cursors.cursors.items);
+    defer t.allocator.free(before);
+    try t.expectEqual(@as(usize, 3), try replaceAllInDoc(&doc, "é", "😀", true, false));
+    const after = try t.allocator.dupe(Cursor, doc.cursors.cursors.items);
+    defer t.allocator.free(after);
+    try t.expectEqualStrings("😀😀 😀", doc.buffer.slice(0, doc.buffer.byteLen()));
+    _ = try doc.undoAction();
+    try t.expectEqualStrings("éé é", doc.buffer.slice(0, doc.buffer.byteLen()));
+    try t.expectEqualSlices(Cursor, before, doc.cursors.cursors.items);
+    _ = try doc.redoAction();
+    try t.expectEqualSlices(Cursor, after, doc.cursors.cursors.items);
+    try t.expectEqual(@as(usize, 3), try replaceAllInDoc(&doc, "😀", "", true, false));
+    try t.expectEqualStrings(" ", doc.buffer.slice(0, doc.buffer.byteLen()));
+}
+
+test "every replace-all allocation failure leaves content cursors and history unchanged" {
+    const t = std.testing;
+    const Cursor = @import("cursor.zig").Cursor;
+    for (0..64) |fail_index| {
+        var doc = try Document.init(t.allocator);
+        defer doc.deinit();
+        try doc.loadText("catcat\ncat");
+        try doc.cursors.addCursor(10);
+        const before = try t.allocator.dupe(Cursor, doc.cursors.cursors.items);
+        defer t.allocator.free(before);
+        var failing = t.FailingAllocator.init(t.allocator, .{ .fail_index = fail_index });
+        const a = failing.allocator();
+        doc.allocator = a;
+        doc.buffer.allocator = a;
+        doc.history.allocator = a;
+        doc.cursors.allocator = a;
+        const result = replaceAllInDoc(&doc, "cat", "😀\n", true, false);
+        doc.allocator = t.allocator;
+        doc.buffer.allocator = t.allocator;
+        doc.history.allocator = t.allocator;
+        doc.cursors.allocator = t.allocator;
+        if (result) |count| {
+            try t.expectEqual(@as(usize, 3), count);
+            try t.expect(!failing.has_induced_failure);
+            return;
+        } else |err| {
+            try t.expectEqual(error.OutOfMemory, err);
+            try t.expectEqualStrings("catcat\ncat", doc.buffer.slice(0, doc.buffer.byteLen()));
+            try t.expectEqualSlices(Cursor, before, doc.cursors.cursors.items);
+            try t.expect(!doc.dirty and !doc.history.canUndo());
+        }
+    }
+    return error.ExpectedSuccess;
 }

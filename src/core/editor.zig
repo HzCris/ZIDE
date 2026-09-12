@@ -20,6 +20,8 @@ pub const lsp_mod = @import("lsp.zig");
 pub const filetree_mod = @import("filetree.zig");
 pub const lua_api = @import("lua_api.zig");
 pub const search_mod = @import("search.zig");
+pub const text_file = @import("text_file.zig");
+const text_input = @import("text_input.zig");
 const zlua = @import("zlua");
 
 /// The central editor state. NOT a global singleton — passed explicitly.
@@ -93,6 +95,22 @@ pub const Editor = struct {
     goto_buf_len: usize = 0,
     /// Saved cursor offset when entering find mode (for incremental search).
     find_origin: usize = 0,
+    find_case_sensitive: bool = true,
+    find_whole_word: bool = false,
+    encoding_choices: std.ArrayList(EncodingChoice) = .empty,
+    encoding_action: EncodingAction = .choose,
+    encoding_doc_id: ?u64 = null,
+    encoding_path: ?[]u8 = null,
+    encoding_selected: usize = 0,
+    reopen_encoding: ?text_file.TextEncoding = null,
+    reopen_after_save: bool = false,
+    save_as_id: ?u64 = null,
+    save_as_format: ?text_file.TextFormat = null,
+    pending_save_id: ?u64 = null,
+    pending_save_path: ?[]u8 = null,
+    pending_save_format: ?text_file.TextFormat = null,
+    pending_save_overwrite: bool = false,
+    finder_skipped: usize = 0,
 
     /// Word wrap (soft-wrap long lines in display).
     word_wrap: bool = true,
@@ -310,6 +328,9 @@ pub const Editor = struct {
     filetree_clip_paths: std.ArrayList([]u8) = .empty,
     filetree_clip_cut: bool = false,
 
+    pub const EncodingChoice = struct { path: []u8, encoding: text_file.TextEncoding };
+    pub const EncodingAction = enum { choose, open, reopen, save };
+
     pub const CompletionContext = struct {
         doc_id: u64,
         version: u64,
@@ -369,6 +390,9 @@ pub const Editor = struct {
         /// Save requested but the file changed on disk since load —
         /// user picks overwrite / reload / cancel (resolveOverwrite).
         confirm_overwrite,
+        encoding_picker,
+        confirm_reopen,
+        confirm_encoding,
         settings,
         filetree_prompt,
     };
@@ -447,6 +471,10 @@ pub const Editor = struct {
     }
 
     pub fn deinit(self: *Editor) void {
+        for (self.encoding_choices.items) |entry| self.allocator.free(entry.path);
+        self.encoding_choices.deinit(self.allocator);
+        if (self.encoding_path) |p| self.allocator.free(p);
+        if (self.pending_save_path) |p| self.allocator.free(p);
         // Language servers first: joins their reader threads and resets
         // document flags while the documents are still alive.
         self.stopAllLsp();
@@ -634,19 +662,30 @@ pub const Editor = struct {
 
     /// Open a file into a new document tab (in the focused pane).
     pub fn openFile(self: *Editor, path: []const u8) !*Document {
+        return self.openFileWithEncoding(path, self.knownEncoding(path), true);
+    }
+
+    pub fn openFileWithEncoding(self: *Editor, path: []const u8, encoding: ?text_file.TextEncoding, interactive: bool) !*Document {
         var doc = try Document.init(self.allocator);
-        errdefer doc.deinit();
+        var transferred = false;
+        errdefer if (!transferred) doc.deinit();
         doc.history.max_size = self.max_undo_history;
-        try doc.open(self.io, path);
+        doc.openWithEncoding(self.io, path, encoding) catch |err| {
+            if (interactive and (err == error.EncodingRequired or err == error.BinaryFile)) self.requestOpenEncoding(path);
+            return err;
+        };
         try self.documents.append(self.allocator, doc);
+        transferred = true;
         const idx = self.documents.items.len - 1;
         self.active_doc_idx = idx;
         self.paneShowDoc(idx);
         const active = self.activeDoc();
         active.detectLanguage(self);
         self.lspNotifyOpen(active);
+        const id = active.id;
+        if (encoding) |enc| self.rememberEncoding(active.file_path.?, enc) catch {};
         lua_api.fireEvent(self, .open, active);
-        return active;
+        return &self.documents.items[self.docIndexForId(id) orelse return error.DocumentClosed];
     }
 
     /// Open `path` into the current (startup-empty) document — the CLI
@@ -655,7 +694,10 @@ pub const Editor = struct {
     /// extension event) in one place so bypass sites can't drift.
     pub fn openIntoActive(self: *Editor, path: []const u8) !void {
         const doc = self.activeDoc();
-        try doc.open(self.io, path);
+        doc.openWithEncoding(self.io, path, self.knownEncoding(path)) catch |err| {
+            if (err == error.EncodingRequired or err == error.BinaryFile) self.requestOpenEncoding(path);
+            return err;
+        };
         doc.detectLanguage(self);
         self.lspNotifyOpen(doc);
         lua_api.fireEvent(self, .open, doc);
@@ -687,6 +729,7 @@ pub const Editor = struct {
 
     /// Enter .file_finder mode with a fresh workspace file snapshot.
     pub fn finderOpen(self: *Editor) void {
+        self.finder_skipped = 0;
         self.finderClearFiles();
         self.finder_buf_len = 0;
         self.finder_selected = 0;
@@ -819,10 +862,12 @@ pub const Editor = struct {
         }
         const pidx = self.documents.items.len - 1;
         const pdoc = &self.documents.items[pidx];
-        pdoc.open(self.io, path) catch {
+        pdoc.openWithEncoding(self.io, path, self.knownEncoding(path)) catch {
             // Unreadable/binary — drop the peek, show where we were.
             self.finderDropPreview();
             self.finderShowPrev();
+            self.finder_skipped += 1;
+            self.status_message = std.fmt.bufPrint(&self.status_buf, "{d} preview(s) skipped; open to choose encoding", .{self.finder_skipped}) catch "Preview skipped";
             return;
         };
         pdoc.detectLanguage(self);
@@ -996,7 +1041,7 @@ pub const Editor = struct {
         const res = self.search.executeReplace(self, scope);
         self.search.start(self);
         const noun: []const u8 = if (scope == .open_only) "open doc(s)" else "file(s)";
-        const msg = std.fmt.bufPrint(&self.status_buf, "Replaced {d} match(es) in {d} {s}", .{ res.count, res.files, noun }) catch "Replace done";
+        const msg = std.fmt.bufPrint(&self.status_buf, "Replaced {d} match(es) in {d} {s}; {d} failed", .{ res.count, res.files, noun, res.failed }) catch "Replace done";
         self.status_message = msg;
     }
 
@@ -1392,9 +1437,7 @@ pub const Editor = struct {
         if (kind == .rename) {
             // Prefill the input with the current name
             const name = ft.nodes.items[target_idx].name;
-            const n = @min(name.len, self.open_buf.len);
-            @memcpy(self.open_buf[0..n], name[0..n]);
-            self.open_buf_len = n;
+            text_input.set(&self.open_buf, &self.open_buf_len, name);
         }
         self.mode = .filetree_prompt;
     }
@@ -1773,15 +1816,7 @@ pub const Editor = struct {
             return true;
         }
         if (std.mem.eql(u8, action, "save_as")) {
-            self.mode = .save_as;
-            // Pre-fill with current file path if available
-            if (self.activeDocConst().file_path) |path| {
-                const len = @min(path.len, self.open_buf.len);
-                @memcpy(self.open_buf[0..len], path[0..len]);
-                self.open_buf_len = len;
-            } else {
-                self.open_buf_len = 0;
-            }
+            self.startSaveAs(self.activeDoc().id, null);
             return true;
         }
         if (std.mem.eql(u8, action, "command_palette")) {
@@ -1968,8 +2003,255 @@ pub const Editor = struct {
         }
     }
 
-    pub const SaveOutcome = union(enum) { saved, needs_path, conflict, failed: anyerror };
-    pub const SaveOptions = struct { overwrite: bool = false, interactive: bool = true, refresh_tree: bool = true };
+    pub fn findIncremental(self: *Editor) void {
+        self.findFrom(self.find_origin, true);
+    }
+    pub fn findNext(self: *Editor) void {
+        const c = self.activeDoc().cursors.primaryConst();
+        self.findFrom(if (c.selectionRange()) |r| r.end else c.offset, false);
+    }
+    fn findFrom(self: *Editor, origin: usize, incremental: bool) void {
+        const doc = self.activeDoc();
+        const needle = self.find_buf[0..self.find_buf_len];
+        const start = @min(origin, doc.buffer.byteLen());
+        const c = doc.cursors.primary();
+        if (needle.len == 0) {
+            if (incremental) {
+                c.offset = @import("cursor.zig").floorBoundary(&doc.buffer, start);
+                c.clearSelection();
+            }
+            self.status_message = "";
+            return;
+        }
+        const content = doc.buffer.slice(0, doc.buffer.byteLen());
+        var hit = search_mod.findInText(content, needle, self.find_case_sensitive, self.find_whole_word, start);
+        var wrapped = false;
+        if (hit == null) {
+            hit = search_mod.findInText(content, needle, self.find_case_sensitive, self.find_whole_word, 0);
+            wrapped = hit != null;
+        }
+        if (hit) |at| {
+            c.anchor = at;
+            c.offset = at + needle.len;
+            c.preferred_col = doc.buffer.offsetToPos(c.offset).col;
+            self.status_message = if (wrapped) "Search wrapped" else "";
+        } else {
+            if (incremental) {
+                c.offset = @import("cursor.zig").floorBoundary(&doc.buffer, start);
+                c.clearSelection();
+            }
+            self.status_message = "No matches found";
+        }
+    }
+    pub fn replaceOne(self: *Editor) void {
+        const doc = self.activeDoc();
+        const needle = self.find_buf[0..self.find_buf_len];
+        if (needle.len == 0) return;
+        if (doc.cursors.primaryConst().selectionRange()) |r| {
+            const content = doc.buffer.slice(0, doc.buffer.byteLen());
+            if (r.end - r.start == needle.len and search_mod.findInText(content, needle, self.find_case_sensitive, self.find_whole_word, r.start) == r.start) {
+                doc.beginEdit() catch {
+                    self.status_message = "Replace failed";
+                    return;
+                };
+                defer doc.endEdit();
+                doc.replaceRange(r.start, r.end, self.replace_buf[0..self.replace_buf_len]) catch {
+                    self.status_message = "Replace failed";
+                    return;
+                };
+                self.findNext();
+                return;
+            }
+        }
+        self.findNext();
+    }
+    pub fn replaceAll(self: *Editor) void {
+        const n = search_mod.replaceAllInDoc(self.activeDoc(), self.find_buf[0..self.find_buf_len], self.replace_buf[0..self.replace_buf_len], self.find_case_sensitive, self.find_whole_word) catch {
+            self.status_message = "Replace failed; document unchanged";
+            return;
+        };
+        self.status_message = std.fmt.bufPrint(&self.status_buf, "Replaced {d} occurrence(s)", .{n}) catch "Replaced all";
+    }
+
+    pub fn knownEncoding(self: *const Editor, path: []const u8) ?text_file.TextEncoding {
+        const absolute = text_file.pathKey(self.allocator, self.io, path) catch return null;
+        defer self.allocator.free(absolute);
+        for (self.encoding_choices.items) |choice| {
+            if (filetree_mod.normPathEql(choice.path, absolute)) return choice.encoding;
+        }
+        return null;
+    }
+    pub fn rememberEncoding(self: *Editor, path: []const u8, encoding: text_file.TextEncoding) !void {
+        const absolute = try text_file.pathKey(self.allocator, self.io, path);
+        errdefer self.allocator.free(absolute);
+        for (self.encoding_choices.items) |*choice| {
+            if (filetree_mod.normPathEql(choice.path, absolute)) {
+                choice.encoding = encoding;
+                self.allocator.free(absolute);
+                return;
+            }
+        }
+        try self.encoding_choices.append(self.allocator, .{ .path = absolute, .encoding = encoding });
+    }
+    fn requestOpenEncoding(self: *Editor, path: []const u8) void {
+        const owned = self.allocator.dupe(u8, path) catch return;
+        self.cancelEncoding();
+        self.encoding_path = owned;
+        self.encoding_action = .open;
+        self.mode = .encoding_picker;
+        self.status_message = "Choose an encoding to open this file";
+    }
+    pub fn startEncoding(self: *Editor, action: EncodingAction) void {
+        if (self.activePaneIsTerminal()) return;
+        self.cancelEncoding();
+        self.encoding_doc_id = self.activeDoc().id;
+        self.encoding_action = action;
+        self.mode = .encoding_picker;
+    }
+    pub fn cancelEncoding(self: *Editor) void {
+        if (self.encoding_path) |p| self.allocator.free(p);
+        self.encoding_path = null;
+        self.encoding_doc_id = null;
+        self.reopen_encoding = null;
+        self.reopen_after_save = false;
+        self.encoding_selected = 0;
+        self.mode = .normal;
+        self.clearPendingSave();
+    }
+    pub fn encodingTitle(self: *const Editor) []const u8 {
+        return switch (self.encoding_action) {
+            .choose => "File Encoding",
+            .open => "Open with Encoding",
+            .reopen => "Reopen with Encoding",
+            .save => "Save with Encoding",
+        };
+    }
+    pub fn encodingCount(self: *const Editor) usize {
+        return if (self.encoding_action == .choose) 2 else text_file.formats.len;
+    }
+    pub fn encodingLabel(self: *const Editor, idx: usize) []const u8 {
+        if (self.encoding_action == .choose) return if (idx == 0) "Reopen with Encoding" else "Save with Encoding";
+        return text_file.formats[idx].label();
+    }
+    pub fn chooseEncoding(self: *Editor, idx: usize) void {
+        if (idx >= self.encodingCount()) return;
+        if (self.encoding_action == .choose) {
+            self.encoding_action = if (idx == 0) .reopen else .save;
+            self.encoding_selected = 0;
+            return;
+        }
+        const format = text_file.formats[idx];
+        if (self.encoding_action == .open) {
+            const path = self.encoding_path orelse return;
+            _ = self.openFileWithEncoding(path, format.encoding, false) catch |err| {
+                self.status_message = std.fmt.bufPrint(&self.status_buf, "Cannot decode: {s}", .{@errorName(err)}) catch "Cannot decode";
+                return;
+            };
+            self.cancelEncoding();
+            return;
+        }
+        const id = self.encoding_doc_id orelse return;
+        const di = self.docIndexForId(id) orelse {
+            self.cancelEncoding();
+            return;
+        };
+        if (self.encoding_action == .save) {
+            self.mode = .normal;
+            switch (self.saveDocument(id, .{ .format = format })) {
+                .needs_path => self.startSaveAs(id, format),
+                else => {},
+            }
+        } else {
+            if (self.documents.items[di].file_path == null) {
+                self.status_message = "Save the untitled document before reopening";
+                return;
+            }
+            self.reopen_encoding = format.encoding;
+            if (self.documents.items[di].dirty) self.mode = .confirm_reopen else self.finishReopen();
+        }
+    }
+    fn finishReopen(self: *Editor) void {
+        const id = self.encoding_doc_id orelse return;
+        const idx = self.docIndexForId(id) orelse {
+            self.cancelEncoding();
+            return;
+        };
+        const enc = self.reopen_encoding orelse return;
+        const doc = &self.documents.items[idx];
+        doc.reloadWithEncoding(self.io, enc) catch |err| {
+            self.status_message = std.fmt.bufPrint(&self.status_buf, "Reload failed: {s}", .{@errorName(err)}) catch "Reload failed";
+            self.cancelEncoding();
+            return;
+        };
+        if (doc.file_path) |p| self.rememberEncoding(p, enc) catch {};
+        self.status_message = "Reopened with selected encoding";
+        self.cancelEncoding();
+    }
+    pub fn resolveReopen(self: *Editor, choice: CloseChoice) void {
+        switch (choice) {
+            .cancel => self.cancelEncoding(),
+            .discard => self.finishReopen(),
+            .save => {
+                const id = self.encoding_doc_id orelse return;
+                self.reopen_after_save = true;
+                self.mode = .normal;
+                switch (self.saveDocument(id, .{})) {
+                    .needs_path => self.startSaveAs(id, null),
+                    else => {},
+                }
+            },
+        }
+    }
+    pub fn startSaveAs(self: *Editor, id: u64, format: ?text_file.TextFormat) void {
+        const idx = self.docIndexForId(id) orelse return;
+        self.save_as_id = id;
+        self.save_as_format = format;
+        text_input.set(&self.open_buf, &self.open_buf_len, self.documents.items[idx].file_path orelse "");
+        self.mode = .save_as;
+    }
+    pub fn finishSaveAs(self: *Editor, path: []const u8) SaveOutcome {
+        const id = self.save_as_id orelse return .{ .failed = error.DocumentClosed };
+        const format = self.save_as_format;
+        self.mode = .normal;
+        self.save_as_id = null;
+        self.save_as_format = null;
+        return self.saveDocument(id, .{ .path = path, .format = format });
+    }
+    pub fn cancelSaveAs(self: *Editor) void {
+        self.save_as_id = null;
+        self.save_as_format = null;
+        self.cancelEncoding();
+    }
+    fn holdSave(self: *Editor, id: u64, options: SaveOptions) !void {
+        const path = if (options.path) |p| try self.allocator.dupe(u8, p) else null;
+        if (self.pending_save_path) |p| self.allocator.free(p);
+        self.pending_save_path = path;
+        self.pending_save_id = id;
+        self.pending_save_format = options.format;
+        self.pending_save_overwrite = options.overwrite;
+    }
+    fn clearPendingSave(self: *Editor) void {
+        if (self.pending_save_path) |p| self.allocator.free(p);
+        self.pending_save_path = null;
+        self.pending_save_id = null;
+        self.pending_save_format = null;
+        self.pending_save_overwrite = false;
+    }
+    pub fn resolveEncodingSave(self: *Editor, convert: bool) void {
+        self.mode = .normal;
+        const id = self.pending_save_id orelse return;
+        if (!convert) {
+            self.cancelEncoding();
+            return;
+        }
+        const path = self.pending_save_path;
+        self.pending_save_path = null;
+        defer if (path) |p| self.allocator.free(p);
+        _ = self.saveDocument(id, .{ .format = .{}, .path = path, .overwrite = self.pending_save_overwrite });
+    }
+
+    pub const SaveOutcome = union(enum) { saved, needs_path, conflict, unrepresentable, failed: anyerror };
+    pub const SaveOptions = struct { overwrite: bool = false, interactive: bool = true, refresh_tree: bool = true, format: ?text_file.TextFormat = null, path: ?[]const u8 = null };
 
     pub fn docIndexForId(self: *const Editor, id: u64) ?usize {
         for (self.documents.items, 0..) |doc, i| if (doc.id == id) return i;
@@ -1995,6 +2277,10 @@ pub const Editor = struct {
             },
             .needs_path => self.status_message = "Use Save As for the untitled document, then quit again",
             .failed => |err| self.status_message = std.fmt.bufPrint(&self.status_buf, "Save failed: {s}", .{@errorName(err)}) catch "Save failed",
+            .unrepresentable => {
+                self.mode = .confirm_encoding;
+                self.status_message = "Text cannot be represented in Windows-1252";
+            },
             .saved => {},
         }
     }
@@ -2002,19 +2288,55 @@ pub const Editor = struct {
     /// document pointer across the extension notification at the end.
     pub fn saveDocument(self: *Editor, id: u64, options: SaveOptions) SaveOutcome {
         const idx = self.docIndexForId(id) orelse return .{ .failed = error.DocumentClosed };
-        if (!options.overwrite) if (self.saveBlocker(idx)) |blocker| {
-            if (options.interactive) self.showSaveBlocker(idx, blocker);
+        const doc = &self.documents.items[idx];
+        const same_path = options.path == null or (doc.file_path != null and filetree_mod.normPathEql(doc.file_path.?, options.path.?));
+        if (!options.overwrite and same_path) if (self.saveBlocker(idx)) |blocker| {
+            if (options.interactive) {
+                self.holdSave(id, options) catch return .{ .failed = error.OutOfMemory };
+                self.showSaveBlocker(idx, blocker);
+            }
             return blocker;
         };
-        const doc = &self.documents.items[idx];
-        doc.save(self.io) catch |err| {
-            const result: SaveOutcome = .{ .failed = err };
-            if (options.interactive) self.showSaveBlocker(idx, result);
-            return result;
+        const old_path = if (options.path != null and doc.file_path != null) self.allocator.dupe(u8, doc.file_path.?) catch return .{ .failed = error.OutOfMemory } else null;
+        defer if (old_path) |p| self.allocator.free(p);
+        const result = if (options.path) |p| doc.saveAsWithFormat(self.io, p, options.format) else doc.saveWithFormat(self.io, options.format);
+        result catch |err| {
+            const outcome: SaveOutcome = if (err == error.UnrepresentableText) .unrepresentable else .{ .failed = err };
+            if (options.interactive) {
+                if (outcome == .unrepresentable) {
+                    self.holdSave(id, options) catch return .{ .failed = error.OutOfMemory };
+                } else self.cancelEncoding();
+                self.showSaveBlocker(idx, outcome);
+            }
+            return outcome;
         };
+        if (options.path != null) {
+            const saved_path = doc.file_path;
+            doc.file_path = old_path;
+            self.lspForgetDoc(doc);
+            doc.file_path = saved_path;
+            self.relanguageDoc(doc);
+        }
+        if (options.format != null or doc.format.encoding == .windows1252 or
+            ((doc.format.encoding == .utf16_le or doc.format.encoding == .utf16_be) and !doc.format.bom))
+            if (doc.file_path) |p| self.rememberEncoding(p, doc.format.encoding) catch {};
+        if (self.pending_save_id == id) self.clearPendingSave();
         self.status_message = std.fmt.bufPrint(&self.status_buf, "Saved {s}", .{doc.display_name}) catch "Saved";
         self.lspDidSave(doc);
-        if (options.refresh_tree) self.noteFileSaved(false, doc) else lua_api.fireEvent(self, .save, doc);
+        const saved_version = doc.buffer.version;
+        if (options.refresh_tree) self.noteFileSaved(options.path != null, doc) else lua_api.fireEvent(self, .save, doc);
+        if (options.interactive and self.encoding_doc_id == id and self.reopen_after_save) {
+            const current = self.docIndexForId(id) orelse {
+                self.cancelEncoding();
+                return .saved;
+            };
+            if (self.documents.items[current].buffer.version == saved_version and !self.documents.items[current].dirty) {
+                self.finishReopen();
+            } else {
+                self.cancelEncoding();
+                self.status_message = "Document changed during save; reopen cancelled";
+            }
+        }
         return .saved;
     }
     fn dirtyDocumentIds(self: *Editor) ![]u64 {
@@ -2036,6 +2358,10 @@ pub const Editor = struct {
         for (ids) |id| {
             const idx = self.docIndexForId(id) orelse continue;
             if (self.saveBlocker(idx)) |blocker| {
+                self.holdSave(id, .{}) catch {
+                    self.status_message = "Save failed: out of memory";
+                    return;
+                };
                 self.showSaveBlocker(idx, blocker);
                 return;
             }
@@ -2060,16 +2386,27 @@ pub const Editor = struct {
     /// for (confirm_overwrite_doc), not whatever is active when answered.
     pub fn resolveOverwrite(self: *Editor, choice: OverwriteChoice) void {
         self.mode = .normal;
-        if (self.confirm_overwrite_doc >= self.documents.items.len) {
-            self.status_message = "Save cancelled (the document was closed)";
+        const id = self.pending_save_id orelse blk: {
+            if (self.confirm_overwrite_doc >= self.documents.items.len) {
+                self.status_message = "Save cancelled (the document was closed)";
+                return;
+            }
+            break :blk self.documents.items[self.confirm_overwrite_doc].id;
+        };
+        const idx = self.docIndexForId(id) orelse {
+            self.cancelEncoding();
             return;
-        }
-        const doc = &self.documents.items[self.confirm_overwrite_doc];
+        };
+        const doc = &self.documents.items[idx];
+        const path = self.pending_save_path;
+        self.pending_save_path = null;
+        defer if (path) |p| self.allocator.free(p);
         switch (choice) {
             .overwrite => {
-                _ = self.saveDocument(doc.id, .{ .overwrite = true });
+                _ = self.saveDocument(id, .{ .overwrite = true, .format = self.pending_save_format, .path = path });
             },
             .reload => {
+                self.cancelEncoding();
                 doc.reloadFromDisk(self.io) catch |err| {
                     const msg = std.fmt.bufPrint(&self.status_buf, "Reload failed: {s}", .{@errorName(err)}) catch "Reload failed";
                     self.status_message = msg;
@@ -2079,6 +2416,7 @@ pub const Editor = struct {
                 self.status_message = msg;
             },
             .cancel => {
+                self.cancelEncoding();
                 self.status_message = "Save cancelled (file changed on disk)";
             },
         }
@@ -2090,18 +2428,23 @@ pub const Editor = struct {
         const ids = self.dirtyDocumentIds() catch return 0;
         defer self.allocator.free(ids);
         var saved: usize = 0;
+        var failed: usize = 0;
         for (ids) |id| {
             const idx = self.docIndexForId(id) orelse continue;
             if (!self.documents.items[idx].dirty) continue;
+            if (id == self.pending_save_id or
+                (id == self.encoding_doc_id and (self.mode == .encoding_picker or self.mode == .confirm_reopen))) continue;
             switch (self.saveDocument(id, .{ .interactive = false, .refresh_tree = false })) {
                 .saved => saved += 1,
-                else => {},
+                .needs_path => {},
+                else => failed += 1,
             }
         }
         if (saved > 0) {
             self.noteFileSaved(false, null);
             self.status_message = std.fmt.bufPrint(&self.status_buf, "Auto-saved {d} file(s)", .{saved}) catch "Auto-saved";
         }
+        if (failed > 0) self.status_message = std.fmt.bufPrint(&self.status_buf, "Auto-save: {d} saved, {d} failed (encoding, conflict or I/O)", .{ saved, failed }) catch "Auto-save failed";
         return saved;
     }
 
@@ -2137,6 +2480,18 @@ pub const Editor = struct {
             std.Io.Dir.cwd().createDirPath(self.io, dir) catch {};
         }
 
+        self.saveSessionTo(path) catch {
+            self.status_message = "Session save failed";
+        };
+    }
+
+    pub fn saveSessionTo(self: *Editor, path: []const u8) !void {
+        const bytes = try self.sessionTextAlloc();
+        defer self.allocator.free(bytes);
+        try text_file.atomicWrite(self.allocator, self.io, path, bytes);
+    }
+
+    pub fn sessionTextAlloc(self: *Editor) ![]u8 {
         // Active index within the saved (path-bearing) list, not all docs.
         var active_saved: usize = 0;
         var n: usize = 0;
@@ -2146,20 +2501,27 @@ pub const Editor = struct {
             n += 1;
         }
 
-        const file = std.Io.Dir.cwd().createFile(self.io, path, .{}) catch return;
-        defer file.close(self.io);
+        var output: std.ArrayList(u8) = .empty;
+        errdefer output.deinit(self.allocator);
 
         var buf: [1024]u8 = undefined;
-        const head = std.fmt.bufPrint(&buf, "active {d}\n", .{active_saved}) catch return;
-        file.writeStreamingAll(self.io, head) catch return;
+        const head = std.fmt.bufPrint(&buf, "active {d}\n", .{active_saved}) catch return error.OutOfMemory;
+        output.appendSlice(self.allocator, head) catch return error.OutOfMemory;
+        for (self.encoding_choices.items) |choice| {
+            const line = std.fmt.allocPrint(self.allocator, "encoding {s} {s}\n", .{ @tagName(choice.encoding), choice.path }) catch return error.OutOfMemory;
+            defer self.allocator.free(line);
+            output.appendSlice(self.allocator, line) catch return error.OutOfMemory;
+        }
         for (self.documents.items) |*doc| {
             if (doc.preview) continue;
             const fp = doc.file_path orelse continue;
-            const line = std.fmt.bufPrint(&buf, "doc {d} {d} {s}\n", .{
+            const line = try std.fmt.allocPrint(self.allocator, "doc {d} {d} {s}\n", .{
                 doc.cursors.primaryConst().offset, doc.scroll_top, fp,
-            }) catch continue; // path too long for buf — skip that file
-            file.writeStreamingAll(self.io, line) catch return;
+            });
+            defer self.allocator.free(line);
+            output.appendSlice(self.allocator, line) catch return error.OutOfMemory;
         }
+        return output.toOwnedSlice(self.allocator);
     }
 
     /// Restore the session written by saveSession (files, cursor positions,
@@ -2171,6 +2533,18 @@ pub const Editor = struct {
         const content = std.Io.Dir.cwd().readFileAlloc(self.io, path, self.allocator, .limited(1024 * 1024)) catch return 0;
         defer self.allocator.free(content);
 
+        return self.restoreSessionText(content);
+    }
+
+    pub fn restoreSessionText(self: *Editor, content: []const u8) usize {
+        var choices = std.mem.splitScalar(u8, content, '\n');
+        while (choices.next()) |raw| {
+            const line = std.mem.trimEnd(u8, raw, "\r");
+            if (!std.mem.startsWith(u8, line, "encoding ")) continue;
+            var fields = std.mem.splitScalar(u8, line[9..], ' ');
+            const enc = std.meta.stringToEnum(text_file.TextEncoding, fields.next() orelse continue) orelse continue;
+            self.rememberEncoding(fields.rest(), enc) catch {};
+        }
         var active: usize = 0;
         var opened: usize = 0;
         var lines = std.mem.splitScalar(u8, content, '\n');
@@ -2188,15 +2562,20 @@ pub const Editor = struct {
                 var doc: *Document = undefined;
                 if (opened == 0) {
                     // Replace the initial empty document, like a CLI file open.
-                    self.openIntoActive(file_path) catch continue;
                     doc = self.activeDoc();
+                    doc.openWithEncoding(self.io, file_path, self.knownEncoding(file_path)) catch continue;
+                    doc.detectLanguage(self);
+                    self.lspNotifyOpen(doc);
+                    const id = doc.id;
+                    lua_api.fireEvent(self, .open, doc);
+                    doc = &self.documents.items[self.docIndexForId(id) orelse continue];
                 } else {
-                    doc = self.openFile(file_path) catch continue;
+                    doc = self.openFileWithEncoding(file_path, self.knownEncoding(file_path), false) catch continue;
                 }
                 const offset = std.fmt.parseInt(usize, off_str, 10) catch 0;
                 const scroll = std.fmt.parseInt(usize, scroll_str, 10) catch 0;
                 const c = doc.cursors.primary();
-                c.offset = @min(offset, doc.buffer.byteLen());
+                c.offset = @import("cursor.zig").floorBoundary(&doc.buffer, offset);
                 c.preferred_col = doc.buffer.offsetToPos(c.offset).col;
                 doc.scroll_top = @min(scroll, doc.buffer.lineCount() -| 1);
                 opened += 1;
@@ -2312,12 +2691,11 @@ pub const Editor = struct {
         self.switchToDoc(doc_idx);
     }
 
-    /// Leave any transient modal (finder, palette, find bars, prompts) and
-    /// drop a pending completion list. The settings dialog stays open (it
-    /// follows the focused window).
+    /// Leave transient input and completion modes. Settings and pending file
+    /// decisions follow window focus; the latter retain their document IDs.
     pub fn cancelTransientMode(self: *Editor) void {
         switch (self.mode) {
-            .normal, .settings => {},
+            .normal, .settings, .encoding_picker, .confirm_reopen, .confirm_encoding, .confirm_overwrite, .save_as => {},
             .file_finder => self.finderCancel(),
             .filetree_prompt => self.cancelFiletreePrompt(),
             else => self.mode = .normal,
@@ -3064,10 +3442,13 @@ pub const Editor = struct {
     /// touched when the write fails except that the document is re-opened
     /// on the LSP side under its old uri by the next sync (harmless).
     pub fn saveDocAs(self: *Editor, doc: *Document, path: []const u8) !void {
-        self.lspForgetDoc(doc);
-        try doc.saveAs(self.io, path);
-        self.relanguageDoc(doc);
-        self.noteFileSaved(true, doc);
+        switch (self.saveDocument(doc.id, .{ .path = path, .interactive = false })) {
+            .saved => {},
+            .unrepresentable => return error.UnrepresentableText,
+            .conflict => return error.ExternalChange,
+            .needs_path => return error.NoFilePath,
+            .failed => |err| return err,
+        }
     }
 
     /// Get the resolved GUI syntax theme for a language (per-lang override or global).
@@ -4437,4 +4818,285 @@ test "completion fallback works and stale responses cannot target reused tabs" {
     _ = editor.closeDocAt(0); // replace the last tab with a different document ID
     editor.acceptCompletion();
     try t.expectEqual(@as(usize, 0), editor.activeDoc().buffer.byteLen());
+}
+
+test "shared find replaces empty text and visits adjacent and wrapped Unicode matches" {
+    const t = std.testing;
+    var editor = try Editor.init(t.allocator, t.io);
+    defer editor.deinit();
+    try editor.activeDoc().loadText("éé é");
+    text_input.set(&editor.find_buf, &editor.find_buf_len, "é");
+    editor.findIncremental();
+    try t.expectEqual(@as(usize, 2), editor.activeDoc().cursors.primary().offset);
+    editor.findNext();
+    try t.expectEqual(@as(usize, 4), editor.activeDoc().cursors.primary().offset);
+    editor.replaceOne();
+    try t.expectEqualStrings("é é", editor.activeDoc().buffer.slice(0, editor.activeDoc().buffer.byteLen()));
+    try t.expectEqual(@as(usize, 5), editor.activeDoc().cursors.primary().offset);
+    _ = try editor.activeDoc().undoAction();
+    try t.expectEqual(@as(usize, 4), editor.activeDoc().cursors.primary().offset);
+    _ = try editor.activeDoc().redoAction();
+    try t.expectEqual(@as(usize, 5), editor.activeDoc().cursors.primary().offset);
+    editor.findNext();
+    try t.expectEqual(@as(usize, 2), editor.activeDoc().cursors.primary().offset);
+    try t.expectEqualStrings("Search wrapped", editor.status_message);
+}
+
+test "encoding picker preserves stable targets and dirty reopen cancellation" {
+    const t = std.testing;
+    var tmp = t.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(t.io, ".", t.allocator);
+    defer t.allocator.free(root);
+    const path = try std.fs.path.join(t.allocator, &.{ root, "café.txt" });
+    defer t.allocator.free(path);
+    try text_file.atomicWrite(t.allocator, t.io, path, "caf\xe9");
+    var editor = try Editor.init(t.allocator, t.io);
+    defer editor.deinit();
+    try t.expectError(error.EncodingRequired, editor.openFile(path));
+    try t.expectEqual(Editor.Mode.encoding_picker, editor.mode);
+    try t.expectEqual(@as(usize, 1), editor.documents.items.len);
+    editor.cancelEncoding();
+    try t.expectEqual(@as(usize, 1), editor.documents.items.len);
+    try t.expectError(error.EncodingRequired, editor.openFile(path));
+    editor.chooseEncoding(4);
+    const id = editor.activeDoc().id;
+    try t.expectEqualStrings("café", editor.activeDoc().buffer.slice(0, 5));
+    try t.expectEqual(@as(?text_file.TextEncoding, .windows1252), editor.knownEncoding(path));
+    try editor.activeDoc().insertAtCursor("draft ");
+    editor.startEncoding(.reopen);
+    editor.chooseEncoding(0);
+    try t.expectEqual(Editor.Mode.confirm_reopen, editor.mode);
+    editor.resolveReopen(.cancel);
+    try t.expect(editor.activeDoc().dirty);
+    editor.startEncoding(.reopen);
+    editor.chooseEncoding(0);
+    editor.resolveReopen(.discard); // Invalid UTF-8 leaves the draft intact.
+    try t.expectEqualStrings("draft café", editor.activeDoc().buffer.slice(0, editor.activeDoc().buffer.byteLen()));
+    try t.expect(editor.activeDoc().history.canUndo());
+    editor.startEncoding(.save);
+    _ = try editor.newDocument();
+    try editor.activeDoc().insertAtCursor("other tab");
+    const other = editor.activeDoc().id;
+    editor.chooseEncoding(2);
+    const idx = editor.docIndexForId(id).?;
+    try t.expectEqualDeep(text_file.TextFormat{ .encoding = .utf16_le, .bom = true }, editor.documents.items[idx].format);
+    try t.expect(!editor.documents.items[idx].dirty);
+    try t.expect(editor.documents.items[editor.docIndexForId(other).?].dirty);
+    editor.switchToDoc(idx);
+    editor.activeDoc().cursors.primary().offset = 0;
+    try editor.activeDoc().insertAtCursor("saved ");
+    editor.startEncoding(.reopen);
+    editor.chooseEncoding(2);
+    editor.resolveReopen(.save);
+    try t.expectEqual(Editor.Mode.normal, editor.mode);
+    try t.expect(!editor.activeDoc().dirty);
+    try t.expectEqualStrings("saved draft café", editor.activeDoc().buffer.slice(0, editor.activeDoc().buffer.byteLen()));
+}
+
+test "reopen waits for its decision and save hooks cannot redirect or discard edits" {
+    const t = std.testing;
+    var tmp = t.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(t.io, ".", t.allocator);
+    defer t.allocator.free(root);
+    const path = try std.fs.path.join(t.allocator, &.{ root, "hooks.txt" });
+    defer t.allocator.free(path);
+    for ([_]bool{ false, true }) |edit_in_hook| {
+        try text_file.write(t.allocator, t.io, path, "café", .{ .encoding = .windows1252 });
+        var lua = try zlua.Lua.init(t.allocator);
+        defer lua.deinit();
+        lua.openLibs();
+        var editor = try Editor.init(t.allocator, t.io);
+        defer editor.deinit();
+        @import("lua_settings.zig").registerApi(lua, &editor);
+        const original = try editor.openFileWithEncoding(path, .windows1252, false);
+        const id = original.id;
+        try original.insertAtCursor("draft ");
+        editor.startEncoding(.reopen);
+        editor.chooseEncoding(4);
+        try t.expectEqual(Editor.Mode.confirm_reopen, editor.mode);
+        try t.expectEqual(@as(usize, 0), editor.autoSaveAll());
+        try t.expectEqual(Editor.Mode.confirm_reopen, editor.mode);
+        try t.expect(original.dirty);
+        const before = try tmp.dir.readFileAlloc(t.io, "hooks.txt", t.allocator, .limited(100));
+        defer t.allocator.free(before);
+        try t.expectEqualStrings("caf\xe9", before);
+        if (edit_in_hook) {
+            try lua.doString("zide.on('save', function() zide.insert('hook ') end)");
+        } else {
+            _ = try editor.newDocument();
+            editor.multi_window_supported = true;
+            const window = try editor.newWindow(.{ .editor = editor.activeDocIdx() });
+            editor.focusWindow(window);
+            try t.expectEqual(Editor.Mode.confirm_reopen, editor.mode);
+            try lua.doString("zide.on('save', function() zide.exec('new_document'); zide.insert('hook tab') end)");
+        }
+        editor.resolveReopen(.save);
+        const doc = &editor.documents.items[editor.docIndexForId(id).?];
+        try t.expectEqual(Editor.Mode.normal, editor.mode);
+        try t.expectEqual(edit_in_hook, doc.dirty);
+        try t.expectEqualStrings(if (edit_in_hook) "draft hook café" else "draft café", doc.buffer.slice(0, doc.buffer.byteLen()));
+        try t.expect(editor.encoding_doc_id == null);
+        try t.expect(editor.pending_save_id == null);
+        if (edit_in_hook) {
+            try t.expectEqualStrings("Document changed during save; reopen cancelled", editor.status_message);
+            try t.expect(doc.history.canUndo());
+        } else {
+            try t.expect(editor.activeDoc().id != id);
+            try t.expectEqualStrings("hook tab", editor.activeDoc().buffer.slice(0, editor.activeDoc().buffer.byteLen()));
+        }
+        const after = try tmp.dir.readFileAlloc(t.io, "hooks.txt", t.allocator, .limited(100));
+        defer t.allocator.free(after);
+        try t.expectEqualStrings("draft caf\xe9", after);
+    }
+}
+
+test "encoding save handles untitled paths conflicts and unrepresentable text without retargeting" {
+    const t = std.testing;
+    var tmp = t.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(t.io, ".", t.allocator);
+    defer t.allocator.free(root);
+    const path = try std.fs.path.join(t.allocator, &.{ root, "new.txt" });
+    defer t.allocator.free(path);
+    var editor = try Editor.init(t.allocator, t.io);
+    defer editor.deinit();
+    try editor.activeDoc().insertAtCursor("😀");
+    const id = editor.activeDoc().id;
+    editor.startEncoding(.save);
+    editor.chooseEncoding(4);
+    try t.expectEqual(Editor.Mode.save_as, editor.mode);
+    _ = try editor.newDocument();
+    try t.expectEqual(Editor.SaveOutcome.unrepresentable, editor.finishSaveAs(path));
+    try t.expectEqual(Editor.Mode.confirm_encoding, editor.mode);
+    try t.expect(editor.documents.items[editor.docIndexForId(id).?].file_path == null);
+    editor.resolveEncodingSave(false);
+    editor.switchToDoc(editor.docIndexForId(id).?);
+    editor.startEncoding(.save);
+    editor.chooseEncoding(4);
+    try t.expectEqual(Editor.SaveOutcome.unrepresentable, editor.finishSaveAs(path));
+    editor.switchToDoc(1);
+    editor.resolveEncodingSave(true);
+    const doc = &editor.documents.items[editor.docIndexForId(id).?];
+    try t.expectEqualStrings(path, doc.file_path.?);
+    try t.expectEqualDeep(text_file.TextFormat{}, doc.format);
+    try t.expect(!doc.dirty);
+    try doc.insertAtCursor("x");
+    try text_file.atomicWrite(t.allocator, t.io, path, "external");
+    doc.external_changed = true;
+    editor.switchToDoc(editor.docIndexForId(id).?);
+    editor.startEncoding(.save);
+    editor.chooseEncoding(3);
+    try t.expectEqual(Editor.Mode.confirm_overwrite, editor.mode);
+    editor.resolveOverwrite(.cancel);
+    try t.expectEqualDeep(text_file.TextFormat{}, doc.format);
+    editor.startEncoding(.save);
+    editor.chooseEncoding(3);
+    editor.switchToDoc(1);
+    editor.multi_window_supported = true;
+    _ = try editor.newWindow(.{ .editor = 1 });
+    try t.expectEqual(Editor.Mode.confirm_overwrite, editor.mode);
+    editor.resolveOverwrite(.overwrite);
+    try t.expectEqualDeep(text_file.TextFormat{ .encoding = .utf16_be, .bom = true }, doc.format);
+}
+
+test "autosave and workspace replacements report failures and preserve source formats" {
+    const t = std.testing;
+    var tmp = t.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(t.io, ".", t.allocator);
+    defer t.allocator.free(root);
+    const path = try std.fs.path.join(t.allocator, &.{ root, "legacy.txt" });
+    defer t.allocator.free(path);
+    const utf16 = try std.fs.path.join(t.allocator, &.{ root, "wide.txt" });
+    defer t.allocator.free(utf16);
+    try text_file.write(t.allocator, t.io, path, "café cat", .{ .encoding = .windows1252 });
+    try text_file.write(t.allocator, t.io, utf16, "😀cat", .{ .encoding = .utf16_le, .bom = true });
+    var editor = try Editor.init(t.allocator, t.io);
+    defer editor.deinit();
+    editor.filetree_root = try t.allocator.dupe(u8, root);
+    text_input.set(&editor.search.query_buf, &editor.search.query_len, "cat");
+    editor.search.start(&editor);
+    waitSearch(&editor.search);
+    try t.expectEqual(@as(usize, 1), editor.search.files_skipped);
+    try t.expectEqual(@as(usize, 1), editor.search.matches.items.len);
+    try t.expectEqual(@as(u32, 4), editor.search.matches.items[0].col);
+    try editor.rememberEncoding(path, .windows1252);
+    editor.search.start(&editor);
+    waitSearch(&editor.search);
+    try t.expectEqual(@as(usize, 2), editor.search.matches.items.len);
+    text_input.set(&editor.search.replace_buf, &editor.search.replace_len, "😀");
+    const result = editor.search.executeReplace(&editor, .all);
+    try t.expectEqual(@as(usize, 1), result.failed);
+    try t.expectEqual(@as(usize, 1), result.files);
+    try t.expectEqual(@as(usize, 1), result.count);
+    for (std.enums.values(text_file.FailureStage)) |stage| {
+        text_file.testing_failure = stage;
+        defer text_file.testing_failure = null;
+        if (search_mod.replaceAllInFile(t.allocator, t.io, path, "cat", "dog", true, false, .windows1252)) |_| return error.ExpectedFailure else |_| {}
+    }
+    const doc = try editor.openFile(path);
+    try doc.insertAtCursor("edit ");
+    for (std.enums.values(text_file.FailureStage)) |stage| {
+        text_file.testing_failure = stage;
+        defer text_file.testing_failure = null;
+        try t.expectEqual(@as(usize, 0), editor.autoSaveAll());
+        try t.expect(doc.dirty);
+        try t.expectEqualDeep(text_file.TextFormat{ .encoding = .windows1252 }, doc.format);
+    }
+    try doc.insertAtCursor("😀");
+    editor.mode = .find;
+    try t.expectEqual(@as(usize, 0), editor.autoSaveAll());
+    try t.expectEqual(Editor.Mode.find, editor.mode);
+    try t.expect(std.mem.indexOf(u8, editor.status_message, "failed") != null);
+    try t.expect(doc.dirty);
+    const bytes = try tmp.dir.readFileAlloc(t.io, "legacy.txt", t.allocator, .limited(100));
+    defer t.allocator.free(bytes);
+    try t.expectEqualStrings("caf\xe9 cat", bytes);
+}
+
+test "session restores explicit BOM-less encodings and reads old session records" {
+    const t = std.testing;
+    var tmp = t.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(t.io, ".", t.allocator);
+    defer t.allocator.free(root);
+    const path = try std.fs.path.join(t.allocator, &.{ root, "café space.txt" });
+    defer t.allocator.free(path);
+    const session = try std.fs.path.join(t.allocator, &.{ root, "session" });
+    defer t.allocator.free(session);
+    try text_file.write(t.allocator, t.io, path, "café\r\n😀", .{ .encoding = .utf16_be });
+    var editor = try Editor.init(t.allocator, t.io);
+    defer editor.deinit();
+    _ = try editor.openFileWithEncoding(path, .utf16_be, false);
+    const bytes = try editor.sessionTextAlloc();
+    defer t.allocator.free(bytes);
+    var lua = try zlua.Lua.init(t.allocator);
+    defer lua.deinit();
+    lua.openLibs();
+    var restored = try Editor.init(t.allocator, t.io);
+    defer restored.deinit();
+    @import("lua_settings.zig").registerApi(lua, &restored);
+    try lua.doString("zide.on('open', function() opened_text = zide.get_text(); zide.exec('new_document') end)");
+    try t.expectEqual(@as(usize, 1), restored.restoreSessionText(bytes));
+    try lua.doString("assert(opened_text == 'café\\r\\n😀')");
+    try t.expectEqualDeep(text_file.TextFormat{ .encoding = .utf16_be }, restored.activeDoc().format);
+    try t.expectEqualStrings("café\r\n😀", restored.activeDoc().buffer.slice(0, restored.activeDoc().buffer.byteLen()));
+    try text_file.atomicWrite(t.allocator, t.io, session, "old session");
+    for (std.enums.values(text_file.FailureStage)) |stage| {
+        text_file.testing_failure = stage;
+        defer text_file.testing_failure = null;
+        if (editor.saveSessionTo(session)) |_| return error.ExpectedFailure else |_| {}
+        const previous = try tmp.dir.readFileAlloc(t.io, "session", t.allocator, .limited(100));
+        defer t.allocator.free(previous);
+        try t.expectEqualStrings("old session", previous);
+    }
+    try text_file.write(t.allocator, t.io, path, "plain", .{});
+    var old = try Editor.init(t.allocator, t.io);
+    defer old.deinit();
+    const old_text = try std.fmt.allocPrint(t.allocator, "active 0\ndoc 2 0 {s}\n", .{path});
+    defer t.allocator.free(old_text);
+    try t.expectEqual(@as(usize, 1), old.restoreSessionText(old_text));
+    try t.expectEqual(@as(usize, 2), old.activeDoc().cursors.primary().offset);
 }

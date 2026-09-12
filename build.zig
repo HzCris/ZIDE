@@ -73,6 +73,10 @@ pub fn build(b: *std.Build) void {
 
         b.installArtifact(gui_exe);
 
+        const gui_smoke = b.addTest(.{ .root_module = gui_mod, .filters = &.{"GUI encoding smoke"} });
+        const run_gui_smoke = b.addRunArtifact(gui_smoke);
+        b.step("test-gui", "Run GUI encoding/input smoke tests in a hidden SDL window").dependOn(&run_gui_smoke.step);
+
         const run_gui = b.addRunArtifact(gui_exe);
         run_gui.step.dependOn(b.getInstallStep());
         if (b.args) |args| run_gui.addArgs(args);

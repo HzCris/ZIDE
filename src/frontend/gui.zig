@@ -1,4 +1,5 @@
 const std = @import("std");
+const text_input = @import("../core/text_input.zig");
 const build_options = @import("build_options");
 const dvui = if (build_options.has_gui) @import("dvui") else struct {};
 const Editor = @import("../core/editor.zig").Editor;
@@ -878,6 +879,10 @@ fn guiMode(editor: *Editor) Editor.Mode {
 }
 
 fn modalDialogs(editor: *Editor) void {
+    if (cur_win == editor.active_window) {
+        if (editor.mode == .save_as) saveAs(editor);
+        if (editor.mode == .encoding_picker or editor.mode == .confirm_reopen or editor.mode == .confirm_encoding) encodingDialog(editor);
+    }
     // --- Settings dialog (modal floating window) ---
     // Declared before the panes so its widgets consume their events first;
     // the panes' raw event loops only see what the dialog left unhandled.
@@ -1252,7 +1257,7 @@ fn statusBar(editor: *Editor) void {
                 .hint => "Hint: ",
             };
             var diag_buf: [256]u8 = undefined;
-            const max_msg = @min(diag.message.len, diag_buf.len - prefix.len);
+            const max_msg = text_input.floor(diag.message, diag_buf.len - prefix.len);
             @memcpy(diag_buf[0..prefix.len], prefix);
             @memcpy(diag_buf[prefix.len..][0..max_msg], diag.message[0..max_msg]);
             const diag_str = diag_buf[0 .. prefix.len + max_msg];
@@ -1269,6 +1274,20 @@ fn statusBar(editor: *Editor) void {
 
         // Right: filename + dirty marker (nothing for a terminal pane)
         if (!term_active) {
+            const enc = doc.format.label();
+            const enc_w = status_font.textSize(enc).w * sscale;
+            const enc_rect: dvui.Rect.Physical = .{ .x = sarea.x + sarea.w - enc_w, .y = sarea.y, .w = enc_w, .h = sarea.h };
+            enc_rect.fill(.{}, .{ .color = toDvui(editor.theme.status_bg), .fade = 1.0 });
+            renderOverlayText(status_font, enc, enc_rect.x, enc_rect.y, srs, status_text_color);
+            for (dvui.events()) |*e| {
+                if (e.handled or e.evt != .mouse) continue;
+                const me = e.evt.mouse;
+                if (me.action == .press and me.button == .left and enc_rect.contains(me.p)) {
+                    e.handle(@src(), swd);
+                    editor.focusWindow(cur_win);
+                    editor.startEncoding(.choose);
+                }
+            }
             const dirty_str: []const u8 = if (doc.dirty) " [Modified]" else "";
             var name_buf: [256]u8 = undefined;
             const name_str = std.fmt.bufPrint(&name_buf, "{s}{s}", .{ doc.display_name, dirty_str }) catch doc.display_name;
@@ -1277,7 +1296,7 @@ fn statusBar(editor: *Editor) void {
                 .font = status_font,
                 .text = name_str,
                 .rs = srs,
-                .p = .{ .x = sarea.x + sarea.w - name_w, .y = sarea.y },
+                .p = .{ .x = sarea.x + sarea.w - enc_w - 16 * sscale - name_w, .y = sarea.y },
                 .color = status_text_color,
             }) catch {};
         }
@@ -3205,7 +3224,7 @@ fn searchPanelGui(editor: *Editor) void {
     } else {
         const busy: []const u8 = if (sp.searching) "  searching…" else "";
         const cap: []const u8 = if (sp.capped) "  (capped at 2000)" else "";
-        const main_txt = std.fmt.bufPrint(&sbuf, "{d} results in {d} files{s}{s}", .{ sp.matches.items.len, sp.paths.items.len, busy, cap }) catch "";
+        const main_txt = std.fmt.bufPrint(&sbuf, "{d} results in {d} files, {d} skipped{s}{s}", .{ sp.matches.items.len, sp.paths.items.len, sp.files_skipped, busy, cap }) catch "";
         renderOverlayText(font, main_txt, area.x + pad, status_y, render_rs, fg);
         const main_w = font.textSize(main_txt).w * scale;
         renderOverlayText(font, "   Alt+C case · Alt+W word · Tab fields · Enter on Replace = replace all", area.x + pad + main_w, status_y, render_rs, dim);
@@ -5438,6 +5457,7 @@ fn openFileDialog(editor: *Editor) void {
     if (path) |p| {
         defer editor.allocator.free(p);
         _ = editor.openFile(p) catch |err| {
+            if (err == error.EncodingRequired) return;
             if (err == error.BinaryFile) {
                 guiNotify(editor, "Not opened: binary or unsupported text encoding", .{});
             } else {
@@ -5458,21 +5478,15 @@ fn save(editor: *Editor) void {
 /// Open a native OS save dialog and save the document to the selected path.
 fn saveAs(editor: *Editor) void {
     if (!build_options.has_gui) return;
-
-    const path = dvui.dialogNativeFileSave(editor.allocator, .{
-        .title = "Save As",
-    }) catch return;
-
+    if (editor.save_as_id == null) editor.startSaveAs(editor.activeDoc().id, null);
+    const path = dvui.dialogNativeFileSave(editor.allocator, .{ .title = "Save As" }) catch {
+        editor.cancelSaveAs();
+        return;
+    };
     if (path) |p| {
         defer editor.allocator.free(p);
-        // saveDocAs = LSP forget (old uri) → write → re-detect language →
-        // file tree + extension bookkeeping.
-        editor.saveDocAs(editor.activeDoc(), p) catch |err| {
-            editor.status_message = @errorName(err);
-            return;
-        };
-        editor.status_message = "Saved";
-    }
+        _ = editor.finishSaveAs(p);
+    } else editor.cancelSaveAs();
 }
 
 /// Advance through `line` starting at `start_pos`, consuming up to `max_width`
@@ -5853,6 +5867,7 @@ fn handleModalKey(editor: *Editor, key: dvui.Event.Key) void {
         .confirm_quit => handleConfirmQuitKeyGui(editor, key),
         .confirm_close => handleConfirmCloseKeyGui(editor, key),
         .confirm_overwrite => handleConfirmOverwriteKeyGui(editor, key),
+        .encoding_picker, .confirm_reopen, .confirm_encoding => handleEncodingKeyGui(editor, key),
         .settings => {}, // DVUI dialog handles its own input (settingsDialog)
         .file_open, .save_as => {}, // handled by native dialogs in GUI
         .filetree_prompt => handleFiletreePromptKeyGui(editor, key),
@@ -5875,43 +5890,32 @@ fn handleModalText(editor: *Editor, txt: []const u8) void {
         },
         .filetree_prompt => {
             if (editor.filetree_prompt_kind != .delete_confirm) {
-                guiAppendText(&editor.open_buf, &editor.open_buf_len, txt);
+                text_input.append(&editor.open_buf, &editor.open_buf_len, txt);
             }
         },
         .find => {
             editor.status_message = "";
-            guiAppendText(&editor.find_buf, &editor.find_buf_len, txt);
-            guiFindIncremental(editor);
+            text_input.append(&editor.find_buf, &editor.find_buf_len, txt);
+            editor.findIncremental();
         },
         .find_replace => {
             editor.status_message = "";
             if (editor.replace_field_active) {
-                guiAppendText(&editor.replace_buf, &editor.replace_buf_len, txt);
+                text_input.append(&editor.replace_buf, &editor.replace_buf_len, txt);
             } else {
-                guiAppendText(&editor.find_buf, &editor.find_buf_len, txt);
-                guiFindIncremental(editor);
+                text_input.append(&editor.find_buf, &editor.find_buf_len, txt);
+                editor.findIncremental();
             }
         },
         .command_palette => {
-            guiAppendText(&editor.palette_buf, &editor.palette_buf_len, txt);
+            text_input.append(&editor.palette_buf, &editor.palette_buf_len, txt);
             editor.palette_selected = 0;
         },
         .file_finder => {
-            guiAppendText(&editor.finder_buf, &editor.finder_buf_len, txt);
+            text_input.append(&editor.finder_buf, &editor.finder_buf_len, txt);
             editor.finderRefresh();
         },
         else => {},
-    }
-}
-
-fn guiAppendText(buf: []u8, buf_len: *usize, txt: []const u8) void {
-    for (txt) |ch| {
-        if (ch >= 32 and ch < 127) {
-            if (buf_len.* < buf.len) {
-                buf[buf_len.*] = ch;
-                buf_len.* += 1;
-            }
-        }
     }
 }
 
@@ -5942,12 +5946,12 @@ fn handleFindKeyGui(editor: *Editor, key: dvui.Event.Key) void {
             editor.status_message = "";
         },
         .enter => {
-            if (editor.find_buf_len > 0) guiFindNext(editor);
+            if (editor.find_buf_len > 0) editor.findNext();
         },
         .backspace => {
             if (editor.find_buf_len > 0) {
-                editor.find_buf_len -= 1;
-                guiFindIncremental(editor);
+                text_input.backspace(&editor.find_buf, &editor.find_buf_len);
+                editor.findIncremental();
             }
         },
         else => {},
@@ -5955,6 +5959,10 @@ fn handleFindKeyGui(editor: *Editor, key: dvui.Event.Key) void {
 }
 
 fn handleFindReplaceKeyGui(editor: *Editor, key: dvui.Event.Key) void {
+    if (key.mod.control() and (key.code == .enter or key.code == .a)) {
+        editor.replaceAll();
+        return;
+    }
     switch (key.code) {
         .escape => {
             editor.mode = .normal;
@@ -5965,25 +5973,25 @@ fn handleFindReplaceKeyGui(editor: *Editor, key: dvui.Event.Key) void {
         },
         .enter => {
             if (!editor.replace_field_active) {
-                if (editor.find_buf_len > 0) guiFindNext(editor);
+                if (editor.find_buf_len > 0) editor.findNext();
             } else {
-                guiReplaceOne(editor);
+                editor.replaceOne();
             }
         },
         .backspace => {
             if (editor.replace_field_active) {
-                if (editor.replace_buf_len > 0) editor.replace_buf_len -= 1;
+                if (editor.replace_buf_len > 0) text_input.backspace(&editor.replace_buf, &editor.replace_buf_len);
             } else {
                 if (editor.find_buf_len > 0) {
-                    editor.find_buf_len -= 1;
-                    guiFindIncremental(editor);
+                    text_input.backspace(&editor.find_buf, &editor.find_buf_len);
+                    editor.findIncremental();
                 }
             }
         },
         else => {
             // Ctrl+A in find_replace = replace all
             if (key.mod.control() and key.code == .a) {
-                guiReplaceAll(editor);
+                editor.replaceAll();
             }
         },
     }
@@ -6009,7 +6017,7 @@ fn handleFinderKeyGui(editor: *Editor, key: dvui.Event.Key) void {
         },
         .backspace => {
             if (editor.finder_buf_len > 0) {
-                editor.finder_buf_len -= 1;
+                text_input.backspace(&editor.finder_buf, &editor.finder_buf_len);
                 editor.finderRefresh();
             }
         },
@@ -6059,7 +6067,7 @@ fn handlePaletteKeyGui(editor: *Editor, key: dvui.Event.Key) void {
         },
         .backspace => {
             if (editor.palette_buf_len > 0) {
-                editor.palette_buf_len -= 1;
+                text_input.backspace(&editor.palette_buf, &editor.palette_buf_len);
                 editor.palette_selected = 0;
             }
         },
@@ -6082,7 +6090,7 @@ fn handleFiletreePromptKeyGui(editor: *Editor, key: dvui.Event.Key) void {
         .escape => editor.cancelFiletreePrompt(),
         .enter => editor.applyFiletreePrompt(),
         .backspace => {
-            if (editor.open_buf_len > 0) editor.open_buf_len -= 1;
+            if (editor.open_buf_len > 0) text_input.backspace(&editor.open_buf, &editor.open_buf_len);
         },
         else => {},
     }
@@ -6105,10 +6113,11 @@ fn handleConfirmCloseKeyGui(editor: *Editor, key: dvui.Event.Key) void {
     switch (key.code) {
         .s => {
             if (editor.resolveCloseDoc(.save) != .needs_path) return;
-            const idx = editor.confirm_close_doc; // active now (resolveCloseDoc switched to it)
+            const id = editor.activeDoc().id;
+            editor.startSaveAs(id, null);
             saveAs(editor);
-            if (idx < editor.documents.items.len and !editor.documents.items[idx].dirty) {
-                _ = editor.closeDocAt(idx);
+            if (editor.docIndexForId(id)) |idx| {
+                if (!editor.documents.items[idx].dirty and editor.documents.items[idx].file_path != null) _ = editor.closeDocAt(idx);
             }
         },
         .d => {
@@ -6529,118 +6538,6 @@ fn openThemeFolder(io: std.Io) void {
 
     const argv = [_][]const u8{ opener, dir_z };
     _ = std.process.spawn(io, .{ .argv = &argv }) catch return;
-}
-
-// ===========================================================================
-// Search logic (mirrors TUI — operates on Editor state only)
-// ===========================================================================
-
-fn guiFindIncremental(editor: *Editor) void {
-    const doc = editor.activeDoc();
-    const needle = editor.find_buf[0..editor.find_buf_len];
-    if (needle.len == 0) {
-        doc.cursors.primary().offset = editor.find_origin;
-        doc.cursors.primary().clearSelection();
-        editor.status_message = "";
-        return;
-    }
-    const buf_len = doc.buffer.byteLen();
-    const content = doc.buffer.slice(0, buf_len);
-    const origin = @min(editor.find_origin, buf_len);
-
-    if (std.mem.indexOf(u8, content[origin..], needle)) |idx| {
-        const abs = origin + idx;
-        doc.cursors.primary().anchor = abs;
-        doc.cursors.primary().offset = abs + needle.len;
-        doc.cursors.primary().preferred_col = doc.buffer.offsetToPos(doc.cursors.primary().offset).col;
-        editor.status_message = "";
-        return;
-    }
-    if (std.mem.indexOf(u8, content[0..origin], needle)) |idx| {
-        doc.cursors.primary().anchor = idx;
-        doc.cursors.primary().offset = idx + needle.len;
-        doc.cursors.primary().preferred_col = doc.buffer.offsetToPos(doc.cursors.primary().offset).col;
-        editor.status_message = "Search wrapped";
-        return;
-    }
-    doc.cursors.primary().offset = editor.find_origin;
-    doc.cursors.primary().clearSelection();
-    editor.status_message = "No matches found";
-}
-
-fn guiFindNext(editor: *Editor) void {
-    const doc = editor.activeDoc();
-    const needle = editor.find_buf[0..editor.find_buf_len];
-    if (needle.len == 0) return;
-    const cursor_offset = doc.cursors.primary().offset;
-    const buf_len = doc.buffer.byteLen();
-    const content = doc.buffer.slice(0, buf_len);
-    const search_start = @min(cursor_offset + 1, buf_len);
-
-    if (std.mem.indexOf(u8, content[search_start..], needle)) |idx| {
-        const abs = search_start + idx;
-        doc.cursors.primary().anchor = abs;
-        doc.cursors.primary().offset = abs + needle.len;
-        doc.cursors.primary().preferred_col = doc.buffer.offsetToPos(doc.cursors.primary().offset).col;
-        editor.status_message = "";
-        return;
-    }
-    if (std.mem.indexOf(u8, content[0..search_start], needle)) |idx| {
-        doc.cursors.primary().anchor = idx;
-        doc.cursors.primary().offset = idx + needle.len;
-        doc.cursors.primary().preferred_col = doc.buffer.offsetToPos(doc.cursors.primary().offset).col;
-        editor.status_message = "Search wrapped";
-        return;
-    }
-    editor.status_message = "No matches found";
-}
-
-fn guiReplaceOne(editor: *Editor) void {
-    const doc = editor.activeDoc();
-    const needle = editor.find_buf[0..editor.find_buf_len];
-    const replacement = editor.replace_buf[0..editor.replace_buf_len];
-    if (needle.len == 0) return;
-    if (doc.selectedText()) |sel| {
-        if (std.mem.eql(u8, sel, needle)) {
-            // insertAtCursor replaces the active selection as one undo step
-            doc.insertAtCursor(replacement) catch {};
-        }
-    }
-    guiFindNext(editor);
-}
-
-fn guiReplaceAll(editor: *Editor) void {
-    const doc = editor.activeDoc();
-    const needle = editor.find_buf[0..editor.find_buf_len];
-    const replacement = editor.replace_buf[0..editor.replace_buf_len];
-    if (needle.len == 0) return;
-    doc.beginEdit() catch return;
-    defer doc.endEdit();
-    doc.cursors.primary().offset = 0;
-    doc.cursors.primary().clearSelection();
-
-    var count: usize = 0;
-    while (count < 100_000) {
-        const content = doc.buffer.slice(0, doc.buffer.byteLen());
-        const start = doc.cursors.primary().offset;
-        if (std.mem.indexOf(u8, content[start..], needle)) |idx| {
-            const abs = start + idx;
-            doc.cursors.primary().offset = abs;
-            doc.cursors.primary().anchor = abs;
-            doc.cursors.primary().offset = abs + needle.len;
-            doc.deleteSelection() catch break;
-            doc.insertAtCursor(replacement) catch break;
-            count += 1;
-        } else break;
-    }
-    if (count == 0) {
-        editor.status_message = "No matches found";
-    } else {
-        const msg = std.fmt.bufPrint(&editor.status_buf, "Replaced {d} occurrence{s}", .{
-            count, @as([]const u8, if (count == 1) "" else "s"),
-        }) catch "Replaced all";
-        editor.status_message = msg;
-    }
 }
 
 /// Memoized find match count. The overlay queries this every frame while
@@ -7070,4 +6967,110 @@ fn renderOverlayText(font: dvui.Font, text: []const u8, x: f32, y: f32, rs: dvui
         .p = .{ .x = x, .y = y },
         .color = color,
     }) catch {};
+}
+
+fn handleEncodingKeyGui(editor: *Editor, key: dvui.Event.Key) void {
+    switch (editor.mode) {
+        .encoding_picker => switch (key.code) {
+            .escape => editor.cancelEncoding(),
+            .up => editor.encoding_selected -|= 1,
+            .down, .tab => editor.encoding_selected = (editor.encoding_selected + 1) % editor.encodingCount(),
+            .enter => editor.chooseEncoding(editor.encoding_selected),
+            else => {},
+        },
+        .confirm_reopen => switch (key.code) {
+            .s => editor.resolveReopen(.save),
+            .d => editor.resolveReopen(.discard),
+            .c, .escape => editor.resolveReopen(.cancel),
+            else => {},
+        },
+        .confirm_encoding => switch (key.code) {
+            .s => editor.resolveEncodingSave(true),
+            .c, .escape => editor.resolveEncodingSave(false),
+            else => {},
+        },
+        else => {},
+    }
+}
+
+fn encodingDialog(editor: *Editor) void {
+    var open = true;
+    const mode = editor.mode;
+    var dialog = dvui.floatingWindow(@src(), .{ .modal = true, .open_flag = &open }, .{ .min_size_content = .{ .w = 370 } });
+    defer {
+        dialog.deinit();
+        if (!open) editor.cancelEncoding();
+        if (editor.mode != mode or !open) dvui.focusSubwindow(null, null);
+    }
+    const title = if (mode == .encoding_picker) editor.encodingTitle() else if (mode == .confirm_reopen) "Save changes before reopening?" else "Save as UTF-8?";
+    dialog.dragAreaSet(dvui.windowHeader(title, "", &open));
+    var box = dvui.box(@src(), .{ .dir = .vertical }, .{ .expand = .horizontal, .padding = dvui.Rect.all(10) });
+    defer box.deinit();
+    const action = editor.encoding_action;
+    for (dvui.events()) |*e| {
+        if (e.handled or e.evt != .key or e.evt.key.action == .up) continue;
+        handleEncodingKeyGui(editor, e.evt.key);
+        e.handle(@src(), box.data());
+        if (editor.mode != mode or editor.encoding_action != action) return;
+    }
+    if (mode == .encoding_picker) {
+        const count = editor.encodingCount();
+        for (0..count) |idx| {
+            if (dvui.button(@src(), editor.encodingLabel(idx), .{}, .{
+                .id_extra = idx,
+                .expand = .horizontal,
+                .style = if (idx == editor.encoding_selected) .highlight else .control,
+            })) {
+                editor.chooseEncoding(idx);
+                break;
+            }
+        }
+    } else if (mode == .confirm_reopen) {
+        dvui.labelNoFmt(@src(), "The selected document has unsaved changes.", .{}, .{});
+        if (dvui.button(@src(), "Save", .{}, .{})) editor.resolveReopen(.save);
+        if (dvui.button(@src(), "Discard", .{}, .{})) editor.resolveReopen(.discard);
+    } else {
+        dvui.labelNoFmt(@src(), "Windows-1252 cannot represent this text.", .{}, .{});
+        if (dvui.button(@src(), "Save as UTF-8", .{}, .{})) editor.resolveEncodingSave(true);
+    }
+    if (dvui.button(@src(), "Cancel", .{}, .{})) {
+        if (mode == .confirm_encoding) editor.resolveEncodingSave(false) else editor.cancelEncoding();
+    }
+    if (editor.status_message.len > 0) dvui.labelNoFmt(@src(), editor.status_message, .{}, .{});
+}
+
+test "GUI encoding smoke: hidden window renders picker and handles Unicode find replacement" {
+    if (!build_options.has_gui) return error.SkipZigTest;
+    const t = std.testing;
+    var ui = try dvui.testing.init(.{ .window_size = .{ .w = 900, .h = 600 } });
+    defer ui.deinit();
+    var editor = try Editor.init(t.allocator, t.io);
+    defer editor.deinit();
+    editor.filetree_visible = false;
+    cur_win = 0;
+    try editor.activeDoc().loadText("éé😀");
+    statusBar(&editor);
+    editor.startEncoding(.choose);
+    encodingDialog(&editor);
+    handleEncodingKeyGui(&editor, .{ .code = .down, .action = .down, .mod = .none });
+    handleEncodingKeyGui(&editor, .{ .code = .enter, .action = .down, .mod = .none });
+    try t.expectEqual(Editor.EncodingAction.save, editor.encoding_action);
+    _ = try ui.window.end(.{});
+    try ui.window.begin(100 * std.time.ns_per_ms);
+    encodingDialog(&editor);
+    handleEncodingKeyGui(&editor, .{ .code = .escape, .action = .down, .mod = .none });
+    _ = editor.execAction("find_replace");
+    handleModalText(&editor, "é");
+    handleFindReplaceKeyGui(&editor, .{ .code = .enter, .action = .down, .mod = .none });
+    try t.expectEqual(@as(usize, 4), editor.activeDoc().cursors.primary().offset);
+    handleFindReplaceKeyGui(&editor, .{ .code = .tab, .action = .down, .mod = .none });
+    handleFindReplaceKeyGui(&editor, .{ .code = .enter, .action = .down, .mod = .none });
+    try t.expectEqualStrings("é😀", editor.activeDoc().buffer.slice(0, editor.activeDoc().buffer.byteLen()));
+    handleModalText(&editor, "界😀");
+    handleFindReplaceKeyGui(&editor, .{ .code = .backspace, .action = .down, .mod = .none });
+    try t.expectEqualStrings("界", editor.replace_buf[0..editor.replace_buf_len]);
+    _ = try ui.window.end(.{});
+    try ui.window.begin(200 * std.time.ns_per_ms);
+    const area: dvui.Rect.Physical = .{ .x = 0, .y = 0, .w = 900, .h = 600 };
+    drawModalOverlay(&editor, area, .{ .r = area, .s = 1 }, 1);
 }

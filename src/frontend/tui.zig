@@ -1,4 +1,5 @@
 const std = @import("std");
+const text_input = @import("../core/text_input.zig");
 const vaxis = @import("vaxis");
 const Editor = @import("../core/editor.zig").Editor;
 const Document = @import("../core/document.zig").Document;
@@ -90,45 +91,14 @@ fn frameArenaDupe(bytes: []const u8) []const u8 {
     return dst;
 }
 
-/// Write a UTF-8 string to the window, one cell per codepoint (previously
-/// byte-per-cell, which rendered non-ASCII text as mojibake). Multi-byte
-/// codepoints are copied into the frame arena so the cell references stay
-/// valid through render. Returns the column after the last cell written.
+/// Copy temporary strings into frame storage, then let vaxis measure and
+/// render graphemes (including combining marks and double-width characters).
 fn writeStr(win: Window, col: u16, row: u16, text: []const u8, style: Style) u16 {
-    var x = col;
-    var i: usize = 0;
-    while (i < text.len) {
-        if (x >= win.width) break;
-        const b = text[i];
-        if (b < 0x80) {
-            // ASCII fast path — static lookup, no arena
-            win.writeCell(x, row, .{
-                .char = .{ .grapheme = ByteLut.grapheme(b), .width = 1 },
-                .style = style,
-            });
-            i += 1;
-            x += 1;
-            continue;
-        }
-        const seq_len = std.unicode.utf8ByteSequenceLength(b) catch 0;
-        if (seq_len == 0 or i + seq_len > text.len or !std.unicode.utf8ValidateSlice(text[i .. i + seq_len])) {
-            // Invalid byte — render replacement char, advance one byte to resync
-            win.writeCell(x, row, .{
-                .char = .{ .grapheme = "\u{FFFD}", .width = 1 },
-                .style = style,
-            });
-            i += 1;
-            x += 1;
-            continue;
-        }
-        win.writeCell(x, row, .{
-            .char = .{ .grapheme = frameArenaDupe(text[i .. i + seq_len]), .width = 1 },
-            .style = style,
-        });
-        i += seq_len;
-        x += 1;
-    }
-    return x;
+    return win.printSegment(.{ .text = frameArenaDupe(text), .style = style }, .{
+        .col_offset = col,
+        .row_offset = row,
+        .wrap = .none,
+    }).col;
 }
 
 // 0.16 removed these console types/functions from std.os.windows — declare
@@ -406,6 +376,9 @@ pub fn run(allocator: std.mem.Allocator, editor: *Editor) !void {
                 var msg_buf: [320]u8 = undefined;
                 drawOverlay(win, editor, editor.confirmClosePrompt(&msg_buf), "", width, height);
             },
+            .encoding_picker => drawEncodingPicker(win, editor, width, height),
+            .confirm_reopen => drawOverlay(win, editor, "Reopen: [S]ave changes / [D]iscard / [C]ancel", "", width, height),
+            .confirm_encoding => drawOverlay(win, editor, "Cannot encode text: [S]ave as UTF-8 / [C]ancel", "", width, height),
             .confirm_overwrite => {
                 drawOverlay(win, editor, "File changed on disk! [O]verwrite [R]eload [C]ancel: ", "", width, height);
             },
@@ -460,7 +433,7 @@ fn dispatchKey(editor: *Editor, key: Key) void {
     // The close-after-Save-As hand-off only spans one Save As prompt.
     if (editor.mode != .save_as) close_tab_after_save_as = false;
     // Terminal pane: route keys to PTY (except ctrl+backtick for toggle)
-    if (editor.activePaneIsTerminal()) {
+    if (editor.mode == .normal and editor.activePaneIsTerminal()) {
         handleTerminalKey(editor, key);
         return;
     }
@@ -486,6 +459,7 @@ fn dispatchKey(editor: *Editor, key: Key) void {
         .confirm_quit => handleConfirmQuitKey(editor, key),
         .confirm_close => handleConfirmCloseKey(editor, key),
         .confirm_overwrite => handleConfirmOverwriteKey(editor, key),
+        .encoding_picker, .confirm_reopen, .confirm_encoding => handleEncodingKey(editor, key),
         .settings => {
             // Settings panel is GUI-only; Escape returns to normal
             if (key.codepoint == 0x1b) editor.mode = .normal; // Escape
@@ -604,6 +578,8 @@ var filetree_band: ?FiletreeBand = null;
 /// hidden. Used for mouse hit-testing like filetree_band.
 const SearchBand = struct { y: u16, h: u16 };
 var search_band: ?SearchBand = null;
+var encoding_band: ?FiletreeBand = null;
+var encoding_picker_band: ?FiletreeBand = null;
 
 /// Double-click state for tree rows: single click on a row NAME only
 /// selects; a second click on the same row within the threshold toggles
@@ -622,6 +598,12 @@ fn drawEditor(win: Window, editor: *Editor, width: u16, height: u16) void {
     pane_rect_count = 0;
     filetree_band = null;
     search_band = null;
+    encoding_band = null;
+    encoding_picker_band = null;
+    if (!editor.activePaneIsTerminal()) {
+        const w: u16 = @intCast(@min(editor.activeDoc().format.label().len + 2, width));
+        encoding_band = .{ .x = width -| w, .y = height -| 1, .w = w, .h = 1 };
+    }
 
     const tab_bar_height: u16 = if (editor.docCount() > 1) 1 else 0;
     const status_height: u16 = 1;
@@ -1818,19 +1800,22 @@ fn drawStatusBar(win: Window, editor: *Editor, width: u16) void {
     }
 
     // Right side: cursor position — use writeStr (stack buffer)
-    var right_buf: [96]u8 = undefined;
+    var right_buf: [160]u8 = undefined;
     const cursor_count = doc.cursors.count();
     // Show the detected language (and its server once up) so it's obvious
     // what syntax/LSP applies.
     var lang_buf: [64]u8 = undefined;
     const lang_name = editor.languageStatusText(doc, &lang_buf);
     const right = if (cursor_count > 1)
-        std.fmt.bufPrint(&right_buf, "{d} cursors | Ln {d}, Col {d} | {s} ", .{ cursor_count, pos.line + 1, pos.col + 1, lang_name }) catch ""
+        std.fmt.bufPrint(&right_buf, "{d} cursors | Ln {d}, Col {d} | {s} | {s} ", .{ cursor_count, pos.line + 1, pos.col + 1, lang_name, doc.format.label() }) catch ""
     else
-        std.fmt.bufPrint(&right_buf, "Ln {d}, Col {d} | {s} ", .{ pos.line + 1, pos.col + 1, lang_name }) catch "";
+        std.fmt.bufPrint(&right_buf, "Ln {d}, Col {d} | {s} | {s} ", .{ pos.line + 1, pos.col + 1, lang_name, doc.format.label() }) catch "";
     const right_len: u16 = @intCast(@min(right.len, width));
     const right_x = width -| right_len;
     _ = writeStr(win, right_x, 0, right, style);
+    const enc = doc.format.label();
+    const enc_w: u16 = @intCast(@min(enc.len + 1, width));
+    _ = writeStr(win, width -| enc_w, 0, enc, style);
 }
 
 /// Calculate gutter width needed for line numbers.
@@ -1981,7 +1966,21 @@ fn screenToOffset(editor: *Editor, screen_x: i16, screen_y: i16) ?usize {
 
 /// Handle mouse events.
 fn handleMouse(editor: *Editor, mouse: vaxis.Mouse) void {
-    if (editor.mode != .normal) return; // ignore mouse in overlay modes
+    if (mouse.button == .left and mouse.type == .press) {
+        if (editor.mode == .encoding_picker) {
+            if (encoding_picker_band) |b| {
+                if (mouse.row >= b.y and mouse.row < b.y + b.h) editor.chooseEncoding(@as(usize, @intCast(mouse.row)) - b.y);
+            }
+            return;
+        }
+        if (editor.mode == .normal) if (encoding_band) |b| {
+            if (mouse.row == b.y and mouse.col >= b.x) {
+                editor.startEncoding(.choose);
+                return;
+            }
+        };
+    }
+    if (editor.mode != .normal) return;
 
     switch (mouse.button) {
         .left => {
@@ -2449,7 +2448,7 @@ fn drawOverlay(win: Window, editor: *Editor, label: []const u8, input: []const u
     }
 
     // Show cursor in the overlay
-    const cursor_col = label_len +| @as(u16, @intCast(@min(input.len, width -| label_len)));
+    const cursor_col = label_len +| @as(u16, @intCast(@min(win.gwidth(input), width -| label_len)));
     if (cursor_col < width) {
         win.showCursor(cursor_col, overlay_y);
         win.setCursorShape(.beam_blink);
@@ -2487,7 +2486,7 @@ fn drawSearchPanel(win: Window, editor: *Editor, width: u16, panel_h: u16) void 
         const word_s: []const u8 = if (sp.whole_word) "[W]" else " w ";
         const busy: []const u8 = if (sp.searching) "  searching…" else "";
         const cap: []const u8 = if (sp.capped) "  (capped)" else "";
-        break :blk std.fmt.bufPrint(&sbuf, "{s}{s}  {d} match(es) in {d} file(s), {d} scanned{s}{s}   Alt+C case · Alt+W word · Tab fields · Enter on Replace = replace all", .{ case_s, word_s, sp.matches.items.len, sp.paths.items.len, sp.files_searched, busy, cap }) catch "";
+        break :blk std.fmt.bufPrint(&sbuf, "{s}{s}  {d} match(es) in {d} file(s), {d} scanned, {d} skipped{s}{s}   Alt+C case · Alt+W word · Tab fields · Enter on Replace = replace all", .{ case_s, word_s, sp.matches.items.len, sp.paths.items.len, sp.files_searched, sp.files_skipped, busy, cap }) catch "";
     };
     const srow = win.child(.{ .y_off = 4, .height = 1, .width = width });
     srow.fill(.{ .style = status_style });
@@ -2590,9 +2589,13 @@ fn handleSearchKey(editor: *Editor, key: Key) void {
         sp.backspace();
         return;
     }
-    if (key.codepoint >= 32 and key.codepoint < 127) {
-        const ch: [1]u8 = .{@intCast(key.codepoint)};
-        sp.appendText(&ch);
+    if (key.mods.ctrl or key.mods.alt or key.mods.super) return;
+    if (key.text) |text| {
+        sp.appendText(text);
+    } else {
+        var bytes: [4]u8 = undefined;
+        const n = std.unicode.utf8Encode(key.codepoint, &bytes) catch return;
+        sp.appendText(bytes[0..n]);
     }
 }
 
@@ -2643,7 +2646,7 @@ fn drawFileFinder(win: Window, editor: *Editor, width: u16, height: u16) void {
         const filter_win = header_win.child(.{ .x_off = 2, .width = finder_width -| 2 });
         _ = filter_win.printSegment(.{ .text = filter, .style = input_style }, .{ .wrap = .none });
     }
-    const cursor_col = finder_x + 2 + @as(u16, @intCast(@min(filter.len, finder_width -| 2)));
+    const cursor_col = finder_x + 2 + @as(u16, @intCast(@min(win.gwidth(filter), finder_width -| 2)));
     win.showCursor(cursor_col, input_y);
     win.setCursorShape(.beam_blink);
 
@@ -2704,7 +2707,7 @@ fn drawCommandPalette(win: Window, editor: *Editor, width: u16, height: u16) voi
     }
 
     // Show cursor
-    const cursor_col = palette_x + 2 + @as(u16, @intCast(@min(filter.len, palette_width -| 2)));
+    const cursor_col = palette_x + 2 + @as(u16, @intCast(@min(win.gwidth(filter), palette_width -| 2)));
     win.showCursor(cursor_col, input_y);
     win.setCursorShape(.beam_blink);
 
@@ -2857,19 +2860,8 @@ fn drawCompletionPopup(win: Window, editor: *Editor, width: u16, height: u16) vo
 
 /// Append a character to a fixed buffer, returns new length.
 fn appendToInputBuf(buf: []u8, buf_len: *usize, key: Key) void {
-    if (key.text) |text| {
-        for (text) |ch| {
-            if (buf_len.* < buf.len) {
-                buf[buf_len.*] = ch;
-                buf_len.* += 1;
-            }
-        }
-    } else if (key.codepoint >= 32 and key.codepoint < 127) {
-        if (buf_len.* < buf.len) {
-            buf[buf_len.*] = @intCast(key.codepoint);
-            buf_len.* += 1;
-        }
-    }
+    if (key.mods.ctrl or key.mods.alt or key.mods.super) return;
+    if (key.text) |text| text_input.append(buf, buf_len, text) else text_input.appendCodepoint(buf, buf_len, key.codepoint);
 }
 
 /// Handle keys in Find mode.
@@ -2885,20 +2877,20 @@ fn handleFindKey(editor: *Editor, key: Key) void {
     if (key.codepoint == Key.enter) {
         // Find next match from current position
         if (editor.find_buf_len > 0) {
-            findNext(editor);
+            editor.findNext();
         }
         return;
     }
     if (key.codepoint == Key.backspace) {
         if (editor.find_buf_len > 0) {
-            editor.find_buf_len -= 1;
-            findIncremental(editor);
+            text_input.backspace(&editor.find_buf, &editor.find_buf_len);
+            editor.findIncremental();
         }
         return;
     }
     editor.status_message = "";
     appendToInputBuf(&editor.find_buf, &editor.find_buf_len, key);
-    findIncremental(editor);
+    editor.findIncremental();
 }
 
 /// Draw the Find & Replace two-line overlay.
@@ -2946,9 +2938,9 @@ fn drawFindReplaceOverlay(win: Window, editor: *Editor, width: u16, height: u16)
     // Cursor on active field
     const active_y = if (editor.replace_field_active) repl_y else find_y;
     const active_len: u16 = if (editor.replace_field_active)
-        @intCast(editor.replace_buf_len)
+        @intCast(win.gwidth(editor.replace_buf[0..editor.replace_buf_len]))
     else
-        @intCast(editor.find_buf_len);
+        @intCast(win.gwidth(editor.find_buf[0..editor.find_buf_len]));
     const cursor_col: u16 = @as(u16, @intCast(find_label.len)) +| active_len;
     if (cursor_col < width) {
         win.showCursor(cursor_col, active_y);
@@ -2969,28 +2961,28 @@ fn handleFindReplaceKey(editor: *Editor, key: Key) void {
         editor.replace_field_active = !editor.replace_field_active;
         return;
     }
+    // Ctrl+Enter or Ctrl+A in replace mode = replace all
+    if (key.mods.ctrl and (key.codepoint == Key.enter or key.matches('a', .{ .ctrl = true }))) {
+        editor.replaceAll();
+        return;
+    }
     if (key.codepoint == Key.enter) {
         if (!editor.replace_field_active) {
             // In find field: find next
-            if (editor.find_buf_len > 0) findNext(editor);
+            if (editor.find_buf_len > 0) editor.findNext();
         } else {
             // In replace field: replace current match and find next
-            replaceOne(editor);
+            editor.replaceOne();
         }
-        return;
-    }
-    // Ctrl+Enter or Ctrl+A in replace mode = replace all
-    if (key.mods.ctrl and (key.codepoint == Key.enter or key.matches('a', .{ .ctrl = true }))) {
-        replaceAll(editor);
         return;
     }
     if (key.codepoint == Key.backspace) {
         if (editor.replace_field_active) {
-            if (editor.replace_buf_len > 0) editor.replace_buf_len -= 1;
+            if (editor.replace_buf_len > 0) text_input.backspace(&editor.replace_buf, &editor.replace_buf_len);
         } else {
             if (editor.find_buf_len > 0) {
-                editor.find_buf_len -= 1;
-                findIncremental(editor);
+                text_input.backspace(&editor.find_buf, &editor.find_buf_len);
+                editor.findIncremental();
             }
         }
         return;
@@ -3001,63 +2993,7 @@ fn handleFindReplaceKey(editor: *Editor, key: Key) void {
         appendToInputBuf(&editor.replace_buf, &editor.replace_buf_len, key);
     } else {
         appendToInputBuf(&editor.find_buf, &editor.find_buf_len, key);
-        findIncremental(editor);
-    }
-}
-
-/// Replace the current selection (if it matches the find text) and find next.
-fn replaceOne(editor: *Editor) void {
-    const doc = editor.activeDoc();
-    const needle = editor.find_buf[0..editor.find_buf_len];
-    const replacement = editor.replace_buf[0..editor.replace_buf_len];
-    if (needle.len == 0) return;
-
-    // Check if current selection matches the needle
-    if (doc.selectedText()) |sel| {
-        if (std.mem.eql(u8, sel, needle)) {
-            // insertAtCursor replaces the active selection as one undo step
-            doc.insertAtCursor(replacement) catch {};
-        }
-    }
-    findNext(editor);
-}
-
-/// Replace all occurrences of find text with replace text.
-fn replaceAll(editor: *Editor) void {
-    const doc = editor.activeDoc();
-    const needle = editor.find_buf[0..editor.find_buf_len];
-    const replacement = editor.replace_buf[0..editor.replace_buf_len];
-    if (needle.len == 0) return;
-
-    // Start from beginning
-    doc.beginEdit() catch return;
-    defer doc.endEdit();
-    doc.cursors.primary().offset = 0;
-    doc.cursors.primary().clearSelection();
-
-    var count: usize = 0;
-    while (count < 100_000) { // safety limit
-        const content = doc.buffer.slice(0, doc.buffer.byteLen());
-        const start = doc.cursors.primary().offset;
-        if (std.mem.indexOf(u8, content[start..], needle)) |idx| {
-            const abs = start + idx;
-            doc.cursors.primary().offset = abs;
-            doc.cursors.primary().anchor = abs;
-            doc.cursors.primary().offset = abs + needle.len;
-            doc.deleteSelection() catch break;
-            doc.insertAtCursor(replacement) catch break;
-            count += 1;
-        } else break;
-    }
-
-    if (count == 0) {
-        editor.status_message = "No matches found";
-    } else {
-        const msg = std.fmt.bufPrint(&editor.status_buf, "Replaced {d} occurrence{s}", .{
-            count,
-            @as([]const u8, if (count == 1) "" else "s"),
-        }) catch "Replaced all";
-        editor.status_message = msg;
+        editor.findIncremental();
     }
 }
 
@@ -3115,78 +3051,6 @@ fn handleConfirmQuitKey(editor: *Editor, key: Key) void {
     }
 }
 
-/// Incremental search: find first match from the saved origin position.
-/// Called after each keystroke in find mode to jump to matches as user types.
-fn findIncremental(editor: *Editor) void {
-    const doc = editor.activeDoc();
-    const needle = editor.find_buf[0..editor.find_buf_len];
-    if (needle.len == 0) {
-        // Empty query — restore cursor to origin (no empty selection)
-        doc.cursors.primary().offset = editor.find_origin;
-        doc.cursors.primary().clearSelection();
-        editor.status_message = "";
-        return;
-    }
-
-    const buf_len = doc.buffer.byteLen();
-    const content = doc.buffer.slice(0, buf_len);
-    const origin = @min(editor.find_origin, buf_len);
-
-    // Search from origin forward
-    if (std.mem.indexOf(u8, content[origin..], needle)) |idx| {
-        const abs_pos = origin + idx;
-        doc.cursors.primary().anchor = abs_pos;
-        doc.cursors.primary().offset = abs_pos + needle.len;
-        doc.cursors.primary().preferred_col = doc.buffer.offsetToPos(doc.cursors.primary().offset).col;
-        editor.status_message = "";
-        return;
-    }
-    // Wrap around from beginning to origin
-    if (std.mem.indexOf(u8, content[0..origin], needle)) |idx| {
-        doc.cursors.primary().anchor = idx;
-        doc.cursors.primary().offset = idx + needle.len;
-        doc.cursors.primary().preferred_col = doc.buffer.offsetToPos(doc.cursors.primary().offset).col;
-        editor.status_message = "Search wrapped";
-        return;
-    }
-    // No match — keep cursor at origin (no empty selection)
-    doc.cursors.primary().offset = editor.find_origin;
-    doc.cursors.primary().clearSelection();
-    editor.status_message = "No matches found";
-}
-
-/// Find next occurrence of search text from cursor.
-fn findNext(editor: *Editor) void {
-    const doc = editor.activeDoc();
-    const needle = editor.find_buf[0..editor.find_buf_len];
-    if (needle.len == 0) return;
-
-    const cursor_offset = doc.cursors.primary().offset;
-    const buf_len = doc.buffer.byteLen();
-    const content = doc.buffer.slice(0, buf_len);
-
-    // Search from cursor+1 to end, then wrap around
-    const search_start = @min(cursor_offset + 1, buf_len);
-    if (std.mem.indexOf(u8, content[search_start..], needle)) |idx| {
-        const abs_pos = search_start + idx;
-        doc.cursors.primary().anchor = abs_pos;
-        doc.cursors.primary().offset = abs_pos + needle.len;
-        doc.cursors.primary().preferred_col = doc.buffer.offsetToPos(doc.cursors.primary().offset).col;
-        editor.status_message = "";
-        return;
-    }
-    // Wrap around
-    if (std.mem.indexOf(u8, content[0..search_start], needle)) |idx| {
-        doc.cursors.primary().anchor = idx;
-        doc.cursors.primary().offset = idx + needle.len;
-        doc.cursors.primary().preferred_col = doc.buffer.offsetToPos(doc.cursors.primary().offset).col;
-        editor.status_message = "Search wrapped";
-        return;
-    }
-    // No match at all
-    editor.status_message = "No matches found";
-}
-
 /// Handle keys in File Open mode.
 fn handleFileOpenKey(editor: *Editor, key: Key) void {
     if (key.isModifier()) return;
@@ -3196,15 +3060,15 @@ fn handleFileOpenKey(editor: *Editor, key: Key) void {
         return;
     }
     if (key.codepoint == Key.enter) {
+        editor.mode = .normal;
         if (editor.open_buf_len > 0) {
             const path = editor.open_buf[0..editor.open_buf_len];
             _ = editor.openFile(path) catch {};
         }
-        editor.mode = .normal;
         return;
     }
     if (key.codepoint == Key.backspace) {
-        if (editor.open_buf_len > 0) editor.open_buf_len -= 1;
+        if (editor.open_buf_len > 0) text_input.backspace(&editor.open_buf, &editor.open_buf_len);
         return;
     }
     appendToInputBuf(&editor.open_buf, &editor.open_buf_len, key);
@@ -3213,33 +3077,25 @@ fn handleFileOpenKey(editor: *Editor, key: Key) void {
 /// Handle keys in Save As mode.
 fn handleSaveAsKey(editor: *Editor, key: Key) void {
     if (key.isModifier()) return;
-
     if (key.codepoint == Key.escape) {
-        editor.mode = .normal;
+        editor.cancelSaveAs();
         close_tab_after_save_as = false;
         return;
     }
     if (key.codepoint == Key.enter) {
-        var saved = false;
-        if (editor.open_buf_len > 0) {
-            const path = editor.open_buf[0..editor.open_buf_len];
-            // saveDocAs = LSP forget (old uri) → write → re-detect language →
-            // file tree + extension bookkeeping; nothing on failure.
-            editor.saveDocAs(editor.activeDoc(), path) catch {
-                editor.status_message = "Save failed";
-            };
-            saved = !editor.activeDoc().dirty;
-        }
-        editor.mode = .normal;
-        // [S]ave from the close-tab prompt: the file has a name now, close its tab.
+        if (editor.open_buf_len == 0) return;
+        const id = editor.save_as_id orelse editor.activeDoc().id;
+        const saved = editor.finishSaveAs(editor.open_buf[0..editor.open_buf_len]) == .saved;
         if (close_tab_after_save_as) {
             close_tab_after_save_as = false;
-            if (saved) _ = editor.closeActiveDoc();
+            if (saved) if (editor.docIndexForId(id)) |idx| {
+                _ = editor.closeDocAt(idx);
+            };
         }
         return;
     }
     if (key.codepoint == Key.backspace) {
-        if (editor.open_buf_len > 0) editor.open_buf_len -= 1;
+        text_input.backspace(&editor.open_buf, &editor.open_buf_len);
         return;
     }
     appendToInputBuf(&editor.open_buf, &editor.open_buf_len, key);
@@ -3266,7 +3122,7 @@ fn handleFiletreePromptKey(editor: *Editor, key: Key) void {
         return;
     }
     if (key.codepoint == Key.backspace) {
-        if (editor.open_buf_len > 0) editor.open_buf_len -= 1;
+        if (editor.open_buf_len > 0) text_input.backspace(&editor.open_buf, &editor.open_buf_len);
         return;
     }
     appendToInputBuf(&editor.open_buf, &editor.open_buf_len, key);
@@ -3303,7 +3159,7 @@ fn handleFinderKey(editor: *Editor, key: Key) void {
     }
     if (key.codepoint == Key.backspace) {
         if (editor.finder_buf_len > 0) {
-            editor.finder_buf_len -= 1;
+            text_input.backspace(&editor.finder_buf, &editor.finder_buf_len);
             editor.finderRefresh();
         }
         return;
@@ -3354,7 +3210,7 @@ fn handlePaletteKey(editor: *Editor, key: Key) void {
     }
     if (key.codepoint == Key.backspace) {
         if (editor.palette_buf_len > 0) {
-            editor.palette_buf_len -= 1;
+            text_input.backspace(&editor.palette_buf, &editor.palette_buf_len);
             editor.palette_selected = 0;
         }
         return;
@@ -3425,4 +3281,86 @@ fn handleCompletionKey(editor: *Editor, key: Key) void {
             handleKey(editor, key);
         },
     }
+}
+
+fn handleEncodingKey(editor: *Editor, key: Key) void {
+    if (key.isModifier()) return;
+    switch (editor.mode) {
+        .encoding_picker => switch (key.codepoint) {
+            Key.escape => editor.cancelEncoding(),
+            Key.up => editor.encoding_selected -|= 1,
+            Key.down, Key.tab => editor.encoding_selected = (editor.encoding_selected + 1) % editor.encodingCount(),
+            Key.enter => editor.chooseEncoding(editor.encoding_selected),
+            '1'...'5' => editor.chooseEncoding(key.codepoint - '1'),
+            else => {},
+        },
+        .confirm_reopen => switch (key.codepoint) {
+            's', 'S' => editor.resolveReopen(.save),
+            'd', 'D' => editor.resolveReopen(.discard),
+            'c', 'C', Key.escape => editor.resolveReopen(.cancel),
+            else => {},
+        },
+        .confirm_encoding => switch (key.codepoint) {
+            's', 'S' => editor.resolveEncodingSave(true),
+            'c', 'C', Key.escape => editor.resolveEncodingSave(false),
+            else => {},
+        },
+        else => {},
+    }
+}
+
+fn drawEncodingPicker(win: Window, editor: *Editor, width: u16, height: u16) void {
+    const count: u16 = @intCast(editor.encodingCount());
+    const top = height -| (count + 2);
+    const style: Style = .{ .bg = toVaxis(editor.tui_theme.overlay_bg), .fg = toVaxis(editor.tui_theme.overlay_fg) };
+    const panel = win.child(.{ .y_off = @intCast(top), .width = width, .height = count + 2 });
+    panel.fill(.{ .style = style });
+    _ = writeStr(panel, 1, 0, editor.encodingTitle(), style);
+    encoding_picker_band = .{ .x = 0, .y = top + 1, .w = width, .h = count };
+    for (0..count) |idx| {
+        var buf: [80]u8 = undefined;
+        const label = std.fmt.bufPrint(&buf, " {d}. {s}", .{ idx + 1, editor.encodingLabel(idx) }) catch "";
+        var row_style = style;
+        row_style.reverse = idx == editor.encoding_selected;
+        _ = writeStr(panel, 0, @intCast(idx + 1), label, row_style);
+    }
+    _ = writeStr(panel, 1, count + 1, "Enter selects / Esc cancels", style);
+}
+
+test "TUI encoding smoke: status click picker Unicode fields and caret width" {
+    const t = std.testing;
+    var editor = try Editor.init(t.allocator, t.io);
+    defer editor.deinit();
+    editor.filetree_visible = false;
+    var screen = try vaxis.Screen.init(t.allocator, .{ .cols = 100, .rows = 30, .x_pixel = 0, .y_pixel = 0 });
+    defer screen.deinit(t.allocator);
+    const win: Window = .{ .x_off = 0, .y_off = 0, .parent_x_off = 0, .parent_y_off = 0, .width = 100, .height = 30, .screen = &screen };
+    frameArenaReset();
+    drawEditor(win, &editor, 100, 30);
+    try t.expect(encoding_band != null);
+    try t.expectEqualStrings("U", screen.readCell(94, 29).?.char.grapheme);
+    handleMouse(&editor, .{ .row = 29, .col = 98, .button = .left, .type = .press, .mods = .{} });
+    try t.expectEqual(Editor.Mode.encoding_picker, editor.mode);
+    drawEncodingPicker(win, &editor, 100, 30);
+    handleEncodingKey(&editor, .{ .codepoint = Key.down });
+    handleEncodingKey(&editor, .{ .codepoint = Key.enter });
+    try t.expectEqual(Editor.EncodingAction.save, editor.encoding_action);
+    handleEncodingKey(&editor, .{ .codepoint = Key.escape });
+    try editor.activeDoc().loadText("éé😀");
+    _ = editor.execAction("find_replace");
+    handleFindReplaceKey(&editor, .{ .codepoint = 'é', .text = "é" });
+    try t.expectEqualStrings("é", editor.find_buf[0..editor.find_buf_len]);
+    handleFindReplaceKey(&editor, .{ .codepoint = Key.enter });
+    try t.expectEqual(@as(usize, 4), editor.activeDoc().cursors.primary().offset);
+    handleFindReplaceKey(&editor, .{ .codepoint = Key.tab });
+    handleFindReplaceKey(&editor, .{ .codepoint = Key.enter });
+    try t.expectEqualStrings("é😀", editor.activeDoc().buffer.slice(0, editor.activeDoc().buffer.byteLen()));
+    handleFindReplaceKey(&editor, .{ .codepoint = 0x754c });
+    handleFindReplaceKey(&editor, .{ .codepoint = Key.backspace });
+    try t.expectEqual(@as(usize, 0), editor.replace_buf_len);
+    drawOverlay(win, &editor, "Open: ", "é界😀", 100, 30);
+    try t.expectEqual(@as(u16, 11), screen.cursor.col);
+    editor.search.field = .query;
+    handleSearchKey(&editor, .{ .codepoint = 0x754c });
+    try t.expectEqualStrings("界", editor.search.query());
 }

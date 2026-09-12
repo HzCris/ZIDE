@@ -62,11 +62,12 @@ pub const Buffer = struct {
     pub fn loadText(self: *Buffer, text: []const u8) !void {
         const gap_size: usize = @max(text.len / 4, 256);
         const total = text.len + gap_size;
-        if (self.data.len < total) {
-            if (self.data.len > 0) self.allocator.free(self.data);
-            self.data = try self.allocator.alloc(u8, total);
-        }
-        @memcpy(self.data[0..text.len], text);
+        const data = try self.allocator.alloc(u8, total);
+        errdefer self.allocator.free(data);
+        try self.line_starts.ensureTotalCapacity(self.allocator, std.mem.count(u8, text, "\n") + 1);
+        @memcpy(data[0..text.len], text);
+        if (self.data.len > 0) self.allocator.free(self.data);
+        self.data = data;
         self.content_len = text.len;
         self.gap_start = text.len;
         self.version +%= 1;
@@ -75,38 +76,17 @@ pub const Buffer = struct {
 
     /// Load a file into the buffer.
     pub fn loadFile(self: *Buffer, io: std.Io, path: []const u8) !void {
-        const file = try std.Io.Dir.cwd().openFile(io, path, .{});
-        defer file.close(io);
-        const size: usize = @intCast(try file.length(io));
-
-        const gap_size: usize = @max(size / 4, 1024);
-        const total = size + gap_size;
-        if (self.data.len < total) {
-            if (self.data.len > 0) self.allocator.free(self.data);
-            self.data = try self.allocator.alloc(u8, total);
-        }
-        // Tolerate short reads (file shrank between length() and read).
-        var file_reader = file.reader(io, &.{});
-        const bytes = try file_reader.interface.readSliceShort(self.data[0..size]);
-        self.content_len = bytes;
-        self.gap_start = bytes;
-        self.version +%= 1;
-        try self.rebuildLineIndex();
+        const decoded = try @import("text_file.zig").read(self.allocator, io, path, null, std.math.maxInt(usize));
+        defer self.allocator.free(decoded.text);
+        try self.loadText(decoded.text);
     }
 
     /// Save the buffer to a file.
     pub fn saveFile(self: *const Buffer, io: std.Io, path: []const u8) !void {
-        const file = try std.Io.Dir.cwd().createFile(io, path, .{});
-        defer file.close(io);
-        // Write pre-gap content
-        if (self.gap_start > 0) {
-            try file.writeStreamingAll(io, self.data[0..self.gap_start]);
-        }
-        // Write post-gap content
-        const ge = self.gapEnd();
-        if (ge < self.data.len) {
-            try file.writeStreamingAll(io, self.data[ge..]);
-        }
+        const bytes = try self.allocator.alloc(u8, self.byteLen());
+        defer self.allocator.free(bytes);
+        for (bytes, 0..) |*b, i| b.* = self.byteAt(i).?;
+        try @import("text_file.zig").write(self.allocator, io, path, bytes, .{});
     }
 
     /// Total number of bytes in the buffer.
@@ -210,6 +190,15 @@ pub const Buffer = struct {
     pub fn byteAt(self: *const Buffer, offset: usize) ?u8 {
         if (offset >= self.content_len) return null;
         return self.data[self.logToPhys(offset)];
+    }
+
+    /// Owned, fallible snapshot for operations that must never treat an
+    /// allocation failure as an empty buffer (saving and batch edits).
+    pub fn textAlloc(self: *const Buffer, allocator: Allocator) ![]u8 {
+        const bytes = try allocator.alloc(u8, self.content_len);
+        @memcpy(bytes[0..self.gap_start], self.data[0..self.gap_start]);
+        @memcpy(bytes[self.gap_start..], self.data[self.gapEnd()..]);
+        return bytes;
     }
 
     // -- Internal helpers --

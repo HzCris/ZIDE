@@ -219,7 +219,7 @@ Windows terminals commonly intercept Alt combos (Windows Terminal binds Alt+arro
   - Split/close/focus commands available in View menu and command palette
 - Multiple OS windows (View menu, command palette, Ctrl+Shift+N)
   - `open_in_new_window` moves the current document into a new window — its tab goes with it and the source pane switches to the neighbouring tab (the main window gets a fresh untitled document when that was its last tab); `move_pane_to_new_window` moves the focused pane there the same way — a terminal is never shown twice, so a lone terminal pane leaves a fresh untitled document behind in the main window, and an extra window that loses its only pane closes; `detach_terminal` (Ctrl+Alt+`) is the terminal-pane shortcut for that move
-  - Every window has its own split tree and focused pane; the window with OS keyboard focus is the active one (clicking a window's title bar is enough). Keys, IME and modal prompts follow the active pane; switching windows cancels a transient prompt (finder, palette, find bar, confirm) instead of letting it act on another window's document; the Settings dialog instead stays in the window it was opened from while the other windows keep working
+  - Every window has its own split tree and focused pane; the window with OS keyboard focus is the active one (clicking a window's title bar is enough). Keys, IME and modal prompts follow the active pane; switching windows cancels transient input (finder, palette, find bar); pending save and encoding decisions follow focus while retaining their original document; the Settings dialog instead stays in the window it was opened from while the other windows keep working
   - Each window owns its tabs: a document is listed in exactly one window. Files you open or create join the window you are working in, Ctrl+Tab / Ctrl+Shift+Tab cycle that window's tabs, and showing a document in another window (tab drop, Open in New Window, a file-tree double-click while that window is active) moves its tab there. Closing the last tab of an extra window closes the window; the main window gets a fresh untitled document instead. The status bar shows that window's document (`Terminal` for a terminal pane)
   - Drag a tab out of the tab bar to move that document into a new window under the pointer; drop it on another ZIDE window to move it there; release anywhere on the same window or press Escape to cancel. Right-click a tab → Move to New Window / Close Tab (a tab with unsaved changes asks first). The main window hides its tab bar with a single document — use Ctrl+Shift+N there; extra windows always show the bar so a tab can be dragged back. Wayland has no global pointer position: the drop always opens a new window where the compositor puts it
   - The file tree and the search panel live in the main window only — their commands (Ctrl+B, Ctrl+Shift+F, Reveal in Tree) bring the main window forward
@@ -703,7 +703,8 @@ Press **F12** to jump to the definition of the symbol under the cursor. If the d
 - `zig build -Dfrontend=gui` — GUI only
 - `zig build run-tui` — Build and run TUI
 - `zig build run-gui` — Build and run GUI (alias: `run`)
-- `zig build test` — Run unit tests
+- `zig build test` — Run unit tests, including the TUI encoding/input smoke test
+- `zig build test-gui -Dfrontend=gui` — Run the GUI encoding/input smoke test in a hidden SDL window
 
 ### Toolchain & Dependencies (Zig 0.16)
 
@@ -754,6 +755,26 @@ both stdin and stdout must be a TTY.
 - `Ctrl+S` on an **untitled** buffer opens Save As (native dialog in the GUI, path prompt in the TUI)
 - Quit-with-unsaved-changes (`[S]ave`) only quits if **every** dirty document saved; otherwise it cancels and reports how many failed
 - Closing a dirty tab (Ctrl+W, the tab's ×, Close Tab in the File or tab menu) asks `[S]ave [D]iscard [C]ancel` for that document. `[S]ave` on an untitled buffer opens Save As (native dialog in the GUI, path prompt in the TUI) and closes the tab once the file is written — cancelling Save As keeps the tab. A file that changed on disk meanwhile gets the `[O]verwrite [R]eload [C]ancel` prompt instead and the tab stays open
+
+### File encodings
+
+Both frontends show the focused document's encoding at the bottom-right of the status bar. Click it to choose **Reopen with Encoding** or **Save with Encoding**. The command palette exposes the same controls as `file_encoding`, `reopen_with_encoding`, and `save_with_encoding`. Terminal panes hide the encoding label. In the TUI, use Up/Down and Enter, click a picker row, or press its number; Escape cancels.
+
+| Format | Opening and saving |
+|--------|-------------------|
+| UTF-8 | Default for new files, without a BOM. UTF-8 with BOM is also offered. |
+| UTF-16 LE / UTF-16 BE | BOMs are detected automatically. Explicit reopening also supports files without a BOM. Conversions write a BOM. |
+| Windows-1252 | Choose explicitly for legacy text, including accented characters and typographic punctuation. Ordinary saves retain Windows-1252. |
+
+Buffers, Lua buffer APIs, and language-server text stay in UTF-8. Ordinary saves preserve the file's encoding, BOM presence, and line endings. Files without a BOM are first tried as UTF-8; an explicit open offers an encoding picker when that does not produce supported text. Malformed encodings and decoded binary content are rejected without inserting replacement characters. Failed opens and reloads keep the current document, cursor positions, undo history, and scroll position.
+
+**Reopen with Encoding** reads and reinterprets the disk contents. A dirty document first asks Save / Discard / Cancel. A failed decode keeps its current buffer. **Save with Encoding** converts the current buffer and follows the normal save/conflict workflow; an untitled document proceeds to Save As. The format changes only after a successful save. Pending choices stay attached to the original document across tab and window changes.
+
+If Windows-1252 cannot represent edited text, saving offers **Save as UTF-8** or **Cancel** and leaves the destination intact until conversion succeeds. Autosave reports failures in the status bar without opening a dialog. Saves, Save As, autosave, closed-file replacements, and session persistence write a complete temporary sibling, synchronize it, then atomically replace the destination. Existing file permissions (including Windows DACLs and attributes) are preserved, and symlinks retain their link while the target is saved.
+
+Explicit encoding choices are remembered by file path for the current session. With `session_persistence` enabled, those choices are also saved and restored; older session files remain supported. Quick-open previews and workspace searches reuse known choices and otherwise skip files whose encoding is unresolved, malformed, binary, or unreadable. Their skipped counts are shown without interrupting with dialogs. Deliberately opening an unresolved file offers the picker. Search positions refer to decoded UTF-8 buffer bytes; closed-file replacements preserve source formats and report failed files separately from successful replacements.
+
+Find/replace, workspace search, quick open, command palette, and filename prompts accept Unicode text and remove complete code points on Backspace. Matching is literal; existing case-insensitive matching folds ASCII letters, and whole-word matching uses ASCII letters, digits, and underscores. Replace One accepts an empty replacement to delete a match. Replace All is one undoable transaction per open document and preserves every cursor and selection in undo/redo.
 
 ### Welcome Screen
 
@@ -841,7 +862,7 @@ A toggleable side panel for browsing and managing the project directory, backed 
 - **Drag in from Explorer** (GUI): drop files or folders from the OS onto the tree to copy them into the folder under the cursor; drop a file onto the editor area to open it, or a folder to re-root the tree there.
 - **Delete confirms in a clickable dialog** (GUI): Delete/Cancel buttons, with y/n/Enter/Escape still working; multi-selections show the item count. And a click anywhere off an inline create/rename entry cancels it — no Escape hunt after a mis-click.
 - Opening a file that's already open switches to its existing tab instead of duplicating it.
-- Binary files (NUL byte in the first 8 KiB — executables, images, ...) are refused instead of being loaded; this applies to every open path (tree, Ctrl+O, CLI, session restore). The GUI shows a toast ("Not opened: binary or unsupported text encoding") plus the status-bar message; the TUI uses the status bar.
+- File decoding validates the entire text. Binary or malformed data is refused; explicit opens can choose a supported encoding, while session restoration and background previews/search skip unresolved files. See **File encodings** above.
 
 ### Keys (while the tree is focused)
 | Key | Action |

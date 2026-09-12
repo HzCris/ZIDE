@@ -8,6 +8,9 @@ const UndoHistory = @import("undo.zig").UndoHistory;
 const UndoOp = @import("undo.zig").UndoOp;
 const syntax = @import("syntax.zig");
 const lsp = @import("lsp.zig");
+pub const text_file = @import("text_file.zig");
+pub const TextEncoding = text_file.TextEncoding;
+pub const TextFormat = text_file.TextFormat;
 
 /// Default display name. Ownership is tracked by pointer identity — a file
 /// literally named "untitled" must still get its heap name freed.
@@ -39,6 +42,7 @@ pub const Document = struct {
     readonly: bool = false,
     /// Whether the file uses CRLF line endings.
     crlf: bool = false,
+    format: TextFormat = .{},
     /// On-disk mtime (ns) recorded at load/save — external-change detection.
     disk_mtime: ?i96 = null,
     /// The disk copy changed under a dirty buffer (or the file vanished):
@@ -152,26 +156,28 @@ pub const Document = struct {
     }
 
     /// Open a file into this document, replacing its current content.
-    /// Refuses obviously-binary files (error.BinaryFile) — the GUI text
-    /// stack requires valid UTF-8 (dvui's textSize does `catch
-    /// unreachable` on invalid sequences, so one open .exe used to panic
-    /// every subsequent frame).
+    /// Strict decoding and preparation precede every state change.
     pub fn open(self: *Document, io: std.Io, path: []const u8) !void {
-        try self.buffer.loadFile(io, path);
-        // NUL byte in the first 8 KiB = binary. Restore an empty buffer
-        // so a caller that catches the error isn't left holding the bytes.
-        const probe_len = @min(self.buffer.byteLen(), 8192);
-        if (std.mem.indexOfScalar(u8, self.buffer.slice(0, probe_len), 0) != null) {
-            try self.buffer.loadText("");
-            return error.BinaryFile;
-        }
-        // Store owned copy of path
-        if (self.file_path) |old| {
-            self.allocator.free(old);
-        }
-        self.file_path = try self.allocator.dupe(u8, path);
-        // Extract filename for display
-        self.setDisplayNameFromPath(path);
+        return self.openWithEncoding(io, path, null);
+    }
+
+    pub fn openWithEncoding(self: *Document, io: std.Io, path: []const u8, encoding: ?TextEncoding) !void {
+        const decoded = try text_file.read(self.allocator, io, path, encoding, std.math.maxInt(usize));
+        defer self.allocator.free(decoded.text);
+        var replacement = try Buffer.init(self.allocator);
+        errdefer replacement.deinit();
+        try replacement.loadText(decoded.text);
+        replacement.version = self.buffer.version +% 1;
+        const owned_path = try self.allocator.dupe(u8, path);
+        errdefer self.allocator.free(owned_path);
+        const name = try self.allocator.dupe(u8, std.fs.path.basename(path));
+        self.buffer.deinit();
+        self.buffer = replacement;
+        if (self.file_path) |old| self.allocator.free(old);
+        if (self.display_name.ptr != default_display_name.ptr) self.allocator.free(self.display_name);
+        self.file_path = owned_path;
+        self.display_name = name;
+        self.format = decoded.format;
         self.dirty = false;
         // Stale history/highlight state from the previous content must not
         // survive — undoing across a file swap would corrupt the new buffer.
@@ -206,8 +212,16 @@ pub const Document = struct {
 
     /// Save the document to its file path.
     pub fn save(self: *Document, io: std.Io) !void {
+        return self.saveWithFormat(io, null);
+    }
+
+    pub fn saveWithFormat(self: *Document, io: std.Io, format: ?TextFormat) !void {
         const path = self.file_path orelse return error.NoFilePath;
-        try self.buffer.saveFile(io, path);
+        const chosen = format orelse self.format;
+        const text = try self.buffer.textAlloc(self.allocator);
+        defer self.allocator.free(text);
+        try text_file.write(self.allocator, io, path, text, chosen);
+        self.format = chosen;
         self.history.markSaved();
         self.dirty = false;
         self.external_changed = false;
@@ -216,14 +230,25 @@ pub const Document = struct {
 
     /// Save to a new path (Save As).
     pub fn saveAs(self: *Document, io: std.Io, path: []const u8) !void {
+        return self.saveAsWithFormat(io, path, null);
+    }
+
+    pub fn saveAsWithFormat(self: *Document, io: std.Io, path: []const u8, format: ?TextFormat) !void {
         const owned_path = try self.allocator.dupe(u8, path);
         errdefer self.allocator.free(owned_path);
-        try self.buffer.saveFile(io, path);
+        const name = try self.allocator.dupe(u8, std.fs.path.basename(path));
+        errdefer self.allocator.free(name);
+        const chosen = format orelse self.format;
+        const text = try self.buffer.textAlloc(self.allocator);
+        defer self.allocator.free(text);
+        try text_file.write(self.allocator, io, path, text, chosen);
         if (self.file_path) |old| {
             self.allocator.free(old);
         }
         self.file_path = owned_path;
-        self.setDisplayNameFromPath(path);
+        if (self.display_name.ptr != default_display_name.ptr) self.allocator.free(self.display_name);
+        self.display_name = name;
+        self.format = chosen;
         self.history.markSaved();
         self.dirty = false;
         self.external_changed = false;
@@ -252,26 +277,36 @@ pub const Document = struct {
         return st.mtime.nanoseconds != recorded;
     }
 
-    /// Re-read the file from disk, replacing buffer contents. Cursor and
-    /// scroll survive (clamped to the new content); undo history is cleared
-    /// — undoing across a content swap would corrupt the buffer. (No binary
-    /// probe here: a text file morphing to binary mid-session isn't worth
-    /// guarding.)
+    /// Re-read and validate before replacing the buffer. Preserve all cursor
+    /// and scroll state (clamped on success); failures leave history intact.
     pub fn reloadFromDisk(self: *Document, io: std.Io) !void {
+        return self.reloadWithEncoding(io, self.format.encoding);
+    }
+
+    pub fn reloadWithEncoding(self: *Document, io: std.Io, encoding: ?TextEncoding) !void {
         const path = self.file_path orelse return error.NoFilePath;
-        const cursor_offset = self.cursors.primaryConst().offset;
-        const scroll = self.scroll_top;
-        try self.buffer.loadFile(io, path);
+        const decoded = try text_file.read(self.allocator, io, path, encoding, std.math.maxInt(usize));
+        defer self.allocator.free(decoded.text);
+        var replacement = try Buffer.init(self.allocator);
+        errdefer replacement.deinit();
+        try replacement.loadText(decoded.text);
+        replacement.version = self.buffer.version +% 1;
+        self.buffer.deinit();
+        self.buffer = replacement;
+        self.format = decoded.format;
         self.dirty = false;
         self.external_changed = false;
         self.history.clear();
         self.invalidateLineStates(0);
-        self.resetCursors();
         self.detectLineEndings();
         // Content changed: bump so syncLspDocuments pushes a fresh didChange.
         self.lsp_version +%= 1;
-        self.cursors.primary().offset = cursor_mod.floorBoundary(&self.buffer, cursor_offset);
-        self.scroll_top = @min(scroll, self.buffer.lineCount() -| 1);
+        for (self.cursors.cursors.items) |*c| {
+            c.offset = cursor_mod.floorBoundary(&self.buffer, c.offset);
+            if (c.anchor) |a| c.anchor = cursor_mod.floorBoundary(&self.buffer, a);
+            c.preferred_col = self.buffer.offsetToPos(c.offset).col;
+        }
+        self.scroll_top = @min(self.scroll_top, self.buffer.lineCount() -| 1);
         self.refreshDiskMtime(io);
     }
 
@@ -315,7 +350,7 @@ pub const Document = struct {
 
     /// All allocations precede content/history mutation. Ranges use original
     /// byte offsets and must be disjoint, in descending order.
-    fn applyRanges(self: *Document, ranges: []const RangeEdit) !void {
+    pub fn applyRanges(self: *Document, ranges: []const RangeEdit) !void {
         var ops: std.ArrayList(UndoOp) = .empty;
         defer ops.deinit(self.allocator);
         var transferred = false;
@@ -588,14 +623,14 @@ pub const Document = struct {
         @memset(cur_remap, null);
         @memset(anc_remap, null);
         for (self.cursors.cursors.items[0..n_cursors], 0..) |c, i| {
-            if (c.offset >= a_start and c.offset < b_end) {
-                const p = self.buffer.offsetToPos(c.offset);
+            const p = self.buffer.offsetToPos(c.offset);
+            if (p.line == line_a or p.line == line_b) {
                 cur_remap[i] = .{ .line = if (p.line == line_a) line_b else line_a, .col = p.col };
             }
             if (c.anchor) |a| {
-                if (a >= a_start and a < b_end) {
-                    const p = self.buffer.offsetToPos(a);
-                    anc_remap[i] = .{ .line = if (p.line == line_a) line_b else line_a, .col = p.col };
+                const ap = self.buffer.offsetToPos(a);
+                if (ap.line == line_a or ap.line == line_b) {
+                    anc_remap[i] = .{ .line = if (ap.line == line_a) line_b else line_a, .col = ap.col };
                 }
             }
         }
@@ -1633,4 +1668,214 @@ test "undo allocation failure preserves buffer cursors and history" {
         return;
     }
     return error.TestUnexpectedResult;
+}
+
+test "line swaps remap EOF carets and anchors by original logical line" {
+    const t = std.testing;
+    var doc = try Document.init(t.allocator);
+    defer doc.deinit();
+    try doc.loadText("a\nbb");
+    doc.cursors.primary().offset = 4;
+    doc.cursors.primary().anchor = 2;
+    try doc.cursors.addCursor(0);
+    const before = try t.allocator.dupe(Cursor, doc.cursors.cursors.items);
+    defer t.allocator.free(before);
+    try doc.swapAdjacentLines(0);
+    try t.expectEqualStrings("bb\na", doc.buffer.slice(0, doc.buffer.byteLen()));
+    try t.expectEqual(@as(usize, 2), doc.cursors.primary().offset);
+    try t.expectEqual(@as(?usize, 0), doc.cursors.primary().anchor);
+    try t.expectEqual(@as(usize, 3), doc.cursors.cursors.items[1].offset);
+    const after = try t.allocator.dupe(Cursor, doc.cursors.cursors.items);
+    defer t.allocator.free(after);
+    _ = try doc.undoAction();
+    try t.expectEqualSlices(Cursor, before, doc.cursors.cursors.items);
+    _ = try doc.redoAction();
+    try t.expectEqualSlices(Cursor, after, doc.cursors.cursors.items);
+    try doc.loadText("a\n");
+    doc.cursors.primary().offset = 2;
+    doc.cursors.primary().anchor = 0;
+    try doc.swapAdjacentLines(0);
+    try t.expectEqualStrings("\na", doc.buffer.slice(0, doc.buffer.byteLen()));
+    try t.expectEqual(@as(usize, 0), doc.cursors.primary().offset);
+    try t.expectEqual(@as(?usize, 1), doc.cursors.primary().anchor);
+    try doc.loadText("a\nbb\nc");
+    doc.cursors.primary().offset = 6;
+    doc.cursors.primary().anchor = 5;
+    try doc.swapAdjacentLines(0);
+    try t.expectEqual(@as(usize, 6), doc.cursors.primary().offset);
+    try t.expectEqual(@as(?usize, 5), doc.cursors.primary().anchor);
+}
+
+test "save and Save As failures preserve bytes and all saved metadata" {
+    const t = std.testing;
+    var tmp = t.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(t.io, ".", t.allocator);
+    defer t.allocator.free(root);
+    const path = try std.fs.path.join(t.allocator, &.{ root, "café.txt" });
+    defer t.allocator.free(path);
+    const dest = try std.fs.path.join(t.allocator, &.{ root, "other.txt" });
+    defer t.allocator.free(dest);
+    const format: TextFormat = .{ .encoding = .windows1252 };
+    try text_file.write(t.allocator, t.io, path, "café\r\n", format);
+    try text_file.atomicWrite(t.allocator, t.io, dest, "destination");
+    var doc = try Document.init(t.allocator);
+    defer doc.deinit();
+    try doc.openWithEncoding(t.io, path, .windows1252);
+    try doc.insertAtCursor("edit ");
+    const revision = doc.history.saved_revision;
+    const stamp = doc.disk_mtime;
+    for (std.enums.values(text_file.FailureStage)) |stage| {
+        text_file.testing_failure = stage;
+        defer text_file.testing_failure = null;
+        if (doc.save(t.io)) |_| return error.ExpectedFailure else |_| {}
+        if (doc.saveAsWithFormat(t.io, dest, .{ .encoding = .utf16_be, .bom = true })) |_| return error.ExpectedFailure else |_| {}
+        try t.expectEqualStrings(path, doc.file_path.?);
+        try t.expectEqualStrings("café.txt", doc.display_name);
+        try t.expectEqualDeep(format, doc.format);
+        try t.expectEqual(revision, doc.history.saved_revision);
+        try t.expectEqual(stamp, doc.disk_mtime);
+        try t.expect(doc.dirty);
+        const old = try tmp.dir.readFileAlloc(t.io, "café.txt", t.allocator, .limited(100));
+        defer t.allocator.free(old);
+        try t.expectEqualStrings("caf\xe9\r\n", old);
+        const other = try tmp.dir.readFileAlloc(t.io, "other.txt", t.allocator, .limited(100));
+        defer t.allocator.free(other);
+        try t.expectEqualStrings("destination", other);
+        var it = tmp.dir.iterate();
+        var count: usize = 0;
+        while (try it.next(t.io)) |_| count += 1;
+        try t.expectEqual(@as(usize, 2), count);
+    }
+    try doc.insertAtCursor("😀");
+    try t.expectError(error.UnrepresentableText, doc.save(t.io));
+    try t.expectEqualDeep(format, doc.format);
+    try doc.saveWithFormat(t.io, .{});
+    try t.expectEqualDeep(TextFormat{}, doc.format);
+    try t.expect(!doc.dirty);
+}
+
+test "malformed and binary opens and reloads preserve the entire document" {
+    const t = std.testing;
+    var tmp = t.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(t.io, ".", t.allocator);
+    defer t.allocator.free(root);
+    const path = try std.fs.path.join(t.allocator, &.{ root, "text.txt" });
+    defer t.allocator.free(path);
+    try text_file.write(t.allocator, t.io, path, "a\r\nb\r\nc", .{ .encoding = .utf16_le, .bom = true });
+    var doc = try Document.init(t.allocator);
+    defer doc.deinit();
+    try doc.open(t.io, path);
+    try doc.insertAtCursor("é");
+    doc.scroll_top = 2;
+    doc.scroll_left = 3;
+    doc.cursors.primary().anchor = 0;
+    try doc.cursors.addCursor(doc.buffer.byteLen());
+    const before = try doc.buffer.textAlloc(t.allocator);
+    defer t.allocator.free(before);
+    const cursors = try t.allocator.dupe(Cursor, doc.cursors.cursors.items);
+    defer t.allocator.free(cursors);
+    const revision = doc.history.current_revision;
+    const stamp = doc.disk_mtime;
+    for ([_][]const u8{ "\xff\xfe\x00\xd8", "\xff\xfe\x00\x00", "\xff\xfe\x00" }) |bytes| {
+        try text_file.atomicWrite(t.allocator, t.io, path, bytes);
+        if (doc.reloadFromDisk(t.io)) |_| return error.ExpectedFailure else |_| {}
+        if (doc.open(t.io, path)) |_| return error.ExpectedFailure else |_| {}
+        try t.expectEqualStrings(before, doc.buffer.slice(0, doc.buffer.byteLen()));
+        try t.expectEqualSlices(Cursor, cursors, doc.cursors.cursors.items);
+        try t.expectEqual(revision, doc.history.current_revision);
+        try t.expectEqual(stamp, doc.disk_mtime);
+        try t.expectEqual(@as(usize, 2), doc.scroll_top);
+        try t.expectEqual(@as(usize, 3), doc.scroll_left);
+        try t.expect(doc.dirty and doc.crlf);
+        try t.expectEqualDeep(TextFormat{ .encoding = .utf16_le, .bom = true }, doc.format);
+    }
+}
+
+test "open and reload allocation failures preserve content history and cursors" {
+    const t = std.testing;
+    var tmp = t.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(t.io, ".", t.allocator);
+    defer t.allocator.free(root);
+    const path = try std.fs.path.join(t.allocator, &.{ root, "wide.txt" });
+    defer t.allocator.free(path);
+    try text_file.write(t.allocator, t.io, path, "new 😀\r\n", .{ .encoding = .utf16_le, .bom = true });
+    for ([_]bool{ false, true }) |reload| {
+        var completed = false;
+        for (0..64) |fail_index| {
+            var doc = try Document.init(t.allocator);
+            defer doc.deinit();
+            try doc.loadText("old\ntext");
+            try doc.setFilePath(if (reload) path else "original.txt");
+            try doc.insertAtCursor("edit ");
+            doc.cursors.primary().anchor = 0;
+            doc.scroll_top = 1;
+            doc.scroll_left = 2;
+            const before = doc.cursors.primary().*;
+            const revision = doc.history.current_revision;
+            var failing = t.FailingAllocator.init(t.allocator, .{ .fail_index = fail_index });
+            doc.allocator = failing.allocator();
+            const result = if (reload) doc.reloadWithEncoding(t.io, .utf16_le) else doc.open(t.io, path);
+            doc.allocator = t.allocator;
+            doc.buffer.allocator = t.allocator;
+            if (result) |_| {
+                try t.expectEqualStrings("new 😀\r\n", doc.buffer.slice(0, doc.buffer.byteLen()));
+                completed = true;
+                break;
+            } else |err| {
+                try t.expectEqual(error.OutOfMemory, err);
+                try t.expectEqualStrings("edit old\ntext", doc.buffer.slice(0, doc.buffer.byteLen()));
+                try t.expectEqualDeep(before, doc.cursors.primary().*);
+                try t.expectEqual(revision, doc.history.current_revision);
+                try t.expectEqual(@as(usize, 1), doc.scroll_top);
+                try t.expectEqual(@as(usize, 2), doc.scroll_left);
+                try t.expect(doc.dirty);
+                try t.expectEqualDeep(TextFormat{}, doc.format);
+                try t.expectEqualStrings(if (reload) path else "original.txt", doc.file_path.?);
+            }
+        }
+        try t.expect(completed);
+    }
+}
+
+test "every Save As allocation failure leaves destination and document unchanged" {
+    const t = std.testing;
+    var tmp = t.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(t.io, ".", t.allocator);
+    defer t.allocator.free(root);
+    const path = try std.fs.path.join(t.allocator, &.{ root, "saved.txt" });
+    defer t.allocator.free(path);
+    try text_file.atomicWrite(t.allocator, t.io, path, "original disk");
+    for (0..64) |fail_index| {
+        var doc = try Document.init(t.allocator);
+        defer doc.deinit();
+        try doc.loadText("café😀");
+        try doc.setFilePath("old.txt");
+        doc.cursors.primary().offset = 3;
+        try doc.insertAtCursor("edit"); // Interior gap exercises fallible snapshots.
+        var failing = t.FailingAllocator.init(t.allocator, .{ .fail_index = fail_index });
+        doc.allocator = failing.allocator();
+        const result = doc.saveAsWithFormat(t.io, path, .{ .encoding = .utf16_be, .bom = true });
+        doc.allocator = t.allocator;
+        if (result) |_| {
+            try t.expect(!doc.dirty);
+            return;
+        } else |err| {
+            try t.expectEqual(error.OutOfMemory, err);
+            try t.expect(doc.dirty and doc.history.canUndo());
+            try t.expectEqualStrings("old.txt", doc.file_path.?);
+            try t.expectEqualDeep(TextFormat{}, doc.format);
+            const bytes = try tmp.dir.readFileAlloc(t.io, "saved.txt", t.allocator, .limited(100));
+            defer t.allocator.free(bytes);
+            try t.expectEqualStrings("original disk", bytes);
+            var it = tmp.dir.iterate();
+            var count: usize = 0;
+            while (try it.next(t.io)) |_| count += 1;
+            try t.expectEqual(@as(usize, 1), count);
+        }
+    }
+    return error.ExpectedSuccess;
 }

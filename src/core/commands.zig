@@ -203,6 +203,9 @@ pub fn registerBuiltins(registry: *CommandRegistry) !void {
     try registry.register("toggle_comment", "Toggle comment on selected lines", cmdToggleComment);
     try registry.register("next_todo", "Jump to next TODO/FIXME/XXX/HACK/BUG/NOTE marker", cmdNextTodo);
     try registry.register("open_documentation", "Open ZIDE documentation (Documentation.md)", cmdOpenDocumentation);
+    try registry.register("file_encoding", "Choose file encoding", cmdFileEncoding);
+    try registry.register("reopen_with_encoding", "Reopen with Encoding", cmdReopenEncoding);
+    try registry.register("save_with_encoding", "Save with Encoding", cmdSaveEncoding);
     try registry.register("quick_open", "Fuzzy-find a file in the workspace (live preview)", cmdQuickOpen);
     try registry.register("find_in_files", "Search & replace across the workspace (results panel)", cmdFindInFiles);
     try registry.register("next_result", "Jump to the next workspace search result", cmdNextResult);
@@ -1450,4 +1453,14 @@ test "keyboard delete commands remove complete characters" {
     doc.cursors.primary().moveToStart();
     cmdDeleteForward(&editor, null);
     try t.expectEqual(@as(usize, 0), doc.buffer.byteLen());
+}
+
+fn cmdFileEncoding(editor: *Editor, _: ?[]const u8) void {
+    editor.startEncoding(.choose);
+}
+fn cmdReopenEncoding(editor: *Editor, _: ?[]const u8) void {
+    editor.startEncoding(.reopen);
+}
+fn cmdSaveEncoding(editor: *Editor, _: ?[]const u8) void {
+    editor.startEncoding(.save);
 }
