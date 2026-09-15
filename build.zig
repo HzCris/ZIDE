@@ -35,6 +35,7 @@ pub fn build(b: *std.Build) void {
         const gui_options = b.addOptions();
         gui_options.addOption(bool, "has_gui", true);
         gui_options.addOption(bool, "has_gpu", use_gpu);
+        gui_options.addOption(bool, "test_tools", false);
 
         const gui_mod = b.createModule(.{
             .root_source_file = b.path("src/main.zig"),
@@ -73,9 +74,9 @@ pub fn build(b: *std.Build) void {
 
         b.installArtifact(gui_exe);
 
-        const gui_smoke = b.addTest(.{ .root_module = gui_mod, .filters = &.{"GUI encoding smoke"} });
+        const gui_smoke = b.addTest(.{ .root_module = gui_mod, .filters = &.{"GUI "} });
         const run_gui_smoke = b.addRunArtifact(gui_smoke);
-        b.step("test-gui", "Run GUI encoding/input smoke tests in a hidden SDL window").dependOn(&run_gui_smoke.step);
+        b.step("test-gui", "Run GUI smoke tests in hidden SDL windows").dependOn(&run_gui_smoke.step);
 
         const run_gui = b.addRunArtifact(gui_exe);
         run_gui.step.dependOn(b.getInstallStep());
@@ -94,6 +95,7 @@ pub fn build(b: *std.Build) void {
         const tui_options = b.addOptions();
         tui_options.addOption(bool, "has_gui", false);
         tui_options.addOption(bool, "has_gpu", false);
+        tui_options.addOption(bool, "test_tools", false);
 
         const tui_mod = b.createModule(.{
             .root_source_file = b.path("src/main.zig"),
@@ -127,6 +129,18 @@ pub fn build(b: *std.Build) void {
     const test_options = b.addOptions();
     test_options.addOption(bool, "has_gui", false);
     test_options.addOption(bool, "has_gpu", false);
+    test_options.addOption(bool, "test_tools", b.option(bool, "test-tools", "Run integration tests requiring ZLS, Python, Git, and LLDB") orelse false);
+    test_options.addOption([]const u8, "zig_exe", b.graph.zig_exe);
+    const probe_options = b.addOptions();
+    probe_options.addOption(bool, "has_gui", false);
+    probe_options.addOption(bool, "has_gpu", false);
+    probe_options.addOption(bool, "test_tools", false);
+    const probe_module = b.createModule(.{ .root_source_file = b.path("src/recovery_probe.zig"), .target = target, .optimize = optimize });
+    probe_module.addOptions("build_options", probe_options);
+    probe_module.addImport("zlua", ziglua_dep.module("zlua"));
+    probe_module.addImport("vaxis", vaxis_dep.module("vaxis"));
+    const recovery_probe = b.addExecutable(.{ .name = "recovery-probe", .root_module = probe_module });
+    test_options.addOptionPath("recovery_probe", recovery_probe.getEmittedBin());
 
     const test_mod = b.createModule(.{
         .root_source_file = b.path("src/main.zig"),
@@ -140,6 +154,7 @@ pub fn build(b: *std.Build) void {
 
     const tests = b.addTest(.{
         .root_module = test_mod,
+        .filters = b.option([]const []const u8, "test-filter", "Only run core tests whose names contain a filter") orelse &.{},
     });
 
     const run_tests = b.addRunArtifact(tests);

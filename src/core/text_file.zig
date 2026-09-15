@@ -26,10 +26,23 @@ pub const formats = [_]TextFormat{
 pub const Decoded = struct { text: []u8, format: TextFormat };
 
 pub fn pathKey(allocator: Allocator, io: std.Io, path: []const u8) ![]u8 {
-    const root = try std.Io.Dir.cwd().realPathFileAlloc(io, ".", allocator);
-    defer allocator.free(root);
-    return std.fs.path.resolve(allocator, &.{ root, path });
+    return @import("file_identity.zig").key(allocator, io, path);
 }
+
+pub const Stamp = struct {
+    inode: std.Io.File.INode,
+    size: u64,
+    mtime: i96,
+
+    pub fn read(io: std.Io, path: []const u8) !?Stamp {
+        const st = std.Io.Dir.cwd().statFile(io, path, .{}) catch |err| switch (err) {
+            error.FileNotFound => return null,
+            else => return err,
+        };
+        if (st.kind != .file) return error.NotFile;
+        return .{ .inode = st.inode, .size = st.size, .mtime = st.mtime.nanoseconds };
+    }
+};
 
 const cp1252 = [_]u21{
     0x20ac, 0,      0x201a, 0x192,  0x201e, 0x2026, 0x2020, 0x2021,

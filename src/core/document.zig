@@ -42,9 +42,11 @@ pub const Document = struct {
     readonly: bool = false,
     /// Whether the file uses CRLF line endings.
     crlf: bool = false,
+    format_rules: @import("editorconfig.zig").Properties = .{},
     format: TextFormat = .{},
     /// On-disk mtime (ns) recorded at load/save — external-change detection.
     disk_mtime: ?i96 = null,
+    disk_stamp: ?text_file.Stamp = null,
     /// The disk copy changed under a dirty buffer (or the file vanished):
     /// saving prompts before overwriting. Cleared by save/reload.
     external_changed: bool = false,
@@ -168,7 +170,7 @@ pub const Document = struct {
         errdefer replacement.deinit();
         try replacement.loadText(decoded.text);
         replacement.version = self.buffer.version +% 1;
-        const owned_path = try self.allocator.dupe(u8, path);
+        const owned_path = try @import("file_identity.zig").absolute(self.allocator, io, path);
         errdefer self.allocator.free(owned_path);
         const name = try self.allocator.dupe(u8, std.fs.path.basename(path));
         self.buffer.deinit();
@@ -234,7 +236,7 @@ pub const Document = struct {
     }
 
     pub fn saveAsWithFormat(self: *Document, io: std.Io, path: []const u8, format: ?TextFormat) !void {
-        const owned_path = try self.allocator.dupe(u8, path);
+        const owned_path = try @import("file_identity.zig").absolute(self.allocator, io, path);
         errdefer self.allocator.free(owned_path);
         const name = try self.allocator.dupe(u8, std.fs.path.basename(path));
         errdefer self.allocator.free(name);
@@ -257,6 +259,7 @@ pub const Document = struct {
 
     /// Record the file's current on-disk mtime (null when stat fails).
     pub fn refreshDiskMtime(self: *Document, io: std.Io) void {
+        self.disk_stamp = null;
         const path = self.file_path orelse {
             self.disk_mtime = null;
             return;
@@ -266,6 +269,7 @@ pub const Document = struct {
             return;
         };
         self.disk_mtime = st.mtime.nanoseconds;
+        self.disk_stamp = .{ .inode = st.inode, .size = st.size, .mtime = st.mtime.nanoseconds };
     }
 
     /// True when the disk copy no longer matches what was loaded/saved
@@ -348,15 +352,71 @@ pub const Document = struct {
 
     pub const RangeEdit = struct { start: usize, end: usize, text: []const u8 };
 
+    /// All owned data and capacity needed to commit an edit without allocation.
+    /// Preparing several documents before committing any provides workspace atomicity.
+    pub const PreparedEdit = struct {
+        allocator: Allocator,
+        id: u64,
+        version: u64,
+        depth: usize,
+        first_offset: usize = 0,
+        ops: std.ArrayList(UndoOp) = .empty,
+        before: ?[]Cursor = null,
+        after: ?[]Cursor = null,
+
+        pub fn deinit(self: *PreparedEdit) void {
+            for (self.ops.items) |op| self.allocator.free(op.text);
+            self.ops.deinit(self.allocator);
+            if (self.before) |cursors| self.allocator.free(cursors);
+            if (self.after) |cursors| self.allocator.free(cursors);
+        }
+
+        pub fn commit(self: *PreparedEdit, doc: *Document, force_group: bool) void {
+            std.debug.assert(doc.id == self.id and doc.buffer.version == self.version and doc.edit_depth == self.depth);
+            if (self.ops.items.len == 0) return;
+            if (doc.edit_depth == 0) {
+                doc.edit_before = self.before.?;
+                doc.edit_after = self.after.?;
+                self.before = null;
+                self.after = null;
+                doc.edit_revision = doc.history.current_revision;
+            }
+            doc.edit_depth += 1;
+            defer doc.endImplicitEdit();
+            const grouped = force_group or self.ops.items.len > 1;
+            if (grouped) doc.history.beginGroup();
+            defer if (grouped) doc.history.endGroup();
+            for (self.ops.items) |op| {
+                switch (op.op_type) {
+                    .insert => {
+                        _ = doc.buffer.insert(op.offset, op.text) catch unreachable;
+                        doc.cursors.adjustAfterInsert(op.offset, op.text.len);
+                    },
+                    .delete => {
+                        _ = doc.buffer.delete(op.offset, op.text.len);
+                        doc.cursors.adjustAfterDelete(op.offset, op.text.len);
+                    },
+                }
+                doc.history.appendPrepared(op);
+            }
+            self.ops.clearRetainingCapacity();
+            doc.markDirty();
+            doc.invalidateLineStates(doc.buffer.offsetToPos(self.first_offset).line);
+        }
+    };
+
     /// All allocations precede content/history mutation. Ranges use original
     /// byte offsets and must be disjoint, in descending order.
     pub fn applyRanges(self: *Document, ranges: []const RangeEdit) !void {
-        var ops: std.ArrayList(UndoOp) = .empty;
-        defer ops.deinit(self.allocator);
-        var transferred = false;
-        defer if (!transferred) {
-            for (ops.items) |op| self.allocator.free(op.text);
-        };
+        var prepared = try self.prepareRanges(ranges);
+        defer prepared.deinit();
+        prepared.commit(self, false);
+    }
+
+    pub fn prepareRanges(self: *Document, ranges: []const RangeEdit) !PreparedEdit {
+        var prepared: PreparedEdit = .{ .allocator = self.allocator, .id = self.id, .version = self.buffer.version, .depth = self.edit_depth };
+        errdefer prepared.deinit();
+        const ops = &prepared.ops;
         var bytes: usize = 0;
         var lines: usize = 0;
         var previous = self.buffer.byteLen();
@@ -376,30 +436,15 @@ pub const Document = struct {
                 lines += std.mem.count(u8, inserted, "\n");
             }
         }
-        if (ops.items.len == 0) return;
+        if (ops.items.len == 0) return prepared;
         try self.history.undo_stack.ensureUnusedCapacity(self.allocator, ops.items.len);
         try self.buffer.reserveInsert(bytes, lines);
-        try self.beginImplicitEdit();
-        defer self.endImplicitEdit();
-        const grouped = ops.items.len > 1;
-        if (grouped) self.history.beginGroup();
-        defer if (grouped) self.history.endGroup();
-        for (ops.items) |op| {
-            switch (op.op_type) {
-                .insert => {
-                    _ = self.buffer.insert(op.offset, op.text) catch unreachable;
-                    self.cursors.adjustAfterInsert(op.offset, op.text.len);
-                },
-                .delete => {
-                    _ = self.buffer.delete(op.offset, op.text.len);
-                    self.cursors.adjustAfterDelete(op.offset, op.text.len);
-                },
-            }
-            self.history.appendPrepared(op);
+        if (self.edit_depth == 0) {
+            prepared.before = try self.allocator.dupe(Cursor, self.cursors.cursors.items);
+            prepared.after = try self.allocator.alloc(Cursor, self.cursors.cursors.items.len);
         }
-        transferred = true;
-        self.markDirty();
-        self.invalidateLineStates(self.buffer.offsetToPos(ranges[ranges.len - 1].start).line);
+        prepared.first_offset = ranges[ranges.len - 1].start;
+        return prepared;
     }
 
     /// Replace one byte range and put the primary cursor after its replacement.
@@ -896,7 +941,7 @@ pub const Document = struct {
         self.display_name = self.allocator.dupe(u8, basename) catch default_display_name;
     }
 
-    fn detectLineEndings(self: *Document) void {
+    pub fn detectLineEndings(self: *Document) void {
         // Scan first few KB for \r\n
         const scan_len = @min(self.buffer.byteLen(), 8192);
         const content = self.buffer.slice(0, scan_len);

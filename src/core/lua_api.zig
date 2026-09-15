@@ -41,6 +41,8 @@ const max_event_depth = 8;
 /// events. Called from lua_settings.registerApi while the table is open.
 pub fn registerInto(lua: *Lua, editor: *Editor) void {
     editor.lua = lua;
+    @import("task_lua.zig").registerInto(lua);
+    @import("dap_lua.zig").registerInto(lua);
 
     lua.pushFunction(&luaCommand);
     lua.setField(-2, "command");
@@ -170,6 +172,12 @@ pub fn callLuaCommand(editor: *Editor, ref: i32, args: ?[]const u8) void {
 /// Drop every Lua-registered command and event handler (reload/shutdown).
 /// Registry refs are released while the state is still alive.
 pub fn cleanupLuaRefs(editor: *Editor) void {
+    // Reload cancels the old generation before its callbacks can be delivered.
+    for (editor.lua_jobs.items) |pending| {
+        editor.jobs.remove(pending.id);
+        if (editor.lua) |lua| lua.unref(zlua.registry_index, pending.ref);
+    }
+    editor.lua_jobs.clearRetainingCapacity();
     var refs: std.ArrayList(i32) = .empty;
     defer refs.deinit(editor.allocator);
     editor.commands.removeLuaCommands(&refs);
@@ -185,7 +193,8 @@ pub fn cleanupLuaRefs(editor: *Editor) void {
         list.clearRetainingCapacity();
     }
     // A removed lint extension's stale squiggles shouldn't survive reload.
-    for (editor.documents.items) |*doc| doc.clearLintDiagnostics();
+    editor.problems.clear(.lua, null);
+    for (editor.documents.items) |*doc| editor.problems.project(doc, .lua) catch {};
 }
 
 /// Full teardown for Editor.deinit (also frees the ref lists). Must run
@@ -195,19 +204,7 @@ pub fn deinitLua(editor: *Editor) void {
     inline for (comptime std.meta.tags(LuaEvent)) |ev| {
         editor.lua_event_handlers.getPtr(ev).deinit(editor.allocator);
     }
-    // Detach from spawn workers: queued results are dropped (their Lua
-    // refs die with the state); in-flight workers free the state when the
-    // last one finishes.
-    if (editor.lua_spawn) |state| {
-        state.mutex.lockUncancelable(editor.io);
-        state.alive = false;
-        for (state.jobs.items) |job| freeJob(state.allocator, job);
-        state.jobs.clearRetainingCapacity();
-        const workers_in_flight = state.active != 0;
-        state.mutex.unlock(editor.io);
-        if (!workers_in_flight) state.destroy();
-        editor.lua_spawn = null;
-    }
+    editor.lua_jobs.deinit(editor.allocator);
 }
 
 /// Re-run every extensions/*.lua after dropping prior Lua commands and
@@ -223,6 +220,8 @@ pub fn reloadExtensions(editor: *Editor) void {
     // server whose registration changed or vanished (unchanged ones keep
     // running — no clangd restart on every reload).
     editor.dropExtensionLspConfigs();
+    editor.tasks.dropExtensions(editor);
+    editor.dap.dropExtensions(editor);
     lua_settings.loadExtensions(lua);
     editor.reconcileLspClients();
     // Extensions may have (re)registered languages: re-detect every open
@@ -521,43 +520,7 @@ fn luaSetLine(state: ?*zlua.LuaState) callconv(.c) c_int {
 const spawn_stdout_limit = 4 * 1024 * 1024;
 const spawn_stderr_limit = 256 * 1024;
 
-/// A finished zide.spawn job traveling from a worker to the main thread.
-pub const LuaJob = struct {
-    /// Lua registry ref of the callback (released by the deliverer).
-    ref: i32,
-    /// Exit code, or null when the tool didn't exit normally.
-    code: ?i64,
-    stdout: []u8,
-    stderr: []u8,
-    /// Static error name when the run itself failed (spawn error, timeout,
-    /// signal, …).
-    err_name: ?[]const u8,
-};
-
-/// Shared between the editor and detached worker threads. Heap-allocated;
-/// freed by whichever side lets go last (`alive` flag + `active` count).
-pub const SpawnState = struct {
-    allocator: std.mem.Allocator,
-    io: std.Io,
-    mutex: std.Io.Mutex = .init,
-    /// Editor still consuming results (cleared in deinitLua).
-    alive: bool = true,
-    /// Worker threads in flight.
-    active: usize = 0,
-    jobs: std.ArrayList(LuaJob) = .empty,
-    wake_fn: ?*const fn () void = null,
-
-    fn destroy(self: *SpawnState) void {
-        const a = self.allocator;
-        self.jobs.deinit(a);
-        a.destroy(self);
-    }
-};
-
-fn freeJob(allocator: std.mem.Allocator, job: LuaJob) void {
-    allocator.free(job.stdout);
-    allocator.free(job.stderr);
-}
+pub const BackgroundJob = struct { id: u64, ref: i32 };
 
 fn freeArgv(allocator: std.mem.Allocator, argv: []const []const u8) void {
     for (argv) |arg| allocator.free(arg);
@@ -594,89 +557,44 @@ pub fn readArgvAlloc(lua: *Lua, allocator: std.mem.Allocator, index: i32) ?[]con
     };
 }
 
-fn ensureSpawnState(editor: *Editor) ?*SpawnState {
-    if (editor.lua_spawn) |s| return s;
-    const s = editor.allocator.create(SpawnState) catch return null;
-    s.* = .{
-        .allocator = editor.allocator,
-        .io = editor.io,
-        .wake_fn = editor.lua_wake_fn,
-    };
-    editor.lua_spawn = s;
-    return s;
-}
-
-/// Point spawn-result wakes at the frontend's loop (TUI). Also updates an
-/// already-created SpawnState.
+/// Synchronizes with in-flight wakes before the frontend is destroyed.
 pub fn setLuaWake(editor: *Editor, wake: ?*const fn () void) void {
+    editor.git.setWake(wake);
+    editor.dap.setWake(wake);
     editor.lua_wake_fn = wake;
-    if (editor.lua_spawn) |s| {
-        s.mutex.lockUncancelable(editor.io);
-        s.wake_fn = wake;
-        s.mutex.unlock(editor.io);
-    }
+    editor.jobs.setWake(wake);
+    if (editor.recovery) |*recovery| recovery.setWake(wake);
+    editor.lsp_wake_fn = wake;
+    for (editor.lsp_clients.items) |client| client.setWake(wake);
 }
 
-/// Worker thread body: run the tool, hand the result to the queue. When
-/// the editor is already gone, free everything (last worker frees state).
-fn spawnWorker(state: *SpawnState, argv: []const []const u8, ref: i32) void {
-    defer freeArgv(state.allocator, argv);
-
-    var job: LuaJob = .{ .ref = ref, .code = null, .stdout = &.{}, .stderr = &.{}, .err_name = null };
-    if (std.process.run(state.allocator, state.io, .{
-        .argv = argv,
-        .stdout_limit = .limited(spawn_stdout_limit),
-        .stderr_limit = .limited(spawn_stderr_limit),
-    })) |res| {
-        job.stdout = res.stdout;
-        job.stderr = res.stderr;
-        switch (res.term) {
-            .exited => |c| job.code = c,
-            else => job.err_name = "AbnormalExit",
-        }
-    } else |err| {
-        job.err_name = @errorName(err);
-    }
-
-    state.mutex.lockUncancelable(state.io);
-    state.active -= 1;
-    if (state.alive) {
-        state.jobs.append(state.allocator, job) catch {
-            state.mutex.unlock(state.io);
-            freeJob(state.allocator, job);
-            return; // ref stays in the registry until cleanup — OOM path
-        };
-        const wake = state.wake_fn;
-        state.mutex.unlock(state.io);
-        if (wake) |w| w();
-        return;
-    }
-    const last = state.active == 0;
-    state.mutex.unlock(state.io);
-    // Editor is gone: nobody will deliver this. The ref died (or will die)
-    // with the Lua state; only the payload needs freeing.
-    freeJob(state.allocator, job);
-    if (last) state.destroy();
-}
-
-/// Deliver finished spawn results to their Lua callbacks (main thread).
 pub fn pumpLuaJobs(editor: *Editor) void {
-    const state = editor.lua_spawn orelse return;
-    while (true) {
-        state.mutex.lockUncancelable(editor.io);
-        const job: ?LuaJob = if (state.jobs.items.len > 0) state.jobs.orderedRemove(0) else null;
-        state.mutex.unlock(editor.io);
-        deliverJobToLua(editor, job orelse break);
+    var index: usize = 0;
+    while (index < editor.lua_jobs.items.len) {
+        const pending = editor.lua_jobs.items[index];
+        const job = editor.jobs.get(pending.id) orelse {
+            _ = editor.lua_jobs.orderedRemove(index);
+            continue;
+        };
+        if (!job.isDone()) {
+            index += 1;
+            continue;
+        }
+        const result = job.snapshot(editor.allocator, false) catch {
+            index += 1;
+            continue;
+        };
+        defer result.deinit(editor.allocator);
+        // Retire the job before calling Lua: a callback may reload extensions
+        // or start more work, invalidating every list index and worker handle.
+        _ = editor.lua_jobs.orderedRemove(index);
+        editor.jobs.remove(pending.id);
+        const lua = editor.lua orelse continue;
+        defer lua.unref(zlua.registry_index, pending.ref);
+        _ = lua.getIndexRaw(zlua.registry_index, @intCast(pending.ref));
+        pushRunResult(lua, if (result.code) |code| @as(i64, code) else null, result.stdout, result.stderr, if (result.failure) |err| @errorName(err) else null);
+        lua.protectedCall(.{ .args = 1 }) catch reportLuaError(editor, lua, "spawn callback");
     }
-}
-
-fn deliverJobToLua(editor: *Editor, job: LuaJob) void {
-    defer freeJob(editor.allocator, job);
-    const lua = editor.lua orelse return;
-    defer lua.unref(zlua.registry_index, job.ref);
-    _ = lua.getIndexRaw(zlua.registry_index, @intCast(job.ref));
-    pushRunResult(lua, job.code, job.stdout, job.stderr, job.err_name);
-    lua.protectedCall(.{ .args = 1 }) catch reportLuaError(editor, lua, "spawn callback");
 }
 
 /// Push the { code, stdout, stderr, error } result table.
@@ -748,28 +666,16 @@ fn luaSpawn(state_arg: ?*zlua.LuaState) callconv(.c) c_int {
         std.log.warn("zide.spawn: second argument must be a function", .{});
         return 0;
     }
-    const spawn_state = ensureSpawnState(editor) orelse {
-        freeArgv(editor.allocator, argv);
+    defer freeArgv(editor.allocator, argv);
+    editor.lua_jobs.ensureUnusedCapacity(editor.allocator, 1) catch return 0;
+    const id = editor.jobs.start(.{ .argv = argv, .strict_output = true, .output_limit = spawn_stdout_limit + spawn_stderr_limit }) catch |err| {
+        lua.pushValue(2);
+        pushRunResult(lua, null, "", "", @errorName(err));
+        lua.protectedCall(.{ .args = 1 }) catch reportLuaError(editor, lua, "spawn callback");
         return 0;
     };
-
     lua.pushValue(2);
-    const ref = lua.ref(zlua.registry_index);
-
-    spawn_state.mutex.lockUncancelable(editor.io);
-    spawn_state.active += 1;
-    spawn_state.mutex.unlock(editor.io);
-
-    const thread = std.Thread.spawn(.{}, spawnWorker, .{ spawn_state, argv, ref }) catch {
-        spawn_state.mutex.lockUncancelable(editor.io);
-        spawn_state.active -= 1;
-        spawn_state.mutex.unlock(editor.io);
-        lua.unref(zlua.registry_index, ref);
-        freeArgv(editor.allocator, argv);
-        std.log.warn("zide.spawn: failed to start worker thread", .{});
-        return 0;
-    };
-    thread.detach();
+    editor.lua_jobs.appendAssumeCapacity(.{ .id = id, .ref = lua.ref(zlua.registry_index) });
     return 0;
 }
 
@@ -858,15 +764,12 @@ fn luaSetDiagnostics(state: ?*zlua.LuaState) callconv(.c) c_int {
         std.log.warn("zide.set_diagnostics: second argument must be a table", .{});
         return 0;
     }
-    const doc: *Document = blk: {
-        for (editor.documents.items) |*d| {
-            const dp = d.file_path orelse continue;
-            if (filetree_mod.normPathEql(dp, path_z)) break :blk d;
-        }
-        return 0; // not open — nothing to annotate
-    };
-
-    doc.clearLintDiagnostics();
+    const source = lua.toString(3) catch "lint";
+    var diagnostics: std.ArrayList(@import("lsp.zig").Diagnostic) = .empty;
+    defer {
+        for (diagnostics.items) |diagnostic| diagnostic.deinit(editor.allocator);
+        diagnostics.deinit(editor.allocator);
+    }
     const len = lua.lenRaw(2);
     var i: usize = 1;
     while (i <= len) : (i += 1) {
@@ -881,8 +784,8 @@ fn luaSetDiagnostics(state: ?*zlua.LuaState) callconv(.c) c_int {
         const severity = severityFromName(diagFieldString(lua, "severity") orelse "error");
         const message = diagFieldString(lua, "message") orelse "";
 
-        const owned_msg = doc.allocator.dupe(u8, message) catch continue;
-        doc.lint_diagnostics.append(doc.allocator, .{
+        const owned_msg = editor.allocator.dupe(u8, message) catch continue;
+        diagnostics.append(editor.allocator, .{
             .start_line = @intCast(line - 1),
             .start_col = @intCast(col - 1),
             .end_line = @intCast(line - 1),
@@ -890,8 +793,12 @@ fn luaSetDiagnostics(state: ?*zlua.LuaState) callconv(.c) c_int {
             .severity = severity,
             .message = owned_msg,
         }) catch {
-            doc.allocator.free(owned_msg);
+            editor.allocator.free(owned_msg);
         };
+    }
+    editor.problems.replace(path_z, source, .lua, null, .bytes, diagnostics.items) catch return 0;
+    for (editor.documents.items) |*doc| {
+        if (doc.file_path) |path| if (editor.pathsEqual(path, path_z)) editor.problems.project(doc, .lua) catch {};
     }
     return 0;
 }
@@ -1203,15 +1110,8 @@ test "zide.spawn delivers the result through pumpLuaJobs" {
     }
     try testing.expectEqualStrings("spawn delivered", editor.status_message);
 
-    // Let the worker fully retire before deinit so the leak checker sees
-    // the SpawnState freed on the editor side.
-    while (std.Io.Clock.now(.awake, testing.io).nanoseconds - start_ns < 10 * std.time.ns_per_s) {
-        const state = editor.lua_spawn orelse break;
-        state.mutex.lockUncancelable(testing.io);
-        const in_flight = state.active;
-        state.mutex.unlock(testing.io);
-        if (in_flight == 0) break;
-    }
+    try testing.expectEqual(@as(usize, 0), editor.lua_jobs.items.len);
+    try testing.expectEqual(@as(usize, 0), editor.jobs.jobs.items.len);
 }
 
 test "zide.set_diagnostics fills, replaces, merges, and clears" {
@@ -1255,9 +1155,13 @@ test "zide.set_diagnostics fills, replaces, merges, and clears" {
     while (it.next()) |_| seen += 1;
     try testing.expectEqual(@as(usize, 3), seen);
 
-    // Separator-normalized path matching (backslashes vs forward slashes)
-    try lua.doString(
+    // Backslashes are separators only on Windows; POSIX treats them literally.
+    try lua.doString(if (@import("builtin").os.tag == .windows)
         \\zide.set_diagnostics('C:\\fake\\lint_target.zig', {
+        \\  { line = 1, message = 'replaced' },
+        \\})
+    else
+        \\zide.set_diagnostics('C:/fake/./lint_target.zig', {
         \\  { line = 1, message = 'replaced' },
         \\})
     );
@@ -1266,7 +1170,7 @@ test "zide.set_diagnostics fills, replaces, merges, and clears" {
     // LSP list untouched by the lint replace
     try testing.expectEqual(@as(usize, 1), doc.diagnostics.items.len);
 
-    // Unknown path is ignored
+    // A closed-file finding is retained without changing this document.
     try lua.doString("zide.set_diagnostics('C:/other/file.zig', { { line = 1, message = 'x' } })");
     try testing.expectEqual(@as(usize, 1), doc.lint_diagnostics.items.len);
 

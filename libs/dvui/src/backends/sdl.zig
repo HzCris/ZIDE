@@ -71,6 +71,8 @@ pub const InitOptions = struct {
     /// Set the maximum size of the window
     max_size: ?dvui.Size = null,
     vsync: bool,
+    /// Explicit driver, frozen after primary-window initialization.
+    renderer_driver: ?[:0]const u8 = null,
     /// The application title to display
     title: [:0]const u8,
     /// content of a PNG image (or any other format stb_image can load)
@@ -118,10 +120,12 @@ pub fn initSDL() !void {
 
 pub fn initWindow(init_options: InitOptions) !SDLBackend {
     try initSDL();
+    errdefer c.SDL_Quit();
     const new = try createWindowRenderer(init_options);
 
     var back = init(init_options.io, new.win, new.renderer);
     back.init_opts_save = init_options;
+    if (sdl3) back.init_opts_save.?.renderer_driver = std.mem.span(c.SDL_GetRendererName(new.renderer));
 
     try configureBackend(&back, init_options);
 
@@ -141,6 +145,7 @@ pub fn initWindowSecondary(parent: *SDLBackend, child_win_opts: dvui.OsWindowWid
         .min_size = child_win_opts.min_size orelse parent_opts.min_size,
         .max_size = child_win_opts.max_size orelse parent_opts.max_size,
         .vsync = parent_opts.vsync,
+        .renderer_driver = parent_opts.renderer_driver,
         .title = child_win_opts.title orelse parent_opts.title,
         .icon = child_win_opts.icon orelse parent_opts.icon,
         .hidden = child_win_opts.hidden,
@@ -163,6 +168,18 @@ pub fn initWindowSecondary(parent: *SDLBackend, child_win_opts: dvui.OsWindowWid
 
 // Helper function that do the actualy SDL create thingy
 fn createWindowRenderer(options: InitOptions) !struct { win: *c.SDL_Window, renderer: *c.SDL_Renderer } {
+    if (sdl3) if (options.renderer_driver) |name| {
+        if (std.mem.eql(u8, name, "software")) {
+            const video = c.SDL_GetCurrentVideoDriver();
+            const wayland = video != null and std.mem.eql(u8, std.mem.span(video), "wayland");
+            // ZIDE patch: SDL's Wayland driver has no native window framebuffer.
+            // CPU rasterization needs a texture-backed presentation surface there.
+            // An explicit list also keeps later global renderer hints from changing
+            // the presentation path of secondary software windows.
+            _ = c.SDL_SetHintWithPriority("SDL_FRAMEBUFFER_ACCELERATION", if (wayland) "opengles2,opengl,vulkan,gpu" else "0", c.SDL_HINT_OVERRIDE);
+            if (wayland) log.info("Software drawing on Wayland uses a graphics API for presentation; X11 supports native software framebuffers", .{});
+        }
+    };
     var hidden = options.hidden;
     var show_window_in_begin = false;
     if (dvui.accesskit_enabled and !hidden) {
@@ -206,16 +223,18 @@ fn createWindowRenderer(options: InitOptions) !struct { win: *c.SDL_Window, rend
             "SDL_SetPointerProperty in initWindow",
         );
 
-        if (options.vsync) {
+        if (options.renderer_driver) |name| {
             try toErr(
-                c.SDL_SetNumberProperty(props, c.SDL_PROP_RENDERER_CREATE_PRESENT_VSYNC_NUMBER, 1),
-                "SDL_SetNumberProperty in initWindow",
+                c.SDL_SetStringProperty(props, c.SDL_PROP_RENDERER_CREATE_NAME_STRING, name),
+                "SDL_SetStringProperty renderer name",
             );
         }
 
         break :blk c.SDL_CreateRendererWithProperties(props) orelse return logErr("SDL_CreateRendererWithProperties in initWindow");
     };
     errdefer c.SDL_DestroyRenderer(renderer);
+    // Unsupported VSync is a performance preference, not a startup failure.
+    if (sdl3 and options.vsync) _ = c.SDL_SetRenderVSync(renderer, 1);
 
     // do premultiplied alpha blending:
     // * rendering to a texture and then rendering the texture works the same

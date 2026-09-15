@@ -215,6 +215,7 @@ pub fn run(allocator: std.mem.Allocator, editor: *Editor) !void {
     // Search worker results wake the blocking loop the same way.
     editor.search.wake_fn = &terminalWakeFn;
     @import("../core/lua_api.zig").setLuaWake(editor, &luaJobWakeFn);
+    defer @import("../core/lua_api.zig").setLuaWake(editor, null);
 
     // Enter alternate screen
     try vx.enterAltScreen(tty.writer());
@@ -244,9 +245,6 @@ pub fn run(allocator: std.mem.Allocator, editor: *Editor) !void {
         }
     }
 
-    // Auto-save timer
-    var last_auto_save_ns: i128 = std.Io.Clock.now(.awake, editor.io).nanoseconds;
-
     // Main loop
     while (editor.running) {
         // Drain all pending events
@@ -269,15 +267,7 @@ pub fn run(allocator: std.mem.Allocator, editor: *Editor) !void {
         // Deliver finished zide.spawn results to their Lua callbacks
         editor.pumpLuaJobs();
 
-        // Auto-save check
-        if (editor.auto_save and editor.hasUnsavedChanges()) {
-            const now_ns: i128 = std.Io.Clock.now(.awake, editor.io).nanoseconds;
-            const elapsed_ms: u64 = @intCast(@divFloor(now_ns - last_auto_save_ns, std.time.ns_per_ms));
-            if (elapsed_ms >= editor.auto_save_interval_ms) {
-                _ = editor.autoSaveAll();
-                last_auto_save_ns = now_ns;
-            }
-        }
+        editor.serviceTick(std.Io.Clock.now(.awake, editor.io).nanoseconds);
 
         // File tree: pick up files created/removed outside ZIDE — cheap
         // dir-mtime probe at most every ~1.5s, full rescan only on change.
@@ -291,16 +281,6 @@ pub fn run(allocator: std.mem.Allocator, editor: *Editor) !void {
                         ft.gitRefresh();
                     }
                 }
-            }
-        }
-
-        // Open buffers: pick up external edits — reload clean docs, flag
-        // dirty ones (save then asks). Same cheap-stat cadence as the tree.
-        {
-            const poll_now: i128 = std.Io.Clock.now(.awake, editor.io).nanoseconds;
-            if (poll_now - doc_poll_ns > 1500 * std.time.ns_per_ms) {
-                doc_poll_ns = poll_now;
-                editor.pollExternalChanges();
             }
         }
 
@@ -377,10 +357,16 @@ pub fn run(allocator: std.mem.Allocator, editor: *Editor) !void {
                 drawOverlay(win, editor, editor.confirmClosePrompt(&msg_buf), "", width, height);
             },
             .encoding_picker => drawEncodingPicker(win, editor, width, height),
+            .recovery_picker => drawRecoveryPicker(win, editor, width, height),
+            .lsp_panel, .workspace_preview => drawLspPanel(win, editor, width, height),
+            .symbol_rename => drawOverlay(win, editor, "Rename symbol (Enter previews): ", editor.lsp_tools.name[0..editor.lsp_tools.name_len], width, height),
+            .tool_panel => drawToolPanel(win, editor, width, height),
+            .task_save_prompt => drawOverlay(win, editor, "Before running: [S]ave and run / [R]un saved files / [C]ancel", "", width, height),
+            .git_stage_prompt => drawOverlay(win, editor, "Stage saved contents: [S]ave and stage / [C]ancel", "", width, height),
             .confirm_reopen => drawOverlay(win, editor, "Reopen: [S]ave changes / [D]iscard / [C]ancel", "", width, height),
             .confirm_encoding => drawOverlay(win, editor, "Cannot encode text: [S]ave as UTF-8 / [C]ancel", "", width, height),
             .confirm_overwrite => {
-                drawOverlay(win, editor, "File changed on disk! [O]verwrite [R]eload [C]ancel: ", "", width, height);
+                drawOverlay(win, editor, editor.overwritePrompt(), "", width, height);
             },
             .settings => {
                 // Settings panel is GUI-only; in TUI just show a hint
@@ -414,8 +400,9 @@ pub fn run(allocator: std.mem.Allocator, editor: *Editor) !void {
 
         try vx.render(tty.writer());
 
-        // Block until next event
-        const event = try loop.nextEvent();
+        // Sleep until input/background work or the next shared deadline.
+        const micros = editor.deadlines.waitMicros(std.Io.Clock.now(.awake, editor.io).nanoseconds);
+        const event = try loop.nextEventTimeout(.{ .duration = .{ .raw = .fromMicroseconds(micros), .clock = .awake } }) orelse continue;
         switch (event) {
             .key_press => |key| dispatchKey(editor, key),
             .mouse => |mouse| handleMouse(editor, mouse),
@@ -460,6 +447,25 @@ fn dispatchKey(editor: *Editor, key: Key) void {
         .confirm_close => handleConfirmCloseKey(editor, key),
         .confirm_overwrite => handleConfirmOverwriteKey(editor, key),
         .encoding_picker, .confirm_reopen, .confirm_encoding => handleEncodingKey(editor, key),
+        .lsp_panel, .symbol_rename, .workspace_preview => handleLspKey(editor, key),
+        .tool_panel => handleToolKey(editor, key),
+        .git_stage_prompt => switch (key.codepoint) {
+            's', 'S' => editor.git.resolveStage(editor, true),
+            'c', 'C', Key.escape => editor.git.resolveStage(editor, false),
+            else => {},
+        },
+        .task_save_prompt => switch (key.codepoint) {
+            's', 'S' => editor.tasks.resolveSave(editor, .save),
+            'r', 'R' => editor.tasks.resolveSave(editor, .run),
+            'c', 'C', Key.escape => editor.tasks.resolveSave(editor, .cancel),
+            else => {},
+        },
+        .recovery_picker => switch (key.codepoint) {
+            'r', 'R' => editor.resolveRecovery(.recover),
+            'd', 'D' => editor.resolveRecovery(.discard),
+            'l', 'L', Key.escape => editor.resolveRecovery(.later),
+            else => {},
+        },
         .settings => {
             // Settings panel is GUI-only; Escape returns to normal
             if (key.codepoint == 0x1b) editor.mode = .normal; // Escape
@@ -1491,7 +1497,15 @@ fn drawContent(win: Window, doc: *Document, editor: *Editor, width: u16, height:
                 const has_diag = while (diag_it.next()) |d| {
                     if (d.start_line <= line_idx and d.end_line >= line_idx) break d;
                 } else null;
-                if (has_diag) |diag| {
+                const debug_mark = editor.dap.marker(doc.id, line_idx);
+                if (debug_mark != .none) {
+                    _ = writeStr(win, gutter_width, y, switch (debug_mark) {
+                        .execution => ">",
+                        .breakpoint => "●",
+                        .unverified => "○",
+                        .none => " ",
+                    }, gutter_sep_style);
+                } else if (has_diag) |diag| {
                     const diag_fg: Color = switch (diag.severity) {
                         .err => .{ .rgb = .{ 0xE0, 0x40, 0x40 } },
                         .warning => .{ .rgb = .{ 0xE0, 0xC0, 0x40 } },
@@ -1500,7 +1514,13 @@ fn drawContent(win: Window, doc: *Document, editor: *Editor, width: u16, height:
                     };
                     _ = writeStr(win, gutter_width, y, "!", .{ .fg = diag_fg, .bg = bg });
                 } else {
-                    _ = writeStr(win, gutter_width, y, " ", gutter_sep_style);
+                    const mark = editor.git.marker(doc, line_idx);
+                    _ = writeStr(win, gutter_width, y, switch (mark) {
+                        .none => " ",
+                        .added => "+",
+                        .modified => "~",
+                        .deleted => "-",
+                    }, gutter_sep_style);
                 }
             } else {
                 _ = writeStr(win, gutter_width, y, " ", gutter_sep_style);
@@ -3041,7 +3061,7 @@ fn handleConfirmQuitKey(editor: *Editor, key: Key) void {
         's', 'S' => editor.saveAllAndQuit(),
         'd', 'D' => {
             // Discard and quit
-            editor.running = false;
+            editor.discardAndQuit();
         },
         'c', 'C', Key.escape => {
             // Cancel — go back to normal mode
@@ -3307,6 +3327,110 @@ fn handleEncodingKey(editor: *Editor, key: Key) void {
         },
         else => {},
     }
+}
+
+fn handleLspKey(editor: *Editor, key: Key) void {
+    if (key.isModifier()) return;
+    if (key.codepoint == Key.escape) {
+        if (editor.mode == .workspace_preview) editor.lsp_tools.resolvePreview(editor, false) else editor.mode = .normal;
+    } else if (editor.mode == .symbol_rename) {
+        switch (key.codepoint) {
+            Key.enter => editor.lsp_tools.submitRename(editor),
+            Key.backspace => text_input.backspace(&editor.lsp_tools.name, &editor.lsp_tools.name_len),
+            else => appendToInputBuf(&editor.lsp_tools.name, &editor.lsp_tools.name_len, key),
+        }
+    } else switch (key.codepoint) {
+        Key.enter => if (editor.mode == .workspace_preview) {
+            editor.lsp_tools.resolvePreview(editor, true);
+        },
+        Key.up => editor.lsp_tools.scroll -|= 1,
+        Key.down => editor.lsp_tools.scroll +|= 1,
+        else => {},
+    }
+}
+
+fn drawLspPanel(win: Window, editor: *Editor, width: u16, height: u16) void {
+    const rows = @min(height, @max(5, height / 2));
+    const panel = win.child(.{ .y_off = @intCast(height -| rows), .width = width, .height = rows });
+    const style: Style = .{ .bg = toVaxis(editor.tui_theme.overlay_bg), .fg = toVaxis(editor.tui_theme.overlay_fg) };
+    panel.fill(.{ .style = style });
+    const preview = editor.mode == .workspace_preview;
+    _ = writeStr(panel, 0, 0, if (preview) "Workspace edit preview: Enter applies / Esc cancels" else "Hover: Up/Down scroll / Esc closes", style);
+    if (preview) {
+        if (editor.lsp_tools.preview) |*plan| {
+            editor.lsp_tools.scroll = @min(editor.lsp_tools.scroll, plan.files.items.len -| 1);
+            for (plan.files.items[editor.lsp_tools.scroll..], 0..) |file, i| {
+                if (i >= rows -| 1) break;
+                var buf: [1200]u8 = undefined;
+                const label = std.fmt.bufPrint(&buf, "{s} ({d} edits)", .{ file.path, file.ranges.items.len }) catch file.path;
+                _ = writeStr(panel, 0, @intCast(i + 1), label, style);
+            }
+        }
+    } else {
+        const content = editor.lsp_tools.hover orelse "";
+        editor.lsp_tools.scroll = @min(editor.lsp_tools.scroll, std.mem.count(u8, content, "\n"));
+        var lines = std.mem.splitScalar(u8, content, '\n');
+        for (0..editor.lsp_tools.scroll) |_| _ = lines.next();
+        var i: u16 = 1;
+        while (lines.next()) |line| : (i += 1) {
+            if (i >= rows) break;
+            _ = writeStr(panel, 0, i, line, style);
+        }
+    }
+}
+
+fn handleToolKey(editor: *Editor, key: Key) void {
+    if (key.isModifier()) return;
+    switch (key.codepoint) {
+        Key.escape => editor.mode = .normal,
+        Key.enter => editor.tool_panel.activate(editor),
+        Key.up => editor.tool_panel.move(editor, false),
+        Key.down => editor.tool_panel.move(editor, true),
+        Key.page_up => editor.tool_panel.page(editor, false, 20),
+        Key.page_down => editor.tool_panel.page(editor, true, 20),
+        'f', 'F' => editor.tool_panel.action(editor, 'f'),
+        's', 'S' => editor.tool_panel.action(editor, 's'),
+        'r', 'R' => editor.tool_panel.action(editor, 'r'),
+        'd', 'D' => editor.tool_panel.action(editor, 'd'),
+        'u', 'U' => editor.tool_panel.action(editor, 'u'),
+        'o', 'O' => editor.tool_panel.action(editor, 'o'),
+        else => {},
+    }
+}
+
+fn drawToolPanel(win: Window, editor: *Editor, width: u16, height: u16) void {
+    const rows = @min(height, @max(6, height * 2 / 3));
+    const panel = win.child(.{ .y_off = @intCast(height -| rows), .width = width, .height = rows });
+    const style: Style = .{ .bg = toVaxis(editor.tui_theme.overlay_bg), .fg = toVaxis(editor.tui_theme.overlay_fg) };
+    panel.fill(.{ .style = style });
+    var buf: [4096]u8 = undefined;
+    const state = &editor.tool_panel;
+    const total = state.count(editor);
+    _ = writeStr(panel, 0, 0, state.title(editor, &buf), style);
+    const visible = rows -| 2;
+    if (state.selected < state.scroll) state.scroll = state.selected;
+    if (state.selected >= state.scroll + visible) state.scroll = state.selected -| (visible -| 1);
+    if (total == 0) _ = writeStr(panel, 0, 1, "No entries. Tasks can be registered in init.lua.", style);
+    for (0..@min(visible, total -| state.scroll)) |i| {
+        const index = state.scroll + i;
+        var row_style = style;
+        row_style.reverse = index == state.selected;
+        _ = writeStr(panel, 0, @intCast(i + 1), state.row(editor, index, &buf), row_style);
+    }
+    _ = writeStr(panel, 0, rows -| 1, "Up/Down select • PgUp/PgDn scroll • Enter activates • Esc closes", style);
+}
+
+fn drawRecoveryPicker(win: Window, editor: *Editor, width: u16, height: u16) void {
+    const recovery = if (editor.recovery) |*r| r else return;
+    const count: u16 = @intCast(@min(recovery.candidates.items.len, height -| 4));
+    const panel = win.child(.{ .y_off = @intCast(height -| (count + 3)), .width = width, .height = @min(height, count + 3) });
+    const style: Style = .{ .bg = toVaxis(editor.tui_theme.overlay_bg), .fg = toVaxis(editor.tui_theme.overlay_fg) };
+    panel.fill(.{ .style = style });
+    _ = writeStr(panel, 0, 0, "Recover unsaved documents from a previous instance:", style);
+    for (recovery.candidates.items[0..count], 0..) |candidate, index| {
+        _ = writeStr(panel, 1, @intCast(index + 1), candidate.name(), style);
+    }
+    _ = writeStr(panel, 0, count + 1, "[R]ecover all / [D]iscard all / [L]ater (Esc)", style);
 }
 
 fn drawEncodingPicker(win: Window, editor: *Editor, width: u16, height: u16) void {

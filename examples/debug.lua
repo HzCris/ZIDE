@@ -1,0 +1,25 @@
+-- Copy registrations to init.lua or an extension. Build the executable in Debug mode first.
+-- Use Debug Start in the command palette; registrations do not launch an adapter.
+-- zide.register_debug_adapter({ name = "LLDB", argv = { "lldb-dap" } })
+-- zide.register_debug_config({
+--     name = "Debug ZIDE example", adapter = "LLDB", request = "launch",
+--     arguments = {
+--         program = "${workspaceFolder}/zig-out/bin/example.exe", -- omit .exe on Linux
+--         cwd = "${workspaceFolder}", stopOnEntry = false,
+--     },
+-- })
+-- zide.register_debug_config({
+--     name = "Attach to example", adapter = "LLDB", request = "attach",
+--     arguments = { pid = 12345 }, -- choose the actual target PID
+-- })
+
+-- Optional shortcuts; existing bindings can be changed by the user.
+-- zide.bind("f9", "toggle_breakpoint")
+-- zide.bind("f5", "debug_continue")
+-- zide.bind("f10", "debug_step_over")
+-- zide.bind("f11", "debug_step_in")
+
+-- Debug views: threads, stack frames, expandable scopes/variables, breakpoints and output.
+-- Stop terminates launched targets; Stop detaches from attached targets.
+-- debug_terminate explicitly requests termination of an attached target when supported.
+-- Interactive terminal launches, watches and conditional breakpoints are deferred.

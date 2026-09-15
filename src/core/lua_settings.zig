@@ -276,74 +276,64 @@ pub fn getConfigPathAlways() ?[:0]const u8 {
 pub fn writeSettingToFile(key: []const u8, value: []const u8) !void {
     const config_path = getConfigPathAlways() orelse return error.NoConfigPath;
     const io = global_io orelse return error.NoConfigPath;
-
-    // Ensure config directory exists
     const config_dir = getConfigDir() orelse return error.NoConfigPath;
-    std.Io.Dir.cwd().createDirPath(io, config_dir) catch {};
+    try std.Io.Dir.cwd().createDirPath(io, config_dir);
+    try writeSettingAt(std.heap.page_allocator, io, config_path, key, value);
+}
 
-    // Read existing file content (or empty if doesn't exist / oversized)
-    var existing: []u8 = &.{};
-    var file_existed = false;
-    if (std.Io.Dir.cwd().readFileAlloc(io, config_path, std.heap.page_allocator, .limited(1024 * 1024))) |contents| {
-        if (contents.len > 0) {
-            existing = contents;
-            file_existed = true;
-        } else {
-            std.heap.page_allocator.free(contents);
-        }
-    } else |_| {}
-    defer if (file_existed) std.heap.page_allocator.free(existing);
-
-    // Build the target line
-    var line_buf: [256]u8 = undefined;
-    const new_line = std.fmt.bufPrint(&line_buf, "zide.set(\"{s}\", {s})", .{ key, value }) catch return error.FormatFailed;
-
-    // Build search pattern: zide.set("key"
-    var pattern_buf: [128]u8 = undefined;
-    const pattern = std.fmt.bufPrint(&pattern_buf, "zide.set(\"{s}\"", .{key}) catch return error.FormatFailed;
-
-    // Write output file
-    const out_file = std.Io.Dir.cwd().createFile(io, config_path, .{}) catch return error.WriteFailed;
-    defer out_file.close(io);
-
-    if (existing.len > 0) {
-        var replaced = false;
-        var start: usize = 0;
-        while (start < existing.len) {
-            // Find end of current line
-            const line_end = std.mem.indexOfScalar(u8, existing[start..], '\n');
-            const end = if (line_end) |le| start + le else existing.len;
-            const cur_line = existing[start..end];
-
-            if (!replaced and std.mem.indexOf(u8, cur_line, pattern) != null) {
-                // Replace this line
-                out_file.writeStreamingAll(io, new_line) catch return error.WriteFailed;
-                replaced = true;
-            } else {
-                out_file.writeStreamingAll(io, cur_line) catch return error.WriteFailed;
-            }
-
-            if (line_end) |_| {
-                out_file.writeStreamingAll(io, "\n") catch return error.WriteFailed;
-                start = end + 1;
-            } else {
-                break;
-            }
-        }
-        if (!replaced) {
-            // Append new setting
-            if (existing.len > 0 and existing[existing.len - 1] != '\n') {
-                out_file.writeStreamingAll(io, "\n") catch return error.WriteFailed;
-            }
-            out_file.writeStreamingAll(io, new_line) catch return error.WriteFailed;
-            out_file.writeStreamingAll(io, "\n") catch return error.WriteFailed;
-        }
-    } else {
-        // New file — write header + setting
-        out_file.writeStreamingAll(io, "-- ZIDE settings\n") catch return error.WriteFailed;
-        out_file.writeStreamingAll(io, new_line) catch return error.WriteFailed;
-        out_file.writeStreamingAll(io, "\n") catch return error.WriteFailed;
+fn writeSettingAt(allocator: std.mem.Allocator, io: std.Io, path: []const u8, key: []const u8, value: []const u8) !void {
+    const existing = std.Io.Dir.cwd().readFileAlloc(io, path, allocator, .limited(1024 * 1024)) catch |err| switch (err) {
+        error.FileNotFound => try allocator.dupe(u8, "-- ZIDE settings\n"),
+        else => return err,
+    };
+    defer allocator.free(existing);
+    const line = try std.fmt.allocPrint(allocator, "zide.set(\"{s}\", {s})", .{ key, value });
+    defer allocator.free(line);
+    const pattern = try std.fmt.allocPrint(allocator, "zide.set(\"{s}\",", .{key});
+    defer allocator.free(pattern);
+    var output: std.ArrayList(u8) = .empty;
+    defer output.deinit(allocator);
+    var replaced = false;
+    var lines = std.mem.splitScalar(u8, existing, '\n');
+    while (lines.next()) |current| {
+        // Match a statement, never an inline example or a commented setting.
+        const trimmed = std.mem.trim(u8, current, " \t\r");
+        if (!replaced and std.mem.startsWith(u8, trimmed, pattern)) {
+            try output.appendSlice(allocator, line);
+            replaced = true;
+        } else try output.appendSlice(allocator, current);
+        if (lines.index != null) try output.append(allocator, '\n');
     }
+    if (!replaced) {
+        if (output.items.len > 0 and output.items[output.items.len - 1] != '\n') try output.append(allocator, '\n');
+        try output.appendSlice(allocator, line);
+        try output.append(allocator, '\n');
+    }
+    // Prepare all bytes before opening the destination for replacement.
+    try @import("text_file.zig").atomicWrite(allocator, io, path, output.items);
+}
+
+test "settings persistence preserves comments and propagates read failures" {
+    const t = std.testing;
+    var tmp = t.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(t.io, ".", t.allocator);
+    defer t.allocator.free(root);
+    const path = try std.fs.path.join(t.allocator, &.{ root, "init.lua" });
+    defer t.allocator.free(path);
+    try @import("text_file.zig").atomicWrite(t.allocator, t.io, path, "-- zide.set(\"tab_width\", 8)\nzide.set(\"tab_width\", 2)\n");
+    try writeSettingAt(t.allocator, t.io, path, "tab_width", "4");
+    const bytes = try tmp.dir.readFileAlloc(t.io, "init.lua", t.allocator, .limited(4096));
+    defer t.allocator.free(bytes);
+    try t.expectEqualStrings("-- zide.set(\"tab_width\", 8)\nzide.set(\"tab_width\", 4)\n", bytes);
+    // Oversized input must be preserved, rather than treated as an empty config.
+    const huge = try t.allocator.alloc(u8, 1024 * 1024 + 1);
+    defer t.allocator.free(huge);
+    @memset(huge, ' ');
+    try @import("text_file.zig").atomicWrite(t.allocator, t.io, path, huge);
+    try t.expectError(error.StreamTooLong, writeSettingAt(t.allocator, t.io, path, "tab_width", "4"));
+    const st = try tmp.dir.statFile(t.io, "init.lua", .{});
+    try t.expectEqual(@as(u64, huge.len), st.size);
 }
 
 /// Get the config directory path (~/.config/zide/).
@@ -434,6 +424,12 @@ fn luaSet(state: ?*zlua.LuaState) callconv(.c) c_int {
         if (val >= 5 and val <= 200) {
             editor.page_size = @intCast(val);
         }
+    } else if (std.mem.eql(u8, key_str, "editorconfig")) {
+        editor.editorconfig_enabled = lua.toBoolean(2);
+    } else if (std.mem.eql(u8, key_str, "recovery")) {
+        editor.recovery_enabled = lua.toBoolean(2);
+    } else if (std.mem.eql(u8, key_str, "format_on_save")) {
+        editor.lsp_tools.format_on_save = lua.toBoolean(2);
     } else if (std.mem.eql(u8, key_str, "auto_save")) {
         editor.auto_save = lua.toBoolean(2);
     } else if (std.mem.eql(u8, key_str, "auto_save_interval_ms")) {
@@ -680,6 +676,15 @@ fn luaGet(state: ?*zlua.LuaState) callconv(.c) c_int {
         return 1;
     } else if (std.mem.eql(u8, key_str, "click_clears_cursors")) {
         lua.pushBoolean(editor.click_clears_cursors);
+        return 1;
+    } else if (std.mem.eql(u8, key_str, "editorconfig")) {
+        lua.pushBoolean(editor.editorconfig_enabled);
+        return 1;
+    } else if (std.mem.eql(u8, key_str, "recovery")) {
+        lua.pushBoolean(editor.recovery_enabled);
+        return 1;
+    } else if (std.mem.eql(u8, key_str, "format_on_save")) {
+        lua.pushBoolean(editor.lsp_tools.format_on_save);
         return 1;
     } else if (std.mem.eql(u8, key_str, "session_persistence")) {
         lua.pushBoolean(editor.session_persistence);

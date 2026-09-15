@@ -501,31 +501,10 @@ pub fn frame(editor: *Editor, g: *GuiState) bool {
         }
     }
 
-    // Open buffers: pick up external edits — reload clean docs, flag dirty
-    // ones (save then asks). Same cheap-stat cadence as the tree poll.
-    {
-        const poll_now: i128 = std.Io.Clock.now(.awake, editor.io).nanoseconds;
-        if (poll_now - doc_poll_ns > 1500 * std.time.ns_per_ms) {
-            doc_poll_ns = poll_now;
-            editor.pollExternalChanges();
-        }
-    }
-
     // Pull in workspace-search results from the background worker
     _ = editor.search.drain();
 
-    // Auto-save check
-    if (editor.auto_save and editor.hasUnsavedChanges()) {
-        const now_ns: i128 = std.Io.Clock.now(.awake, editor.io).nanoseconds;
-        if (last_auto_save_ns == 0) {
-            last_auto_save_ns = now_ns;
-        }
-        const elapsed_ms: u64 = @intCast(@divFloor(now_ns - last_auto_save_ns, std.time.ns_per_ms));
-        if (elapsed_ms >= editor.auto_save_interval_ms) {
-            _ = editor.autoSaveAll();
-            last_auto_save_ns = now_ns;
-        }
-    }
+    editor.serviceTick(std.Io.Clock.now(.awake, editor.io).nanoseconds);
 
     menuBar(editor);
     modalDialogs(editor);
@@ -881,6 +860,9 @@ fn guiMode(editor: *Editor) Editor.Mode {
 fn modalDialogs(editor: *Editor) void {
     if (cur_win == editor.active_window) {
         if (editor.mode == .save_as) saveAs(editor);
+        if (editor.mode == .recovery_picker) recoveryDialog(editor);
+        if (editor.mode == .tool_panel or editor.mode == .task_save_prompt or editor.mode == .git_stage_prompt) toolDialog(editor);
+        if (editor.mode == .lsp_panel or editor.mode == .symbol_rename or editor.mode == .workspace_preview) lspDialog(editor);
         if (editor.mode == .encoding_picker or editor.mode == .confirm_reopen or editor.mode == .confirm_encoding) encodingDialog(editor);
     }
     // --- Settings dialog (modal floating window) ---
@@ -3925,7 +3907,24 @@ fn editorPane(editor: *Editor, pane_id: u8) void {
                 }
                 // Diagnostic marker: colored dot at left edge of gutter
                 if (wrap_row == 0) {
-                    if (worstDiagnosticOnLine(doc, line_idx)) |diag| {
+                    const git_mark = editor.git.marker(doc, line_idx);
+                    if (git_mark != .none) {
+                        const mark_rect: dvui.Rect.Physical = .{ .x = render_area.x + gutter_width - 2 * scale, .y = y, .w = 2 * scale, .h = if (git_mark == .deleted) 3 * scale else line_height };
+                        mark_rect.fill(.{}, .{ .color = toDvui(switch (git_mark) {
+                            .added => editor.theme.git_added,
+                            .modified => editor.theme.git_modified,
+                            .deleted => editor.theme.git_deleted,
+                            .none => editor.theme.git_modified,
+                        }), .fade = 1.0 });
+                    }
+                    const debug_mark = editor.dap.marker(doc.id, line_idx);
+                    if (debug_mark != .none) dvui.renderText(.{ .font = font, .text = switch (debug_mark) {
+                        .execution => ">",
+                        .breakpoint => "●",
+                        .unverified => "○",
+                        .none => "",
+                    }, .rs = render_rs, .p = .{ .x = render_area.x, .y = y }, .color = if (debug_mark == .execution) dvui.Color{ .r = 240, .g = 200, .b = 40 } else dvui.Color{ .r = 230, .g = 80, .b = 70 } }) catch {};
+                    if (if (debug_mark == .none) worstDiagnosticOnLine(doc, line_idx) else null) |diag| {
                         const diag_color = diagnosticColor(diag.severity);
                         const dot_r: f32 = 3 * scale;
                         const dot_cx = render_area.x + gutter_padding * 0.5;
@@ -5868,6 +5867,9 @@ fn handleModalKey(editor: *Editor, key: dvui.Event.Key) void {
         .confirm_close => handleConfirmCloseKeyGui(editor, key),
         .confirm_overwrite => handleConfirmOverwriteKeyGui(editor, key),
         .encoding_picker, .confirm_reopen, .confirm_encoding => handleEncodingKeyGui(editor, key),
+        .recovery_picker => handleRecoveryKeyGui(editor, key),
+        .lsp_panel, .symbol_rename, .workspace_preview => handleLspKeyGui(editor, key),
+        .tool_panel, .task_save_prompt, .git_stage_prompt => handleToolKeyGui(editor, key),
         .settings => {}, // DVUI dialog handles its own input (settingsDialog)
         .file_open, .save_as => {}, // handled by native dialogs in GUI
         .filetree_prompt => handleFiletreePromptKeyGui(editor, key),
@@ -6133,7 +6135,7 @@ fn handleConfirmCloseKeyGui(editor: *Editor, key: dvui.Event.Key) void {
 fn handleConfirmQuitKeyGui(editor: *Editor, key: dvui.Event.Key) void {
     switch (key.code) {
         .s => editor.saveAllAndQuit(),
-        .d => editor.running = false,
+        .d => editor.discardAndQuit(),
         .c, .escape => editor.mode = .normal,
         else => {},
     }
@@ -6153,6 +6155,9 @@ const SettingDef = struct {
 };
 
 const settings_defs = [_]SettingDef{
+    .{ .key = "format_on_save", .label = "Format on Save", .kind = .boolean, .desc = "Use language-server formatting before saving; failures abort that save" },
+    .{ .key = "recovery", .label = "Recovery", .kind = .boolean, .desc = "Keep recovery snapshots of unsaved buffers" },
+    .{ .key = "editorconfig", .label = "EditorConfig", .kind = .boolean, .desc = "Use project indentation, line-ending and whitespace rules" },
     .{ .key = "tab_width", .label = "Tab Width", .kind = .number, .desc = "Number of spaces per tab (1-16)", .min = 1, .max = 16 },
     .{ .key = "use_tabs", .label = "Use Tabs", .kind = .boolean, .desc = "Insert tabs instead of spaces" },
     .{ .key = "word_wrap", .label = "Word Wrap", .kind = .boolean, .desc = "Soft-wrap long lines in display" },
@@ -6229,6 +6234,31 @@ fn settingsDialog(editor: *Editor) void {
     defer vbox.deinit();
 
     const desc_color = toDvui(editor.theme.overlay_hint);
+
+    const renderer_settings = @import("../core/renderer_settings.zig");
+    dvui.labelNoFmt(@src(), "Renderer (applies after restarting ZIDE)", .{}, .{});
+    dvui.labelNoFmt(@src(), if (editor.renderer_is_software) "Current: Software" else "Current: Hardware accelerated", .{}, .{ .color_text = desc_color });
+    if (@import("builtin").os.tag == .linux and !build_options.has_gpu)
+        dvui.labelNoFmt(@src(), "Software uses CPU drawing; native Wayland still needs a graphics driver for presentation.", .{}, .{ .color_text = desc_color });
+    if (build_options.has_gpu) {
+        dvui.labelNoFmt(@src(), "Experimental GPU build: software mode requires the normal build.", .{}, .{ .color_text = desc_color });
+    } else {
+        var renderer_choice: usize = @intFromEnum(editor.renderer_preference);
+        if (dvui.dropdown(@src(), &renderer_settings.labels, .{ .choice = &renderer_choice }, .{}, .{ .min_size_content = .{ .w = 240 } })) {
+            const mode: renderer_settings.Mode = @enumFromInt(renderer_choice);
+            const path = renderer_settings.configPath(editor.allocator) catch null;
+            if (path) |p| {
+                defer editor.allocator.free(p);
+                if (renderer_settings.save(editor.allocator, editor.io, p, mode)) |_| {
+                    editor.renderer_preference = mode;
+                    editor.status_message = "Renderer preference saved; restart ZIDE to apply";
+                } else |_| editor.status_message = "Could not save renderer preference";
+            } else editor.status_message = "Could not find renderer configuration path";
+        }
+        if (editor.renderer_preference != editor.renderer_active) {
+            dvui.labelNoFmt(@src(), "Restart required. Existing and new windows keep the current renderer.", .{}, .{ .color_text = desc_color });
+        }
+    }
 
     for (settings_defs, 0..) |def, i| {
         var row = dvui.box(@src(), .{ .dir = .horizontal }, .{
@@ -6357,6 +6387,9 @@ fn applySettingText(editor: *Editor, key: []const u8, val: []const u8) void {
 }
 
 fn getSettingBool(editor: *const Editor, key: []const u8) bool {
+    if (std.mem.eql(u8, key, "format_on_save")) return editor.lsp_tools.format_on_save;
+    if (std.mem.eql(u8, key, "recovery")) return editor.recovery_enabled;
+    if (std.mem.eql(u8, key, "editorconfig")) return editor.editorconfig_enabled;
     if (std.mem.eql(u8, key, "use_tabs")) return editor.use_tabs;
     if (std.mem.eql(u8, key, "word_wrap")) return editor.word_wrap;
     if (std.mem.eql(u8, key, "auto_close_brackets")) return editor.auto_close_brackets;
@@ -6374,6 +6407,9 @@ fn getSettingBool(editor: *const Editor, key: []const u8) bool {
 }
 
 fn applySettingBool(editor: *Editor, key: []const u8, val: bool) void {
+    if (std.mem.eql(u8, key, "format_on_save")) editor.lsp_tools.format_on_save = val;
+    if (std.mem.eql(u8, key, "recovery")) editor.recovery_enabled = val;
+    if (std.mem.eql(u8, key, "editorconfig")) editor.editorconfig_enabled = val;
     if (std.mem.eql(u8, key, "use_tabs")) editor.use_tabs = val;
     if (std.mem.eql(u8, key, "word_wrap")) editor.word_wrap = val;
     if (std.mem.eql(u8, key, "auto_close_brackets")) editor.auto_close_brackets = val;
@@ -6941,7 +6977,7 @@ fn drawModalOverlay(editor: *Editor, render_area: dvui.Rect.Physical, render_rs:
         .confirm_overwrite => {
             const h = lh + pad * 2;
             fillBar(render_area, 0, h, bg);
-            renderOverlayText(font, "File changed on disk! [O]verwrite [R]eload [C]ancel", render_area.x + pad, render_area.y + pad, render_rs, fg);
+            renderOverlayText(font, editor.overwritePrompt(), render_area.x + pad, render_area.y + pad, render_rs, fg);
         },
         // .settings is a real DVUI floating dialog now (settingsDialog),
         // not a custom-rendered overlay.
@@ -6991,6 +7027,215 @@ fn handleEncodingKeyGui(editor: *Editor, key: dvui.Event.Key) void {
         },
         else => {},
     }
+}
+
+fn handleToolKeyGui(editor: *Editor, key: dvui.Event.Key) void {
+    if (editor.mode == .git_stage_prompt) {
+        switch (key.code) {
+            .s => editor.git.resolveStage(editor, true),
+            .c, .escape => editor.git.resolveStage(editor, false),
+            else => {},
+        }
+        return;
+    }
+    if (editor.mode == .task_save_prompt) {
+        switch (key.code) {
+            .s => editor.tasks.resolveSave(editor, .save),
+            .r => editor.tasks.resolveSave(editor, .run),
+            .c, .escape => editor.tasks.resolveSave(editor, .cancel),
+            else => {},
+        }
+        return;
+    }
+    switch (key.code) {
+        .escape => editor.mode = .normal,
+        .enter => editor.tool_panel.activate(editor),
+        .up => editor.tool_panel.move(editor, false),
+        .down => editor.tool_panel.move(editor, true),
+        .page_up => editor.tool_panel.page(editor, false, 40),
+        .page_down => editor.tool_panel.page(editor, true, 40),
+        .f => editor.tool_panel.action(editor, 'f'),
+        .s => editor.tool_panel.action(editor, 's'),
+        .r => editor.tool_panel.action(editor, 'r'),
+        .d => editor.tool_panel.action(editor, 'd'),
+        .u => editor.tool_panel.action(editor, 'u'),
+        .o => editor.tool_panel.action(editor, 'o'),
+        else => {},
+    }
+}
+
+fn toolDialog(editor: *Editor) void {
+    const mode = editor.mode;
+    var open = true;
+    var dialog = dvui.floatingWindow(@src(), .{ .modal = true, .open_flag = &open }, .{ .min_size_content = .{ .w = 650 } });
+    defer {
+        dialog.deinit();
+        if (!open and editor.mode == mode) {
+            if (mode == .task_save_prompt) editor.tasks.resolveSave(editor, .cancel) else if (mode == .git_stage_prompt) editor.git.resolveStage(editor, false) else editor.mode = .normal;
+            dvui.focusSubwindow(null, null);
+        }
+    }
+    var title: [1024]u8 = undefined;
+    dialog.dragAreaSet(dvui.windowHeader(if (mode == .task_save_prompt) "Save before running task" else if (mode == .git_stage_prompt) "Save before staging" else editor.tool_panel.title(editor, &title), "", &open));
+    var box = dvui.box(@src(), .{ .dir = .vertical }, .{ .expand = .horizontal, .padding = dvui.Rect.all(10) });
+    defer box.deinit();
+    if (mode == .git_stage_prompt) {
+        dvui.labelNoFmt(@src(), "Staging uses saved file contents. Save the dirty buffer first?", .{}, .{});
+        if (dvui.button(@src(), "Save and stage (S)", .{}, .{})) editor.git.resolveStage(editor, true);
+        if (dvui.button(@src(), "Cancel (Esc)", .{}, .{})) editor.git.resolveStage(editor, false);
+    } else if (mode == .task_save_prompt) {
+        dvui.labelNoFmt(@src(), "The task reads files on disk. Save dirty workspace documents first?", .{}, .{});
+        if (dvui.button(@src(), "Save and run (S)", .{}, .{})) editor.tasks.resolveSave(editor, .save);
+        if (dvui.button(@src(), "Run saved files (R)", .{}, .{})) editor.tasks.resolveSave(editor, .run);
+        if (dvui.button(@src(), "Cancel (Esc)", .{}, .{})) editor.tasks.resolveSave(editor, .cancel);
+    } else {
+        const state = &editor.tool_panel;
+        const total = state.count(editor);
+        switch (state.kind) {
+            .problems => {
+                if (dvui.button(@src(), "Severity (F)", .{}, .{})) state.filterSeverity();
+                if (dvui.button(@src(), "Source (S)", .{}, .{})) state.filterSource(editor);
+            },
+            .task_output => {
+                if (dvui.button(@src(), "Rerun (R)", .{}, .{})) state.action(editor, 'r');
+                if (dvui.button(@src(), "Stop (S)", .{}, .{})) state.action(editor, 's');
+            },
+            .tasks => {},
+            .changes => {
+                if (dvui.button(@src(), "Working tree diff (Enter)", .{}, .{})) state.activate(editor);
+                if (dvui.button(@src(), "Staged diff (D)", .{}, .{})) state.action(editor, 'd');
+                if (dvui.button(@src(), "Stage (S)", .{}, .{})) state.action(editor, 's');
+                if (dvui.button(@src(), "Unstage (U)", .{}, .{})) state.action(editor, 'u');
+                if (dvui.button(@src(), "Open file (O)", .{}, .{})) state.action(editor, 'o');
+                if (dvui.button(@src(), "Refresh (R)", .{}, .{})) state.action(editor, 'r');
+            },
+            .git_diff => {},
+            .debug => {
+                if (dvui.button(@src(), "Debug controls (R)", .{}, .{})) editor.dap.show(editor, .overview);
+                if (dvui.button(@src(), "Stop / detach (S)", .{}, .{})) editor.dap.stop(editor, false);
+            },
+        }
+        if (editor.mode != mode) return;
+        if (dvui.button(@src(), "Previous page (PgUp)", .{}, .{})) state.page(editor, false, 40);
+        if (dvui.button(@src(), "Next page (PgDn)", .{}, .{})) state.page(editor, true, 40);
+        {
+            var scroll = dvui.scrollArea(@src(), .{}, .{ .expand = .horizontal, .max_size_content = .{ .w = 1100, .h = 480 } });
+            defer scroll.deinit();
+            const first = state.selected / 40 * 40;
+            if (total == 0) dvui.labelNoFmt(@src(), "No entries. Register tasks in init.lua.", .{}, .{});
+            for (first..@min(total, first + 40)) |index| {
+                var buf: [4096]u8 = undefined;
+                const label = state.row(editor, index, &buf);
+                var selected_buf: [4120]u8 = undefined;
+                const display = std.fmt.bufPrint(&selected_buf, "{s}{s}", .{ if (index == state.selected) "> " else "  ", label }) catch label;
+                if (dvui.button(@src(), display, .{}, .{ .id_extra = index, .expand = .horizontal })) {
+                    state.selected = index;
+                    if (state.kind != .changes) state.activate(editor);
+                    break;
+                }
+            }
+        }
+        if (dvui.button(@src(), "Close (Esc)", .{}, .{})) open = false;
+    }
+    for (dvui.events()) |*event| {
+        if (event.handled) continue;
+        if (event.evt == .key and event.evt.key.action != .up) {
+            handleToolKeyGui(editor, event.evt.key);
+            event.handle(@src(), box.data());
+        }
+    }
+}
+
+fn handleLspKeyGui(editor: *Editor, key: dvui.Event.Key) void {
+    if (key.code == .escape) {
+        if (editor.mode == .workspace_preview) editor.lsp_tools.resolvePreview(editor, false) else editor.mode = .normal;
+    } else if (editor.mode == .workspace_preview and key.code == .enter) editor.lsp_tools.resolvePreview(editor, true);
+}
+
+fn lspDialog(editor: *Editor) void {
+    const mode = editor.mode;
+    var open = true;
+    var dialog = dvui.floatingWindow(@src(), .{ .modal = true, .open_flag = &open }, .{ .min_size_content = .{ .w = 500 } });
+    defer {
+        dialog.deinit();
+        if (!open) {
+            if (mode == .workspace_preview) editor.lsp_tools.resolvePreview(editor, false) else editor.mode = .normal;
+        }
+        if (editor.mode != mode) dvui.focusSubwindow(null, null);
+    }
+    dialog.dragAreaSet(dvui.windowHeader(if (mode == .symbol_rename) "Rename symbol" else if (mode == .workspace_preview) "Workspace edit preview" else "Hover information", "", &open));
+    var box = dvui.box(@src(), .{ .dir = .vertical }, .{ .expand = .horizontal, .padding = dvui.Rect.all(10) });
+    defer box.deinit();
+    if (mode == .symbol_rename) {
+        const entry = dvui.textEntry(@src(), .{ .text = .{ .buffer = &editor.lsp_tools.name } }, .{ .expand = .horizontal });
+        editor.lsp_tools.name_len = entry.textGet().len;
+        const entered = entry.enter_pressed;
+        entry.deinit();
+        if (entered or dvui.button(@src(), "Preview rename", .{}, .{})) editor.lsp_tools.submitRename(editor);
+    } else {
+        var scroll = dvui.scrollArea(@src(), .{}, .{ .expand = .horizontal, .max_size_content = .{ .w = 900, .h = 420 } });
+        defer scroll.deinit();
+        if (mode == .workspace_preview) {
+            if (editor.lsp_tools.preview) |*plan| for (plan.files.items, 0..) |file, i| {
+                var buf: [1200]u8 = undefined;
+                const label = std.fmt.bufPrint(&buf, "{s} ({d} edits)", .{ file.path, file.ranges.items.len }) catch file.path;
+                dvui.labelNoFmt(@src(), label, .{}, .{ .id_extra = i });
+            };
+        } else {
+            var lines = std.mem.splitScalar(u8, editor.lsp_tools.hover orelse "", '\n');
+            var i: usize = 0;
+            while (lines.next()) |line| : (i += 1) dvui.labelNoFmt(@src(), line, .{}, .{ .id_extra = i });
+        }
+    }
+    if (mode == .workspace_preview and dvui.button(@src(), "Apply edits (Enter)", .{}, .{})) editor.lsp_tools.resolvePreview(editor, true);
+    if (dvui.button(@src(), if (mode == .lsp_panel) "Close (Esc)" else "Cancel (Esc)", .{}, .{})) {
+        if (mode == .workspace_preview) editor.lsp_tools.resolvePreview(editor, false) else editor.mode = .normal;
+    }
+    for (dvui.events()) |*event| {
+        if (event.handled or event.evt != .key or event.evt.key.action == .up) continue;
+        handleLspKeyGui(editor, event.evt.key);
+        event.handle(@src(), box.data());
+        if (editor.mode != mode) break;
+    }
+}
+
+fn handleRecoveryKeyGui(editor: *Editor, key: dvui.Event.Key) void {
+    switch (key.code) {
+        .r => editor.resolveRecovery(.recover),
+        .d => editor.resolveRecovery(.discard),
+        .l, .escape => editor.resolveRecovery(.later),
+        else => {},
+    }
+}
+
+fn recoveryDialog(editor: *Editor) void {
+    var open = true;
+    var dialog = dvui.floatingWindow(@src(), .{ .modal = true, .open_flag = &open }, .{ .min_size_content = .{ .w = 440 } });
+    defer {
+        dialog.deinit();
+        if (!open) editor.resolveRecovery(.later);
+        if (editor.mode != .recovery_picker) dvui.focusSubwindow(null, null);
+    }
+    dialog.dragAreaSet(dvui.windowHeader("Recover unsaved documents", "", &open));
+    var box = dvui.box(@src(), .{ .dir = .vertical }, .{ .expand = .horizontal, .padding = dvui.Rect.all(10) });
+    defer box.deinit();
+    for (dvui.events()) |*event| {
+        if (event.handled or event.evt != .key or event.evt.key.action == .up) continue;
+        handleRecoveryKeyGui(editor, event.evt.key);
+        event.handle(@src(), box.data());
+        if (editor.mode != .recovery_picker) return;
+    }
+    dvui.labelNoFmt(@src(), "Snapshots from a previous instance of this workspace:", .{}, .{});
+    {
+        var scroll = dvui.scrollArea(@src(), .{}, .{ .expand = .horizontal, .max_size_content = .{ .w = 900, .h = 250 } });
+        defer scroll.deinit();
+        if (editor.recovery) |*recovery| for (recovery.candidates.items, 0..) |candidate, index| {
+            dvui.labelNoFmt(@src(), candidate.name(), .{}, .{ .id_extra = index });
+        };
+    }
+    if (dvui.button(@src(), "Recover all (R)", .{}, .{})) editor.resolveRecovery(.recover);
+    if (dvui.button(@src(), "Discard all (D)", .{}, .{})) editor.resolveRecovery(.discard);
+    if (dvui.button(@src(), "Later (Esc)", .{}, .{})) editor.resolveRecovery(.later);
 }
 
 fn encodingDialog(editor: *Editor) void {
@@ -7073,4 +7318,93 @@ test "GUI encoding smoke: hidden window renders picker and handles Unicode find 
     try ui.window.begin(200 * std.time.ns_per_ms);
     const area: dvui.Rect.Physical = .{ .x = 0, .y = 0, .w = 900, .h = 600 };
     drawModalOverlay(&editor, area, .{ .r = area, .s = 1 }, 1);
+}
+
+test "GUI tools smoke: hover, rename, workspace preview and recovery dialogs" {
+    if (!build_options.has_gui) return error.SkipZigTest;
+    const t = std.testing;
+    var ui = try dvui.testing.init(.{ .window_size = .{ .w = 900, .h = 600 } });
+    defer ui.deinit();
+    var editor = try Editor.init(t.allocator, t.io);
+    defer editor.deinit();
+    cur_win = 0;
+    editor.lsp_tools.hover = try t.allocator.dupe(u8, "café: i32\nUnicode documentation 😀");
+    editor.mode = .lsp_panel;
+    lspDialog(&editor);
+    _ = try ui.window.end(.{});
+    try ui.window.begin(100 * std.time.ns_per_ms);
+    editor.mode = .symbol_rename;
+    @memcpy(editor.lsp_tools.name[0..5], "value");
+    lspDialog(&editor);
+    _ = try ui.window.end(.{});
+    try ui.window.begin(200 * std.time.ns_per_ms);
+    editor.mode = .workspace_preview;
+    editor.lsp_tools.preview = .{ .allocator = t.allocator };
+    lspDialog(&editor);
+    handleLspKeyGui(&editor, .{ .code = .escape, .action = .down, .mod = .none });
+    try t.expect(editor.lsp_tools.preview == null);
+    _ = try ui.window.end(.{});
+    try ui.window.begin(300 * std.time.ns_per_ms);
+    editor.mode = .recovery_picker;
+    recoveryDialog(&editor);
+    handleRecoveryKeyGui(&editor, .{ .code = .escape, .action = .down, .mod = .none });
+    try t.expectEqual(Editor.Mode.normal, editor.mode);
+    for ([_]@import("../core/tool_panel.zig").Kind{ .tasks, .task_output, .problems, .changes, .git_diff, .debug }, 0..) |kind, index| {
+        _ = try ui.window.end(.{});
+        try ui.window.begin(@intCast((400 + index * 100) * std.time.ns_per_ms));
+        editor.tool_panel.show(&editor, kind);
+        // Asynchronous list replacement must clamp a selection from a longer list.
+        editor.tool_panel.selected = 1000;
+        toolDialog(&editor);
+        handleToolKeyGui(&editor, .{ .code = .escape, .action = .down, .mod = .none });
+        try t.expectEqual(Editor.Mode.normal, editor.mode);
+    }
+}
+
+test "GUI renderer smoke: software draws text and secondary windows inherit its driver" {
+    if (!build_options.has_gui or build_options.has_gpu) return error.SkipZigTest;
+    const Backend = @import("sdl-backend");
+    const t = std.testing;
+    var backend = try Backend.initWindow(.{
+        .io = t.io,
+        .size = .{ .w = 320, .h = 240 },
+        .title = "ZIDE renderer test",
+        .hidden = true,
+        .vsync = true,
+        .renderer_driver = "software",
+    });
+    defer backend.deinit();
+    try t.expectEqualStrings("software", std.mem.span(Backend.c.SDL_GetRendererName(backend.renderer)));
+    var window = try dvui.Window.init(@src(), t.allocator, backend.backend(), .{});
+    defer window.deinit();
+    try window.begin(0);
+    dvui.labelNoFmt(@src(), "ZIDE software: café 界", .{}, .{});
+    _ = try window.end(.{});
+    // A later global hint must not change the backend chosen for new windows.
+    _ = Backend.c.SDL_SetHint("SDL_RENDER_DRIVER", "invalid-driver");
+    defer _ = Backend.c.SDL_ResetHint("SDL_RENDER_DRIVER");
+    var child = try Backend.initWindowSecondary(&backend, .{ .hidden = true });
+    defer child.deinit();
+    try t.expectEqualStrings("software", std.mem.span(Backend.c.SDL_GetRendererName(child.renderer)));
+}
+
+test "GUI GPU smoke: native backend initializes and draws a text frame" {
+    if (!build_options.has_gui or !build_options.has_gpu) return error.SkipZigTest;
+    // dvui.testing skips this backend, so exercise its actual initialization.
+    const Backend = @import("sdl-backend");
+    const t = std.testing;
+    var backend = try Backend.initWindow(.{
+        .allocator = t.allocator,
+        .io = t.io,
+        .size = .{ .w = 320, .h = 240 },
+        .title = "ZIDE GPU test",
+        .hidden = true,
+        .vsync = true,
+    });
+    defer backend.deinit();
+    var window = try dvui.Window.init(@src(), t.allocator, backend.backend(), .{});
+    defer window.deinit();
+    try window.begin(0);
+    dvui.labelNoFmt(@src(), "ZIDE GPU: café 界", .{}, .{});
+    _ = try window.end(.{});
 }

@@ -1,6 +1,7 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const builtin = @import("builtin");
+const protocol = @import("protocol.zig");
 
 // ---------------------------------------------------------------------------
 // LSP message types (static structs for std.json.parseFromSlice)
@@ -23,6 +24,7 @@ const RpcError = struct {
 
 /// publishDiagnostics notification params.
 const DiagnosticParams = struct {
+    version: ?i32 = null,
     uri: []const u8,
     diagnostics: []const LspDiagnostic,
 };
@@ -255,60 +257,41 @@ fn optStrEql(a: ?[]const u8, b: ?[]const u8) bool {
 }
 
 // ---------------------------------------------------------------------------
-// Thread-safe message queue (ring buffer)
+// Client request context and capability negotiation
 // ---------------------------------------------------------------------------
 
-const QUEUE_CAP = 256;
+var next_generation = std.atomic.Value(u64).init(1);
 
-const IncomingMessage = struct {
-    json_bytes: []const u8, // heap-allocated, owned by consumer
+pub const RequestMethod = enum { initialize, completion, goto_definition, hover, prepare_rename, rename, format_document, format_selection, shutdown };
+pub const Request = struct {
+    method: RequestMethod,
+    doc_id: ?u64 = null,
+    version: u64 = 0,
+    generation: u64 = 0,
+    deadline: i128 = 0,
+    serial: u64 = 0,
+    cursor: ?usize = null,
 };
-
-const MessageQueue = struct {
-    buf: [QUEUE_CAP]IncomingMessage = undefined,
-    read_idx: usize = 0,
-    write_idx: usize = 0,
-    mutex: std.Io.Mutex = .init,
-
-    fn push(self: *MessageQueue, io: std.Io, msg: IncomingMessage, allocator: Allocator) void {
-        self.mutex.lockUncancelable(io);
-        defer self.mutex.unlock(io);
-        // If full, drop (and free) the oldest unread message — previously the
-        // overwritten slot's heap buffer leaked.
-        if (self.write_idx -% self.read_idx >= QUEUE_CAP) {
-            allocator.free(self.buf[self.read_idx % QUEUE_CAP].json_bytes);
-            self.read_idx +%= 1;
-        }
-        self.buf[self.write_idx % QUEUE_CAP] = msg;
-        self.write_idx +%= 1;
-    }
-
-    fn tryPop(self: *MessageQueue, io: std.Io) ?IncomingMessage {
-        self.mutex.lockUncancelable(io);
-        defer self.mutex.unlock(io);
-        if (self.read_idx == self.write_idx) return null;
-        const msg = self.buf[self.read_idx % QUEUE_CAP];
-        self.read_idx +%= 1;
-        return msg;
-    }
+pub const Capabilities = struct {
+    hover: bool = false,
+    rename: bool = false,
+    prepare_rename: bool = false,
+    format_document: bool = false,
+    format_selection: bool = false,
 };
-
-// ---------------------------------------------------------------------------
-// LspClient
-// ---------------------------------------------------------------------------
+fn capability(value: std.json.Value, name: []const u8) bool {
+    if (value != .object) return false;
+    const property = value.object.get(name) orelse return false;
+    return property == .object or (property == .bool and property.bool);
+}
 
 pub const LspClient = struct {
     allocator: Allocator,
     io: std.Io,
-    process: ?std.process.Child = null,
-    reader_thread: ?std.Thread = null,
-    /// "Keep reading" — cleared by stop() before the reader is joined.
-    running: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
-    /// Set by the reader thread when it exits (EOF = the server closed its
-    /// stdout, i.e. it exited or crashed). `process != null and reader_done`
-    /// is how the editor detects a server that died on its own.
-    reader_done: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
-    incoming: MessageQueue = .{},
+    peer: ?*protocol.Peer = null,
+    generation: u64,
+    capabilities: Capabilities = .{},
+    position_encoding: @import("workspace_edit.zig").Encoding = .utf16,
     next_id: i64 = 1,
     initialized: bool = false,
     /// The server rejected `initialize` (or the handshake could not be
@@ -319,7 +302,7 @@ pub const LspClient = struct {
     tui_wake_fn: ?*const fn () void = null,
 
     // Pending request tracking
-    pending: std.AutoHashMap(i64, RequestMethod) = undefined,
+    pending: std.AutoHashMap(i64, Request) = undefined,
 
     /// Deep copy of the registration this server was started from — the
     /// editor's config list can be rewritten (reload_extensions) while the
@@ -328,18 +311,12 @@ pub const LspClient = struct {
     /// Absolute workspace root handed to the server at initialize. Owned.
     root_path: []const u8 = "",
 
-    const RequestMethod = enum {
-        initialize,
-        completion,
-        goto_definition,
-        shutdown,
-    };
-
     pub fn init(allocator: Allocator, io: std.Io) LspClient {
         return .{
             .allocator = allocator,
             .io = io,
-            .pending = std.AutoHashMap(i64, RequestMethod).init(allocator),
+            .generation = next_generation.fetchAdd(1, .monotonic),
+            .pending = std.AutoHashMap(i64, Request).init(allocator),
         };
     }
 
@@ -376,7 +353,7 @@ pub const LspClient = struct {
     /// client is left stopped (nothing to clean up beyond `deinit`), except
     /// that a failed handshake write leaves it `dead` for the sweep.
     pub fn start(self: *LspClient, config: *const ServerConfig, root_path: []const u8) !void {
-        if (self.process != null) return error.AlreadyStarted;
+        if (self.peer != null) return error.AlreadyStarted;
         if (config.argv.len == 0) return error.NoCommand;
 
         var cfg = try config.clone(self.allocator);
@@ -385,31 +362,9 @@ pub const LspClient = struct {
         const root = try self.allocator.dupe(u8, root_path);
         errdefer if (!cfg_moved) self.allocator.free(root);
 
-        const child = try std.process.spawn(self.io, .{
-            .argv = cfg.argv,
-            .stdin = .pipe,
-            .stdout = .pipe,
-            // Nobody drains stderr — a pipe would fill up (~4KB) and block the
-            // server mid-write, freezing the whole LSP session. Discard it.
-            .stderr = .ignore,
-            // Windows: the GUI runs without a console (FreeConsole on desktop
-            // launch), so a console-subsystem server like zls.exe would
-            // otherwise get a brand-new visible console window.
-            .create_no_window = true,
-        });
-        self.process = child;
+        self.peer = try protocol.Peer.start(self.allocator, self.io, cfg.argv, root_path, self.tui_wake_fn);
         self.initialized = false;
         self.dead = false;
-        self.reader_done.store(false, .release);
-        self.running.store(true, .release);
-
-        // Start reader thread (it reads self.process.stdout)
-        self.reader_thread = std.Thread.spawn(.{}, readerThreadFn, .{self}) catch |err| {
-            self.running.store(false, .release);
-            if (self.process) |*proc| proc.kill(self.io);
-            self.process = null;
-            return err;
-        };
 
         self.config = cfg;
         self.root_path = root;
@@ -426,54 +381,22 @@ pub const LspClient = struct {
     /// to ~1s to leave on its own, kill it otherwise, join the reader, free
     /// everything. Safe on a never-started or already-dead client.
     pub fn stop(self: *LspClient) void {
-        if (self.process != null) {
-            if (self.initialized and !self.dead and !self.reader_done.load(.acquire)) {
+        if (self.peer) |peer| {
+            if (self.initialized and !self.dead and !peer.stopped()) {
                 _ = self.sendRequest("shutdown", "null") catch {};
                 self.sendNotification("exit", "null") catch {};
-            }
-            self.running.store(false, .release);
-
-            // Close stdin to signal EOF to the process
-            if (self.process) |*proc| {
-                if (proc.stdin) |stdin| {
-                    stdin.close(self.io);
-                    proc.stdin = null;
+                var elapsed: u32 = 0;
+                while (!peer.stopped() and elapsed < 200) : (elapsed += 10) {
+                    std.Io.sleep(self.io, .fromMilliseconds(10), .awake) catch break;
                 }
             }
-
-            // Grace period: a well-behaved server exits after `exit`, which
-            // closes its stdout and lets the reader thread finish. A hung
-            // server would block join() forever — kill it instead.
-            var waited_ms: u32 = 0;
-            while (!self.reader_done.load(.acquire) and waited_ms < 1000) : (waited_ms += 10) {
-                std.Io.sleep(self.io, .fromMilliseconds(10), .awake) catch break;
-            }
-            var killed = false;
-            if (!self.reader_done.load(.acquire)) {
-                if (self.process) |*proc| proc.kill(self.io); // blocks + reaps
-                killed = true;
-            }
-
-            // Join reader thread (the server's stdout is closed either way)
-            if (self.reader_thread) |thread| {
-                thread.join();
-                self.reader_thread = null;
-            }
-
-            // Reap — kill() already did when it ran (wait() asserts otherwise)
-            if (!killed) {
-                if (self.process) |*proc| _ = proc.wait(self.io) catch {};
-            }
-            self.process = null;
+            peer.deinit();
+            self.peer = null;
         }
         self.initialized = false;
         self.dead = false;
         self.pending.clearRetainingCapacity();
 
-        // Drain remaining messages
-        while (self.incoming.tryPop(self.io)) |msg| {
-            self.allocator.free(msg.json_bytes);
-        }
         if (self.config) |*cfg| {
             cfg.deinit(self.allocator);
             self.config = null;
@@ -486,14 +409,80 @@ pub const LspClient = struct {
 
     /// Handshake done and the server is still alive.
     pub fn isReady(self: *const LspClient) bool {
-        return self.process != null and self.initialized and !self.dead and !self.reader_done.load(.acquire);
+        return self.peer != null and self.initialized and !self.dead and !self.peer.?.stopped();
     }
 
     /// The server went away on its own (crash/exit) or rejected initialize.
     /// The editor sweeps such clients (stop + destroy) and marks their
     /// config failed so the lazy start doesn't respawn a crashing server.
     pub fn isDead(self: *const LspClient) bool {
-        return self.process != null and (self.dead or self.reader_done.load(.acquire));
+        return self.peer != null and (self.dead or self.peer.?.stopped());
+    }
+
+    pub fn diagnosticSource(self: *const LspClient, buf: []u8) []const u8 {
+        return std.fmt.bufPrint(buf, "{s}#{d}", .{ self.name(), self.generation }) catch std.fmt.bufPrint(buf, "LSP#{d}", .{self.generation}) catch "LSP";
+    }
+
+    pub fn setWake(self: *LspClient, wake: ?*const fn () void) void {
+        self.tui_wake_fn = wake;
+        if (self.peer) |peer| peer.setWake(wake);
+    }
+
+    pub fn request(self: *LspClient, method: []const u8, params: []const u8, context: Request) !i64 {
+        if (self.pending.count() >= 256) return error.TooManyRequests;
+        try self.pending.ensureUnusedCapacity(1);
+        const id = try self.sendRequest(method, params);
+        var tracked = context;
+        tracked.generation = self.generation;
+        tracked.deadline = std.Io.Clock.now(.awake, self.io).nanoseconds + 10 * std.time.ns_per_s;
+        self.pending.putAssumeCapacity(id, tracked);
+        return id;
+    }
+
+    pub fn cancelRequest(self: *LspClient, id: i64) void {
+        if (!self.pending.remove(id)) return;
+        var buf: [48]u8 = undefined;
+        const params = std.fmt.bufPrint(&buf, "{{\"id\":{d}}}", .{id}) catch return;
+        self.sendNotification("$/cancelRequest", params) catch {};
+    }
+
+    pub fn expireRequests(self: *LspClient, editor: anytype, now: i128) void {
+        while (true) {
+            var expired: ?struct { id: i64, context: Request } = null;
+            var iterator = self.pending.iterator();
+            while (iterator.next()) |entry| if (entry.value_ptr.deadline <= now) {
+                expired = .{ .id = entry.key_ptr.*, .context = entry.value_ptr.* };
+                break;
+            };
+            const item = expired orelse return;
+            self.cancelRequest(item.id);
+            if (item.context.method == .initialize) self.dead = true;
+            editor.lsp_tools.failed(editor, self, item.context, "Request timed out");
+        }
+    }
+
+    pub fn negotiate(self: *LspClient, json: []const u8) !void {
+        const parsed = try std.json.parseFromSlice(std.json.Value, self.allocator, json, .{});
+        defer parsed.deinit();
+        if (parsed.value != .object) return error.InvalidCapabilities;
+        const result = parsed.value.object.get("result") orelse return error.InvalidCapabilities;
+        if (result != .object) return error.InvalidCapabilities;
+        const caps = result.object.get("capabilities") orelse return error.InvalidCapabilities;
+        if (caps != .object) return error.InvalidCapabilities;
+        self.capabilities = .{
+            .hover = capability(caps, "hoverProvider"),
+            .rename = capability(caps, "renameProvider"),
+            .format_document = capability(caps, "documentFormattingProvider"),
+            .format_selection = capability(caps, "documentRangeFormattingProvider"),
+        };
+        if (caps.object.get("renameProvider")) |rename| {
+            if (rename == .object) self.capabilities.prepare_rename = capability(rename, "prepareProvider");
+        }
+        self.position_encoding = .utf16;
+        if (caps.object.get("positionEncoding")) |encoding| {
+            if (encoding != .string) return error.InvalidCapabilities;
+            if (std.mem.eql(u8, encoding.string, "utf-8")) self.position_encoding = .utf8 else if (!std.mem.eql(u8, encoding.string, "utf-16")) return error.UnsupportedPositionEncoding;
+        }
     }
 
     // ----- Sending messages -----
@@ -531,14 +520,7 @@ pub const LspClient = struct {
     }
 
     fn writeMessage(self: *LspClient, body: []const u8) !void {
-        const proc = &(self.process orelse return error.NotRunning);
-        const stdin = proc.stdin orelse return error.NotRunning;
-
-        var header_buf: [64]u8 = undefined;
-        const header = std.fmt.bufPrint(&header_buf, "Content-Length: {d}\r\n\r\n", .{body.len}) catch return error.NotRunning;
-
-        stdin.writeStreamingAll(self.io, header) catch return error.NotRunning;
-        stdin.writeStreamingAll(self.io, body) catch return error.NotRunning;
+        try (self.peer orelse return error.NotRunning).send(body);
     }
 
     // ----- Initialize handshake -----
@@ -548,8 +530,7 @@ pub const LspClient = struct {
         const params = try buildInitializeParams(self.allocator, self.root_path, cfg.init_options_json);
         defer self.allocator.free(params);
 
-        const id = try self.sendRequest("initialize", params);
-        self.pending.put(id, .initialize) catch {};
+        _ = try self.request("initialize", params, .{ .method = .initialize });
     }
 
     /// Push the registration's `settings` table after the handshake — the
@@ -647,9 +628,7 @@ pub const LspClient = struct {
         try params.print(self.allocator, "{d}", .{col});
         try params.appendSlice(self.allocator, "}}");
 
-        const id = try self.sendRequest("textDocument/completion", params.items);
-        self.pending.put(id, .completion) catch {};
-        return id;
+        return self.request("textDocument/completion", params.items, .{ .method = .completion });
     }
 
     pub fn sendGotoDefinition(self: *LspClient, uri: []const u8, line: u32, col: u32) !i64 {
@@ -666,18 +645,17 @@ pub const LspClient = struct {
         try params.print(self.allocator, "{d}", .{col});
         try params.appendSlice(self.allocator, "}}");
 
-        const id = try self.sendRequest("textDocument/definition", params.items);
-        self.pending.put(id, .goto_definition) catch {};
-        return id;
+        return self.request("textDocument/definition", params.items, .{ .method = .goto_definition });
     }
 
     // ----- Message polling (called from main thread) -----
 
     pub fn pollMessages(self: *LspClient, editor: anytype) void {
         var count: usize = 0;
-        while (self.incoming.tryPop(self.io)) |msg| {
-            defer self.allocator.free(msg.json_bytes);
-            self.dispatchMessage(msg.json_bytes, editor);
+        const peer = self.peer orelse return;
+        while (peer.take()) |message| {
+            defer self.allocator.free(message);
+            self.dispatchMessage(message, editor);
             count += 1;
             if (count > 64) break; // Limit per frame to avoid stalls
         }
@@ -702,8 +680,17 @@ pub const LspClient = struct {
     }
 
     fn handleResponse(self: *LspClient, id: i64, json_bytes: []const u8, editor: anytype) void {
-        const method = self.pending.get(id) orelse return;
+        const context = self.pending.get(id) orelse return;
+        const method = context.method;
         _ = self.pending.remove(id);
+        if (context.generation != self.generation) return;
+        if (context.doc_id) |doc_id| {
+            const index = editor.docIndexForId(doc_id);
+            if (index == null or editor.documents.items[index.?].buffer.version != context.version) {
+                editor.lsp_tools.failed(editor, self, context, "Document changed; request cancelled");
+                return;
+            }
+        }
 
         // A failed request carries `error` instead of `result`.
         const ErrForm = struct { @"error": ?RpcError = null };
@@ -716,12 +703,18 @@ pub const LspClient = struct {
                     self.dead = true;
                     editor.status_message = std.fmt.bufPrint(&editor.status_buf, "LSP {s} rejected initialize — see zide.log", .{self.name()}) catch "LSP initialize failed — see zide.log";
                 }
+                editor.lsp_tools.failed(editor, self, context, e.message);
                 return;
             }
         } else |_| {}
 
         switch (method) {
             .initialize => {
+                self.negotiate(json_bytes) catch {
+                    self.dead = true;
+                    editor.status_message = "LSP capability or position encoding negotiation failed";
+                    return;
+                };
                 self.initialized = true;
                 // Send initialized notification, then the settings
                 self.sendNotification("initialized", "{}") catch {};
@@ -735,8 +728,9 @@ pub const LspClient = struct {
                 if (editor.completionResponseCurrent(self, id)) self.handleCompletionResponse(json_bytes, editor);
             },
             .goto_definition => {
-                self.handleDefinitionResponse(json_bytes, editor);
+                if (context.doc_id == null or (editor.activeDoc().id == context.doc_id.? and (context.cursor == null or editor.activeDoc().cursors.primary().offset == context.cursor.?))) self.handleDefinitionResponse(json_bytes, editor);
             },
+            .hover, .prepare_rename, .rename, .format_document, .format_selection => editor.lsp_tools.response(editor, self, context, json_bytes),
             .shutdown => {},
         }
     }
@@ -765,8 +759,9 @@ pub const LspClient = struct {
     /// Server→client requests must be answered or the server may wait
     /// forever (lua-language-server blocks on workspace/configuration).
     fn handleServerRequest(self: *LspClient, id: std.json.Value, method: []const u8, json_bytes: []const u8, editor: anytype) void {
-        _ = editor;
-        if (std.mem.eql(u8, method, "workspace/configuration")) {
+        if (std.mem.eql(u8, method, "workspace/applyEdit")) {
+            editor.lsp_tools.serverEdit(editor, self, id, json_bytes);
+        } else if (std.mem.eql(u8, method, "workspace/configuration")) {
             self.answerConfiguration(id, json_bytes);
         } else if (std.mem.eql(u8, method, "workspace/workspaceFolders")) {
             var result: std.ArrayList(u8) = .empty;
@@ -791,7 +786,7 @@ pub const LspClient = struct {
         }
     }
 
-    fn respond(self: *LspClient, id: std.json.Value, result_json: []const u8) void {
+    pub fn respond(self: *LspClient, id: std.json.Value, result_json: []const u8) void {
         const body = buildResponse(self.allocator, id, result_json) catch return;
         defer self.allocator.free(body);
         self.writeMessage(body) catch {};
@@ -858,41 +853,31 @@ pub const LspClient = struct {
         const file_path = uriToPath(self.allocator, params.uri) catch return;
         defer self.allocator.free(file_path);
 
-        for (editor.documents.items) |*doc| {
-            const doc_path = doc.file_path orelse continue;
-            if (pathsEqual(doc_path, file_path)) {
-                // Clear old diagnostics
-                for (doc.diagnostics.items) |*d| {
-                    d.deinit(doc.allocator);
-                }
-                doc.diagnostics.clearRetainingCapacity();
+        if (params.version) |version| for (editor.documents.items) |*doc| {
+            if (doc.file_path) |path| if (editor.pathsEqual(path, file_path) and version != doc.lsp_version) return;
+        };
 
-                // Add new diagnostics (server columns are UTF-16 code units;
-                // convert to byte columns, which is what rendering uses)
-                for (params.diagnostics) |lsp_diag| {
-                    const msg = self.allocator.dupe(u8, lsp_diag.message) catch continue;
-                    const start_line_text = doc.buffer.lineContent(lsp_diag.range.start.line);
-                    const start_col: u32 = @intCast(utf16ColToByte(start_line_text, lsp_diag.range.start.character));
-                    const end_line_text = doc.buffer.lineContent(lsp_diag.range.end.line);
-                    const end_col: u32 = @intCast(utf16ColToByte(end_line_text, lsp_diag.range.end.character));
-                    doc.diagnostics.append(doc.allocator, .{
-                        .start_line = lsp_diag.range.start.line,
-                        .start_col = start_col,
-                        .end_line = lsp_diag.range.end.line,
-                        .end_col = end_col,
-                        .severity = if (lsp_diag.severity) |s| switch (s) {
-                            1 => .err,
-                            2 => .warning,
-                            3 => .information,
-                            else => .hint,
-                        } else .err,
-                        .message = msg,
-                    }) catch {
-                        self.allocator.free(msg);
-                    };
-                }
-                break;
-            }
+        var items: std.ArrayList(Diagnostic) = .empty;
+        defer items.deinit(self.allocator);
+        for (params.diagnostics) |diagnostic| {
+            items.append(self.allocator, .{
+                .start_line = diagnostic.range.start.line,
+                .start_col = diagnostic.range.start.character,
+                .end_line = diagnostic.range.end.line,
+                .end_col = diagnostic.range.end.character,
+                .severity = switch (diagnostic.severity orelse 1) {
+                    1 => .err,
+                    2 => .warning,
+                    3 => .information,
+                    else => .hint,
+                },
+                .message = diagnostic.message,
+            }) catch return;
+        }
+        var producer_buf: [256]u8 = undefined;
+        editor.problems.replace(file_path, self.diagnosticSource(&producer_buf), .lsp, params.version, if (self.position_encoding == .utf16) .utf16 else .bytes, items.items) catch return;
+        for (editor.documents.items) |*doc| {
+            if (doc.file_path) |path| if (editor.pathsEqual(path, file_path)) editor.problems.project(doc, .lsp) catch {};
         }
     }
 
@@ -948,235 +933,24 @@ pub const LspClient = struct {
         const file_path = uriToPath(self.allocator, loc.uri) catch return;
         defer self.allocator.free(file_path);
 
-        // Check if the file is already open
-        var found = false;
-        for (editor.documents.items, 0..) |*doc, i| {
-            const dp = doc.file_path orelse continue;
-            if (pathsEqual(dp, file_path)) {
-                editor.switchToDoc(i);
-                doc.gotoLine(loc.range.start.line + 1); // gotoLine is 1-indexed
-                found = true;
-                break;
-            }
-        }
-
-        if (!found) {
-            // Open the file
-            _ = editor.openFile(file_path) catch return;
-            const doc = editor.activeDoc();
-            doc.gotoLine(loc.range.start.line + 1);
-        }
-    }
-
-    // ----- Reader thread -----
-
-    fn readerThreadFn(self: *LspClient) void {
-        const stdout_file = if (self.process) |*proc| (proc.stdout orelse return) else return;
-        const io = self.io;
-
-        // Manual read buffer — readStreaming is the pipe-safe primitive
-        // (positional reads are invalid on pipes).
-        var buf: [8192]u8 = undefined;
-        var buf_start: usize = 0;
-        var buf_end: usize = 0;
-
-        while (self.running.load(.acquire)) {
-            // Read Content-Length header
-            const content_len = pipeReadContentLength(io, stdout_file, &buf, &buf_start, &buf_end) catch break;
-            if (content_len == 0) continue;
-
-            // Read the JSON body
-            const json_buf = self.allocator.alloc(u8, content_len) catch break;
-            pipeReadExact(io, stdout_file, &buf, &buf_start, &buf_end, json_buf) catch {
-                self.allocator.free(json_buf);
-                break;
-            };
-
-            // Push to queue
-            self.incoming.push(io, .{ .json_bytes = json_buf }, self.allocator);
-
-            // Wake TUI if needed
-            if (self.tui_wake_fn) |wake| {
-                wake();
-            }
-        }
-        // EOF / read error / stop(): tell the main thread the server's
-        // stdout is gone (death detection + stop()'s grace loop) and wake
-        // the TUI so it notices without waiting for a keypress.
-        self.reader_done.store(true, .release);
-        if (self.tui_wake_fn) |wake| wake();
+        const doc = editor.openOrFocus(file_path) catch return;
+        const byte = @import("workspace_edit.zig").offset(doc, loc.range.start, self.position_encoding) catch return;
+        doc.gotoLine(loc.range.start.line + 1);
+        doc.cursors.primary().offset = byte;
+        doc.cursors.primary().preferred_col = doc.buffer.offsetToPos(byte).col;
     }
 };
-
-// ---------------------------------------------------------------------------
-// Pipe-safe reading helpers (readStreaming only — never positional reads)
-// ---------------------------------------------------------------------------
-
-/// Read a single byte from the pipe, using the manual buffer for efficiency.
-fn pipeReadByte(
-    io: std.Io,
-    file: std.Io.File,
-    buf: *[8192]u8,
-    buf_start: *usize,
-    buf_end: *usize,
-) !u8 {
-    if (buf_start.* < buf_end.*) {
-        const b = buf[buf_start.*];
-        buf_start.* += 1;
-        return b;
-    }
-    // Buffer empty — refill
-    const n = file.readStreaming(io, &.{buf}) catch return error.EndOfStream;
-    if (n == 0) return error.EndOfStream;
-    buf_start.* = 1;
-    buf_end.* = n;
-    return buf[0];
-}
-
-/// Read exactly `dest.len` bytes from the pipe into `dest`.
-fn pipeReadExact(
-    io: std.Io,
-    file: std.Io.File,
-    buf: *[8192]u8,
-    buf_start: *usize,
-    buf_end: *usize,
-    dest: []u8,
-) !void {
-    var written: usize = 0;
-    while (written < dest.len) {
-        // Drain what we can from the buffer
-        const buffered = buf_end.* - buf_start.*;
-        if (buffered > 0) {
-            const needed = dest.len - written;
-            const take = @min(buffered, needed);
-            @memcpy(dest[written..][0..take], buf[buf_start.*..][0..take]);
-            buf_start.* += take;
-            written += take;
-        } else {
-            // Buffer empty — read directly if remaining is large, else refill buffer
-            const remaining = dest.len - written;
-            if (remaining >= buf.len) {
-                const n = file.readStreaming(io, &.{dest[written..]}) catch return error.EndOfStream;
-                if (n == 0) return error.EndOfStream;
-                written += n;
-            } else {
-                const n = file.readStreaming(io, &.{buf}) catch return error.EndOfStream;
-                if (n == 0) return error.EndOfStream;
-                buf_start.* = 0;
-                buf_end.* = n;
-            }
-        }
-    }
-}
-
-/// Parse Content-Length from LSP JSON-RPC headers using pipe-safe reads.
-fn pipeReadContentLength(
-    io: std.Io,
-    file: std.Io.File,
-    buf: *[8192]u8,
-    buf_start: *usize,
-    buf_end: *usize,
-) !usize {
-    var content_length: usize = 0;
-
-    // Read headers line by line until empty line (\r\n\r\n)
-    while (true) {
-        var line_buf: [256]u8 = undefined;
-        var line_len: usize = 0;
-
-        // Read until \n
-        while (line_len < line_buf.len) {
-            const byte = pipeReadByte(io, file, buf, buf_start, buf_end) catch return error.EndOfStream;
-            if (byte == '\n') break;
-            line_buf[line_len] = byte;
-            line_len += 1;
-        }
-
-        // Strip trailing \r
-        const line = std.mem.trimEnd(u8, line_buf[0..line_len], "\r");
-
-        // Empty line = end of headers
-        if (line.len == 0) break;
-
-        // Parse Content-Length
-        if (std.ascii.startsWithIgnoreCase(line, "content-length:")) {
-            const val_str = std.mem.trimStart(u8, line["content-length:".len..], " ");
-            content_length = std.fmt.parseInt(usize, val_str, 10) catch 0;
-        }
-    }
-
-    return content_length;
-}
 
 // ---------------------------------------------------------------------------
 // URI <-> Path conversion
 // ---------------------------------------------------------------------------
 
 pub fn pathToUri(allocator: Allocator, path: []const u8) ![]const u8 {
-    var result: std.ArrayList(u8) = .empty;
-    errdefer result.deinit(allocator);
-
-    try result.appendSlice(allocator, "file:///");
-
-    for (path) |ch| {
-        if (ch == '\\') {
-            try result.append(allocator, '/');
-        } else if (ch == ' ') {
-            try result.appendSlice(allocator, "%20");
-        } else {
-            try result.append(allocator, ch);
-        }
-    }
-
-    return result.toOwnedSlice(allocator);
+    return @import("file_uri.zig").encode(allocator, path);
 }
 
 pub fn uriToPath(allocator: Allocator, uri: []const u8) ![]const u8 {
-    var path_part = uri;
-    if (std.mem.startsWith(u8, uri, "file:///")) {
-        path_part = uri["file:///".len..];
-    } else if (std.mem.startsWith(u8, uri, "file://")) {
-        path_part = uri["file://".len..];
-    }
-
-    var result: std.ArrayList(u8) = .empty;
-    errdefer result.deinit(allocator);
-
-    var i: usize = 0;
-    while (i < path_part.len) {
-        if (path_part[i] == '%' and i + 2 < path_part.len) {
-            const high = std.fmt.charToDigit(path_part[i + 1], 16) catch {
-                try result.append(allocator, path_part[i]);
-                i += 1;
-                continue;
-            };
-            const low = std.fmt.charToDigit(path_part[i + 2], 16) catch {
-                try result.append(allocator, path_part[i]);
-                i += 1;
-                continue;
-            };
-            try result.append(allocator, @as(u8, high) * 16 + low);
-            i += 3;
-        } else if (builtin.os.tag == .windows and path_part[i] == '/') {
-            try result.append(allocator, '\\');
-            i += 1;
-        } else {
-            try result.append(allocator, path_part[i]);
-            i += 1;
-        }
-    }
-
-    // On Windows, strip leading backslash from \C:\...
-    if (builtin.os.tag == .windows and result.items.len >= 3) {
-        if (result.items[0] == '\\' and result.items[2] == ':') {
-            const slice = result.items[1..];
-            const owned = try allocator.dupe(u8, slice);
-            result.deinit(allocator);
-            return owned;
-        }
-    }
-
-    return result.toOwnedSlice(allocator);
+    return @import("file_uri.zig").decode(allocator, uri, builtin.os.tag == .windows);
 }
 
 // ---------------------------------------------------------------------------
@@ -1359,12 +1133,13 @@ pub fn buildInitializeParams(gpa: Allocator, root_path: []const u8, init_options
     try p.appendSlice(gpa, ",\"name\":");
     try writeJsonString(&p, gpa, if (folder_name.len > 0) folder_name else root_path);
     try p.appendSlice(gpa, "}],\"capabilities\":{");
+    try p.appendSlice(gpa, "\"general\":{\"positionEncodings\":[\"utf-8\",\"utf-16\"]},");
     try p.appendSlice(gpa, "\"textDocument\":{");
     try p.appendSlice(gpa, "\"synchronization\":{\"didSave\":true,\"didOpen\":true,\"didClose\":true},");
     try p.appendSlice(gpa, "\"completion\":{\"completionItem\":{\"insertReplaceSupport\":true}},");
     try p.appendSlice(gpa, "\"publishDiagnostics\":{},");
-    try p.appendSlice(gpa, "\"definition\":{}},");
-    try p.appendSlice(gpa, "\"workspace\":{\"workspaceFolders\":true,\"configuration\":true,\"didChangeConfiguration\":{\"dynamicRegistration\":false}}");
+    try p.appendSlice(gpa, "\"hover\":{\"contentFormat\":[\"plaintext\"]},\"rename\":{\"prepareSupport\":true},\"formatting\":{},\"rangeFormatting\":{},\"definition\":{}},");
+    try p.appendSlice(gpa, "\"workspace\":{\"applyEdit\":true,\"workspaceEdit\":{\"documentChanges\":true,\"resourceOperations\":[],\"failureHandling\":\"transactional\"},\"workspaceFolders\":true,\"configuration\":true,\"didChangeConfiguration\":{\"dynamicRegistration\":false}}");
     try p.append(gpa, '}');
     if (init_options_json) |opts| {
         try p.appendSlice(gpa, ",\"initializationOptions\":");
@@ -1492,9 +1267,9 @@ test "uriToPath percent decode" {
     const path = try uriToPath(alloc, "file:///path/to%20my/file.zig");
     defer alloc.free(path);
     if (builtin.os.tag == .windows) {
-        try std.testing.expectEqualStrings("path\\to my\\file.zig", path);
+        try std.testing.expectEqualStrings("\\path\\to my\\file.zig", path);
     } else {
-        try std.testing.expectEqualStrings("path/to my/file.zig", path);
+        try std.testing.expectEqualStrings("/path/to my/file.zig", path);
     }
 }
 
@@ -1535,18 +1310,6 @@ test "utf16 column conversion" {
     // Clamping: past end of line
     try std.testing.expectEqual(@as(u32, 2), byteColToUtf16("ab", 99));
     try std.testing.expectEqual(@as(usize, 2), utf16ColToByte("ab", 99));
-}
-
-test "MessageQueue push pop" {
-    var q = MessageQueue{};
-    const alloc = std.testing.allocator;
-    const io = std.testing.io;
-    const msg1 = try alloc.dupe(u8, "hello");
-    q.push(io, .{ .json_bytes = msg1 }, alloc);
-    const popped = q.tryPop(io).?;
-    try std.testing.expectEqualStrings("hello", popped.json_bytes);
-    alloc.free(popped.json_bytes);
-    try std.testing.expect(q.tryPop(io) == null);
 }
 
 test "ServerConfig defaults, lookup, equality, display name" {
@@ -1655,27 +1418,139 @@ test "parseCompletionItems handles list and array forms" {
     try std.testing.expectEqual(@as(usize, 0), none.len);
 }
 
-test "MessageQueue overflow frees dropped messages" {
-    var q = MessageQueue{};
-    const alloc = std.testing.allocator;
-    const io = std.testing.io;
-    // Push past capacity — the overwritten oldest messages must be freed
-    // (std.testing.allocator fails the test on any leak).
-    var i: usize = 0;
-    while (i < QUEUE_CAP + 16) : (i += 1) {
-        const msg = try alloc.dupe(u8, "x");
-        q.push(io, .{ .json_bytes = msg }, alloc);
-    }
-    var popped: usize = 0;
-    while (q.tryPop(io)) |msg| {
-        alloc.free(msg.json_bytes);
-        popped += 1;
-    }
-    try std.testing.expectEqual(@as(usize, QUEUE_CAP), popped);
-}
-
 test "completion parser rejects an edit with no usable range" {
     try std.testing.expectError(error.InvalidCompletionEdit, parseCompletionItems(std.testing.allocator,
         \\{"result":[{"label":"bad","textEdit":{"newText":"bad"}}]}
     ));
+}
+
+test "LSP negotiates capabilities and rejects unsupported position encodings" {
+    const t = std.testing;
+    var client = LspClient.init(t.allocator, t.io);
+    defer client.deinit();
+    try client.negotiate("{\"result\":{\"capabilities\":{\"positionEncoding\":\"utf-8\",\"hoverProvider\":true,\"renameProvider\":{\"prepareProvider\":true},\"documentFormattingProvider\":{}}}}");
+    try t.expect(client.capabilities.hover and client.capabilities.rename and client.capabilities.prepare_rename and client.capabilities.format_document);
+    try t.expectEqual(@import("workspace_edit.zig").Encoding.utf8, client.position_encoding);
+    try t.expect(!client.capabilities.format_selection);
+    try client.negotiate("{\"result\":{\"capabilities\":{}}}");
+    try t.expectEqual(@import("workspace_edit.zig").Encoding.utf16, client.position_encoding);
+    try t.expect(!client.capabilities.hover);
+    try t.expectError(error.UnsupportedPositionEncoding, client.negotiate("{\"result\":{\"capabilities\":{\"positionEncoding\":\"utf-32\"}}}"));
+}
+
+test "LSP drops stale and out-of-order feature replies; timeout aborts formatting save" {
+    const t = std.testing;
+    const Editor = @import("editor.zig").Editor;
+    var editor = try Editor.init(t.allocator, t.io);
+    defer editor.deinit();
+    editor.lsp_enabled = false;
+    var client = LspClient.init(t.allocator, t.io);
+    defer client.deinit();
+    const doc = editor.activeDoc();
+    try doc.insertAtCursor("😀 name");
+    var request: Request = .{ .method = .hover, .generation = client.generation, .doc_id = doc.id, .version = doc.buffer.version, .serial = 1, .cursor = doc.cursors.primary().offset };
+    editor.lsp_tools.serial = 2;
+    try client.pending.put(1, request);
+    client.dispatchMessage("{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"contents\":\"old hover\"}}", &editor);
+    try t.expect(editor.lsp_tools.hover == null);
+    request.serial = 2;
+    try client.pending.put(2, request);
+    client.dispatchMessage("{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{\"contents\":{\"kind\":\"plaintext\",\"value\":\"name: i32\"}}}", &editor);
+    try t.expectEqualStrings("name: i32", editor.lsp_tools.hover.?);
+    editor.mode = .normal;
+    request.method = .format_document;
+    editor.lsp_tools.formatting = request;
+    editor.lsp_tools.save = .{ .id = doc.id, .options = .{}, .owned_path = null };
+    try client.pending.put(3, request);
+    try doc.insertAtCursor("new edit");
+    client.dispatchMessage("{\"jsonrpc\":\"2.0\",\"id\":3,\"result\":[]}", &editor);
+    try t.expect(editor.lsp_tools.save == null and editor.lsp_tools.formatting == null);
+    try t.expect(std.mem.startsWith(u8, editor.status_message, "Save aborted"));
+    try t.expect(doc.dirty);
+    request.version = doc.buffer.version;
+    editor.lsp_tools.formatting = request;
+    editor.lsp_tools.save = .{ .id = doc.id, .options = .{}, .owned_path = null };
+    try client.pending.put(4, request);
+    client.expireRequests(&editor, 1);
+    try t.expectEqual(@as(usize, 0), client.pending.count());
+    try t.expect(editor.lsp_tools.save == null and doc.dirty);
+}
+
+test "LSP integration: ZLS hover, prepare rename, multi-location edit and formatting" {
+    if (!@import("build_options").test_tools) return error.SkipZigTest;
+    const t = std.testing;
+    const Editor = @import("editor.zig").Editor;
+    var tmp = t.tmpDir(.{});
+    defer tmp.cleanup();
+    const base = try tmp.dir.realPathFileAlloc(t.io, ".", t.allocator);
+    defer t.allocator.free(base);
+    const path = try std.fs.path.join(t.allocator, &.{ base, "main.zig" });
+    defer t.allocator.free(path);
+    const source = "pub fn main() void {const value:i32=1;_ = value;}\n";
+    try @import("text_file.zig").atomicWrite(t.allocator, t.io, path, source);
+    var editor = try Editor.init(t.allocator, t.io);
+    defer editor.deinit();
+    editor.editorconfig_enabled = false;
+    editor.filetree_root = try t.allocator.dupe(u8, base);
+    try editor.openIntoActive(path);
+    var ready = false;
+    for (0..2000) |_| {
+        editor.lspTick();
+        if (editor.activeDoc().lsp_opened) {
+            ready = true;
+            break;
+        }
+        try std.Io.sleep(t.io, .fromMilliseconds(10), .awake);
+    }
+    if (!ready) std.debug.print("ZLS startup: {s}\n", .{editor.status_message});
+    try t.expect(ready);
+    editor.activeDoc().cursors.primary().offset = std.mem.indexOf(u8, source, "value").?;
+    editor.lsp_tools.start(&editor, .hover);
+    try waitLspMode(&editor, .lsp_panel);
+    try t.expect(editor.lsp_tools.hover.?.len > 0);
+    editor.mode = .normal;
+    editor.lsp_tools.start(&editor, .prepare_rename);
+    try waitLspMode(&editor, .symbol_rename);
+    const name = "renamed_value";
+    @memcpy(editor.lsp_tools.name[0..name.len], name);
+    editor.lsp_tools.name_len = name.len;
+    editor.lsp_tools.submitRename(&editor);
+    try waitLspMode(&editor, .workspace_preview);
+    try t.expect(editor.lsp_tools.preview.?.edit_count >= 2);
+    editor.lsp_tools.resolvePreview(&editor, true);
+    editor.lsp_tools.start(&editor, .format_document);
+    try t.expect(editor.lsp_tools.formatting != null);
+    for (0..2000) |_| {
+        editor.lspTick();
+        if (editor.lsp_tools.formatting == null) break;
+        try std.Io.sleep(t.io, .fromMilliseconds(10), .awake);
+    }
+    try t.expect(editor.lsp_tools.formatting == null);
+    const doc = editor.activeDoc();
+    try t.expect(std.mem.indexOf(u8, doc.buffer.slice(0, doc.buffer.byteLen()), "const renamed_value: i32 = 1;") != null);
+    try t.expect(doc.dirty);
+    const disk = try tmp.dir.readFileAlloc(t.io, "main.zig", t.allocator, .limited(1024));
+    defer t.allocator.free(disk);
+    try t.expectEqualStrings(source, disk);
+    editor.lsp_tools.format_on_save = true;
+    try t.expectEqual(Editor.SaveOutcome.formatting, editor.saveDocument(doc.id, .{}));
+    for (0..2000) |_| {
+        editor.lspTick();
+        if (editor.lsp_tools.formatting == null) break;
+        try std.Io.sleep(t.io, .fromMilliseconds(10), .awake);
+    }
+    try t.expect(editor.lsp_tools.formatting == null and !doc.dirty);
+    const saved = try tmp.dir.readFileAlloc(t.io, "main.zig", t.allocator, .limited(1024));
+    defer t.allocator.free(saved);
+    try t.expect(std.mem.indexOf(u8, saved, "const renamed_value: i32 = 1;") != null);
+}
+
+fn waitLspMode(editor: *@import("editor.zig").Editor, mode: @import("editor.zig").Editor.Mode) !void {
+    for (0..2000) |_| {
+        editor.lspTick();
+        if (editor.mode == mode) return;
+        try std.Io.sleep(std.testing.io, .fromMilliseconds(10), .awake);
+    }
+    std.debug.print("LSP expected {s}: {s}\n", .{ @tagName(mode), editor.status_message });
+    return error.LspTimedOut;
 }

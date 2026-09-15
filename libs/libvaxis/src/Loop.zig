@@ -79,6 +79,10 @@ pub fn Loop(comptime T: type) type {
             return try self.queue.pop();
         }
 
+        pub fn nextEventTimeout(self: *Self, timeout: std.Io.Timeout) !?T {
+            return self.queue.popTimeout(timeout);
+        }
+
         /// blocks until an event is available. Useful when your application is
         /// operating on a poll + drain architecture (see tryEvent)
         pub fn pollEvent(self: *Self) !void {

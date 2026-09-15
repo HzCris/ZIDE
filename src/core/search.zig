@@ -233,9 +233,14 @@ pub const SearchPanel = struct {
         for (editor.documents.items) |*doc| {
             if (doc.preview) continue;
             const p = doc.file_path orelse continue;
-            if (self.allocator.dupe(u8, p)) |dup| {
-                ctx.open_paths.append(self.allocator, dup) catch self.allocator.free(dup);
-            } else |_| {}
+            if (text_file.pathKey(self.allocator, self.io, p)) |dup| {
+                ctx.open_paths.append(self.allocator, dup) catch {
+                    self.allocator.free(dup);
+                    ok = false;
+                };
+            } else |_| {
+                ok = false;
+            }
             const text = doc.buffer.slice(0, doc.buffer.byteLen());
             self.searchOpenDoc(p, text, needle);
             self.files_searched_open += 1;
@@ -384,7 +389,7 @@ pub const SearchPanel = struct {
             for (editor.documents.items) |*doc| {
                 if (doc.preview) continue;
                 const dp = doc.file_path orelse continue;
-                if (filetree_mod.normPathEql(dp, p)) {
+                if (editor.pathsEqual(dp, p)) {
                     open_doc = doc;
                     break;
                 }
@@ -418,7 +423,7 @@ pub const SearchPanel = struct {
             for (editor.documents.items) |*doc| {
                 if (doc.preview) continue;
                 const dp = doc.file_path orelse continue;
-                if (filetree_mod.normPathEql(dp, p)) {
+                if (editor.pathsEqual(dp, p)) {
                     is_open = true;
                     break;
                 }
@@ -648,14 +653,14 @@ fn searchDiskFile(ctx: *WorkerCtx, dir: std.Io.Dir, prefix: []const u8, name: []
     else
         std.fmt.bufPrint(&full_buf, "{s}/{s}", .{ ctx.root, rel }) catch return;
 
+    const key = text_file.pathKey(ctx.allocator, ctx.io, full) catch return;
+    defer ctx.allocator.free(key);
     // Open documents were already searched on the main thread.
     for (ctx.open_paths.items) |op| {
-        if (filetree_mod.normPathEql(op, full)) return;
+        if (filetree_mod.normPathEql(op, key)) return;
     }
 
     _ = dir;
-    const key = text_file.pathKey(ctx.allocator, ctx.io, full) catch return;
-    defer ctx.allocator.free(key);
     var encoding: ?text_file.TextEncoding = null;
     for (ctx.encodings.items) |entry| {
         if (filetree_mod.normPathEql(key, entry.path)) {

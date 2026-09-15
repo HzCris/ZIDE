@@ -1,0 +1,1242 @@
+[
+  {
+    "name": "star_single_ML",
+    "fixture": "star.in",
+    "path": "ace.c",
+    "expected": {
+      "key": "value",
+      "keyc": "valuec"
+    },
+    "upstream_expected": {
+      "key": "value",
+      "keyc": "valuec"
+    }
+  },
+  {
+    "name": "star_zero_ML",
+    "fixture": "star.in",
+    "path": "ae.c",
+    "expected": {
+      "key": "value",
+      "keyc": "valuec"
+    },
+    "upstream_expected": {
+      "key": "value",
+      "keyc": "valuec"
+    }
+  },
+  {
+    "name": "star_multiple_ML",
+    "fixture": "star.in",
+    "path": "abcde.c",
+    "expected": {
+      "key": "value",
+      "keyc": "valuec"
+    },
+    "upstream_expected": {
+      "key": "value",
+      "keyc": "valuec"
+    }
+  },
+  {
+    "name": "star_over_slash",
+    "fixture": "star.in",
+    "path": "a/e.c",
+    "expected": {
+      "keyc": "valuec"
+    },
+    "upstream_expected": {
+      "keyc": "valuec"
+    }
+  },
+  {
+    "name": "star_after_slash_ML",
+    "fixture": "star.in",
+    "path": "Bar/foo.txt",
+    "expected": {
+      "keyb": "valueb",
+      "keyc": "valuec"
+    },
+    "upstream_expected": {
+      "keyb": "valueb",
+      "keyc": "valuec"
+    }
+  },
+  {
+    "name": "star_matches_dot_file_after_slash_ML",
+    "fixture": "star.in",
+    "path": "Bar/.editorconfig",
+    "expected": {
+      "keyb": "valueb",
+      "keyc": "valuec"
+    },
+    "upstream_expected": {
+      "keyb": "valueb",
+      "keyc": "valuec"
+    }
+  },
+  {
+    "name": "star_matches_dot_file",
+    "fixture": "star.in",
+    "path": ".editorconfig",
+    "expected": {
+      "keyc": "valuec"
+    },
+    "upstream_expected": {
+      "keyc": "valuec"
+    }
+  },
+  {
+    "name": "star_after_slash_ML_in_subdir",
+    "fixture": "star.in",
+    "path": "bat/Bar/foo.txt",
+    "expected": {
+      "keyc": "valuec"
+    },
+    "upstream_expected": {
+      "keyc": "valuec"
+    }
+  },
+  {
+    "name": "star_matches_dot_file_after_slash_ML_in_subdir",
+    "fixture": "star.in",
+    "path": "bat/Bar/.editorconfig",
+    "expected": {
+      "keyc": "valuec"
+    },
+    "upstream_expected": {
+      "keyc": "valuec"
+    }
+  },
+  {
+    "name": "question_single",
+    "fixture": "question.in",
+    "path": "some.c",
+    "expected": {
+      "key": "value"
+    },
+    "upstream_expected": {
+      "key": "value"
+    }
+  },
+  {
+    "name": "question_zero",
+    "fixture": "question.in",
+    "path": "som.c",
+    "expected": {},
+    "upstream_expected": {}
+  },
+  {
+    "name": "question_multiple",
+    "fixture": "question.in",
+    "path": "something.c",
+    "expected": {},
+    "upstream_expected": {}
+  },
+  {
+    "name": "question_slash",
+    "fixture": "question.in",
+    "path": "som/.c",
+    "expected": {},
+    "upstream_expected": {}
+  },
+  {
+    "name": "brackets_close_inside",
+    "fixture": "brackets.in",
+    "path": "].g",
+    "expected": {
+      "close_inside": "true"
+    },
+    "upstream_expected": {
+      "close_inside": "true"
+    }
+  },
+  {
+    "name": "brackets_close_outside",
+    "fixture": "brackets.in",
+    "path": "b].g",
+    "expected": {
+      "close_outside": "true"
+    },
+    "upstream_expected": {
+      "close_outside": "true"
+    }
+  },
+  {
+    "name": "brackets_nclose_inside",
+    "fixture": "brackets.in",
+    "path": "c.g",
+    "expected": {
+      "close_inside": "false"
+    },
+    "upstream_expected": {
+      "close_inside": "false"
+    }
+  },
+  {
+    "name": "brackets_nclose_outside",
+    "fixture": "brackets.in",
+    "path": "c].g",
+    "expected": {
+      "close_outside": "false"
+    },
+    "upstream_expected": {
+      "close_outside": "false"
+    }
+  },
+  {
+    "name": "brackets_choice",
+    "fixture": "brackets.in",
+    "path": "a.a",
+    "expected": {
+      "choice": "true"
+    },
+    "upstream_expected": {
+      "choice": "true"
+    }
+  },
+  {
+    "name": "brackets_choice2",
+    "fixture": "brackets.in",
+    "path": "c.a",
+    "expected": {},
+    "upstream_expected": {}
+  },
+  {
+    "name": "brackets_nchoice",
+    "fixture": "brackets.in",
+    "path": "c.b",
+    "expected": {
+      "choice": "false"
+    },
+    "upstream_expected": {
+      "choice": "false"
+    }
+  },
+  {
+    "name": "brackets_nchoice2",
+    "fixture": "brackets.in",
+    "path": "a.b",
+    "expected": {},
+    "upstream_expected": {}
+  },
+  {
+    "name": "brackets_range",
+    "fixture": "brackets.in",
+    "path": "f.c",
+    "expected": {},
+    "upstream_expected": {
+      "range": "true"
+    }
+  },
+  {
+    "name": "brackets_range2",
+    "fixture": "brackets.in",
+    "path": "h.c",
+    "expected": {},
+    "upstream_expected": {}
+  },
+  {
+    "name": "brackets_nrange",
+    "fixture": "brackets.in",
+    "path": "h.d",
+    "expected": {
+      "range": "false"
+    },
+    "upstream_expected": {
+      "range": "false"
+    }
+  },
+  {
+    "name": "brackets_nrange2",
+    "fixture": "brackets.in",
+    "path": "f.d",
+    "expected": {
+      "range": "false"
+    },
+    "upstream_expected": {}
+  },
+  {
+    "name": "brackets_range_and_choice",
+    "fixture": "brackets.in",
+    "path": "e.e",
+    "expected": {},
+    "upstream_expected": {
+      "range_and_choice": "true"
+    }
+  },
+  {
+    "name": "brackets_choice_with_dash",
+    "fixture": "brackets.in",
+    "path": "-.f",
+    "expected": {
+      "choice_with_dash": "true"
+    },
+    "upstream_expected": {
+      "choice_with_dash": "true"
+    }
+  },
+  {
+    "name": "brackets_slash_inside1",
+    "fixture": "brackets.in",
+    "path": "ab/cd.i",
+    "expected": {
+      "slash_inside": "true"
+    },
+    "upstream_expected": {}
+  },
+  {
+    "name": "brackets_slash_inside2",
+    "fixture": "brackets.in",
+    "path": "abecd.i",
+    "expected": {
+      "slash_inside": "true"
+    },
+    "upstream_expected": {}
+  },
+  {
+    "name": "brackets_slash_inside3",
+    "fixture": "brackets.in",
+    "path": "ab[e/]cd.i",
+    "expected": {},
+    "upstream_expected": {
+      "slash_inside": "true"
+    }
+  },
+  {
+    "name": "brackets_slash_inside4",
+    "fixture": "brackets.in",
+    "path": "ab[/c",
+    "expected": {
+      "slash_half_open": "true"
+    },
+    "upstream_expected": {
+      "slash_half_open": "true"
+    }
+  },
+  {
+    "name": "braces_word_choice1",
+    "fixture": "braces.in",
+    "path": "test.py",
+    "expected": {
+      "choice": "true"
+    },
+    "upstream_expected": {
+      "choice": "true"
+    }
+  },
+  {
+    "name": "braces_word_choice2",
+    "fixture": "braces.in",
+    "path": "test.js",
+    "expected": {
+      "choice": "true"
+    },
+    "upstream_expected": {
+      "choice": "true"
+    }
+  },
+  {
+    "name": "braces_word_choice3",
+    "fixture": "braces.in",
+    "path": "test.html",
+    "expected": {
+      "choice": "true"
+    },
+    "upstream_expected": {
+      "choice": "true"
+    }
+  },
+  {
+    "name": "braces_word_choice4",
+    "fixture": "braces.in",
+    "path": "test.pyc",
+    "expected": {},
+    "upstream_expected": {}
+  },
+  {
+    "name": "braces_single_choice",
+    "fixture": "braces.in",
+    "path": "{single}.b",
+    "expected": {
+      "choice": "single"
+    },
+    "upstream_expected": {
+      "choice": "single"
+    }
+  },
+  {
+    "name": "braces_single_choice_negative",
+    "fixture": "braces.in",
+    "path": ".b",
+    "expected": {},
+    "upstream_expected": {}
+  },
+  {
+    "name": "braces_empty_choice",
+    "fixture": "braces.in",
+    "path": "{}.c",
+    "expected": {
+      "empty": "all"
+    },
+    "upstream_expected": {
+      "empty": "all"
+    }
+  },
+  {
+    "name": "braces_empty_choice_negative",
+    "fixture": "braces.in",
+    "path": ".c",
+    "expected": {},
+    "upstream_expected": {}
+  },
+  {
+    "name": "braces_empty_word1",
+    "fixture": "braces.in",
+    "path": "a.d",
+    "expected": {
+      "empty": "word"
+    },
+    "upstream_expected": {
+      "empty": "word"
+    }
+  },
+  {
+    "name": "braces_empty_word2",
+    "fixture": "braces.in",
+    "path": "ab.d",
+    "expected": {
+      "empty": "word"
+    },
+    "upstream_expected": {
+      "empty": "word"
+    }
+  },
+  {
+    "name": "braces_empty_word3",
+    "fixture": "braces.in",
+    "path": "ac.d",
+    "expected": {
+      "empty": "word"
+    },
+    "upstream_expected": {
+      "empty": "word"
+    }
+  },
+  {
+    "name": "braces_empty_word4",
+    "fixture": "braces.in",
+    "path": "a,.d",
+    "expected": {},
+    "upstream_expected": {}
+  },
+  {
+    "name": "braces_empty_words1",
+    "fixture": "braces.in",
+    "path": "a.e",
+    "expected": {
+      "empty": "words"
+    },
+    "upstream_expected": {
+      "empty": "words"
+    }
+  },
+  {
+    "name": "braces_empty_words2",
+    "fixture": "braces.in",
+    "path": "ab.e",
+    "expected": {
+      "empty": "words"
+    },
+    "upstream_expected": {
+      "empty": "words"
+    }
+  },
+  {
+    "name": "braces_empty_words3",
+    "fixture": "braces.in",
+    "path": "ac.e",
+    "expected": {
+      "empty": "words"
+    },
+    "upstream_expected": {
+      "empty": "words"
+    }
+  },
+  {
+    "name": "braces_empty_words4",
+    "fixture": "braces.in",
+    "path": "a,.e",
+    "expected": {},
+    "upstream_expected": {}
+  },
+  {
+    "name": "braces_no_closing",
+    "fixture": "braces.in",
+    "path": "{.f",
+    "expected": {
+      "closing": "false"
+    },
+    "upstream_expected": {
+      "closing": "false"
+    }
+  },
+  {
+    "name": "braces_no_closing_negative",
+    "fixture": "braces.in",
+    "path": ".f",
+    "expected": {},
+    "upstream_expected": {}
+  },
+  {
+    "name": "braces_nested1",
+    "fixture": "braces.in",
+    "path": "word,this}.g",
+    "expected": {},
+    "upstream_expected": {}
+  },
+  {
+    "name": "braces_nested2",
+    "fixture": "braces.in",
+    "path": "{also,this}.g",
+    "expected": {},
+    "upstream_expected": {}
+  },
+  {
+    "name": "braces_nested3",
+    "fixture": "braces.in",
+    "path": "word.g",
+    "expected": {
+      "nested": "true"
+    },
+    "upstream_expected": {
+      "nested": "true"
+    }
+  },
+  {
+    "name": "braces_nested4",
+    "fixture": "braces.in",
+    "path": "{also}.g",
+    "expected": {
+      "nested": "true"
+    },
+    "upstream_expected": {
+      "nested": "true"
+    }
+  },
+  {
+    "name": "braces_nested5",
+    "fixture": "braces.in",
+    "path": "this.g",
+    "expected": {
+      "nested": "true"
+    },
+    "upstream_expected": {
+      "nested": "true"
+    }
+  },
+  {
+    "name": "braces_nested_start1",
+    "fixture": "braces.in",
+    "path": "{{a,b},c}.k",
+    "expected": {},
+    "upstream_expected": {}
+  },
+  {
+    "name": "braces_nested_start2",
+    "fixture": "braces.in",
+    "path": "{a,b}.k",
+    "expected": {},
+    "upstream_expected": {}
+  },
+  {
+    "name": "braces_nested_start3",
+    "fixture": "braces.in",
+    "path": "a.k",
+    "expected": {
+      "nested_start": "true"
+    },
+    "upstream_expected": {
+      "nested_start": "true"
+    }
+  },
+  {
+    "name": "braces_nested_start4",
+    "fixture": "braces.in",
+    "path": "b.k",
+    "expected": {
+      "nested_start": "true"
+    },
+    "upstream_expected": {
+      "nested_start": "true"
+    }
+  },
+  {
+    "name": "braces_nested_start5",
+    "fixture": "braces.in",
+    "path": "c.k",
+    "expected": {
+      "nested_start": "true"
+    },
+    "upstream_expected": {
+      "nested_start": "true"
+    }
+  },
+  {
+    "name": "braces_nested_end1",
+    "fixture": "braces.in",
+    "path": "{a,{b,c}}.l",
+    "expected": {},
+    "upstream_expected": {}
+  },
+  {
+    "name": "braces_nested_end2",
+    "fixture": "braces.in",
+    "path": "{b,c}.l",
+    "expected": {},
+    "upstream_expected": {}
+  },
+  {
+    "name": "braces_nested_end3",
+    "fixture": "braces.in",
+    "path": "a.l",
+    "expected": {
+      "nested_end": "true"
+    },
+    "upstream_expected": {
+      "nested_end": "true"
+    }
+  },
+  {
+    "name": "braces_nested_end4",
+    "fixture": "braces.in",
+    "path": "b.l",
+    "expected": {
+      "nested_end": "true"
+    },
+    "upstream_expected": {
+      "nested_end": "true"
+    }
+  },
+  {
+    "name": "braces_nested_end5",
+    "fixture": "braces.in",
+    "path": "c.l",
+    "expected": {
+      "nested_end": "true"
+    },
+    "upstream_expected": {
+      "nested_end": "true"
+    }
+  },
+  {
+    "name": "braces_closing_in_beginning",
+    "fixture": "braces.in",
+    "path": "{},b}.h",
+    "expected": {
+      "closing": "inside"
+    },
+    "upstream_expected": {
+      "closing": "inside"
+    }
+  },
+  {
+    "name": "braces_unmatched1",
+    "fixture": "braces.in",
+    "path": "{{,b,c{d}.i",
+    "expected": {
+      "unmatched": "true"
+    },
+    "upstream_expected": {
+      "unmatched": "true"
+    }
+  },
+  {
+    "name": "braces_unmatched2",
+    "fixture": "braces.in",
+    "path": "{.i",
+    "expected": {},
+    "upstream_expected": {}
+  },
+  {
+    "name": "braces_unmatched3",
+    "fixture": "braces.in",
+    "path": "b.i",
+    "expected": {},
+    "upstream_expected": {}
+  },
+  {
+    "name": "braces_unmatched4",
+    "fixture": "braces.in",
+    "path": "c{d.i",
+    "expected": {},
+    "upstream_expected": {}
+  },
+  {
+    "name": "braces_unmatched5",
+    "fixture": "braces.in",
+    "path": ".i",
+    "expected": {},
+    "upstream_expected": {}
+  },
+  {
+    "name": "braces_escaped_comma1",
+    "fixture": "braces.in",
+    "path": "a,b.txt",
+    "expected": {
+      "comma": "yes"
+    },
+    "upstream_expected": {
+      "comma": "yes"
+    }
+  },
+  {
+    "name": "braces_escaped_comma2",
+    "fixture": "braces.in",
+    "path": "a.txt",
+    "expected": {},
+    "upstream_expected": {}
+  },
+  {
+    "name": "braces_escaped_comma3",
+    "fixture": "braces.in",
+    "path": "cd.txt",
+    "expected": {
+      "comma": "yes"
+    },
+    "upstream_expected": {
+      "comma": "yes"
+    }
+  },
+  {
+    "name": "braces_escaped_brace1",
+    "fixture": "braces.in",
+    "path": "e.txt",
+    "expected": {
+      "closing": "yes"
+    },
+    "upstream_expected": {
+      "closing": "yes"
+    }
+  },
+  {
+    "name": "braces_escaped_brace2",
+    "fixture": "braces.in",
+    "path": "}.txt",
+    "expected": {
+      "closing": "yes"
+    },
+    "upstream_expected": {
+      "closing": "yes"
+    }
+  },
+  {
+    "name": "braces_escaped_brace3",
+    "fixture": "braces.in",
+    "path": "f.txt",
+    "expected": {
+      "closing": "yes"
+    },
+    "upstream_expected": {
+      "closing": "yes"
+    }
+  },
+  {
+    "name": "braces_escaped_backslash1",
+    "fixture": "braces.in",
+    "path": "g.txt",
+    "expected": {
+      "backslash": "yes"
+    },
+    "upstream_expected": {
+      "backslash": "yes"
+    }
+  },
+  {
+    "name": "braces_escaped_backslash2",
+    "fixture": "braces.in",
+    "path": "\\.txt",
+    "expected": {
+      "backslash": "yes"
+    },
+    "upstream_expected": {
+      "backslash": "yes"
+    }
+  },
+  {
+    "name": "braces_escaped_backslash3",
+    "fixture": "braces.in",
+    "path": "i.txt",
+    "expected": {
+      "backslash": "yes"
+    },
+    "upstream_expected": {
+      "backslash": "yes"
+    }
+  },
+  {
+    "name": "braces_patterns_nested1",
+    "fixture": "braces.in",
+    "path": "some.j",
+    "expected": {
+      "patterns": "nested"
+    },
+    "upstream_expected": {
+      "patterns": "nested"
+    }
+  },
+  {
+    "name": "braces_patterns_nested2",
+    "fixture": "braces.in",
+    "path": "abe.j",
+    "expected": {
+      "patterns": "nested"
+    },
+    "upstream_expected": {
+      "patterns": "nested"
+    }
+  },
+  {
+    "name": "braces_patterns_nested3",
+    "fixture": "braces.in",
+    "path": "abf.j",
+    "expected": {
+      "patterns": "nested"
+    },
+    "upstream_expected": {
+      "patterns": "nested"
+    }
+  },
+  {
+    "name": "braces_patterns_nested4",
+    "fixture": "braces.in",
+    "path": "abg.j",
+    "expected": {},
+    "upstream_expected": {}
+  },
+  {
+    "name": "braces_patterns_nested5",
+    "fixture": "braces.in",
+    "path": "ace.j",
+    "expected": {
+      "patterns": "nested"
+    },
+    "upstream_expected": {
+      "patterns": "nested"
+    }
+  },
+  {
+    "name": "braces_patterns_nested6",
+    "fixture": "braces.in",
+    "path": "acf.j",
+    "expected": {
+      "patterns": "nested"
+    },
+    "upstream_expected": {
+      "patterns": "nested"
+    }
+  },
+  {
+    "name": "braces_patterns_nested7",
+    "fixture": "braces.in",
+    "path": "acg.j",
+    "expected": {},
+    "upstream_expected": {}
+  },
+  {
+    "name": "braces_patterns_nested8",
+    "fixture": "braces.in",
+    "path": "abce.j",
+    "expected": {
+      "patterns": "nested"
+    },
+    "upstream_expected": {
+      "patterns": "nested"
+    }
+  },
+  {
+    "name": "braces_patterns_nested9",
+    "fixture": "braces.in",
+    "path": "abcf.j",
+    "expected": {
+      "patterns": "nested"
+    },
+    "upstream_expected": {
+      "patterns": "nested"
+    }
+  },
+  {
+    "name": "braces_patterns_nested10",
+    "fixture": "braces.in",
+    "path": "abcg.j",
+    "expected": {},
+    "upstream_expected": {}
+  },
+  {
+    "name": "braces_patterns_nested11",
+    "fixture": "braces.in",
+    "path": "ae.j",
+    "expected": {},
+    "upstream_expected": {}
+  },
+  {
+    "name": "braces_patterns_nested12",
+    "fixture": "braces.in",
+    "path": ".j",
+    "expected": {},
+    "upstream_expected": {}
+  },
+  {
+    "name": "braces_numeric_range1",
+    "fixture": "braces.in",
+    "path": "1",
+    "expected": {},
+    "upstream_expected": {}
+  },
+  {
+    "name": "braces_numeric_range2",
+    "fixture": "braces.in",
+    "path": "3",
+    "expected": {
+      "number": "true"
+    },
+    "upstream_expected": {
+      "number": "true"
+    }
+  },
+  {
+    "name": "braces_numeric_range3",
+    "fixture": "braces.in",
+    "path": "15",
+    "expected": {
+      "number": "true"
+    },
+    "upstream_expected": {
+      "number": "true"
+    }
+  },
+  {
+    "name": "braces_numeric_range4",
+    "fixture": "braces.in",
+    "path": "60",
+    "expected": {
+      "number": "true"
+    },
+    "upstream_expected": {
+      "number": "true"
+    }
+  },
+  {
+    "name": "braces_numeric_range5",
+    "fixture": "braces.in",
+    "path": "5a",
+    "expected": {},
+    "upstream_expected": {}
+  },
+  {
+    "name": "braces_numeric_range6",
+    "fixture": "braces.in",
+    "path": "120",
+    "expected": {
+      "number": "true"
+    },
+    "upstream_expected": {
+      "number": "true"
+    }
+  },
+  {
+    "name": "braces_numeric_range7",
+    "fixture": "braces.in",
+    "path": "121",
+    "expected": {},
+    "upstream_expected": {}
+  },
+  {
+    "name": "braces_numeric_range8",
+    "fixture": "braces.in",
+    "path": "060",
+    "expected": {},
+    "upstream_expected": {}
+  },
+  {
+    "name": "braces_alpha_range1",
+    "fixture": "braces.in",
+    "path": "{aardvark..antelope}",
+    "expected": {
+      "words": "a"
+    },
+    "upstream_expected": {
+      "words": "a"
+    }
+  },
+  {
+    "name": "braces_alpha_range2",
+    "fixture": "braces.in",
+    "path": "a",
+    "expected": {},
+    "upstream_expected": {}
+  },
+  {
+    "name": "braces_alpha_range3",
+    "fixture": "braces.in",
+    "path": "aardvark",
+    "expected": {},
+    "upstream_expected": {}
+  },
+  {
+    "name": "braces_alpha_range4",
+    "fixture": "braces.in",
+    "path": "agreement",
+    "expected": {},
+    "upstream_expected": {}
+  },
+  {
+    "name": "braces_alpha_range5",
+    "fixture": "braces.in",
+    "path": "antelope",
+    "expected": {},
+    "upstream_expected": {}
+  },
+  {
+    "name": "braces_alpha_range6",
+    "fixture": "braces.in",
+    "path": "antimatter",
+    "expected": {},
+    "upstream_expected": {}
+  },
+  {
+    "name": "utf_8_char",
+    "fixture": "utf8char.in",
+    "path": "中文.txt",
+    "expected": {
+      "key": "value"
+    },
+    "upstream_expected": {
+      "key": "value"
+    }
+  },
+  {
+    "name": "star_star_over_separator1",
+    "fixture": "star_star.in",
+    "path": "a/z.c",
+    "expected": {
+      "key1": "value1"
+    },
+    "upstream_expected": {
+      "key1": "value1"
+    }
+  },
+  {
+    "name": "star_star_over_separator2",
+    "fixture": "star_star.in",
+    "path": "amnz.c",
+    "expected": {
+      "key1": "value1"
+    },
+    "upstream_expected": {
+      "key1": "value1"
+    }
+  },
+  {
+    "name": "star_star_over_separator3",
+    "fixture": "star_star.in",
+    "path": "am/nz.c",
+    "expected": {
+      "key1": "value1"
+    },
+    "upstream_expected": {
+      "key1": "value1"
+    }
+  },
+  {
+    "name": "star_star_over_separator4",
+    "fixture": "star_star.in",
+    "path": "a/mnz.c",
+    "expected": {
+      "key1": "value1"
+    },
+    "upstream_expected": {
+      "key1": "value1"
+    }
+  },
+  {
+    "name": "star_star_over_separator5",
+    "fixture": "star_star.in",
+    "path": "amn/z.c",
+    "expected": {
+      "key1": "value1"
+    },
+    "upstream_expected": {
+      "key1": "value1"
+    }
+  },
+  {
+    "name": "star_star_over_separator6",
+    "fixture": "star_star.in",
+    "path": "a/mn/z.c",
+    "expected": {
+      "key1": "value1"
+    },
+    "upstream_expected": {
+      "key1": "value1"
+    }
+  },
+  {
+    "name": "star_star_over_separator7",
+    "fixture": "star_star.in",
+    "path": "b/z.c",
+    "expected": {
+      "key2": "value2"
+    },
+    "upstream_expected": {
+      "key2": "value2"
+    }
+  },
+  {
+    "name": "star_star_over_separator8",
+    "fixture": "star_star.in",
+    "path": "b/mnz.c",
+    "expected": {
+      "key2": "value2"
+    },
+    "upstream_expected": {
+      "key2": "value2"
+    }
+  },
+  {
+    "name": "star_star_over_separator9",
+    "fixture": "star_star.in",
+    "path": "b/mn/z.c",
+    "expected": {
+      "key2": "value2"
+    },
+    "upstream_expected": {
+      "key2": "value2"
+    }
+  },
+  {
+    "name": "star_star_over_separator10",
+    "fixture": "star_star.in",
+    "path": "bmnz.c",
+    "expected": {},
+    "upstream_expected": {}
+  },
+  {
+    "name": "star_star_over_separator11",
+    "fixture": "star_star.in",
+    "path": "bm/nz.c",
+    "expected": {},
+    "upstream_expected": {}
+  },
+  {
+    "name": "star_star_over_separator12",
+    "fixture": "star_star.in",
+    "path": "bmn/z.c",
+    "expected": {},
+    "upstream_expected": {}
+  },
+  {
+    "name": "star_star_over_separator13",
+    "fixture": "star_star.in",
+    "path": "c/z.c",
+    "expected": {
+      "key3": "value3"
+    },
+    "upstream_expected": {
+      "key3": "value3"
+    }
+  },
+  {
+    "name": "star_star_over_separator14",
+    "fixture": "star_star.in",
+    "path": "cmn/z.c",
+    "expected": {
+      "key3": "value3"
+    },
+    "upstream_expected": {
+      "key3": "value3"
+    }
+  },
+  {
+    "name": "star_star_over_separator15",
+    "fixture": "star_star.in",
+    "path": "c/mn/z.c",
+    "expected": {
+      "key3": "value3"
+    },
+    "upstream_expected": {
+      "key3": "value3"
+    }
+  },
+  {
+    "name": "star_star_over_separator16",
+    "fixture": "star_star.in",
+    "path": "cmnz.c",
+    "expected": {},
+    "upstream_expected": {}
+  },
+  {
+    "name": "star_star_over_separator17",
+    "fixture": "star_star.in",
+    "path": "cm/nz.c",
+    "expected": {},
+    "upstream_expected": {}
+  },
+  {
+    "name": "star_star_over_separator18",
+    "fixture": "star_star.in",
+    "path": "c/mnz.c",
+    "expected": {},
+    "upstream_expected": {}
+  },
+  {
+    "name": "star_star_over_separator19",
+    "fixture": "star_star.in",
+    "path": "d/z.c",
+    "expected": {
+      "key4": "value4"
+    },
+    "upstream_expected": {
+      "key4": "value4"
+    }
+  },
+  {
+    "name": "star_star_over_separator20",
+    "fixture": "star_star.in",
+    "path": "d/mn/z.c",
+    "expected": {
+      "key4": "value4"
+    },
+    "upstream_expected": {
+      "key4": "value4"
+    }
+  },
+  {
+    "name": "star_star_over_separator21",
+    "fixture": "star_star.in",
+    "path": "dmnz.c",
+    "expected": {},
+    "upstream_expected": {}
+  },
+  {
+    "name": "star_star_over_separator22",
+    "fixture": "star_star.in",
+    "path": "dm/nz.c",
+    "expected": {},
+    "upstream_expected": {}
+  },
+  {
+    "name": "star_star_over_separator23",
+    "fixture": "star_star.in",
+    "path": "d/mnz.c",
+    "expected": {},
+    "upstream_expected": {}
+  },
+  {
+    "name": "star_star_over_separator24",
+    "fixture": "star_star.in",
+    "path": "dmn/z.c",
+    "expected": {},
+    "upstream_expected": {}
+  }
+]

@@ -161,6 +161,32 @@ pub const CommandRegistry = struct {
 
 /// Register all built-in editor commands.
 pub fn registerBuiltins(registry: *CommandRegistry) !void {
+    try registry.register("recover_documents", "Recover unsaved documents from a previous instance", cmdRecover);
+    try registry.register("run_task", "Choose and run a registered task", cmdRunTask);
+    try registry.register("task_output", "Show the latest task output", cmdTaskOutput);
+    try registry.register("rerun_task", "Rerun the latest task", cmdRerunTask);
+    try registry.register("stop_task", "Cancel the latest task and its child processes", cmdStopTask);
+    try registry.register("problems", "Show workspace problems", cmdProblems);
+    try registry.register("git_changes", "Show staged and working tree changes", cmdGitChanges);
+    try registry.register("debug", "Show debugger controls and views", cmdDebug);
+    try registry.register("debug_start", "Choose a launch or attach configuration", cmdDebugStart);
+    try registry.register("toggle_breakpoint", "Toggle a source breakpoint at the cursor", cmdBreakpoint);
+    try registry.register("debug_continue", "Continue the stopped debuggee", cmdDebugContinue);
+    try registry.register("debug_pause", "Pause the running debuggee", cmdDebugPause);
+    try registry.register("debug_step_over", "Step over the current statement", cmdDebugNext);
+    try registry.register("debug_step_in", "Step into the current call", cmdDebugIn);
+    try registry.register("debug_step_out", "Step out of the current frame", cmdDebugOut);
+    try registry.register("debug_stop", "Stop a launched program or detach from an attached target", cmdDebugStop);
+    try registry.register("debug_terminate", "Explicitly terminate the debug target when supported", cmdDebugTerminate);
+    try registry.register("git_refresh", "Refresh workspace Git status", cmdGitRefresh);
+    try registry.register("git_stage", "Stage the selected file's saved contents", cmdGitStage);
+    try registry.register("git_unstage", "Unstage the selected file", cmdGitUnstage);
+    try registry.register("next_problem", "Open the next problem", cmdNextProblem);
+    try registry.register("previous_problem", "Open the previous problem", cmdPreviousProblem);
+    try registry.register("hover", "Show language-server information at the cursor", cmdHover);
+    try registry.register("rename_symbol", "Rename a symbol with a workspace edit preview", cmdRenameSymbol);
+    try registry.register("format_document", "Format the current document with its language server", cmdFormatDocument);
+    try registry.register("format_selection", "Format the selected range when supported", cmdFormatSelection);
     try registry.register("cursor_right", "Move cursor right", cmdCursorRight);
     try registry.register("cursor_left", "Move cursor left", cmdCursorLeft);
     try registry.register("cursor_up", "Move cursor up", cmdCursorUp);
@@ -594,24 +620,115 @@ fn cmdSmartHomeSelect(editor: *Editor, _: ?[]const u8) void {
 
 // --- Indent / Dedent ---
 
+fn cmdRecover(editor: *Editor, _: ?[]const u8) void {
+    editor.showRecovery();
+}
+fn cmdRunTask(editor: *Editor, args: ?[]const u8) void {
+    if (args) |name| {
+        _ = editor.tasks.request(editor, name) catch |err| {
+            editor.status_message = std.fmt.bufPrint(&editor.status_buf, "Task: {s}", .{@errorName(err)}) catch "Task failed";
+            return;
+        };
+        if (editor.mode == .normal) editor.tool_panel.show(editor, .task_output);
+    } else editor.tool_panel.show(editor, .tasks);
+}
+fn cmdTaskOutput(editor: *Editor, _: ?[]const u8) void {
+    editor.tool_panel.show(editor, .task_output);
+}
+fn cmdRerunTask(editor: *Editor, _: ?[]const u8) void {
+    const run = editor.tasks.get(editor.tasks.selected_run orelse return) orelse return;
+    // Request may evict old history, so retain the name independently.
+    const name = editor.allocator.dupe(u8, run.config.options.name) catch return;
+    defer editor.allocator.free(name);
+    editor.mode = .normal;
+    cmdRunTask(editor, name);
+}
+fn cmdStopTask(editor: *Editor, _: ?[]const u8) void {
+    editor.tasks.cancel(editor, editor.tasks.selected_run orelse return);
+}
+fn cmdProblems(editor: *Editor, _: ?[]const u8) void {
+    editor.tool_panel.show(editor, .problems);
+}
+fn cmdGitChanges(editor: *Editor, _: ?[]const u8) void {
+    editor.git.requestRefresh();
+    editor.tool_panel.show(editor, .changes);
+}
+fn cmdGitRefresh(editor: *Editor, _: ?[]const u8) void {
+    editor.git.requestRefresh();
+}
+fn cmdDebug(editor: *Editor, _: ?[]const u8) void {
+    editor.dap.show(editor, .overview);
+}
+fn cmdDebugStart(editor: *Editor, args: ?[]const u8) void {
+    if (args) |name| editor.dap.start(editor, name) catch |err| {
+        editor.status_message = std.fmt.bufPrint(&editor.status_buf, "Debug: {s}", .{@errorName(err)}) catch "Debug launch failed";
+    } else editor.dap.show(editor, .configurations);
+}
+fn cmdBreakpoint(editor: *Editor, _: ?[]const u8) void {
+    editor.dap.toggleBreakpoint(editor);
+}
+fn cmdDebugContinue(editor: *Editor, _: ?[]const u8) void {
+    editor.dap.control(editor, .@"continue");
+}
+fn cmdDebugPause(editor: *Editor, _: ?[]const u8) void {
+    editor.dap.control(editor, .pause);
+}
+fn cmdDebugNext(editor: *Editor, _: ?[]const u8) void {
+    editor.dap.control(editor, .next);
+}
+fn cmdDebugIn(editor: *Editor, _: ?[]const u8) void {
+    editor.dap.control(editor, .stepIn);
+}
+fn cmdDebugOut(editor: *Editor, _: ?[]const u8) void {
+    editor.dap.control(editor, .stepOut);
+}
+fn cmdDebugStop(editor: *Editor, _: ?[]const u8) void {
+    editor.dap.stop(editor, false);
+}
+fn cmdDebugTerminate(editor: *Editor, _: ?[]const u8) void {
+    editor.dap.stop(editor, true);
+}
+fn cmdGitStage(editor: *Editor, _: ?[]const u8) void {
+    if (editor.tool_panel.kind == .changes) editor.git.stage(editor, editor.tool_panel.selected, false) else cmdGitChanges(editor, null);
+}
+fn cmdGitUnstage(editor: *Editor, _: ?[]const u8) void {
+    if (editor.tool_panel.kind == .changes) editor.git.stage(editor, editor.tool_panel.selected, true) else cmdGitChanges(editor, null);
+}
+fn cmdNextProblem(editor: *Editor, _: ?[]const u8) void {
+    editor.tool_panel.nextProblem(editor, true);
+}
+fn cmdPreviousProblem(editor: *Editor, _: ?[]const u8) void {
+    editor.tool_panel.nextProblem(editor, false);
+}
+fn cmdHover(editor: *Editor, _: ?[]const u8) void {
+    editor.lsp_tools.start(editor, .hover);
+}
+fn cmdRenameSymbol(editor: *Editor, _: ?[]const u8) void {
+    editor.lsp_tools.start(editor, .prepare_rename);
+}
+fn cmdFormatDocument(editor: *Editor, _: ?[]const u8) void {
+    editor.lsp_tools.start(editor, .format_document);
+}
+fn cmdFormatSelection(editor: *Editor, _: ?[]const u8) void {
+    editor.lsp_tools.start(editor, .format_selection);
+}
+
 fn cmdIndent(editor: *Editor, _: ?[]const u8) void {
     const doc = editor.activeDoc();
-    if (editor.useTabsFor(doc)) {
-        doc.insertAtAllCursors("\t") catch {
-            editor.status_message = "Edit failed: out of memory";
-        };
-    } else {
-        const spaces = "                "; // 16 spaces max
-        const width = @min(editor.tabWidthFor(doc), 16);
-        doc.insertAtAllCursors(spaces[0..width]) catch {
-            editor.status_message = "Edit failed: out of memory";
-        };
-    }
+    const width = @min(editor.indentWidthFor(doc), 256);
+    const tabs = if (editor.useTabsFor(doc)) width / @max(1, editor.tabWidthFor(doc)) else 0;
+    const spaces = width - tabs * editor.tabWidthFor(doc);
+    var indentation: [256]u8 = undefined;
+    @memset(indentation[0..tabs], '\t');
+    @memset(indentation[tabs..][0..spaces], ' ');
+    doc.insertAtAllCursors(indentation[0 .. tabs + spaces]) catch {
+        editor.status_message = "Edit failed: out of memory";
+    };
 }
 
 fn cmdDedent(editor: *Editor, _: ?[]const u8) void {
     const doc = editor.activeDoc();
-    doc.dedentLine(editor.tabWidthFor(doc)) catch {};
+    doc.dedentLine(editor.indentWidthFor(doc)) catch {};
 }
 
 // --- Comment toggle ---

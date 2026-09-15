@@ -1,0 +1,32 @@
+-- Add registrations to ~/.config/zide/init.lua or an extension.
+-- Registration does not run anything. Use Run Task in the command palette.
+-- argv is passed directly; explicitly name a shell if a command needs shell syntax.
+
+-- zide.register_task({
+--     name = "Zig build",
+--     argv = { "zig", "build", "--color", "off" },
+--     problem_matcher = "zig",
+-- })
+-- zide.register_task({
+--     name = "Zig test",
+--     argv = { "zig", "build", "test", "--color", "off" },
+--     cwd = ".", -- Relative to the workspace, which is also the default cwd.
+--     env = { NO_COLOR = "1" },
+--     problem_matcher = "zig",
+-- })
+
+-- Custom matchers run on the editor thread. Return nil or one diagnostic.
+-- Locations use one-based lines and UTF-8 byte columns; file is relative to task cwd.
+-- zide.register_task({
+--     name = "Example checker",
+--     argv = { "my-checker", "src" },
+--     problem_matcher = function(line)
+--         local file, row, col, message = line:match("^(.-):(%d+):(%d+): (.+)$")
+--         if file then
+--             return { file = file, line = tonumber(row), col = tonumber(col),
+--                      severity = "warning", message = message }
+--         end
+--     end,
+-- })
+-- local id, err = zide.run_task("Zig test")
+-- zide.cancel_task(id)

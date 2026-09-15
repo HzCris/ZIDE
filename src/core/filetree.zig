@@ -65,6 +65,7 @@ pub const FileTree = struct {
     /// Row coloring by git status (editor mirrors `filetree_git_colors`
     /// onto this; off = gitRefresh never shells out).
     git_enabled: bool = true,
+    git_refresh_requested: bool = true,
     /// Multi-select: node indices of the selected set. When non-empty it
     /// IS the effective selection (and includes the primary); empty means
     /// the primary `selected` row alone. Node indices die on refresh —
@@ -581,7 +582,7 @@ pub const FileTree = struct {
         const dir_part = node.rel_path[0 .. node.rel_path.len - node.name.len];
         const new_rel = try std.mem.concat(allocator, u8, &.{ dir_part, new_name });
         errdefer allocator.free(new_rel);
-        try std.Io.Dir.renamePreserve(self.root_dir, node.rel_path, self.root_dir, new_rel, self.io);
+        try @import("file_operations.zig").renamePreserve(self.root_dir, node.rel_path, self.root_dir, new_rel, self.io);
         return new_rel;
     }
 
@@ -620,7 +621,7 @@ pub const FileTree = struct {
         else
             try std.mem.concat(allocator, u8, &.{ dest.rel_path, "/", base });
         errdefer allocator.free(new_rel);
-        try std.Io.Dir.renamePreserve(self.root_dir, src_rel, self.root_dir, new_rel, self.io);
+        try @import("file_operations.zig").renamePreserve(self.root_dir, src_rel, self.root_dir, new_rel, self.io);
         return new_rel;
     }
 
@@ -736,7 +737,7 @@ pub const FileTree = struct {
 
     // ---- Git status ----
 
-    fn clearGitMaps(self: *FileTree) void {
+    pub fn clearGitMaps(self: *FileTree) void {
         var kit = self.git_map.keyIterator();
         while (kit.next()) |k| self.allocator.free(k.*);
         self.git_map.clearRetainingCapacity();
@@ -745,45 +746,10 @@ pub const FileTree = struct {
         self.git_dirty_dirs.clearRetainingCapacity();
     }
 
-    /// Re-run `git status --porcelain -z` for the tree root and rebuild the
-    /// status maps. Silently leaves them empty when git is missing or the
-    /// root isn't inside a repository. Blocking one-shot — called on load,
-    /// refresh, file ops, and save; never per frame.
-    /// No-op (beyond clearing) when `git_enabled` is off — statusFor then
-    /// returns null for everything and rows render uncolored.
+    /// Invalidate the asynchronous workspace Git service. No subprocess runs here.
     pub fn gitRefresh(self: *FileTree) void {
-        self.clearGitMaps();
-        if (!self.git_enabled) return;
-
-        // Porcelain paths are repo-root-relative; --show-prefix tells us
-        // where our tree root sits inside the repo (with a trailing '/').
-        const prefix_res = std.process.run(self.allocator, self.io, .{
-            .argv = &.{ "git", "-C", self.root_path, "rev-parse", "--show-prefix" },
-            .stdout_limit = .limited(4096),
-            .stderr_limit = .limited(4096),
-        }) catch return;
-        defer self.allocator.free(prefix_res.stdout);
-        defer self.allocator.free(prefix_res.stderr);
-        switch (prefix_res.term) {
-            .exited => |code| if (code != 0) return,
-            else => return,
-        }
-        const prefix = std.mem.trimEnd(u8, prefix_res.stdout, "\r\n");
-
-        // Pathspec '.' limits output to our subtree; -z gives NUL-separated
-        // records with no quoting (spaces in names stay literal).
-        const status_res = std.process.run(self.allocator, self.io, .{
-            .argv = &.{ "git", "-C", self.root_path, "status", "--porcelain", "-z", "--", "." },
-            .stdout_limit = .limited(4 * 1024 * 1024),
-            .stderr_limit = .limited(4096),
-        }) catch return;
-        defer self.allocator.free(status_res.stdout);
-        defer self.allocator.free(status_res.stderr);
-        switch (status_res.term) {
-            .exited => |code| if (code != 0) return,
-            else => return,
-        }
-        self.parseGitPorcelain(prefix, status_res.stdout) catch {};
+        self.git_refresh_requested = true;
+        if (!self.git_enabled) self.clearGitMaps();
     }
 
     /// Parse `git status --porcelain -z` output into the status maps.

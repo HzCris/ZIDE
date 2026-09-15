@@ -691,7 +691,8 @@ pub fn createPipeline(self: *SDLBackend) !void {
 
     // Get swapchain texture format
     const swapchain_format = c.SDL_GetGPUSwapchainTextureFormat(self.device, self.window);
-    log.err("swapchain format: {d}", .{swapchain_format});
+    // ZIDE patch: a successfully selected format is diagnostic information.
+    log.debug("swapchain format: {d}", .{swapchain_format});
 
     // Create color target description
     var color_target = std.mem.zeroes(c.SDL_GPUColorTargetDescription);

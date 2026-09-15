@@ -19,6 +19,7 @@ pub fn Queue(
         not_full: std.Io.Condition = .init,
         // ...or empty
         not_empty: std.Io.Condition = .init,
+        timed_ready: std.Io.Event = .unset,
 
         const Self = @This();
 
@@ -35,6 +36,26 @@ pub fn Queue(
             }
             std.debug.assert(!self.isEmptyLH());
             return self.popAndSignalLH();
+        }
+
+        /// Deadline wait for the single UI consumer. No timer producer or
+        /// polling thread is needed. Normal pop remains available to users.
+        pub fn popTimeout(self: *Self, timeout: std.Io.Timeout) !?T {
+            const deadline = timeout.toDeadline(self.io);
+            while (true) {
+                try self.mutex.lock(self.io);
+                if (!self.isEmptyLH()) {
+                    const item = self.popAndSignalLH();
+                    self.mutex.unlock(self.io);
+                    return item;
+                }
+                self.timed_ready.reset();
+                self.mutex.unlock(self.io);
+                self.timed_ready.waitTimeout(self.io, deadline) catch |err| switch (err) {
+                    error.Timeout => return null,
+                    else => return err,
+                };
+            }
         }
 
         /// Push an item into the queue. Blocks until an item has been
@@ -148,6 +169,7 @@ pub fn Queue(
             self.write_index = self.mask2(self.write_index + 1);
             if (was_empty) {
                 self.not_empty.signal(self.io);
+                self.timed_ready.set(self.io);
             }
         }
 

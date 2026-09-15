@@ -364,8 +364,9 @@ pub const Terminal = struct {
             'r' => { // Set Scrolling Region (DECSTBM)
                 const top = csi.get(0, 1);
                 const bottom = csi.get(1, self.rows);
-                self.scroll_top = @as(u16, @intCast(top)) -| 1;
-                self.scroll_bottom = @min(self.rows -| 1, @as(u16, @intCast(bottom)) -| 1);
+                if (top < 1 or bottom < 1 or top >= bottom or bottom > self.rows) return;
+                self.scroll_top = @intCast(top - 1);
+                self.scroll_bottom = @intCast(bottom - 1);
                 self.cursor_row = 0;
                 self.cursor_col = 0;
             },
@@ -624,6 +625,7 @@ pub const Terminal = struct {
     }
 
     fn scrollUp(self: *Terminal) void {
+        if (self.rows == 0 or self.scroll_top > self.scroll_bottom or self.scroll_bottom >= self.rows) return;
         // Move lines up within scroll region
         for (self.scroll_top..self.scroll_bottom) |r| {
             const src_start = (r + 1) * @as(usize, self.cols);
@@ -637,6 +639,7 @@ pub const Terminal = struct {
     }
 
     fn scrollDown(self: *Terminal) void {
+        if (self.rows == 0 or self.scroll_top > self.scroll_bottom or self.scroll_bottom >= self.rows) return;
         // Move lines down within scroll region
         var r = self.scroll_bottom;
         while (r > self.scroll_top) : (r -= 1) {
@@ -809,6 +812,24 @@ fn makeTestTerminal(allocator: Allocator, cols: u16, rows: u16) !Terminal {
 fn freeTestTerminal(allocator: Allocator, term: *Terminal) void {
     allocator.free(term.cells);
     if (term.alt_cells) |ac| allocator.free(ac);
+}
+
+test "bounded randomized CSI and resizing preserve terminal grid invariants" {
+    const t = std.testing;
+    var term = try makeTestTerminal(t.allocator, 20, 8);
+    defer freeTestTerminal(t.allocator, &term);
+    var generator = std.Random.DefaultPrng.init(0x5a1de);
+    const random = generator.random();
+    const commands = "rHfSTLMJKP@ABCD";
+    for (0..1000) |iteration| {
+        var bytes: [64]u8 = undefined;
+        const sequence = try std.fmt.bufPrint(&bytes, "\x1b[{d};{d}{c}", .{ random.int(u16), random.int(u16), commands[random.uintLessThan(usize, commands.len)] });
+        term.processOutput(sequence);
+        if (iteration % 13 == 0) term.resizeGrid(1 + random.uintLessThan(u16, 30), 1 + random.uintLessThan(u16, 12));
+        try t.expectEqual(@as(usize, term.cols) * term.rows, term.cells.len);
+        try t.expect(term.scroll_top <= term.scroll_bottom and term.scroll_bottom < term.rows);
+        try t.expect(term.cursor_row < term.rows and term.cursor_col < term.cols);
+    }
 }
 
 test "hostile SGR truecolor params are clamped" {

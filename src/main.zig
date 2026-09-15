@@ -182,6 +182,7 @@ pub fn main(init: std.process.Init) !void {
     const argv = try init.minimal.args.toSlice(init.arena.allocator());
 
     var mode: ?FrontendMode = null;
+    var renderer_override: ?@import("core/renderer_settings.zig").Mode = null;
     var files: std.ArrayList([]const u8) = .empty;
     defer files.deinit(allocator);
     // `zide path/to/project`: a folder argument is the workspace for this
@@ -191,6 +192,12 @@ pub fn main(init: std.process.Init) !void {
     for (argv[1..]) |arg| {
         if (std.mem.eql(u8, arg, "--gui")) {
             mode = .gui;
+        } else if (std.mem.startsWith(u8, arg, "--renderer=")) {
+            renderer_override = @import("core/renderer_settings.zig").parse(arg["--renderer=".len..]) catch {
+                try stderr.print("Renderer must be auto, hardware, or software.\n", .{});
+                try stderr.flush();
+                return error.InvalidRenderer;
+            };
         } else if (std.mem.eql(u8, arg, "--tui")) {
             mode = .tui;
         } else if (std.mem.eql(u8, arg, "--help") or std.mem.eql(u8, arg, "-h")) {
@@ -249,7 +256,7 @@ pub fn main(init: std.process.Init) !void {
     switch (frontend) {
         .gui => {
             if (build_options.has_gui) {
-                try runGui(allocator, io, lua, files.items, project_dir);
+                try runGui(allocator, io, lua, files.items, project_dir, renderer_override);
             } else {
                 // CLI usage error — must reach the terminal (logs go to a file).
                 try stderr.print("GUI not available in this build. Use zide (not zide-tui) for GUI mode.\n", .{});
@@ -309,16 +316,23 @@ fn isConsoleHandle(handle: std.Io.File.Handle) bool {
     return GetConsoleMode(handle, &console_mode) != 0;
 }
 
-fn runGui(allocator: std.mem.Allocator, io: std.Io, lua: *zlua.Lua, cli_files: []const []const u8, project_dir: ?[]const u8) !void {
+fn runGui(allocator: std.mem.Allocator, io: std.Io, lua: *zlua.Lua, cli_files: []const []const u8, project_dir: ?[]const u8, renderer_override: ?@import("core/renderer_settings.zig").Mode) !void {
     if (!build_options.has_gui) return;
 
     if (builtin.os.tag == .windows) {
         dvui.Backend.Common.windowsAttachConsole() catch {};
     }
 
+    const started = (try @import("frontend/renderer.zig").start(allocator, io, renderer_override)) orelse return;
+    var backend = started.backend;
+    defer backend.deinit();
+
     // Init editor state
     var editor = try Editor.init(allocator, io);
     defer editor.deinit();
+    editor.renderer_active = started.active;
+    editor.renderer_preference = started.preference;
+    if (!build_options.has_gpu) editor.renderer_is_software = std.mem.eql(u8, std.mem.span(SDLBackend.c.SDL_GetRendererName(backend.renderer)), "software");
 
     // Register Lua API and load user config BEFORE starting the LSP —
     // init.lua may override the server command via zide.register_lsp
@@ -362,6 +376,9 @@ fn runGui(allocator: std.mem.Allocator, io: std.Io, lua: *zlua.Lua, cli_files: [
         try editor.activeDoc().loadText(welcome_text);
     }
 
+    editor.startRecovery();
+    editor.startDebugWorkspace();
+
     // Per-window GUI state (mono font bytes, per-window pane/drop state).
     // Declared before the dvui window so it outlives every window's font
     // database (which references the font bytes).
@@ -379,24 +396,6 @@ fn runGui(allocator: std.mem.Allocator, io: std.Io, lua: *zlua.Lua, cli_files: [
     // default swallows it, which with several ZIDE windows ate the first
     // click of every double-click in the file tree after using another one.
     _ = SDLBackend.c.SDL_SetHint("SDL_MOUSE_FOCUS_CLICKTHROUGH", "1");
-
-    // Init SDL backend (creates OS window). The sdl3gpu backend's options
-    // additionally want an allocator for its init-time scratch.
-    var backend = try SDLBackend.initWindow(if (@hasField(SDLBackend.InitOptions, "allocator")) .{
-        .io = io,
-        .allocator = allocator,
-        .size = .{ .w = 1024.0, .h = 768.0 },
-        .min_size = .{ .w = 400.0, .h = 300.0 },
-        .vsync = true,
-        .title = "ZIDE",
-    } else .{
-        .io = io,
-        .size = .{ .w = 1024.0, .h = 768.0 },
-        .min_size = .{ .w = 400.0, .h = 300.0 },
-        .vsync = true,
-        .title = "ZIDE",
-    });
-    defer backend.deinit();
 
     // Init DVUI window with custom theme matching editor theme preset
     var win = try dvui.Window.init(@src(), allocator, backend.backend(), .{
@@ -425,6 +424,8 @@ fn runGui(allocator: std.mem.Allocator, io: std.Io, lua: *zlua.Lua, cli_files: [
     // waitEventTimeout — wake it so the grid repaints promptly (the TUI does
     // the same through vaxis).
     editor.terminal_wake_fn = &guiWake;
+    @import("core/lua_api.zig").setLuaWake(&editor, &guiWake);
+    defer @import("core/lua_api.zig").setLuaWake(&editor, null);
 
     var interrupted = false;
 
@@ -436,7 +437,7 @@ fn runGui(allocator: std.mem.Allocator, io: std.Io, lua: *zlua.Lua, cli_files: [
         // value; the renderer backend adds .window/.app events instead,
         // which gui.frame handles.
         if (@TypeOf(events_result) == bool) {
-            if (events_result) editor.running = false;
+            if (events_result) _ = editor.execAction("quit");
         }
 
         // Language servers: sweep dead ones, drain messages, sync documents
@@ -456,7 +457,7 @@ fn runGui(allocator: std.mem.Allocator, io: std.Io, lua: *zlua.Lua, cli_files: [
         const end_micros = try win.end(.{});
         if (!keep_running) break :main_loop;
 
-        const wait_event_micros = win.waitTime(end_micros);
+        const wait_event_micros = @min(win.waitTime(end_micros), editor.deadlines.waitMicros(std.Io.Clock.now(.awake, io).nanoseconds));
         interrupted = try backend.waitEventTimeout(wait_event_micros);
     }
 
@@ -514,6 +515,8 @@ fn runTui(allocator: std.mem.Allocator, io: std.Io, lua: *zlua.Lua, cli_files: [
         try editor.activeDoc().loadText(welcome_text);
     }
 
+    editor.startRecovery();
+    editor.startDebugWorkspace();
     try tui.run(allocator, &editor);
 
     // Record the session for the next bare launch (no-op unless enabled).
@@ -527,6 +530,7 @@ fn printUsage(stdout: *std.Io.Writer) void {
         \\Usage: zide [options] [folder] [files...]
         \\
         \\Options:
+        \\  --renderer=auto|hardware|software  GUI renderer for this launch
         \\  --gui          Force GUI mode
         \\  --tui          Force TUI mode
         \\  -h, --help     Show this help
@@ -586,6 +590,31 @@ comptime {
     _ = @import("core/ansi.zig");
     _ = @import("core/terminal.zig");
     _ = @import("core/pty.zig");
+    // Import test-bearing services directly so filtered runs discover them even
+    // when Editor.init and the other editor tests are not being analyzed.
+    _ = @import("core/file_identity.zig");
+    _ = @import("core/file_operations.zig");
+    _ = @import("core/file_uri.zig");
+    _ = @import("core/deadlines.zig");
+    _ = @import("core/renderer_settings.zig");
+    _ = @import("core/jobs.zig");
+    _ = @import("core/protocol.zig");
+    _ = @import("core/diagnostics.zig");
+    _ = @import("core/editorconfig.zig");
+    _ = @import("core/recovery.zig");
+    _ = @import("core/workspace_edit.zig");
+    _ = @import("core/tasks.zig");
+    _ = @import("core/tool_output.zig");
+    _ = @import("core/git.zig");
+    _ = @import("core/line_diff.zig");
+    _ = @import("core/breakpoints.zig");
+    _ = @import("core/dap_session.zig");
+    _ = @import("core/dap_lua.zig");
+    _ = @import("core/dap_integration.zig");
     _ = @import("frontend/gui.zig");
     _ = @import("frontend/tui.zig");
+}
+
+test {
+    _ = @import("core/review_regressions.zig");
 }

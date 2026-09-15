@@ -110,6 +110,9 @@ pub const Editor = struct {
     pending_save_path: ?[]u8 = null,
     pending_save_format: ?text_file.TextFormat = null,
     pending_save_overwrite: bool = false,
+    pending_destination_stamp: ?text_file.Stamp = null,
+    save_destination_conflict: bool = false,
+    close_after_save_id: ?u64 = null,
     finder_skipped: usize = 0,
 
     /// Word wrap (soft-wrap long lines in display).
@@ -120,6 +123,14 @@ pub const Editor = struct {
     auto_close_brackets: bool = true,
     /// Auto-save dirty documents after a period of inactivity.
     auto_save: bool = false,
+    renderer_active: @import("renderer_settings.zig").Mode = .auto,
+    renderer_preference: @import("renderer_settings.zig").Mode = .auto,
+    renderer_is_software: bool = false,
+    deadlines: @import("deadlines.zig").Deadlines = .{},
+    recovery_enabled: bool = true,
+    recovery: ?@import("recovery.zig").Manager = null,
+    recovery_offer_pending: bool = false,
+    recovery_reported_error: ?anyerror = null,
     /// Auto-save delay in milliseconds (default 5 seconds).
     auto_save_interval_ms: u32 = 5000,
     /// Minimum digit width for line number gutter (default 3).
@@ -244,7 +255,16 @@ pub const Editor = struct {
     lua_event_depth: u8 = 0,
     /// Shared state for zide.spawn worker threads (created on first use;
     /// refcounted teardown lets detached workers outlive the editor).
-    lua_spawn: ?*lua_api.SpawnState = null,
+    jobs: @import("jobs.zig").Manager,
+    problems: @import("diagnostics.zig").Store,
+    lsp_tools: @import("lsp_tools.zig").State = .{},
+    tasks: @import("tasks.zig").State = .{},
+    tool_panel: @import("tool_panel.zig").State = .{},
+    git: @import("git.zig").State = .{},
+    dap: @import("dap.zig").State = .{},
+    editorconfig_enabled: bool = true,
+    project_formatting: @import("editorconfig.zig").Cache,
+    lua_jobs: std.ArrayList(lua_api.BackgroundJob) = .empty,
     /// Wake callback fired when a spawn result lands (TUI sets this like
     /// terminal_wake_fn; the GUI polls every frame and leaves it null).
     lua_wake_fn: ?*const fn () void = null,
@@ -393,6 +413,13 @@ pub const Editor = struct {
         encoding_picker,
         confirm_reopen,
         confirm_encoding,
+        recovery_picker,
+        lsp_panel,
+        symbol_rename,
+        workspace_preview,
+        task_save_prompt,
+        tool_panel,
+        git_stage_prompt,
         settings,
         filetree_prompt,
     };
@@ -428,6 +455,9 @@ pub const Editor = struct {
             .commands = CommandRegistry.init(allocator),
             .allocator = allocator,
             .io = io,
+            .jobs = .{ .allocator = allocator, .io = io },
+            .problems = .{ .allocator = allocator, .io = io },
+            .project_formatting = .{ .allocator = allocator, .io = io },
             .keybinds = KeybindMap.init(allocator),
             .completion_items = .empty,
             .lsp_configs = .empty,
@@ -471,6 +501,13 @@ pub const Editor = struct {
     }
 
     pub fn deinit(self: *Editor) void {
+        if (self.recovery) |*recovery| {
+            recovery.setWake(null);
+            recovery.flush(self.documents.items, self.recovery_enabled);
+            self.reportRecoveryError();
+            recovery.deinit();
+            self.recovery = null;
+        }
         for (self.encoding_choices.items) |entry| self.allocator.free(entry.path);
         self.encoding_choices.deinit(self.allocator);
         if (self.encoding_path) |p| self.allocator.free(p);
@@ -478,10 +515,18 @@ pub const Editor = struct {
         // Language servers first: joins their reader threads and resets
         // document flags while the documents are still alive.
         self.stopAllLsp();
+        self.lsp_tools.deinit(self.allocator);
         self.lsp_clients.deinit(self.allocator);
         // Release Lua refs next: touches the command registry and needs
         // the (caller-owned, still-alive) Lua state.
         lua_api.deinitLua(self);
+        self.tasks.deinit(self);
+        self.git.deinit(self);
+        self.dap.deinit(self);
+        self.tool_panel.deinit(self.allocator);
+        self.jobs.deinit();
+        self.problems.deinit();
+        self.project_formatting.deinit();
         for (self.documents.items) |*doc| {
             doc.deinit();
         }
@@ -666,6 +711,10 @@ pub const Editor = struct {
     }
 
     pub fn openFileWithEncoding(self: *Editor, path: []const u8, encoding: ?text_file.TextEncoding, interactive: bool) !*Document {
+        if (try self.findDocument(path)) |idx| {
+            self.switchToDoc(idx);
+            return self.activeDoc();
+        }
         var doc = try Document.init(self.allocator);
         var transferred = false;
         errdefer if (!transferred) doc.deinit();
@@ -680,6 +729,9 @@ pub const Editor = struct {
         self.active_doc_idx = idx;
         self.paneShowDoc(idx);
         const active = self.activeDoc();
+        self.resolveFormatting(active);
+        self.problems.project(active, .lsp) catch {};
+        self.problems.project(active, .lua) catch {};
         active.detectLanguage(self);
         self.lspNotifyOpen(active);
         const id = active.id;
@@ -700,20 +752,38 @@ pub const Editor = struct {
         };
         doc.detectLanguage(self);
         self.lspNotifyOpen(doc);
+        self.resolveFormatting(doc);
+        self.problems.project(doc, .lsp) catch {};
+        self.problems.project(doc, .lua) catch {};
         lua_api.fireEvent(self, .open, doc);
     }
 
     /// Open `path`, or switch to the tab that already has it open
     /// (separator-normalized compare, case-insensitive on Windows).
     pub fn openOrFocus(self: *Editor, path: []const u8) !*Document {
-        for (self.documents.items, 0..) |*doc, idx| {
-            const dp = doc.file_path orelse continue;
-            if (filetree_mod.normPathEql(dp, path)) {
-                self.switchToDoc(idx);
-                return self.activeDoc();
-            }
+        if (try self.findDocument(path)) |idx| {
+            self.switchToDoc(idx);
+            return self.activeDoc();
         }
         return try self.openFile(path);
+    }
+
+    pub fn pathsEqual(self: *const Editor, a: []const u8, b: []const u8) bool {
+        return @import("file_identity.zig").same(self.allocator, self.io, a, b) catch false;
+    }
+
+    pub fn findDocument(self: *const Editor, path: []const u8) !?usize {
+        const identity = @import("file_identity.zig");
+        const key = try identity.key(self.allocator, self.io, path);
+        defer self.allocator.free(key);
+        for (self.documents.items, 0..) |doc, idx| {
+            const p = doc.file_path orelse continue;
+            if (doc.preview) continue;
+            const doc_key = try identity.key(self.allocator, self.io, p);
+            defer self.allocator.free(doc_key);
+            if (identity.equalKeys(key, doc_key)) return idx;
+        }
+        return null;
     }
 
     // ------------------------------------------------------------------
@@ -844,7 +914,7 @@ pub const Editor = struct {
         for (self.documents.items, 0..) |*doc, idx| {
             if (doc.preview) continue;
             const dp = doc.file_path orelse continue;
-            if (filetree_mod.normPathEql(dp, path)) {
+            if (self.pathsEqual(dp, path)) {
                 self.finderDropPreview();
                 self.active_doc_idx = idx;
                 self.paneShowDoc(idx);
@@ -914,7 +984,7 @@ pub const Editor = struct {
         if (self.finder_preview_appended) {
             const pidx = self.documents.items.len - 1;
             const pdoc = &self.documents.items[pidx];
-            if (pdoc.file_path != null and filetree_mod.normPathEql(pdoc.file_path.?, path)) {
+            if (pdoc.file_path != null and self.pathsEqual(pdoc.file_path.?, path)) {
                 // Promote in place — same post-open bookkeeping as openFile.
                 pdoc.preview = false;
                 self.finder_preview_appended = false;
@@ -1653,7 +1723,14 @@ pub const Editor = struct {
             .save => {
                 const id = self.documents.items[idx].id;
                 switch (self.saveDocument(id, .{})) {
-                    .needs_path => return .needs_path,
+                    .formatting => {
+                        self.close_after_save_id = id;
+                        return .kept;
+                    },
+                    .needs_path => {
+                        self.close_after_save_id = id;
+                        return .needs_path;
+                    },
                     .saved => {
                         const current = self.docIndexForId(id) orelse return .closed;
                         if (self.documents.items[current].dirty) return .kept;
@@ -1686,6 +1763,7 @@ pub const Editor = struct {
             var fresh = Document.init(self.allocator) catch return false;
             fresh.history.max_size = self.max_undo_history;
             fresh.loadText("") catch {};
+            self.forgetRecovery(self.documents.items[0].id);
             // Send didClose before resetting
             self.lspForgetDoc(&self.documents.items[0]);
             self.documents.items[0].deinit();
@@ -1712,6 +1790,7 @@ pub const Editor = struct {
             }
         }
         self.lspForgetDoc(&self.documents.items[removed_idx]);
+        self.forgetRecovery(self.documents.items[removed_idx].id);
         self.documents.items[removed_idx].deinit();
         _ = self.documents.orderedRemove(removed_idx);
         if (self.active_doc_idx > removed_idx) {
@@ -1975,6 +2054,9 @@ pub const Editor = struct {
     /// place; dirty buffers are flagged so save prompts; vanished files are
     /// flagged AND marked dirty so quit protects the surviving buffer.
     pub fn pollExternalChanges(self: *Editor) void {
+        if (self.project_formatting.refresh() catch false) {
+            for (self.documents.items) |*doc| self.resolveFormatting(doc);
+        }
         for (self.documents.items) |*doc| {
             const path = doc.file_path orelse continue;
             if (doc.external_changed) continue; // flagged; waiting on the user
@@ -2109,6 +2191,7 @@ pub const Editor = struct {
         self.mode = .encoding_picker;
     }
     pub fn cancelEncoding(self: *Editor) void {
+        self.close_after_save_id = null;
         if (self.encoding_path) |p| self.allocator.free(p);
         self.encoding_path = null;
         self.encoding_doc_id = null;
@@ -2229,6 +2312,7 @@ pub const Editor = struct {
         self.pending_save_id = id;
         self.pending_save_format = options.format;
         self.pending_save_overwrite = options.overwrite;
+        self.pending_destination_stamp = options.destination_stamp;
     }
     fn clearPendingSave(self: *Editor) void {
         if (self.pending_save_path) |p| self.allocator.free(p);
@@ -2236,6 +2320,8 @@ pub const Editor = struct {
         self.pending_save_id = null;
         self.pending_save_format = null;
         self.pending_save_overwrite = false;
+        self.pending_destination_stamp = null;
+        self.save_destination_conflict = false;
     }
     pub fn resolveEncodingSave(self: *Editor, convert: bool) void {
         self.mode = .normal;
@@ -2247,11 +2333,15 @@ pub const Editor = struct {
         const path = self.pending_save_path;
         self.pending_save_path = null;
         defer if (path) |p| self.allocator.free(p);
-        _ = self.saveDocument(id, .{ .format = .{}, .path = path, .overwrite = self.pending_save_overwrite });
+        _ = self.saveDocument(id, .{ .format = .{}, .path = path, .overwrite = self.pending_save_overwrite, .destination_stamp = self.pending_destination_stamp });
     }
 
-    pub const SaveOutcome = union(enum) { saved, needs_path, conflict, unrepresentable, failed: anyerror };
-    pub const SaveOptions = struct { overwrite: bool = false, interactive: bool = true, refresh_tree: bool = true, format: ?text_file.TextFormat = null, path: ?[]const u8 = null };
+    pub const SaveOutcome = union(enum) { saved, formatting, needs_path, conflict, destination_exists, unrepresentable, failed: anyerror };
+    pub const SaveOptions = struct { overwrite: bool = false, interactive: bool = true, refresh_tree: bool = true, format: ?text_file.TextFormat = null, path: ?[]const u8 = null, destination_stamp: ?text_file.Stamp = null, skip_format: bool = false, format_group: ?u64 = null };
+
+    pub fn overwritePrompt(self: *const Editor) []const u8 {
+        return if (self.save_destination_conflict) "Destination exists! [O]verwrite [C]ancel" else "File changed on disk! [O]verwrite [R]eload [C]ancel";
+    }
 
     pub fn docIndexForId(self: *const Editor, id: u64) ?usize {
         for (self.documents.items, 0..) |doc, i| if (doc.id == id) return i;
@@ -2270,10 +2360,18 @@ pub const Editor = struct {
         self.switchToDoc(idx);
         self.mode = .normal;
         switch (result) {
+            .formatting => self.status_message = "Formatting before save",
             .conflict => {
+                self.save_destination_conflict = false;
                 self.confirm_overwrite_doc = idx;
                 self.mode = .confirm_overwrite;
                 self.status_message = "File changed on disk; save cancelled";
+            },
+            .destination_exists => {
+                self.confirm_overwrite_doc = idx;
+                self.save_destination_conflict = true;
+                self.mode = .confirm_overwrite;
+                self.status_message = "Save As destination exists; confirm overwrite";
             },
             .needs_path => self.status_message = "Use Save As for the untitled document, then quit again",
             .failed => |err| self.status_message = std.fmt.bufPrint(&self.status_buf, "Save failed: {s}", .{@errorName(err)}) catch "Save failed",
@@ -2289,7 +2387,31 @@ pub const Editor = struct {
     pub fn saveDocument(self: *Editor, id: u64, options: SaveOptions) SaveOutcome {
         const idx = self.docIndexForId(id) orelse return .{ .failed = error.DocumentClosed };
         const doc = &self.documents.items[idx];
-        const same_path = options.path == null or (doc.file_path != null and filetree_mod.normPathEql(doc.file_path.?, options.path.?));
+        const same_path = options.path == null or (doc.file_path != null and self.pathsEqual(doc.file_path.?, options.path.?));
+        if (options.path) |path| {
+            const owner = self.findDocument(path) catch |err| return .{ .failed = err };
+            if (owner) |other| if (other != idx) {
+                self.switchToDoc(other);
+                self.status_message = "Destination is already open; save its document instead";
+                self.cancelEncoding();
+                return .{ .failed = error.DestinationOpen };
+            };
+            if (!same_path) {
+                const stamp = text_file.Stamp.read(self.io, path) catch |err| {
+                    if (options.interactive) self.showSaveBlocker(idx, .{ .failed = err });
+                    return .{ .failed = err };
+                };
+                if (stamp) |current| if (!options.overwrite or options.destination_stamp == null or !std.meta.eql(current, options.destination_stamp.?)) {
+                    if (options.interactive) {
+                        var held = options;
+                        held.destination_stamp = current;
+                        self.holdSave(id, held) catch return .{ .failed = error.OutOfMemory };
+                        self.showSaveBlocker(idx, .destination_exists);
+                    }
+                    return .destination_exists;
+                };
+            }
+        }
         if (!options.overwrite and same_path) if (self.saveBlocker(idx)) |blocker| {
             if (options.interactive) {
                 self.holdSave(id, options) catch return .{ .failed = error.OutOfMemory };
@@ -2299,6 +2421,14 @@ pub const Editor = struct {
         };
         const old_path = if (options.path != null and doc.file_path != null) self.allocator.dupe(u8, doc.file_path.?) catch return .{ .failed = error.OutOfMemory } else null;
         defer if (old_path) |p| self.allocator.free(p);
+        if (self.lsp_tools.maybeFormatSave(self, doc, options) catch |err| {
+            self.showSaveBlocker(idx, .{ .failed = err });
+            return .{ .failed = err };
+        }) return .formatting;
+        self.prepareProjectFormatting(doc, options.path orelse doc.file_path orelse return .needs_path, options.format_group) catch |err| {
+            if (options.interactive) self.showSaveBlocker(idx, .{ .failed = err });
+            return .{ .failed = err };
+        };
         const result = if (options.path) |p| doc.saveAsWithFormat(self.io, p, options.format) else doc.saveWithFormat(self.io, options.format);
         result catch |err| {
             const outcome: SaveOutcome = if (err == error.UnrepresentableText) .unrepresentable else .{ .failed = err };
@@ -2316,6 +2446,7 @@ pub const Editor = struct {
             self.lspForgetDoc(doc);
             doc.file_path = saved_path;
             self.relanguageDoc(doc);
+            self.resolveFormatting(doc);
         }
         if (options.format != null or doc.format.encoding == .windows1252 or
             ((doc.format.encoding == .utf16_le or doc.format.encoding == .utf16_be) and !doc.format.bom))
@@ -2324,6 +2455,7 @@ pub const Editor = struct {
         self.status_message = std.fmt.bufPrint(&self.status_buf, "Saved {s}", .{doc.display_name}) catch "Saved";
         self.lspDidSave(doc);
         const saved_version = doc.buffer.version;
+        self.forgetRecovery(id);
         if (options.refresh_tree) self.noteFileSaved(options.path != null, doc) else lua_api.fireEvent(self, .save, doc);
         if (options.interactive and self.encoding_doc_id == id and self.reopen_after_save) {
             const current = self.docIndexForId(id) orelse {
@@ -2335,6 +2467,12 @@ pub const Editor = struct {
             } else {
                 self.cancelEncoding();
                 self.status_message = "Document changed during save; reopen cancelled";
+            }
+        }
+        if (self.close_after_save_id == id) {
+            self.close_after_save_id = null;
+            if (self.docIndexForId(id)) |current| {
+                if (!self.documents.items[current].dirty) _ = self.closeDocAt(current);
             }
         }
         return .saved;
@@ -2373,6 +2511,10 @@ pub const Editor = struct {
             if (!self.documents.items[idx].dirty) continue;
             switch (self.saveDocument(id, .{ .refresh_tree = false })) {
                 .saved => saved += 1,
+                .formatting => {
+                    self.lsp_tools.quit_after_format = true;
+                    return;
+                },
                 else => return,
             }
         }
@@ -2385,6 +2527,7 @@ pub const Editor = struct {
     /// Resolve the .confirm_overwrite prompt for the document it was opened
     /// for (confirm_overwrite_doc), not whatever is active when answered.
     pub fn resolveOverwrite(self: *Editor, choice: OverwriteChoice) void {
+        if (self.save_destination_conflict and choice == .reload) return;
         self.mode = .normal;
         const id = self.pending_save_id orelse blk: {
             if (self.confirm_overwrite_doc >= self.documents.items.len) {
@@ -2403,7 +2546,7 @@ pub const Editor = struct {
         defer if (path) |p| self.allocator.free(p);
         switch (choice) {
             .overwrite => {
-                _ = self.saveDocument(id, .{ .overwrite = true, .format = self.pending_save_format, .path = path });
+                _ = self.saveDocument(id, .{ .overwrite = true, .format = self.pending_save_format, .path = path, .destination_stamp = self.pending_destination_stamp });
             },
             .reload => {
                 self.cancelEncoding();
@@ -2417,7 +2560,7 @@ pub const Editor = struct {
             },
             .cancel => {
                 self.cancelEncoding();
-                self.status_message = "Save cancelled (file changed on disk)";
+                self.status_message = "Save cancelled";
             },
         }
     }
@@ -2436,7 +2579,7 @@ pub const Editor = struct {
                 (id == self.encoding_doc_id and (self.mode == .encoding_picker or self.mode == .confirm_reopen))) continue;
             switch (self.saveDocument(id, .{ .interactive = false, .refresh_tree = false })) {
                 .saved => saved += 1,
-                .needs_path => {},
+                .needs_path, .formatting => {},
                 else => failed += 1,
             }
         }
@@ -3179,6 +3322,10 @@ pub const Editor = struct {
     /// Effective settings for a document: the language's override when
     /// set, else the global default. Frontends hoist one call per frame.
     pub fn tabWidthFor(self: *const Editor, doc: *const Document) usize {
+        if (self.editorconfig_enabled) {
+            if (doc.format_rules.tab_width) |width| return width;
+            if (doc.format_rules.indent_size) |width| return width;
+        }
         if (self.langProfileFor(doc)) |p| {
             if (p.settings.tab_width) |v| return v;
         }
@@ -3186,10 +3333,183 @@ pub const Editor = struct {
     }
 
     pub fn useTabsFor(self: *const Editor, doc: *const Document) bool {
+        if (self.editorconfig_enabled) if (doc.format_rules.use_tabs) |tabs| return tabs;
         if (self.langProfileFor(doc)) |p| {
             if (p.settings.use_tabs) |v| return v;
         }
         return self.use_tabs;
+    }
+
+    pub fn indentWidthFor(self: *const Editor, doc: *const Document) usize {
+        if (self.editorconfig_enabled) {
+            if (doc.format_rules.indent_is_tab) return self.tabWidthFor(doc);
+            if (doc.format_rules.indent_size) |width| return width;
+        }
+        if (self.langProfileFor(doc)) |profile| if (profile.settings.tab_width) |width| return width;
+        return self.tab_width;
+    }
+
+    pub fn startRecovery(self: *Editor) void {
+        const base = @import("lua_settings.zig").getConfigDir() orelse {
+            self.status_message = "Recovery unavailable: no configuration directory";
+            return;
+        };
+        self.startRecoveryAt(base, self.filetree_root orelse ".") catch |err| {
+            self.status_message = std.fmt.bufPrint(&self.status_buf, "Recovery unavailable: {s}", .{@errorName(err)}) catch "Recovery unavailable";
+            std.log.err("Recovery startup: {s}", .{@errorName(err)});
+        };
+    }
+
+    pub fn startDebugWorkspace(self: *Editor) void {
+        if (@import("lua_settings.zig").getConfigDir()) |base| self.dap.configureStorage(self, base, self.filetree_root orelse ".");
+    }
+
+    pub fn startRecoveryAt(self: *Editor, base: []const u8, workspace: []const u8) !void {
+        if (self.recovery != null) return;
+        self.recovery = try @import("recovery.zig").Manager.init(self.allocator, self.io, base, workspace);
+        self.recovery.?.setWake(self.lua_wake_fn);
+        self.recovery_offer_pending = self.recovery.?.candidates.items.len > 0;
+        self.reportRecoveryError();
+    }
+
+    fn reportRecoveryError(self: *Editor) void {
+        if (self.recovery) |*recovery| if (recovery.failure) |err| {
+            if (self.recovery_reported_error == null or self.recovery_reported_error.? != err) {
+                self.status_message = std.fmt.bufPrint(&self.status_buf, "Recovery: {s}; earlier snapshots retained", .{@errorName(err)}) catch "Recovery snapshot failed";
+                std.log.err("Recovery: {s}; earlier snapshots retained", .{@errorName(err)});
+                self.recovery_reported_error = err;
+            }
+            recovery.failure = null;
+        };
+    }
+
+    fn forgetRecovery(self: *Editor, id: u64) void {
+        if (self.recovery) |*recovery| recovery.forget(id) catch |err| {
+            recovery.failure = err;
+            self.reportRecoveryError();
+        };
+    }
+
+    pub fn serviceTick(self: *Editor, now: i128) void {
+        self.deadlines.tick(self, now);
+        self.tasks.tick(self);
+        self.git.tick(self, now);
+        self.dap.tick(self, now);
+        if (self.recovery) |*recovery| {
+            recovery.tick(self.documents.items, now, self.recovery_enabled);
+            self.deadlines.next_service = recovery.next_deadline;
+            self.reportRecoveryError();
+        }
+        if (self.recovery_offer_pending and self.mode == .normal) {
+            self.recovery_offer_pending = false;
+            self.showRecovery();
+        }
+    }
+
+    pub fn discardAndQuit(self: *Editor) void {
+        if (self.recovery) |*recovery| recovery.discard(self.documents.items);
+        self.reportRecoveryError();
+        self.running = false;
+    }
+
+    pub fn showRecovery(self: *Editor) void {
+        if (self.recovery) |*recovery| if (recovery.candidates.items.len > 0) {
+            self.mode = .recovery_picker;
+            return;
+        };
+        self.status_message = "No recovery snapshots for this workspace";
+    }
+
+    pub fn resolveRecovery(self: *Editor, choice: enum { recover, discard, later }) void {
+        self.mode = .normal;
+        if (choice == .later) return;
+        const recovery = if (self.recovery) |*r| r else return;
+        var index: usize = 0;
+        while (index < recovery.candidates.items.len) {
+            const candidate = &recovery.candidates.items[index];
+            if (choice == .recover and !candidate.restored) {
+                self.recoverSnapshot(candidate.parsed.value) catch |err| {
+                    recovery.failure = err;
+                    index += 1;
+                    continue;
+                };
+                candidate.restored = true;
+            }
+            recovery.removeCandidate(index) catch |err| {
+                recovery.failure = err;
+                index += 1;
+            };
+        }
+        self.status_message = if (choice == .recover) "Recovered documents are unsaved; review before saving" else "Recovery snapshots discarded";
+        self.reportRecoveryError();
+    }
+
+    fn recoverSnapshot(self: *Editor, snapshot: @import("recovery.zig").Snapshot) !void {
+        const existing = if (snapshot.path) |path| try self.findDocument(path) else null;
+        const replace = if (existing) |index| !self.documents.items[index].dirty else false;
+        var restored = try @import("recovery.zig").restore(self.allocator, self.io, snapshot, existing == null or replace);
+        errdefer restored.deinit();
+        restored.history.max_size = self.max_undo_history;
+        if (replace) {
+            const old = &self.documents.items[existing.?];
+            restored.id = old.id;
+            restored.buffer.version = old.buffer.version +% 1;
+            restored.lsp_version = old.lsp_version +% 1;
+        } else {
+            try self.documents.ensureUnusedCapacity(self.allocator, 1);
+            try self.activeWindow().tabs.ensureUnusedCapacity(self.allocator, 1);
+        }
+        // A failed transfer leaves the original stale snapshot and live documents intact.
+        try self.recovery.?.captureSync(&restored);
+        const index = if (replace) existing.? else self.documents.items.len;
+        if (replace) {
+            self.lspForgetDoc(&self.documents.items[index]);
+            self.documents.items[index].deinit();
+            self.documents.items[index] = restored;
+        } else self.documents.appendAssumeCapacity(restored);
+        self.relanguageDoc(&self.documents.items[index]);
+        self.resolveFormatting(&self.documents.items[index]);
+        self.switchToDoc(index);
+        self.lspNotifyOpen(&self.documents.items[index]);
+    }
+
+    pub fn resolveFormatting(self: *Editor, doc: *Document) void {
+        doc.format_rules = if (doc.file_path) |path| self.project_formatting.resolve(path) catch .{} else .{};
+    }
+
+    fn prepareProjectFormatting(self: *Editor, doc: *Document, path: []const u8, format_group: ?u64) !void {
+        if (!self.editorconfig_enabled) return;
+        _ = try self.project_formatting.refresh();
+        const rules = try self.project_formatting.resolve(path);
+        if (rules.eol == null and rules.final_newline == null and !(rules.trim orelse false)) return;
+        const before = try doc.buffer.textAlloc(self.allocator);
+        defer self.allocator.free(before);
+        const after = try @import("editorconfig.zig").normalize(self.allocator, before, rules, doc.crlf);
+        defer self.allocator.free(after);
+        var ranges: std.ArrayList(Document.RangeEdit) = .empty;
+        defer ranges.deinit(self.allocator);
+        var old_at: usize = 0;
+        var new_at: usize = 0;
+        while (old_at < before.len or new_at < after.len) {
+            const old_end = if (std.mem.indexOfScalarPos(u8, before, old_at, '\n')) |end| end + 1 else before.len;
+            const new_end = if (std.mem.indexOfScalarPos(u8, after, new_at, '\n')) |end| end + 1 else after.len;
+            const old_line = before[old_at..old_end];
+            const new_line = after[new_at..new_end];
+            var prefix: usize = 0;
+            while (prefix < old_line.len and prefix < new_line.len and old_line[prefix] == new_line[prefix]) : (prefix += 1) {}
+            if (prefix != old_line.len or prefix != new_line.len) try ranges.append(self.allocator, .{ .start = old_at + prefix, .end = old_end, .text = new_line[prefix..] });
+            old_at = old_end;
+            new_at = new_end;
+        }
+        std.mem.reverse(Document.RangeEdit, ranges.items);
+        const join = format_group != null and doc.history.undo_stack.items.len > 0 and doc.history.undo_stack.items[doc.history.undo_stack.items.len - 1].group_id == format_group.?;
+        if (join) {
+            doc.history.beginGroup();
+            doc.history.active_group = format_group.?;
+        }
+        defer if (join) doc.history.endGroup();
+        try doc.applyRanges(ranges.items);
+        doc.detectLineEndings();
     }
 
     pub fn wordWrapFor(self: *const Editor, doc: *const Document) bool {
@@ -3284,6 +3604,9 @@ pub const Editor = struct {
     /// were opened so the next sync re-opens them on whatever serves them.
     fn stopLspClient(self: *Editor, idx: usize) void {
         const client = self.lsp_clients.items[idx];
+        self.lsp_tools.clientStopped(self, client);
+        var producer_buf: [256]u8 = undefined;
+        self.problems.clear(.lsp, client.diagnosticSource(&producer_buf));
         if (self.completion_context) |ctx| {
             if (ctx.client == client) self.clearCompletionItems();
         }
@@ -3370,8 +3693,9 @@ pub const Editor = struct {
                 i += 1;
                 continue;
             }
-            std.log.warn("LSP[{s}] exited unexpectedly — run lsp_restart to bring it back", .{client.name()});
-            self.status_message = std.fmt.bufPrint(&self.status_buf, "LSP {s} exited — run lsp_restart (see zide.log)", .{client.name()}) catch "LSP server exited — run lsp_restart";
+            const reason = if (client.peer) |peer| peer.errorState() orelse error.ServerExited else error.ServerExited;
+            std.log.warn("LSP[{s}]: {s} — run lsp_restart to bring it back", .{ client.name(), @errorName(reason) });
+            self.status_message = std.fmt.bufPrint(&self.status_buf, "LSP {s}: {s} — run lsp_restart", .{ client.name(), @errorName(reason) }) catch "LSP server exited — run lsp_restart";
             if (client.config) |*dead_cfg| {
                 for (self.lsp_configs.items) |*cfg| {
                     if (cfg.eql(dead_cfg)) cfg.failed = true;
@@ -3384,6 +3708,7 @@ pub const Editor = struct {
         var j: usize = 0;
         while (j < self.lsp_clients.items.len) : (j += 1) {
             self.lsp_clients.items[j].pollMessages(self);
+            self.lsp_clients.items[j].expireRequests(self, std.Io.Clock.now(.awake, self.io).nanoseconds);
         }
         self.syncLspDocuments();
     }
@@ -3435,6 +3760,7 @@ pub const Editor = struct {
         self.lspForgetDoc(doc);
         try doc.setFilePath(path);
         self.relanguageDoc(doc);
+        self.resolveFormatting(doc);
     }
 
     /// Save As: write `path`, adopt it, re-detect the language, then the
@@ -3444,6 +3770,8 @@ pub const Editor = struct {
     pub fn saveDocAs(self: *Editor, doc: *Document, path: []const u8) !void {
         switch (self.saveDocument(doc.id, .{ .path = path, .interactive = false })) {
             .saved => {},
+            .formatting => return error.FormattingInProgress,
+            .destination_exists => return error.DestinationExists,
             .unrepresentable => return error.UnrepresentableText,
             .conflict => return error.ExternalChange,
             .needs_path => return error.NoFilePath,
@@ -3623,15 +3951,19 @@ pub const Editor = struct {
 
         const cursor = doc.cursors.primary();
         const pos = doc.buffer.offsetToPos(cursor.offset);
-        // LSP positions are UTF-16 code units, not bytes
-        const utf16_col = lsp_mod.byteColToUtf16(doc.buffer.lineContent(pos.line), pos.col);
+        const column = if (lsp_client.position_encoding == .utf16) lsp_mod.byteColToUtf16(doc.buffer.lineContent(pos.line), pos.col) else @as(u32, @intCast(pos.col));
 
         // The server must see edits made since the preceding frame first.
         if (doc.lsp_version != doc.lsp_last_synced) {
             lsp_client.sendDidChange(uri, doc.lsp_version, doc.buffer.slice(0, doc.buffer.byteLen())) catch return;
             doc.lsp_last_synced = doc.lsp_version;
         }
-        const request_id = lsp_client.sendCompletion(uri, @intCast(pos.line), utf16_col) catch return;
+        const request_id = lsp_client.sendCompletion(uri, @intCast(pos.line), column) catch return;
+        if (lsp_client.pending.getPtr(request_id)) |request| {
+            request.doc_id = doc.id;
+            request.version = doc.buffer.version;
+            request.cursor = cursor.offset;
+        }
         self.completion_context = .{
             .doc_id = doc.id,
             .version = doc.buffer.version,
@@ -3655,20 +3987,25 @@ pub const Editor = struct {
 
         const cursor = doc.cursors.primary();
         const pos = doc.buffer.offsetToPos(cursor.offset);
-        // LSP positions are UTF-16 code units, not bytes
-        const utf16_col = lsp_mod.byteColToUtf16(doc.buffer.lineContent(pos.line), pos.col);
+        const column = if (lsp_client.position_encoding == .utf16) lsp_mod.byteColToUtf16(doc.buffer.lineContent(pos.line), pos.col) else @as(u32, @intCast(pos.col));
 
-        _ = lsp_client.sendGotoDefinition(uri, @intCast(pos.line), utf16_col) catch return;
+        if (doc.lsp_version != doc.lsp_last_synced) {
+            lsp_client.sendDidChange(uri, doc.lsp_version, doc.buffer.slice(0, doc.buffer.byteLen())) catch return;
+            doc.lsp_last_synced = doc.lsp_version;
+        }
+        const request_id = lsp_client.sendGotoDefinition(uri, @intCast(pos.line), column) catch return;
+        if (lsp_client.pending.getPtr(request_id)) |request| {
+            request.doc_id = doc.id;
+            request.version = doc.buffer.version;
+            request.cursor = cursor.offset;
+        }
     }
 
     /// Validate the completion's single-line UTF-16 range against this document.
-    fn completionByteRange(doc: *Document, range: lsp_mod.LspRange, cursor_offset: usize) !struct { start: usize, end: usize } {
+    fn completionByteRange(doc: *Document, range: lsp_mod.LspRange, cursor_offset: usize, encoding: @import("workspace_edit.zig").Encoding) !struct { start: usize, end: usize } {
         if (range.start.line != range.end.line or range.start.line >= doc.lineCount() or range.start.character > range.end.character) return error.InvalidCompletionEdit;
-        const line = doc.lineContent(range.start.line);
-        const start_col = try lsp_mod.checkedUtf16ColToByte(line, range.start.character);
-        const end_col = try lsp_mod.checkedUtf16ColToByte(line, range.end.character);
-        const start = doc.buffer.posToOffset(range.start.line, start_col);
-        const end = doc.buffer.posToOffset(range.start.line, end_col);
+        const start = try @import("workspace_edit.zig").offset(doc, range.start, encoding);
+        const end = try @import("workspace_edit.zig").offset(doc, range.end, encoding);
         if (cursor_offset < start or cursor_offset > end) return error.InvalidCompletionEdit;
         return .{ .start = start, .end = end };
     }
@@ -3679,17 +4016,18 @@ pub const Editor = struct {
         const item = self.completion_items.items[self.completion_selected];
         const doc = self.activeDoc();
         const offset = doc.cursors.primaryConst().offset;
+        const encoding = if (self.completion_context.?.client) |client| client.position_encoding else .utf16;
         var start = offset;
         var end = offset;
         if (item.edit) |edit| {
             const range = switch (edit) {
                 .replace => |r| r,
                 .insert_replace => |r| blk: {
-                    const insert = completionByteRange(doc, r.insert, offset) catch {
+                    const insert = completionByteRange(doc, r.insert, offset, encoding) catch {
                         self.status_message = "Invalid completion range";
                         return;
                     };
-                    const replace = completionByteRange(doc, r.replace, offset) catch {
+                    const replace = completionByteRange(doc, r.replace, offset, encoding) catch {
                         self.status_message = "Invalid completion range";
                         return;
                     };
@@ -3700,7 +4038,7 @@ pub const Editor = struct {
                     break :blk r.replace;
                 },
             };
-            const bytes = completionByteRange(doc, range, offset) catch {
+            const bytes = completionByteRange(doc, range, offset, encoding) catch {
                 self.status_message = "Invalid completion range";
                 return;
             };

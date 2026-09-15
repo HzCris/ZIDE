@@ -1,5 +1,49 @@
 # ZIDE Feature Documentation
 
+## Recovery, formatting, and language-server edits
+
+Recovery snapshots are enabled by default, independently of autosave and session persistence. Dirty named and untitled buffers are captured after two seconds without edits or at most ten seconds during continuous editing. Each workspace and instance has a separate recovery directory and an OS lock. On restart, both frontends offer Recover, Discard, or Later; `recover_documents` opens the prompt again. Recovered documents stay dirty and use the normal save/conflict checks. A dirty document already open at the same path is preserved and the recovered version opens as an untitled copy. Damaged snapshots remain on disk and errors are reported. `zide.set("recovery", false)` disables new snapshots.
+
+EditorConfig resolves ancestor files, `root=true`, section precedence and `unset`. Supported properties are `indent_style`, `indent_size`, `tab_width`, `end_of_line=lf|crlf`, `trim_trailing_whitespace` and `insert_final_newline`. Save As uses destination rules; normalization is undoable, failed writes retain visible dirty edits, and an empty file stays empty. `charset`, lone-CR output and spelling are unsupported. Use `zide.set("editorconfig", false)` to disable project formatting. Matching fixtures and specification differences are documented in `tests/editorconfig/README.md`.
+
+Both frontends expose these language-server commands through the command palette:
+
+| Command | Behavior |
+| --- | --- |
+| `hover` | Opens a scrollable text view of documentation at the cursor; Escape closes it. |
+| `rename_symbol` | Uses `prepareRename` when supported, asks for a name, then previews affected files. Enter applies; Escape cancels. |
+| `format_document` | Formats the document when the server supports it. |
+| `format_selection` | Formats the selection when the server supports range formatting. |
+
+Text workspace edits run in memory and produce one undo group per document. Closed files open dirty. Versions, aliases, ranges and allocation requirements are checked before any buffer changes; stale previews fail without partial application. Server `workspace/applyEdit` requests use the same preview. File creation, deletion and rename operations are unsupported.
+
+`zide.set("format_on_save", true)` enables optional language-server formatting before saving (default false). It applies to documents served by a formatter. Stale responses, failures and timeouts abort that save. Successful formatting then uses the regular EditorConfig, encoding, external-change and destination-overwrite checks. These settings are also available in GUI Settings.
+
+Protocol processes use managed reader/writer workers and bounded queues. Overflow reports a failure and stops the session instead of dropping replies. UTF-8 and UTF-16 positions are negotiated. `zig build test -Dtest-tools=true` adds installed-tool integration tests; the regular test suite does not require ZLS.
+
+## Tasks, Problems, Git and debugging
+
+All of these features share their commands, state and keyboard navigation between GUI and TUI. Open a view from the command palette, use arrows or Page Up/Down to select rows, Enter to activate, and Escape to return to editing. GUI views also provide buttons and clickable locations.
+
+| Feature | Commands | Current scope |
+| --- | --- | --- |
+| Tasks | `run_task`, `rerun_task`, `stop_task`, `task_output` | Explicit build/check commands, save-before-run prompts, streaming stdout/stderr, exit status and cancellation. |
+| Problems | `problems`, `next_problem`, `previous_problem` | Findings from language servers, Lua linters and tasks, sorted by file and position. F cycles severity; S cycles source. Closed files open at the location. |
+| Git | `git_changes` | Staged/working changes, read-only previews, whole-file stage/unstage and buffer-versus-index gutter marks. |
+| Debugger | `debug_start`, `debug`, `toggle_breakpoint`, `debug_continue`, `debug_pause`, `debug_step_over`, `debug_step_in`, `debug_step_out`, `debug_stop`, `debug_terminate` | One local source session, launch/attach, breakpoint verification, threads, stack frames, expandable scopes/variables, execution location and output. |
+
+Register tasks in `init.lua` or an extension with `zide.register_task({name, argv, cwd, env, problem_matcher})`. `name` and the argv array are required. The workspace is the default cwd; relative cwd values resolve against it. `env` is a table of string overrides. Arguments are passed directly to the executable; shell syntax requires an explicit shell in argv. Registration returns true or nil plus an error and never starts a command. `zide.run_task(name)` returns a task ID or nil plus an error; `zide.cancel_task(id)` cancels that run and its owned processes.
+
+`problem_matcher = "zig"` parses Zig diagnostics. A Lua matcher receives an output line and returns nil or `{file, line, col, severity, message}`. Lines and UTF-8 byte columns are one-based; filenames resolve against the task cwd. Severity accepts `error`, `warning`, `info`, or `hint`. [examples/tasks.lua](examples/tasks.lua) contains commented registrations. Each run replaces only its own producer's findings; locations from an edited buffer are marked possibly stale. Output is bounded at 4 MiB, individual matcher lines at 64 KiB, and findings at 10,000 per run; truncation is shown. Finished run history retains up to 64 runs.
+
+The Changes panel uses the Git CLI on PATH. Enter previews saved working-tree changes against the index; D previews the index against HEAD; S stages; U unstages; O opens the file; R refreshes. Dirty files offer Save and stage or Cancel. Save As during that prompt cancels staging and asks for a refreshed selection. Renames retain both paths and repositories without a first commit are supported. Conflicts have an explanatory read-only preview. Gutters compare the in-memory buffer, including unsaved edits, with the index; previews use saved disk contents. Status and index checks run on deadlines, and background results are discarded when their inputs change. Commits, network operations, hunk staging and a merge editor are deferred.
+
+Register a debug adapter with `zide.register_debug_adapter({name, argv})`, then `zide.register_debug_config({name, adapter, request, arguments})`. `request` is `launch` (default) or `attach`; `arguments` is the adapter's JSON-compatible argument table. `${workspaceFolder}` expands in string values. `zide.start_debug(name)` starts a configuration; `zide.stop_debug()` applies normal Stop behavior. `zide.stop_debug(true)` requests attached-target termination when supported. Registrations and start return true or nil plus an error. See [examples/debug.lua](examples/debug.lua) for LLDB configurations and optional bindings.
+
+Build the executable with debug information before starting. Source breakpoints persist per workspace in `debug/` under the configuration directory; the adapter reports verification, relocated lines and failures. Save and rebuild after source changes so executable locations correspond to the source. Resume discards stale stack/variable handles. Stop terminates a launched target and detaches from an attached target; explicit `debug_terminate` requires adapter support. Closing ZIDE also disconnects the session. Adapter errors, timeouts and stderr are reported in debug output. Interactive terminal input/launch, watches, conditional/log breakpoints, memory/disassembly and multiple sessions are deferred.
+
+Reloading extensions cancels their tasks, disconnects their active debug session and replaces their registrations. Core tests use deterministic fixtures; `zig build test -Dtest-tools=true` additionally requires working ZLS, Git and LLDB installations on PATH. See [ImplementationProgress.md](ImplementationProgress.md) for validation results and outstanding hardware checks.
+
 ## TUI Frontend
 
 ### Keyboard Shortcuts
@@ -142,7 +186,7 @@ Windows terminals commonly intercept Alt combos (Windows Terminal binds Alt+arro
 - Config folder hierarchy: `~/.config/zide/` with `themes/` and `extensions/` subfolders
 - Lua settings file (`~/.config/zide/init.lua`)
   - `zide.set_language(name, { tab_width = 2, use_tabs = false, word_wrap = true, auto_close_brackets = false })` — per-language overrides of those four settings for files of that language (merge: only the keys given change; name matched case-insensitively; works for built-ins and for languages registered later); `zide.get_language(name)` reads the overrides back (nil when none)
-  - `zide.set(key, value)` — tab_width, use_tabs, word_wrap, auto_close_brackets (global defaults — see `zide.set_language`), page_size, auto_save, auto_save_interval_ms, click_clears_cursors, max_undo_history, session_persistence, filetree_visible, filetree_side ("left"/"right"), filetree_width (GUI px), tui_filetree_width (columns), filetree_root (starting directory, "" = cwd), lsp_enabled (off = no language servers; running ones stop on the next frame), syntax_highlighting (off = plain-text look), filetree_git_colors (off = no git status colors/subprocesses), secondary_window_chrome (GUI: menu bar + status bar in extra windows; false = bare pane containers)
+  - `zide.set(key, value)` — tab_width, use_tabs, word_wrap, auto_close_brackets (global defaults — see `zide.set_language`), page_size, auto_save, auto_save_interval_ms, click_clears_cursors, max_undo_history, session_persistence, filetree_visible, filetree_side ("left"/"right"), filetree_width (GUI px), tui_filetree_width (columns), filetree_root (starting directory, "" = cwd), lsp_enabled (off = no language servers; running ones stop on the next frame), syntax_highlighting (off = plain-text look), filetree_git_colors (off = no tree Git colors; Changes and gutters remain available), secondary_window_chrome (GUI: menu bar + status bar in extra windows; false = bare pane containers)
   - `zide.set("mono_font_path", "/path/to/font.ttf")` — use a custom monospace font (e.g. a Nerd Font for box-drawing and powerline glyphs in the embedded terminal)
   - `zide.set("mono_font_size", 14)` — override the default monospace font size
   - `zide.set("tui_theme", name)` — switch TUI theme ("terminal", "dark", "light", "high_contrast")
@@ -156,7 +200,7 @@ Windows terminals commonly intercept Alt combos (Windows Terminal binds Alt+arro
   - `zide.unbind(key_combo [, { language = "zig" }])` — remove a keybinding (global, or from a language overlay)
 - Data-driven keybinding map (all Ctrl/Alt shortcuts remappable, globally or per language)
 - File tree side panel (Ctrl+B) — dockable left/right column band with mouse + keyboard browsing, create/rename/delete prompts, reveal-current-file (see File Tree section)
-- Auto-save (saves dirty documents with file paths after configurable interval, default 5s)
+- Auto-save (saves dirty documents with file paths after configurable interval, default 5s; continues while the TUI is idle)
 - Application icon embedded in exe
 - Multiple cursor editing (Ctrl+Shift or Ctrl+Alt+Up/Down, Ctrl+D, Alt+click, Escape/click to clear)
 - Theme system: 3 built-in themes (dark, light, high-contrast)
@@ -619,11 +663,11 @@ Registration is not checked against the language registry — `init.lua` runs be
 - **`reload_extensions`**: registrations made by `extensions/*.lua` are dropped and re-created; a server whose registration is unchanged keeps running, changed or removed ones are stopped.
 - **`lsp_enabled`** (`zide.set("lsp_enabled", false)` or the Settings dialog): no servers start and running ones stop on the next frame — takes effect immediately.
 - **Quit**: every server gets `shutdown` + `exit`, up to a second to leave on its own, then is killed.
-- Server→client requests are answered: `workspace/configuration` from `settings`, `workspace/workspaceFolders`, capability registrations and progress tokens with `null`, anything else with a JSON-RPC MethodNotFound. `window/logMessage` / `window/showMessage` go to `zide.log` (server errors also to the status bar). Every server's stderr is discarded, and on Windows servers are spawned with `CREATE_NO_WINDOW` so no console window appears.
+- Server→client requests are answered: `workspace/configuration` from `settings`, `workspace/workspaceFolders`, capability registrations and progress tokens with `null`, and `workspace/applyEdit` through the shared preview. Unsupported requests receive JSON-RPC MethodNotFound. `window/logMessage` / `window/showMessage` go to `zide.log` (server errors also to the status bar). The transport drains and bounds stderr; Windows servers start without a console window.
 
 ### Architecture
 
-- **One background reader thread per server** reads JSON-RPC messages from the server's stdout and pushes them onto a thread-safe ring buffer queue
+- **Managed protocol workers per server** read framed JSON-RPC messages, queue writes and drain adapter stderr off the editor thread. Incoming and outgoing queues are bounded; overflow reports an error and stops the connection instead of dropping replies.
 - **Main thread** (`Editor.lspTick`) sweeps dead servers, polls every queue each frame (GUI) or event loop iteration (TUI) — no blocking — then syncs documents
 - **Full-text document sync** with version coalescing: rapid keystrokes are batched into a single `didChange` notification per frame
 - In the TUI, reader threads wake the blocking event loop via `loop.postEvent(.lsp_data)`; a server's stdout closing wakes it too, so a crash is noticed without a keypress
@@ -689,7 +733,14 @@ Press **F12** to jump to the definition of the symbol under the cursor. If the d
 | `src/core/theme.zig` | Theme system (ThemeColor, EditorTheme, TuiTheme, SyntaxTheme, presets) |
 | `src/core/layout.zig` | Split pane layout tree (binary tree of panes + splits) |
 | `src/core/clipboard.zig` | System clipboard (Win32 API, Linux wl-copy/xclip/xsel) |
-| `src/core/lsp.zig` | LSP client (JSON-RPC over stdio, one reader thread per server) + `ServerConfig` registrations |
+| `src/core/lsp.zig` | LSP client, capability negotiation, versioned requests and `ServerConfig` registrations |
+| `src/core/protocol.zig` | Managed framed stdio transport shared by LSP and DAP |
+| `src/core/jobs.zig` | Owned process groups, bounded streaming output, cancellation and wakeups |
+| `src/core/tasks.zig` | Explicit task registrations, save-before-run and diagnostic matching |
+| `src/core/diagnostics.zig` | Workspace Problems store, isolated producers and closed-file findings |
+| `src/core/git.zig` | Asynchronous Git status, previews, saved-file staging and gutter caches |
+| `src/core/dap.zig` | Debugger registrations, workspace breakpoints and shared views |
+| `src/core/dap_session.zig` | DAP lifecycle, request deadlines, threads, frames, variables and controls |
 | `src/core/lua_json.zig` | Lua table → JSON (register_lsp `settings` / `init_options`) |
 | `src/core/lua_settings.zig` | Lua settings bridge (zide.set/get/bind/unbind, register_language, register_lsp) |
 | `src/core/lua_api.zig` | Extension runtime API (zide.command/on/exec/status, buffer API, run/spawn, set_diagnostics) |
@@ -846,7 +897,7 @@ A toggleable side panel for browsing and managing the project directory, backed 
 - Starts **visible** by default — to launch with it closed, uncheck "File Tree Visible" in the settings dialog (persists to init.lua) or `zide.set("filetree_visible", false)`; Ctrl+B at runtime never writes settings.
 - Root = current directory by default, or the folder given on the command line (`zide path/to/project` — see *Hybrid Launch*). Change it in the Settings dialog ("File Tree Root" — type a path, Enter applies; a bad path keeps the previous root and shows why) or `zide.set("filetree_root", "/path")`; "" resets to cwd. **Backspace / u** (or `filetree_root_up`) re-roots at the parent directory to climb the hierarchy.
 - The panel header shows a clickable **up-button** (level-up icon in the GUI, `^` in the TUI) plus the full root path, truncated from the left (`...\Zig\ZIDE`) so the tail stays readable — click it to go up one folder.
-- Files created, deleted, or renamed **outside ZIDE** (Explorer, a terminal) appear automatically: a cheap directory-mtime probe runs every ~1.5s and triggers the full rescan + git recolor only when something actually changed. (The TUI checks when input arrives, since its loop sleeps between events.)
+- Files created, deleted, or renamed **outside ZIDE** (Explorer, a terminal) appear automatically: a cheap directory-mtime probe runs every ~1.5s and triggers a rescan when something changes. Both frontends wake for these deadlines even without input.
 - Directories sort first, names case-insensitive; children scan lazily on first expand; everything is listed, dotfiles and `.git` included.
 - Indent guide lines mark each ancestor level (thin rules in the GUI, `│` columns in the TUI) so deep nesting stays readable.
 - **GUI rows render VS Code-style**: chevron expanders on folders, per-type file icons in fixed accent colors (Zig orange, Lua blue, Markdown blue, images purple, executables green, folders steel blue, unknown types a dimmed generic document), the UI font instead of mono, a hover highlight under the pointer, and a selection bar that dims while the tree doesn't own the keyboard. Classification lives in `src/core/fileicons.zig` (frontend-agnostic — both frontends draw the same nerdfont glyphs, **per-language logos included**: the Zig zero, Lua moon, Rust gear, ...); special basenames beat extensions (README → book, LICENSE → shield, `.gitignore` → git, Makefile/Dockerfile/dotfiles → gear). The GUI renders the glyphs as text from the bundled Fira Code Nerd Font Mono, so they're always present — but if you point `mono_font_path` at a non-Nerd font, tree icons will show as boxes (pick any "NF" font to keep them). Entypo TinyVG icons remain for panel chrome (chevrons, header buttons). Extensions can override any assignment with `zide.set_icon` (see Extension Runtime API).
@@ -915,10 +966,10 @@ Ctrl/Alt chords (Ctrl+P, Ctrl+B, ...) still work while the tree is focused.
 | `filetree_paste` | Paste the file clipboard into the selected folder (Ctrl+V) — cut moves, copy copies recursively |
 
 ### Git status colors
-Tree rows are colored from `git status --porcelain` (a one-shot `git` shell-out — no libgit2): **untracked** and **added** files green/teal, **modified** amber, and any directory containing changes rolls up as modified; children of an untracked folder inherit untracked. In the GUI each changed row also gets a right-edge **badge**: an A/M/D/U letter on files, a `•` dot on directories rolling up changes (long names clip before the badge instead of running under it). Refreshed on panel load, manual refresh (Shift+R / `filetree_refresh`), after create/rename/delete, and after saves (including auto-save). Outside a git repo (or without git installed) rows simply stay uncolored. Colors are theme fields overridable via `zide.set("color_git_added" | "color_git_modified" | "color_git_deleted" | "color_git_untracked", "#hex")` and the `tui_color_git_*` equivalents.
+Tree rows use the shared asynchronous Git status service: **untracked** and **added** files green/teal, **modified** amber, and any directory containing changes rolls up as modified; children of an untracked folder inherit untracked. In the GUI each changed row also gets a right-edge **badge**: an A/M/D/U letter on files, a `•` dot on directories rolling up changes. Refresh runs on panel load, manual refresh (Shift+R / `filetree_refresh`), after create/rename/delete, after saves, and on background deadlines. Outside a repository (or without Git installed) rows stay uncolored. Colors are theme fields overridable via `zide.set("color_git_added" | "color_git_modified" | "color_git_deleted" | "color_git_untracked", "#hex")` and the `tui_color_git_*` equivalents. Disabling tree colors leaves the shared Git service available for Changes and gutter comparisons.
 
 ### Settings
-Settings dialog (GUI) or `zide.set` in init.lua: `filetree_visible` (bool, default true), `filetree_side` ("left"/"right"), `filetree_width` (120–600 px), `tui_filetree_width` (16–80 cols), `filetree_root` (path text field in the dialog — Enter applies and persists), `filetree_git_colors` (bool, default true — off stops the git status coloring and its `git status` subprocess calls entirely), `filetree_auto_reveal` (bool, default true — select the active file in the tree on tab switch), `tui_filetree_icons` (bool, default false — nerdfont icons in the TUI tree; needs a Nerd Font terminal font), `filetree_font_size` (GUI, points, 0 = theme default — row height, text, and icons all scale together), `filetree_icon_scale` (GUI, 50–200 — icon size as a percentage of the row font, default 90). The TUI's sizes are the terminal's font size — nothing to configure there.
+Settings dialog (GUI) or `zide.set` in init.lua: `filetree_visible` (bool, default true), `filetree_side` ("left"/"right"), `filetree_width` (120–600 px), `tui_filetree_width` (16–80 cols), `filetree_root` (path text field in the dialog — Enter applies and persists), `filetree_git_colors` (bool, default true — controls tree coloring; shared Git work continues for Changes and gutters), `filetree_auto_reveal` (bool, default true — select the active file in the tree on tab switch), `tui_filetree_icons` (bool, default false — nerdfont icons in the TUI tree; needs a Nerd Font terminal font), `filetree_font_size` (GUI, points, 0 = theme default — row height, text, and icons all scale together), `filetree_icon_scale` (GUI, 50–200 — icon size as a percentage of the row font, default 90). The TUI's sizes are the terminal's font size — nothing to configure there.
 
 ## Performance
 - **Gap buffer** text storage — inserts/deletes at cursor are O(1) amortized instead of O(n) memmove
