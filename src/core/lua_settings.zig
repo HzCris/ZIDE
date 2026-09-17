@@ -1213,6 +1213,7 @@ pub fn loadExtensions(lua: *Lua) void {
 
     var iter_dir = std.Io.Dir.cwd().openDir(io, ext_path, .{ .iterate = true }) catch return;
     defer iter_dir.close(io);
+    ensureSnippetExtension(iter_dir, io) catch |err| std.log.warn("Cannot create snippets-zig.lua: {s}", .{@errorName(err)});
 
     // Tag what the extension files register (register_lsp reads this) so
     // reload_extensions can drop and re-add exactly those configs.
@@ -1239,6 +1240,18 @@ pub fn loadExtensions(lua: *Lua) void {
             std.log.info("Loaded extension: {s}", .{entry.name});
         }
     }
+}
+
+pub const zig_snippets = @embedFile("../extensions/snippets-zig.lua");
+
+/// Exclusive creation also preserves edits if another instance starts concurrently.
+pub fn ensureSnippetExtension(dir: std.Io.Dir, io: std.Io) !void {
+    const file = dir.createFile(io, "snippets-zig.lua", .{ .exclusive = true }) catch |err| switch (err) {
+        error.PathAlreadyExists => return,
+        else => return err,
+    };
+    defer file.close(io);
+    try file.writeStreamingAll(io, zig_snippets);
 }
 
 /// Create extensions/example-lint-zig.lua (fully commented out) if it

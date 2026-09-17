@@ -444,6 +444,8 @@ pub fn applyWindowFonts(win: *dvui.Window, g: *GuiState, editor: *Editor) void {
 /// `win_ui`/`cur_win` pointing at the window being drawn.
 pub fn frame(editor: *Editor, g: *GuiState) bool {
     if (!build_options.has_gui) return false;
+    editor.validateSnippetState();
+    defer editor.validateSnippetState();
 
     // Windows whose close was requested (OS close button via the open flag,
     // close_window, the last pane closing) go away before anything is drawn;
@@ -3206,7 +3208,7 @@ fn searchPanelGui(editor: *Editor) void {
     } else {
         const busy: []const u8 = if (sp.searching) "  searching…" else "";
         const cap: []const u8 = if (sp.capped) "  (capped at 2000)" else "";
-        const main_txt = std.fmt.bufPrint(&sbuf, "{d} results in {d} files, {d} skipped{s}{s}", .{ sp.matches.items.len, sp.paths.items.len, sp.files_skipped, busy, cap }) catch "";
+        const main_txt = std.fmt.bufPrint(&sbuf, "{d} results in {d} files, {d} skipped{s}{s}", .{ sp.matches.items.len, sp.resultFileCount(), sp.files_skipped, busy, cap }) catch "";
         renderOverlayText(font, main_txt, area.x + pad, status_y, render_rs, fg);
         const main_w = font.textSize(main_txt).w * scale;
         renderOverlayText(font, "   Alt+C case · Alt+W word · Tab fields · Enter on Replace = replace all", area.x + pad + main_w, status_y, render_rs, dim);
@@ -3214,7 +3216,7 @@ fn searchPanelGui(editor: *Editor) void {
 
     // --- Results: file headers + highlighted match rows ---
     if (rows_visible == 0 or search_disp.items.len == 0) return;
-    const needle = sp.query();
+
     const prev_clip = dvui.clip(area);
     defer dvui.clipSet(prev_clip);
 
@@ -3281,10 +3283,10 @@ fn searchPanelGui(editor: *Editor) void {
                 // excerpt's trim offset); lines with several matches get one
                 // row each, so first-occurrence-always looked like dupes.
                 const hit_opt: ?usize = if (m.col >= m.excerpt_off and
-                    (m.col - m.excerpt_off) + needle.len <= m.excerpt.len)
+                    (m.col - m.excerpt_off) + m.len <= m.excerpt.len)
                     m.col - m.excerpt_off
                 else
-                    search_mod.findInText(m.excerpt, needle, sp.case_sensitive, sp.whole_word, 0);
+                    null;
                 var start: usize = 0;
                 var end: usize = m.excerpt.len;
                 var lead = false;
@@ -3293,7 +3295,7 @@ fn searchPanelGui(editor: *Editor) void {
                     var span = max_chars - 1;
                     trail = true;
                     if (hit_opt) |hit| {
-                        const h_end = @min(hit + needle.len, m.excerpt.len);
+                        const h_end = @min(hit + m.len, m.excerpt.len);
                         if (h_end > span) {
                             lead = true;
                             span = max_chars - 2;
@@ -3310,7 +3312,7 @@ fn searchPanelGui(editor: *Editor) void {
                     x += char_w;
                 }
                 if (hit_opt) |hit| {
-                    const h_end = @min(hit + needle.len, m.excerpt.len);
+                    const h_end = @min(hit + m.len, m.excerpt.len);
                     const c_pre_end = std.math.clamp(hit, start, end);
                     const c_hit_end = std.math.clamp(h_end, start, end);
                     const pre = m.excerpt[start..c_pre_end];
@@ -3518,7 +3520,7 @@ fn handleSearchKeysGui(editor: *Editor, wd: *dvui.WidgetData) void {
                         switch (sp.field) {
                             .query, .filter, .exclude => editor.searchStart(),
                             .replace => {
-                                if (sp.matches.items.len > 0) sp.confirm_armed = true;
+                                editor.searchArmReplace();
                             },
                             .results => {
                                 editor.searchOpenSelected();
@@ -4624,6 +4626,7 @@ fn paneContextMenu(editor: *Editor, pane_id: u8, area: dvui.Rect.Physical) void 
 
 /// Handle mouse events for the custom editor pane.
 fn handleMouseEvents(editor: *Editor, pane_id: u8, wd: *dvui.WidgetData, area: dvui.Rect.Physical, font: dvui.Font, line_height: f32, scale: f32) void {
+    defer editor.validateSnippetState();
     const pane_doc_idx = switch (winLayout(editor, cur_win).panes.items[pane_id].content) {
         .editor => |idx| idx,
         .terminal => return,
@@ -5017,6 +5020,8 @@ fn screenToOffset(doc: *Document, area: dvui.Rect.Physical, font: dvui.Font, lin
 
 /// Handle keyboard events for the GUI, routing through our core command system.
 fn handleGuiKeyEvents(editor: *Editor, wd: *dvui.WidgetData) bool {
+    editor.validateSnippetState();
+    defer editor.validateSnippetState();
     const is_focused = if (dvui.focusedWidgetId()) |fid| fid == wd.id else false;
     var handled_any = false;
 
@@ -5071,51 +5076,6 @@ fn handleGuiKeyEvents(editor: *Editor, wd: *dvui.WidgetData) bool {
         return handled_any;
     }
 
-    // --- Completion popup input handling ---
-    if (editor.completion_active) {
-        for (dvui.events()) |*e| {
-            if (e.handled) continue;
-            if (e.evt != .key) continue;
-            const key = e.evt.key;
-            if (key.action != .down and key.action != .repeat) continue;
-
-            const item_count = editor.completion_items.items.len;
-            switch (key.code) {
-                .escape => {
-                    e.handle(@src(), wd);
-                    handled_any = true;
-                    editor.clearCompletionItems();
-                },
-                .enter, .tab => {
-                    e.handle(@src(), wd);
-                    handled_any = true;
-                    editor.acceptCompletion();
-                },
-                .up => {
-                    e.handle(@src(), wd);
-                    handled_any = true;
-                    if (editor.completion_selected > 0) {
-                        editor.completion_selected -= 1;
-                    } else if (item_count > 0) {
-                        editor.completion_selected = item_count - 1;
-                    }
-                },
-                .down => {
-                    e.handle(@src(), wd);
-                    handled_any = true;
-                    if (item_count > 0) {
-                        editor.completion_selected = (editor.completion_selected + 1) % item_count;
-                    }
-                },
-                else => {
-                    // Any other key dismisses completion (don't consume the event)
-                    editor.clearCompletionItems();
-                },
-            }
-        }
-        if (handled_any) return handled_any;
-    }
-
     for (dvui.events()) |*e| {
         if (e.handled) continue;
 
@@ -5140,6 +5100,11 @@ fn handleGuiKeyEvents(editor: *Editor, wd: *dvui.WidgetData) bool {
 
                 // Movement and special keys — only when focused
                 if (!is_focused) continue;
+                if (handleGuiSnippetOrCompletionKey(editor, key)) {
+                    e.handle(@src(), wd);
+                    handled_any = true;
+                    continue;
+                }
                 const shift = key.mod.shift();
                 switch (key.code) {
                     .up => {
@@ -5229,6 +5194,32 @@ fn handleGuiKeyEvents(editor: *Editor, wd: *dvui.WidgetData) bool {
         }
     }
     return handled_any;
+}
+
+/// Called in event order, only by the editor widget which owns keyboard focus.
+fn handleGuiSnippetOrCompletionKey(editor: *Editor, key: dvui.Event.Key) bool {
+    if (!editor.editorOwnsInput() or key.mod.control() or key.mod.alt() or key.mod.command()) return false;
+    const snippet_key: ?Editor.SnippetKey = switch (key.code) {
+        .tab => if (key.mod.shift()) .shift_tab else .tab,
+        .escape => .escape,
+        else => null,
+    };
+    if (snippet_key) |k| if (editor.handleSnippetKey(k)) return true;
+    if (!editor.completion_active) return false;
+    const count = editor.completion_items.items.len;
+    switch (key.code) {
+        .escape => editor.clearCompletionItems(),
+        .enter => editor.acceptCompletion(),
+        .up => editor.completion_selected = if (editor.completion_selected > 0) editor.completion_selected - 1 else count -| 1,
+        .down => if (count > 0) {
+            editor.completion_selected = (editor.completion_selected + 1) % count;
+        },
+        else => {
+            editor.clearCompletionItems();
+            return false;
+        },
+    }
+    return true;
 }
 
 /// Execute an action with GUI-specific overrides (native file dialogs).
@@ -7284,6 +7275,41 @@ fn encodingDialog(editor: *Editor) void {
     if (editor.status_message.len > 0) dvui.labelNoFmt(@src(), editor.status_message, .{}, .{});
 }
 
+test "GUI snippets: hidden window dispatches Tab text Shift-Tab and Escape in order" {
+    if (!build_options.has_gui) return error.SkipZigTest;
+    const t = std.testing;
+    var ui = try dvui.testing.init(.{ .window_size = .{ .w = 900, .h = 600 } });
+    defer ui.deinit();
+    var editor = try Editor.init(t.allocator, t.io);
+    defer editor.deinit();
+    var window_state: WinUi = .{ .win_id = 0 };
+    win_ui = &window_state;
+    defer win_ui = undefined;
+    cur_win = 0;
+    var box = dvui.box(@src(), .{ .dir = .vertical }, .{ .expand = .both });
+    defer box.deinit();
+    dvui.focusWidget(box.data().id, null, null);
+    _ = try editor.registerSnippet("*", "demo", "Demo", "${1:first} ${2:tail}$0");
+    const doc = editor.activeDoc();
+    try doc.loadText("demo");
+    doc.cursors.primary().moveToEnd(&doc.buffer);
+    try dvui.testing.pressKey(.tab, .none);
+    try dvui.testing.writeText("😀");
+    try dvui.testing.pressKey(.tab, .none);
+    try t.expect(handleGuiKeyEvents(&editor, box.data()));
+    try t.expectEqualStrings("😀 tail", doc.buffer.slice(0, doc.buffer.byteLen()));
+    try t.expectEqualStrings("tail", doc.selectedText().?);
+    try dvui.testing.pressKey(.tab, .lshift);
+    try t.expect(handleGuiKeyEvents(&editor, box.data()));
+    try t.expectEqualStrings("😀", doc.selectedText().?);
+    try dvui.testing.pressKey(.escape, .none);
+    try t.expect(handleGuiKeyEvents(&editor, box.data()));
+    try t.expect(doc.snippet_session == null);
+    try t.expectEqualStrings("😀 tail", doc.buffer.slice(0, doc.buffer.byteLen()));
+    editor.search_focused = true;
+    try t.expect(!handleGuiSnippetOrCompletionKey(&editor, .{ .code = .tab, .action = .down, .mod = .none }));
+}
+
 test "GUI encoding smoke: hidden window renders picker and handles Unicode find replacement" {
     if (!build_options.has_gui) return error.SkipZigTest;
     const t = std.testing;
@@ -7358,6 +7384,80 @@ test "GUI tools smoke: hover, rename, workspace preview and recovery dialogs" {
         toolDialog(&editor);
         handleToolKeyGui(&editor, .{ .code = .escape, .action = .down, .mod = .none });
         try t.expectEqual(Editor.Mode.normal, editor.mode);
+    }
+}
+
+comptime {
+    if (build_options.has_gui) _ = @import("software_render_tests.zig");
+}
+
+test "GUI software profile: editor and settings at desktop resolution" {
+    if (!build_options.has_gui or build_options.has_gpu) return error.SkipZigTest;
+    const Backend = @import("sdl-backend");
+    if (Backend.c.SDL_getenv("ZIDE_SOFTWARE_PROFILE") == null) return error.SkipZigTest;
+    const t = std.testing;
+    var backend = try Backend.initWindow(.{
+        .io = t.io,
+        .size = .{ .w = 2048, .h = 1119 },
+        .title = "ZIDE software profile",
+        .hidden = true,
+        .vsync = false,
+        .renderer_driver = "software",
+    });
+    defer backend.deinit();
+    var editor = try Editor.init(t.allocator, t.io);
+    defer editor.deinit();
+    var g = try GuiState.init(t.allocator);
+    defer g.deinit();
+    var window = try dvui.Window.init(@src(), t.allocator, backend.backend(), .{});
+    defer window.deinit();
+    applyWindowFonts(&window, &g, &editor);
+    editor.renderer_is_software = true;
+    try std.Io.Dir.cwd().createDirPath(t.io, ".zig-cache");
+    const profiles = [_]struct { name: []const u8, mode: Editor.Mode, capture: [:0]const u8 }{
+        .{ .name = "Settings / empty buffer", .mode = .settings, .capture = ".zig-cache/software-settings.png" },
+        .{ .name = "Editor / text", .mode = .normal, .capture = ".zig-cache/software-editor.png" },
+        .{ .name = "Settings / text", .mode = .settings, .capture = ".zig-cache/software-settings-text.png" },
+    };
+    for (profiles, 0..) |profile, profile_index| {
+        if (profile_index == 1) try editor.activeDoc().loadText("const result = try renderer.drawText(\"Software: café 界\");\n" ** 80);
+        editor.mode = profile.mode;
+        var samples: [60]u64 = undefined;
+        var submission: [60]u64 = undefined;
+        var presentation: [60]u64 = undefined;
+        // Ten warmup frames, sixty measured frames, then an untimed capture.
+        for (0..samples.len + 11) |index| {
+            const start = Backend.c.SDL_GetPerformanceCounter();
+            try window.begin(@intCast((profile_index * (samples.len + 11) + index) * 16 * std.time.ns_per_ms));
+            _ = frame(&editor, &g);
+            window.endRendering(.{});
+            const submitted = Backend.c.SDL_GetPerformanceCounter();
+            if (index == samples.len + 10) {
+                const surface = Backend.c.SDL_RenderReadPixels(backend.renderer, null) orelse return error.ReadPixels;
+                defer Backend.c.SDL_DestroySurface(surface);
+                try t.expect(Backend.c.SDL_SavePNG(surface, profile.capture));
+            }
+            _ = try window.end(.{});
+            const ended = Backend.c.SDL_GetPerformanceCounter();
+            if (index >= 10 and index < samples.len + 10) {
+                samples[index - 10] = ended - start;
+                submission[index - 10] = submitted - start;
+                presentation[index - 10] = ended - submitted;
+            }
+        }
+        std.mem.sort(u64, &samples, {}, std.sort.asc(u64));
+        std.mem.sort(u64, &submission, {}, std.sort.asc(u64));
+        std.mem.sort(u64, &presentation, {}, std.sort.asc(u64));
+        const ticks_per_ms = @as(f64, @floatFromInt(Backend.c.SDL_GetPerformanceFrequency())) / 1000;
+        std.debug.print("software 2048x1119, {s}, 60 frames: median {d:.2} ms, p95 {d:.2} ms\n", .{
+            profile.name,
+            @as(f64, @floatFromInt(samples[30])) / ticks_per_ms,
+            @as(f64, @floatFromInt(samples[57])) / ticks_per_ms,
+        });
+        std.debug.print("median submission {d:.2} ms, raster/present {d:.2} ms\n", .{
+            @as(f64, @floatFromInt(submission[30])) / ticks_per_ms,
+            @as(f64, @floatFromInt(presentation[30])) / ticks_per_ms,
+        });
     }
 }
 

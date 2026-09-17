@@ -22,6 +22,7 @@ pub const lua_api = @import("lua_api.zig");
 pub const search_mod = @import("search.zig");
 pub const text_file = @import("text_file.zig");
 const text_input = @import("text_input.zig");
+const snippets_mod = @import("snippets.zig");
 const zlua = @import("zlua");
 
 /// The central editor state. NOT a global singleton — passed explicitly.
@@ -30,6 +31,8 @@ pub const Editor = struct {
     documents: std.ArrayList(Document),
     active_doc_idx: usize = 0,
     commands: CommandRegistry,
+    snippets: snippets_mod.Registry = .{},
+    snippet_owner: ?struct { document: u64, window: u32, pane: u8 } = null,
     allocator: Allocator,
 
     /// Whether the editor should keep running.
@@ -285,7 +288,7 @@ pub const Editor = struct {
     confirm_overwrite_doc: usize = 0,
     /// Document the .confirm_close prompt (closing a dirty tab) was opened
     /// for — resolved by index, bounds-checked when answered.
-    confirm_close_doc: usize = 0,
+    confirm_close_doc: ?u64 = null,
     /// Window whose Settings dialog is open (an EditorWindow.id): the dialog
     /// stays in the window it was opened from instead of following focus.
     settings_window_id: u32 = 0,
@@ -532,6 +535,7 @@ pub const Editor = struct {
         }
         self.documents.deinit(self.allocator);
         self.commands.deinit();
+        self.snippets.deinit(self.allocator);
         self.keybinds.deinit();
         var prof_it = self.lang_profiles.iterator();
         while (prof_it.next()) |entry| {
@@ -1063,27 +1067,52 @@ pub const Editor = struct {
 
     /// Open the selected result at its match (real tab, match selected).
     pub fn searchOpenSelected(self: *Editor) void {
+        _ = self.openSelectedSearchResult();
+    }
+
+    fn openSelectedSearchResult(self: *Editor) bool {
         const sp = &self.search;
-        if (sp.selected >= sp.matches.items.len) return;
-        const m = sp.matches.items[sp.selected];
-        const path = sp.paths.items[m.path_idx];
-        _ = self.openOrFocus(path) catch {
+        if (sp.selected >= sp.matches.items.len) return false;
+        const old = sp.matches.items[sp.selected];
+        if (old.path_idx >= sp.paths.items.len) return false;
+        const generation = sp.generation;
+        // Opening fires Lua hooks, which may alter documents or search state.
+        const path = self.allocator.dupe(u8, sp.paths.items[old.path_idx]) catch return false;
+        defer self.allocator.free(path);
+        const opened = self.openOrFocus(path) catch {
             const msg = std.fmt.bufPrint(&self.status_buf, "Cannot open {s}", .{path}) catch "Cannot open result";
             self.status_message = msg;
-            return;
+            return false;
         };
-        const doc = self.activeDoc();
-        // Positions may be stale after edits — clamp defensively.
-        const line = @min(m.line, @as(u32, @intCast(doc.buffer.lineCount() -| 1)));
-        const line_len = doc.buffer.lineContent(line).len;
-        const col = @min(m.col, @as(u32, @intCast(line_len)));
-        const start_off = doc.buffer.posToOffset(line, col);
+        if (sp.generation != generation or opened.file_path == null or !self.pathsEqual(opened.file_path.?, path)) {
+            self.status_message = "Search changed; select a result again";
+            return false;
+        }
+        const id = opened.id;
+        const m = (sp.refreshedMatch(old, opened) catch {
+            self.status_message = "Cannot refresh search results";
+            return false;
+        }) orelse {
+            self.status_message = "Match no longer exists; file results refreshed";
+            return false;
+        };
+        const idx = self.docIndexForId(id) orelse return false;
+        self.switchToDoc(idx);
+        const doc = &self.documents.items[idx];
+        const start_off = doc.buffer.posToOffset(m.line, m.col);
+        const end_off = start_off + m.len;
+        const cursor = @import("cursor.zig");
+        if (cursor.floorBoundary(&doc.buffer, start_off) != start_off or cursor.floorBoundary(&doc.buffer, end_off) != end_off) {
+            self.status_message = "Match is not a complete character";
+            return false;
+        }
         doc.cursors.clearSecondary();
         const c = doc.cursors.primary();
         c.anchor = start_off;
-        c.offset = @min(start_off + sp.query_len, doc.buffer.byteLen());
+        c.offset = end_off;
         c.preferred_col = doc.buffer.offsetToPos(c.offset).col;
         self.search_focused = false;
+        return true;
     }
 
     /// Cycle to the next/previous result and jump to it (works with the
@@ -1100,14 +1129,27 @@ pub const Editor = struct {
         } else {
             sp.selected = if (sp.selected == 0) count - 1 else sp.selected - 1;
         }
-        self.searchOpenSelected();
-        const msg = std.fmt.bufPrint(&self.status_buf, "Result {d}/{d}", .{ sp.selected + 1, count }) catch "";
+        if (!self.openSelectedSearchResult()) return;
+        const msg = std.fmt.bufPrint(&self.status_buf, "Result {d}/{d}", .{ sp.selected + 1, sp.matches.items.len }) catch "";
         self.status_message = msg;
+    }
+
+    pub fn searchArmReplace(self: *Editor) void {
+        self.search.confirm_armed = false;
+        if (!self.search.criteriaCurrent()) {
+            self.status_message = "Run search after changing its criteria";
+        } else if (self.search.searching) {
+            self.status_message = "Wait for search to finish before replacing";
+        } else if (self.search.matches.items.len > 0) self.search.confirm_armed = true;
     }
 
     /// Execute the armed replace and report; re-runs the search after so
     /// the results reflect the new state.
     pub fn searchExecuteReplace(self: *Editor, scope: search_mod.ReplaceScope) void {
+        if (!self.search.criteriaCurrent() or self.search.searching) {
+            self.searchArmReplace();
+            return;
+        }
         const res = self.search.executeReplace(self, scope);
         self.search.start(self);
         const noun: []const u8 = if (scope == .open_only) "open doc(s)" else "file(s)";
@@ -1688,7 +1730,7 @@ pub const Editor = struct {
     pub fn requestCloseDoc(self: *Editor, doc_idx: usize) bool {
         if (doc_idx >= self.documents.items.len) return false;
         if (self.documents.items[doc_idx].dirty) {
-            self.confirm_close_doc = doc_idx;
+            self.confirm_close_doc = self.documents.items[doc_idx].id;
             self.mode = .confirm_close;
             return false;
         }
@@ -1709,11 +1751,12 @@ pub const Editor = struct {
     /// meanwhile gets the overwrite prompt instead and the tab stays.
     pub fn resolveCloseDoc(self: *Editor, choice: CloseChoice) CloseOutcome {
         self.mode = .normal;
-        const idx = self.confirm_close_doc;
-        if (idx >= self.documents.items.len) {
+        const id = self.confirm_close_doc;
+        self.confirm_close_doc = null;
+        const idx = (if (id) |target| self.docIndexForId(target) else null) orelse {
             self.status_message = "Close cancelled (the document is gone)";
             return .kept;
-        }
+        };
         switch (choice) {
             .cancel => return .kept,
             .discard => {
@@ -1721,18 +1764,18 @@ pub const Editor = struct {
                 return .closed;
             },
             .save => {
-                const id = self.documents.items[idx].id;
-                switch (self.saveDocument(id, .{})) {
+                const target_id = self.documents.items[idx].id;
+                switch (self.saveDocument(target_id, .{})) {
                     .formatting => {
-                        self.close_after_save_id = id;
+                        self.close_after_save_id = target_id;
                         return .kept;
                     },
                     .needs_path => {
-                        self.close_after_save_id = id;
+                        self.close_after_save_id = target_id;
                         return .needs_path;
                     },
                     .saved => {
-                        const current = self.docIndexForId(id) orelse return .closed;
+                        const current = self.docIndexForId(target_id) orelse return .closed;
                         if (self.documents.items[current].dirty) return .kept;
                         _ = self.closeDocAt(current);
                         return .closed;
@@ -1745,8 +1788,9 @@ pub const Editor = struct {
 
     /// Text of the .confirm_close prompt (both frontends draw it).
     pub fn confirmClosePrompt(self: *const Editor, buf: []u8) []const u8 {
-        const name: []const u8 = if (self.confirm_close_doc < self.documents.items.len)
-            self.documents.items[self.confirm_close_doc].display_name
+        const idx = if (self.confirm_close_doc) |id| self.docIndexForId(id) else null;
+        const name: []const u8 = if (idx) |i|
+            self.documents.items[i].display_name
         else
             "Document";
         return std.fmt.bufPrint(buf, "{s} has unsaved changes! [S]ave [D]iscard [C]ancel", .{name}) catch "Unsaved changes! [S]ave [D]iscard [C]ancel";
@@ -1840,6 +1884,7 @@ pub const Editor = struct {
     /// Switch to document at index (in the currently focused pane).
     pub fn switchToDoc(self: *Editor, idx: usize) void {
         if (idx < self.documents.items.len) {
+            if (idx != self.activeDocIdx()) self.cancelSnippets();
             self.active_doc_idx = idx;
             self.paneShowDoc(idx);
         }
@@ -1860,6 +1905,8 @@ pub const Editor = struct {
     /// that aren't in the command registry, then falls back to execCommand.
     /// Returns true if the action was recognized and handled.
     pub fn execAction(self: *Editor, action: []const u8) bool {
+        self.validateSnippetState();
+        defer self.validateSnippetState();
         if (std.mem.eql(u8, action, "quit")) {
             if (self.hasUnsavedChanges()) {
                 self.mode = .confirm_quit;
@@ -2060,8 +2107,15 @@ pub const Editor = struct {
         for (self.documents.items) |*doc| {
             const path = doc.file_path orelse continue;
             if (doc.external_changed) continue; // flagged; waiting on the user
-            if (doc.disk_mtime == null) continue; // no stamp to compare
-            const st = std.Io.Dir.cwd().statFile(self.io, path, .{}) catch {
+            const recorded = doc.disk_stamp orelse continue;
+            const current = text_file.Stamp.read(self.io, path) catch {
+                doc.external_changed = true;
+                doc.history.saved_revision = null;
+                doc.dirty = true;
+                self.status_message = "Cannot check file on disk (buffer kept; saving will ask)";
+                continue;
+            };
+            const stamp = current orelse {
                 doc.external_changed = true;
                 doc.history.saved_revision = null;
                 doc.dirty = true;
@@ -2069,7 +2123,7 @@ pub const Editor = struct {
                 self.status_message = msg;
                 continue;
             };
-            if (st.mtime.nanoseconds == doc.disk_mtime.?) continue;
+            if (std.meta.eql(stamp, recorded)) continue;
             if (doc.dirty) {
                 doc.external_changed = true;
                 const msg = std.fmt.bufPrint(&self.status_buf, "{s} changed on disk — saving will ask", .{doc.display_name}) catch "File changed on disk";
@@ -2737,6 +2791,7 @@ pub const Editor = struct {
         const win = self.activeWindow();
         const current_doc_idx = self.activeDocIdx();
         const new_pane = win.layout.splitPane(win.active_pane, direction, .{ .editor = current_doc_idx }) catch return;
+        self.cancelSnippets();
         win.active_pane = new_pane;
         // Keep active_doc_idx in sync for compatibility
         self.active_doc_idx = current_doc_idx;
@@ -2757,6 +2812,7 @@ pub const Editor = struct {
             return;
         }
         const closed_pane = win.active_pane;
+        self.cancelSnippets();
         // If closing a terminal pane, clean up the terminal
         if (closed_pane < win.layout.panes.items.len) {
             switch (win.layout.panes.items[closed_pane].content) {
@@ -2778,6 +2834,7 @@ pub const Editor = struct {
     pub fn focusNextPane(self: *Editor) void {
         const win = self.activeWindow();
         if (win.layout.nextPane(win.active_pane)) |next| {
+            if (next != win.active_pane) self.cancelSnippets();
             win.active_pane = next;
             self.active_doc_idx = self.activeDocIdx();
         }
@@ -2787,6 +2844,7 @@ pub const Editor = struct {
     pub fn focusPrevPane(self: *Editor) void {
         const win = self.activeWindow();
         if (win.layout.prevPane(win.active_pane)) |prev| {
+            if (prev != win.active_pane) self.cancelSnippets();
             win.active_pane = prev;
             self.active_doc_idx = self.activeDocIdx();
         }
@@ -2796,6 +2854,7 @@ pub const Editor = struct {
     pub fn focusPane(self: *Editor, pane_id: u8) void {
         const win = self.activeWindow();
         if (pane_id < win.layout.panes.items.len) {
+            if (pane_id != win.active_pane) self.cancelSnippets();
             win.active_pane = pane_id;
             switch (win.layout.panes.items[pane_id].content) {
                 .editor => |idx| self.active_doc_idx = idx,
@@ -2837,6 +2896,7 @@ pub const Editor = struct {
     /// Leave transient input and completion modes. Settings and pending file
     /// decisions follow window focus; the latter retain their document IDs.
     pub fn cancelTransientMode(self: *Editor) void {
+        self.cancelSnippets();
         switch (self.mode) {
             .normal, .settings, .encoding_picker, .confirm_reopen, .confirm_encoding, .confirm_overwrite, .save_as => {},
             .file_finder => self.finderCancel(),
@@ -4057,6 +4117,166 @@ pub const Editor = struct {
         };
     }
 
+    pub fn registerSnippet(self: *Editor, language: []const u8, prefix: []const u8, description: []const u8, body: []const u8) ![]const u8 {
+        var def = try snippets_mod.Definition.init(self.allocator, language, prefix, description, body, self.loading_extensions);
+        errdefer def.deinit(self.allocator);
+        var replace: ?usize = null;
+        for (self.snippets.items.items, 0..) |*old, i| {
+            if (std.mem.eql(u8, old.command, def.command)) {
+                replace = i;
+                break;
+            }
+        }
+        if (replace == null) try self.snippets.items.ensureUnusedCapacity(self.allocator, 1);
+        try self.commands.registerSnippet(def.command, def.description);
+        if (replace) |i| {
+            self.snippets.items.items[i].deinit(self.allocator);
+            self.snippets.items.items[i] = def;
+        } else self.snippets.items.appendAssumeCapacity(def);
+        return def.command;
+    }
+
+    pub fn dropExtensionSnippets(self: *Editor) void {
+        self.cancelSnippets();
+        var i = self.snippets.items.items.len;
+        while (i > 0) {
+            i -= 1;
+            if (!self.snippets.items.items[i].from_extension) continue;
+            var def = self.snippets.items.orderedRemove(i);
+            self.commands.removeSnippet(def.command);
+            def.deinit(self.allocator);
+        }
+    }
+
+    pub fn editorOwnsInput(self: *Editor) bool {
+        return self.mode == .normal and !self.filetree_focused and !self.search_focused and !self.activePaneIsTerminal();
+    }
+
+    pub fn cancelSnippets(self: *Editor) void {
+        for (self.documents.items) |*doc| doc.cancelSnippet(false);
+        self.snippet_owner = null;
+    }
+
+    /// Frontends also call this after mouse/visual cursor movement and mode changes.
+    pub fn validateSnippetState(self: *Editor) void {
+        if (self.snippet_owner) |owner| {
+            if (!self.editorOwnsInput() or owner.document != self.activeDoc().id or
+                owner.window != self.activeWindow().id or owner.pane != self.activePaneId())
+            {
+                self.cancelSnippets();
+                return;
+            }
+            self.activeDoc().validateSnippet();
+            if (self.activeDoc().snippet_session == null) self.snippet_owner = null;
+        }
+    }
+
+    fn insertSnippetDefinition(self: *Editor, def: *const snippets_mod.Definition, start: usize, end: usize) void {
+        const doc = self.activeDoc();
+        doc.insertSnippet(&def.template, start, end, self.useTabsFor(doc), self.indentWidthFor(doc)) catch |err| {
+            self.status_message = snippets_mod.errorMessage(err);
+            return;
+        };
+        self.clearCompletionItems();
+        self.snippet_owner = if (doc.snippet_session != null)
+            .{ .document = doc.id, .window = self.activeWindow().id, .pane = self.activePaneId() }
+        else
+            null;
+    }
+
+    pub fn insertSnippetCommand(self: *Editor, name: []const u8) void {
+        if (!self.editorOwnsInput()) return;
+        const def = self.snippets.command(name) orelse return;
+        const doc = self.activeDoc();
+        if (doc.cursors.count() != 1) {
+            self.status_message = "Snippets require a single cursor";
+            return;
+        }
+        if (!def.matchesLanguage(if (doc.language) |l| l.name else null)) {
+            self.status_message = "Snippet language does not match this document";
+            return;
+        }
+        const cursor = doc.cursors.primaryConst();
+        const range = cursor.selectionRange();
+        self.insertSnippetDefinition(def, if (range) |r| r.start else cursor.offset, if (range) |r| r.end else cursor.offset);
+    }
+
+    /// True means a matching trigger was handled, including a reported allocation failure.
+    pub fn expandSnippet(self: *Editor, explicit: bool) bool {
+        if (!self.editorOwnsInput()) return false;
+        const doc = self.activeDoc();
+        if (doc.cursors.count() != 1) {
+            if (explicit) self.status_message = "Snippets require a single cursor";
+            return false;
+        }
+        const c = doc.cursors.primaryConst();
+        if (c.hasSelection()) {
+            if (explicit) self.status_message = "Snippet expansion requires an unselected trigger";
+            return false;
+        }
+        const start = snippets_mod.triggerStart(&doc.buffer, c.offset) orelse {
+            if (explicit) self.status_message = "No matching snippet trigger";
+            return false;
+        };
+        // Compare directly against the buffer: no scratch allocation or truncated trigger.
+        const language = if (doc.language) |l| l.name else null;
+        var global: ?*const snippets_mod.Definition = null;
+        var specific: ?*const snippets_mod.Definition = null;
+        for (self.snippets.items.items) |*def| {
+            if (def.prefix.len != c.offset - start or !def.matchesLanguage(language)) continue;
+            var matches = true;
+            for (def.prefix, 0..) |byte, i| if (doc.buffer.byteAt(start + i).? != byte) {
+                matches = false;
+                break;
+            };
+            if (!matches) continue;
+            if (std.mem.eql(u8, def.language, "*")) global = def else specific = def;
+        }
+        const def = specific orelse global orelse {
+            if (explicit) self.status_message = "No matching snippet trigger";
+            return false;
+        };
+        self.insertSnippetDefinition(def, start, c.offset);
+        return true;
+    }
+
+    pub fn navigateSnippet(self: *Editor, previous: bool) bool {
+        self.validateSnippetState();
+        if (!self.editorOwnsInput() or !self.activeDoc().navigateSnippet(previous)) return false;
+        self.clearCompletionItems();
+        self.validateSnippetState();
+        return true;
+    }
+
+    pub const SnippetKey = enum { tab, shift_tab, escape };
+
+    /// Shared GUI/TUI priority: field, exact trigger, completion, indentation.
+    pub fn handleSnippetKey(self: *Editor, key: SnippetKey) bool {
+        self.validateSnippetState();
+        if (!self.editorOwnsInput()) return false;
+        switch (key) {
+            .tab => {
+                if (self.navigateSnippet(false) or self.expandSnippet(false)) return true;
+                if (self.completion_active) self.acceptCompletion() else _ = self.execCommand("indent", null);
+                return true;
+            },
+            .shift_tab => {
+                if (!self.navigateSnippet(true)) {
+                    self.clearCompletionItems();
+                    _ = self.execCommand("dedent", null);
+                }
+                return true;
+            },
+            .escape => {
+                if (self.activeDoc().snippet_session == null) return false;
+                self.activeDoc().cancelSnippet(true);
+                self.snippet_owner = null;
+                self.clearCompletionItems();
+                return true;
+            },
+        }
+    }
+
     fn isIdentChar(c: u8) bool {
         return (c >= 'a' and c <= 'z') or (c >= 'A' and c <= 'Z') or (c >= '0' and c <= '9') or c == '_' or c == '@';
     }
@@ -4845,7 +5065,7 @@ test "close tab: a dirty document prompts; discard closes, cancel keeps it" {
     try d2.insertAtCursor("draft");
     try t.expect(editor.execAction("close_tab"));
     try t.expectEqual(Editor.Mode.confirm_close, editor.mode);
-    try t.expectEqual(@as(usize, 1), editor.confirm_close_doc);
+    try t.expectEqual(d2.id, editor.confirm_close_doc.?);
     try t.expectEqual(@as(usize, 2), editor.documents.items.len);
     // Cancel keeps the tab
     try t.expectEqual(Editor.CloseOutcome.kept, editor.resolveCloseDoc(.cancel));
@@ -4868,7 +5088,7 @@ test "close tab: a dirty document prompts; discard closes, cancel keeps it" {
     try t.expectEqual(@as(usize, 1), editor.active_doc_idx);
     try t.expectEqual(Editor.Mode.normal, editor.mode);
     // A prompt whose document vanished resolves to nothing
-    editor.confirm_close_doc = 7;
+    editor.confirm_close_doc = std.math.maxInt(u64);
     editor.mode = .confirm_close;
     try t.expectEqual(Editor.CloseOutcome.kept, editor.resolveCloseDoc(.discard));
     try t.expectEqual(@as(usize, 2), editor.documents.items.len);
@@ -4996,7 +5216,7 @@ test "save and quit preflights all files and conflict resolution never resumes q
         try editor.activeDoc().insertAtCursor("local ");
         try testWriteFile(tmp.dir, "b.txt", "external");
         // Guarantee a stale stamp independent of filesystem timestamp precision.
-        editor.activeDoc().disk_mtime = -1;
+        editor.activeDoc().disk_stamp.?.mtime = -1;
         editor.switchToDoc(0);
         editor.saveAllAndQuit();
         try t.expect(editor.running);

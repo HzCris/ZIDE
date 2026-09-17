@@ -45,13 +45,17 @@ pub fn build(b: *std.Build) void {
 
         gui_mod.addOptions("build_options", gui_options);
 
+        // Keep SDL's CPU rasterizer optimized even while debugging Zig code.
+        // Unoptimized per-pixel C loops make desktop software rendering unusable.
+        const sdl_optimize = b.option(std.builtin.OptimizeMode, "sdl-optimize", "SDL C library optimization (default: ReleaseFast for Debug builds)") orelse
+            (if (optimize == .Debug) .ReleaseFast else optimize);
         // Backend-specific DVUI imports (enum literals can't be selected at runtime)
         if (use_gpu) {
-            const dvui_dep = b.dependency("dvui", .{ .target = target, .optimize = optimize, .backend = .sdl3gpu });
+            const dvui_dep = b.dependency("dvui", .{ .target = target, .optimize = optimize, .@"sdl-optimize" = sdl_optimize, .backend = .sdl3gpu });
             gui_mod.addImport("dvui", dvui_dep.module("dvui_sdl3gpu"));
             gui_mod.addImport("sdl-backend", dvui_dep.module("sdl3"));
         } else {
-            const dvui_dep = b.dependency("dvui", .{ .target = target, .optimize = optimize, .backend = .sdl3 });
+            const dvui_dep = b.dependency("dvui", .{ .target = target, .optimize = optimize, .@"sdl-optimize" = sdl_optimize, .backend = .sdl3 });
             gui_mod.addImport("dvui", dvui_dep.module("dvui_sdl3"));
             gui_mod.addImport("sdl-backend", dvui_dep.module("sdl3"));
         }

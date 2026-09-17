@@ -46,6 +46,8 @@ pub fn registerInto(lua: *Lua, editor: *Editor) void {
 
     lua.pushFunction(&luaCommand);
     lua.setField(-2, "command");
+    lua.pushFunction(&luaRegisterSnippet);
+    lua.setField(-2, "register_snippet");
     lua.pushFunction(&luaOn);
     lua.setField(-2, "on");
     lua.pushFunction(&luaExec);
@@ -178,12 +180,11 @@ pub fn cleanupLuaRefs(editor: *Editor) void {
         if (editor.lua) |lua| lua.unref(zlua.registry_index, pending.ref);
     }
     editor.lua_jobs.clearRetainingCapacity();
-    var refs: std.ArrayList(i32) = .empty;
-    defer refs.deinit(editor.allocator);
-    editor.commands.removeLuaCommands(&refs);
-    if (editor.lua) |lua| {
-        for (refs.items) |r| lua.unref(zlua.registry_index, r);
-    }
+    editor.commands.removeLuaCommands(editor.lua, struct {
+        fn release(lua: ?*Lua, ref: i32) void {
+            if (lua) |state| state.unref(zlua.registry_index, ref);
+        }
+    }.release);
     inline for (comptime std.meta.tags(LuaEvent)) |ev| {
         const list = editor.lua_event_handlers.getPtr(ev);
         for (list.items) |h| {
@@ -220,6 +221,7 @@ pub fn reloadExtensions(editor: *Editor) void {
     // server whose registration changed or vanished (unchanged ones keep
     // running — no clangd restart on every reload).
     editor.dropExtensionLspConfigs();
+    editor.dropExtensionSnippets();
     editor.tasks.dropExtensions(editor);
     editor.dap.dropExtensions(editor);
     lua_settings.loadExtensions(lua);
@@ -235,6 +237,36 @@ pub fn reloadExtensions(editor: *Editor) void {
 // ---------------------------------------------------------------------------
 // zide.* callback implementations
 // ---------------------------------------------------------------------------
+
+fn snippetStringField(lua: *Lua, key: [:0]const u8) ?[]const u8 {
+    _ = lua.getField(1, key);
+    defer lua.pop(1);
+    return if (lua.typeOf(-1) == .string) lua.toString(-1) catch null else null;
+}
+
+fn snippetError(lua: *Lua, message: []const u8) c_int {
+    lua.pushNil();
+    _ = lua.pushString(message);
+    return 2;
+}
+
+fn luaRegisterSnippet(state: ?*zlua.LuaState) callconv(.c) c_int {
+    const lua: *Lua = @ptrCast(@alignCast(state orelse return 0));
+    const editor = lua_settings.getEditor(state) orelse return 0;
+    if (lua.typeOf(1) != .table) return snippetError(lua, "register_snippet expects a table");
+    const language = snippetStringField(lua, "language") orelse return snippetError(lua, "Snippet language (string) is required");
+    const prefix = snippetStringField(lua, "prefix") orelse return snippetError(lua, "Snippet prefix (string) is required");
+    const body = snippetStringField(lua, "body") orelse return snippetError(lua, "Snippet body (string) is required");
+    _ = lua.getField(1, "description");
+    const valid_description = lua.isNil(-1) or lua.typeOf(-1) == .string;
+    lua.pop(1);
+    if (!valid_description) return snippetError(lua, "Snippet description must be a string");
+    const description = snippetStringField(lua, "description") orelse prefix;
+    const command = editor.registerSnippet(language, prefix, description, body) catch |err|
+        return snippetError(lua, @import("snippets.zig").errorMessage(err));
+    _ = lua.pushString(command);
+    return 1;
+}
 
 /// zide.command(name, description, fn) — register a command that shows up
 /// in the palette and can be bound via zide.bind.
@@ -861,6 +893,66 @@ test "Lua command may shadow a built-in" {
     try lua.doString("zide.command('undo', '', function() zide.status('custom undo') end)");
     _ = editor.execCommand("undo", null);
     try testing.expectEqualStrings("custom undo", editor.status_message);
+}
+
+test "Lua reload restores overridden built-ins and keeps palette names unique" {
+    const old_level = testing.log_level;
+    testing.log_level = .err;
+    defer testing.log_level = old_level;
+    var lua = try Lua.init(testing.allocator);
+    defer lua.deinit();
+    lua.openLibs();
+    var editor = try Editor.init(testing.allocator, testing.io);
+    defer editor.deinit();
+    lua_settings.registerApi(lua, &editor);
+    const count = editor.commands.count();
+    for (0..3) |_| {
+        try editor.activeDoc().insertAtCursor("text");
+        try lua.doString("zide.command('undo', '', function() zide.status('first') end)");
+        try lua.doString("zide.command('undo', '', function() zide.status('second') end)");
+        _ = editor.execCommand("undo", null);
+        try testing.expectEqualStrings("second", editor.status_message);
+        try testing.expectEqual(count, editor.commands.count());
+        var found: usize = 0;
+        for (try editor.commands.allNames()) |name| if (std.mem.eql(u8, name, "undo")) {
+            found += 1;
+        };
+        try testing.expectEqual(@as(usize, 1), found);
+        reloadExtensions(&editor);
+        try testing.expect(editor.commands.get("undo").?.lua_ref == null);
+        _ = editor.execCommand("undo", null);
+        try testing.expectEqualStrings("", editor.activeDoc().buffer.slice(0, editor.activeDoc().buffer.byteLen()));
+        try testing.expectEqual(count, (try editor.commands.allNames()).len);
+    }
+}
+
+test "Lua overrides reveal updated snippets and cannot resurrect removed snippets" {
+    const old_level = testing.log_level;
+    testing.log_level = .err;
+    defer testing.log_level = old_level;
+    var lua = try Lua.init(testing.allocator);
+    defer lua.deinit();
+    lua.openLibs();
+    var editor = try Editor.init(testing.allocator, testing.io);
+    defer editor.deinit();
+    lua_settings.registerApi(lua, &editor);
+    try lua.doString("assert(zide.register_snippet{language='*', prefix='demo', body='old'})");
+    try lua.doString("zide.command('snippet.*.demo', '', function() end)");
+    try lua.doString("assert(zide.register_snippet{language='*', prefix='demo', body='new'})");
+    _ = try editor.commands.allNames();
+    cleanupLuaRefs(&editor);
+    try testing.expect(editor.commands.get("snippet.*.demo").?.snippet);
+    _ = editor.execCommand("snippet.*.demo", null);
+    try testing.expectEqualStrings("new", editor.activeDoc().buffer.slice(0, editor.activeDoc().buffer.byteLen()));
+    editor.loading_extensions = true;
+    try lua.doString("assert(zide.register_snippet{language='*', prefix='demo', body='extension'})");
+    editor.loading_extensions = false;
+    try lua.doString("zide.command('snippet.*.demo', '', function() end)");
+    editor.dropExtensionSnippets();
+    try testing.expect(editor.commands.get("snippet.*.demo").?.lua_ref != null);
+    cleanupLuaRefs(&editor);
+    try testing.expect(editor.commands.get("snippet.*.demo") == null);
+    for (try editor.commands.allNames()) |name| try testing.expect(!std.mem.eql(u8, name, "snippet.*.demo"));
 }
 
 test "broken Lua command reports an error instead of crashing" {

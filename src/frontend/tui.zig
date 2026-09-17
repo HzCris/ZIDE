@@ -417,6 +417,8 @@ pub fn run(allocator: std.mem.Allocator, editor: *Editor) !void {
 
 /// Dispatch key based on current editor mode.
 fn dispatchKey(editor: *Editor, key: Key) void {
+    editor.validateSnippetState();
+    defer editor.validateSnippetState();
     // The close-after-Save-As hand-off only spans one Save As prompt.
     if (editor.mode != .save_as) close_tab_after_save_as = false;
     // Terminal pane: route keys to PTY (except ctrl+backtick for toggle)
@@ -424,8 +426,19 @@ fn dispatchKey(editor: *Editor, key: Key) void {
         handleTerminalKey(editor, key);
         return;
     }
-    // Completion popup intercepts keys when active (regardless of mode)
-    if (editor.completion_active) {
+    if (editor.editorOwnsInput() and !key.mods.ctrl and !key.mods.alt and !key.mods.super) {
+        const snippet_key: ?Editor.SnippetKey = switch (key.codepoint) {
+            Key.tab => if (key.mods.shift) .shift_tab else .tab,
+            Key.escape => .escape,
+            else => null,
+        };
+        if (snippet_key) |k| if (editor.handleSnippetKey(k)) {
+            scroll_pinned = false;
+            return;
+        };
+    }
+    // Only the editor can consume completion and snippet keys.
+    if (editor.editorOwnsInput() and editor.completion_active) {
         handleCompletionKey(editor, key);
         return;
     }
@@ -1986,6 +1999,7 @@ fn screenToOffset(editor: *Editor, screen_x: i16, screen_y: i16) ?usize {
 
 /// Handle mouse events.
 fn handleMouse(editor: *Editor, mouse: vaxis.Mouse) void {
+    defer editor.validateSnippetState();
     if (mouse.button == .left and mouse.type == .press) {
         if (editor.mode == .encoding_picker) {
             if (encoding_picker_band) |b| {
@@ -2506,7 +2520,7 @@ fn drawSearchPanel(win: Window, editor: *Editor, width: u16, panel_h: u16) void 
         const word_s: []const u8 = if (sp.whole_word) "[W]" else " w ";
         const busy: []const u8 = if (sp.searching) "  searching…" else "";
         const cap: []const u8 = if (sp.capped) "  (capped)" else "";
-        break :blk std.fmt.bufPrint(&sbuf, "{s}{s}  {d} match(es) in {d} file(s), {d} scanned, {d} skipped{s}{s}   Alt+C case · Alt+W word · Tab fields · Enter on Replace = replace all", .{ case_s, word_s, sp.matches.items.len, sp.paths.items.len, sp.files_searched, sp.files_skipped, busy, cap }) catch "";
+        break :blk std.fmt.bufPrint(&sbuf, "{s}{s}  {d} match(es) in {d} file(s), {d} scanned, {d} skipped{s}{s}   Alt+C case · Alt+W word · Tab fields · Enter on Replace = replace all", .{ case_s, word_s, sp.matches.items.len, sp.resultFileCount(), sp.files_searched, sp.files_skipped, busy, cap }) catch "";
     };
     const srow = win.child(.{ .y_off = 4, .height = 1, .width = width });
     srow.fill(.{ .style = status_style });
@@ -2583,7 +2597,7 @@ fn handleSearchKey(editor: *Editor, key: Key) void {
         switch (sp.field) {
             .query, .filter, .exclude => editor.searchStart(),
             .replace => {
-                if (sp.matches.items.len > 0) sp.confirm_armed = true;
+                editor.searchArmReplace();
             },
             .results => editor.searchOpenSelected(),
         }
@@ -3449,6 +3463,35 @@ fn drawEncodingPicker(win: Window, editor: *Editor, width: u16, height: u16) voi
         _ = writeStr(panel, 0, @intCast(idx + 1), label, row_style);
     }
     _ = writeStr(panel, 1, count + 1, "Enter selects / Esc cancels", style);
+}
+
+test "TUI snippets: dispatched keys edit fields and respect search focus" {
+    const t = std.testing;
+    var editor = try Editor.init(t.allocator, t.io);
+    defer editor.deinit();
+    _ = try editor.registerSnippet("*", "demo", "Demo", "${1:first} ${2:tail}$0");
+    const doc = editor.activeDoc();
+    try doc.loadText("demo");
+    doc.cursors.primary().moveToEnd(&doc.buffer);
+    dispatchKey(&editor, .{ .codepoint = Key.tab });
+    try t.expectEqualStrings("first", doc.selectedText().?);
+    dispatchKey(&editor, .{ .codepoint = 0x1f600, .text = "😀" });
+    dispatchKey(&editor, .{ .codepoint = Key.tab });
+    try t.expectEqualStrings("tail", doc.selectedText().?);
+    dispatchKey(&editor, .{ .codepoint = Key.tab, .mods = .{ .shift = true } });
+    try t.expectEqualStrings("😀", doc.selectedText().?);
+    dispatchKey(&editor, .{ .codepoint = Key.escape });
+    try t.expect(doc.snippet_session == null);
+    try t.expectEqualStrings("😀 tail", doc.buffer.slice(0, doc.buffer.byteLen()));
+    try doc.loadText("demo");
+    doc.cursors.primary().moveToEnd(&doc.buffer);
+    dispatchKey(&editor, .{ .codepoint = Key.tab });
+    editor.search_focused = true;
+    editor.search.field = .query;
+    dispatchKey(&editor, .{ .codepoint = Key.tab });
+    try t.expectEqual(@import("../core/search.zig").Field.replace, editor.search.field);
+    try t.expect(doc.snippet_session == null);
+    try t.expectEqualStrings("first tail", doc.buffer.slice(0, doc.buffer.byteLen()));
 }
 
 test "TUI encoding smoke: status click picker Unicode fields and caret width" {

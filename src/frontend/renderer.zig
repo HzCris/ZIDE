@@ -21,8 +21,8 @@ fn softwareFailureNotice() void {
 
 fn choose() !?Mode {
     const buttons = [_]c.SDL_MessageBoxButtonData{
-        .{ .flags = c.SDL_MESSAGEBOX_BUTTON_RETURNKEY_DEFAULT, .buttonID = 0, .text = "Automatic (recommended)" },
-        .{ .flags = 0, .buttonID = 1, .text = "Hardware accelerated" },
+        .{ .flags = c.SDL_MESSAGEBOX_BUTTON_RETURNKEY_DEFAULT, .buttonID = 0, .text = "Automatic" },
+        .{ .flags = 0, .buttonID = 1, .text = "Hardware(GPU)" },
         .{ .flags = if (gpu) c.SDL_MESSAGEBOX_BUTTON_ESCAPEKEY_DEFAULT else 0, .buttonID = if (gpu) 3 else 2, .text = if (gpu) "Cancel" else "Software" },
         .{ .flags = c.SDL_MESSAGEBOX_BUTTON_ESCAPEKEY_DEFAULT, .buttonID = 3, .text = "Cancel" },
     };

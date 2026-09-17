@@ -359,7 +359,6 @@ pub fn restore(allocator: Allocator, io: std.Io, snapshot: Snapshot, keep_path: 
     if (keep_path) if (snapshot.path) |path| {
         try doc.setFilePath(path);
         doc.disk_stamp = snapshot.disk_stamp;
-        doc.disk_mtime = if (snapshot.disk_stamp) |stamp| stamp.mtime else null;
         const current = text_file.Stamp.read(io, path) catch null;
         doc.external_changed = snapshot.external_changed or !std.meta.eql(current, snapshot.disk_stamp);
     };

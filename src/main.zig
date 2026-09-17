@@ -581,6 +581,8 @@ comptime {
     _ = @import("core/undo.zig");
     _ = @import("core/commands.zig");
     _ = @import("core/editor.zig");
+    _ = @import("core/snippets.zig");
+    _ = @import("core/snippet_integration_tests.zig");
     _ = @import("core/keybind.zig");
     _ = @import("core/syntax.zig");
     _ = @import("core/theme.zig");

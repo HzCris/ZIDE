@@ -8,6 +8,7 @@ const UndoHistory = @import("undo.zig").UndoHistory;
 const UndoOp = @import("undo.zig").UndoOp;
 const syntax = @import("syntax.zig");
 const lsp = @import("lsp.zig");
+const snippets = @import("snippets.zig");
 pub const text_file = @import("text_file.zig");
 pub const TextEncoding = text_file.TextEncoding;
 pub const TextFormat = text_file.TextFormat;
@@ -30,6 +31,7 @@ pub const Document = struct {
     cursors: CursorSet,
     history: UndoHistory,
     allocator: Allocator,
+    snippet_session: ?snippets.Session = null,
 
     /// Absolute file path, or null for unsaved/new buffers.
     file_path: ?[]const u8 = null,
@@ -44,8 +46,7 @@ pub const Document = struct {
     crlf: bool = false,
     format_rules: @import("editorconfig.zig").Properties = .{},
     format: TextFormat = .{},
-    /// On-disk mtime (ns) recorded at load/save — external-change detection.
-    disk_mtime: ?i96 = null,
+    /// On-disk identity, size and mtime recorded at load/save.
     disk_stamp: ?text_file.Stamp = null,
     /// The disk copy changed under a dirty buffer (or the file vanished):
     /// saving prompts before overwriting. Cleared by save/reload.
@@ -94,6 +95,7 @@ pub const Document = struct {
     }
 
     pub fn deinit(self: *Document) void {
+        self.cancelSnippet(false);
         self.history.deinit();
         self.cursors.deinit();
         self.buffer.deinit();
@@ -173,6 +175,7 @@ pub const Document = struct {
         const owned_path = try @import("file_identity.zig").absolute(self.allocator, io, path);
         errdefer self.allocator.free(owned_path);
         const name = try self.allocator.dupe(u8, std.fs.path.basename(path));
+        self.cancelSnippet(false);
         self.buffer.deinit();
         self.buffer = replacement;
         if (self.file_path) |old| self.allocator.free(old);
@@ -188,7 +191,7 @@ pub const Document = struct {
         self.resetCursors();
         self.detectLineEndings();
         self.external_changed = false;
-        self.refreshDiskMtime(io);
+        self.refreshDiskStamp(io);
     }
 
     /// Update the stored file path (e.g. after a rename on disk) without
@@ -205,6 +208,7 @@ pub const Document = struct {
     /// Load text directly (for new buffers, testing, etc.).
     pub fn loadText(self: *Document, text: []const u8) !void {
         try self.buffer.loadText(text);
+        self.cancelSnippet(false);
         self.history.clear();
         self.dirty = false;
         self.resetCursors();
@@ -227,7 +231,7 @@ pub const Document = struct {
         self.history.markSaved();
         self.dirty = false;
         self.external_changed = false;
-        self.refreshDiskMtime(io);
+        self.refreshDiskStamp(io);
     }
 
     /// Save to a new path (Save As).
@@ -254,31 +258,21 @@ pub const Document = struct {
         self.history.markSaved();
         self.dirty = false;
         self.external_changed = false;
-        self.refreshDiskMtime(io);
+        self.refreshDiskStamp(io);
     }
 
-    /// Record the file's current on-disk mtime (null when stat fails).
-    pub fn refreshDiskMtime(self: *Document, io: std.Io) void {
-        self.disk_stamp = null;
-        const path = self.file_path orelse {
-            self.disk_mtime = null;
-            return;
-        };
-        const st = std.Io.Dir.cwd().statFile(io, path, .{}) catch {
-            self.disk_mtime = null;
-            return;
-        };
-        self.disk_mtime = st.mtime.nanoseconds;
-        self.disk_stamp = .{ .inode = st.inode, .size = st.size, .mtime = st.mtime.nanoseconds };
+    /// Record the file's current identity, size and mtime (null on failure).
+    pub fn refreshDiskStamp(self: *Document, io: std.Io) void {
+        self.disk_stamp = if (self.file_path) |path| text_file.Stamp.read(io, path) catch null else null;
     }
 
     /// True when the disk copy no longer matches what was loaded/saved
-    /// (different mtime, or the file vanished).
+    /// (different identity, size or mtime, or the file is unavailable).
     pub fn checkExternalChange(self: *const Document, io: std.Io) bool {
         const path = self.file_path orelse return false;
-        const recorded = self.disk_mtime orelse return false;
-        const st = std.Io.Dir.cwd().statFile(io, path, .{}) catch return true;
-        return st.mtime.nanoseconds != recorded;
+        const recorded = self.disk_stamp orelse return false;
+        const current = (text_file.Stamp.read(io, path) catch return true) orelse return true;
+        return !std.meta.eql(current, recorded);
     }
 
     /// Re-read and validate before replacing the buffer. Preserve all cursor
@@ -295,6 +289,7 @@ pub const Document = struct {
         errdefer replacement.deinit();
         try replacement.loadText(decoded.text);
         replacement.version = self.buffer.version +% 1;
+        self.cancelSnippet(false);
         self.buffer.deinit();
         self.buffer = replacement;
         self.format = decoded.format;
@@ -311,7 +306,7 @@ pub const Document = struct {
             c.preferred_col = self.buffer.offsetToPos(c.offset).col;
         }
         self.scroll_top = @min(self.scroll_top, self.buffer.lineCount() -| 1);
-        self.refreshDiskMtime(io);
+        self.refreshDiskStamp(io);
     }
 
     /// Explicit composite edit. Capture cursors before callers reposition them.
@@ -363,6 +358,7 @@ pub const Document = struct {
         ops: std.ArrayList(UndoOp) = .empty,
         before: ?[]Cursor = null,
         after: ?[]Cursor = null,
+        primary_after: ?Cursor = null,
 
         pub fn deinit(self: *PreparedEdit) void {
             for (self.ops.items) |op| self.allocator.free(op.text);
@@ -373,7 +369,11 @@ pub const Document = struct {
 
         pub fn commit(self: *PreparedEdit, doc: *Document, force_group: bool) void {
             std.debug.assert(doc.id == self.id and doc.buffer.version == self.version and doc.edit_depth == self.depth);
-            if (self.ops.items.len == 0) return;
+            if (self.ops.items.len == 0) {
+                if (self.primary_after) |c| doc.cursors.primary().* = c;
+                return;
+            }
+            doc.validateSnippet();
             if (doc.edit_depth == 0) {
                 doc.edit_before = self.before.?;
                 doc.edit_after = self.after.?;
@@ -387,6 +387,9 @@ pub const Document = struct {
             if (grouped) doc.history.beginGroup();
             defer if (grouped) doc.history.endGroup();
             for (self.ops.items) |op| {
+                if (doc.snippet_session) |*session| {
+                    if (!session.edit(op.offset, if (op.op_type == .delete) op.text.len else 0, if (op.op_type == .insert) op.text.len else 0)) doc.cancelSnippet(false);
+                }
                 switch (op.op_type) {
                     .insert => {
                         _ = doc.buffer.insert(op.offset, op.text) catch unreachable;
@@ -400,6 +403,7 @@ pub const Document = struct {
                 doc.history.appendPrepared(op);
             }
             self.ops.clearRetainingCapacity();
+            if (self.primary_after) |c| doc.cursors.primary().* = c;
             doc.markDirty();
             doc.invalidateLineStates(doc.buffer.offsetToPos(self.first_offset).line);
         }
@@ -536,15 +540,84 @@ pub const Document = struct {
         return if (self.crlf) "\r\n" else "\n";
     }
     pub fn undoAction(self: *Document) !bool {
+        self.cancelSnippet(false);
         if (!try self.history.undoCursors(&self.buffer, &self.cursors)) return false;
         self.markDirty();
         self.invalidateLineStates(0);
         return true;
     }
     pub fn redoAction(self: *Document) !bool {
+        self.cancelSnippet(false);
         if (!try self.history.redoCursors(&self.buffer, &self.cursors)) return false;
         self.markDirty();
         self.invalidateLineStates(0);
+        return true;
+    }
+
+    /// Preparation includes text, live ranges, buffer capacity and undo snapshots.
+    /// Nothing observable changes until every allocation has succeeded.
+    pub fn insertSnippet(self: *Document, template: *const snippets.Template, start: usize, end: usize, use_tabs: bool, indent_width: usize) !void {
+        if (self.cursors.count() != 1) return error.MultipleCursors;
+        if (start > end or end > self.buffer.byteLen()) return error.InvalidRange;
+        const line_start = self.buffer.line_starts.items[self.buffer.offsetToPos(start).line];
+        var indent_end = line_start;
+        while (self.buffer.byteAt(indent_end)) |c| {
+            if (c != ' ' and c != '\t') break;
+            indent_end += 1;
+        }
+        const base = try self.allocator.alloc(u8, indent_end - line_start);
+        defer self.allocator.free(base);
+        for (base, 0..) |*byte, i| byte.* = self.buffer.byteAt(line_start + i).?;
+        var expansion = try template.expand(self.allocator, base, use_tabs, indent_width, self.lineEnding());
+        defer expansion.deinit(self.allocator);
+        expansion.session.relocate(start);
+        var edit = try self.prepareRanges(&.{.{ .start = start, .end = end, .text = expansion.text }});
+        defer edit.deinit();
+        const has_stops = expansion.session.stops.len > 0;
+        const first = if (has_stops) expansion.session.active() else expansion.session.final;
+        edit.primary_after = .{ .offset = if (has_stops) first.end else first.start, .anchor = if (has_stops and first.start != first.end) first.start else null };
+        self.cancelSnippet(false);
+        edit.commit(self, true);
+        self.cursors.primary().preferred_col = self.buffer.offsetToPos(self.cursors.primary().offset).col;
+        if (has_stops) {
+            self.snippet_session = expansion.session;
+            expansion.session.stops = &.{};
+        }
+        self.history.merge_allowed = false;
+    }
+
+    pub fn cancelSnippet(self: *Document, clear_selection: bool) void {
+        if (self.snippet_session) |*session| {
+            session.deinit(self.allocator);
+            self.snippet_session = null;
+            self.history.merge_allowed = false;
+            if (clear_selection) self.cursors.primary().clearSelection();
+        }
+    }
+
+    pub fn validateSnippet(self: *Document) void {
+        if (self.snippet_session) |*session| {
+            const c = self.cursors.primaryConst();
+            if (self.cursors.count() != 1 or !session.contains(c.offset, c.anchor)) self.cancelSnippet(false);
+        }
+    }
+
+    pub fn navigateSnippet(self: *Document, previous: bool) bool {
+        self.validateSnippet();
+        const session = if (self.snippet_session) |*s| s else return false;
+        self.history.merge_allowed = false;
+        if (previous) {
+            session.current -|= 1;
+        } else if (session.current + 1 < session.stops.len) {
+            session.current += 1;
+        } else {
+            const offset = session.final.start;
+            self.cancelSnippet(true);
+            self.cursors.primary().* = .{ .offset = offset, .preferred_col = self.buffer.offsetToPos(offset).col };
+            return true;
+        }
+        const r = session.active();
+        self.cursors.primary().* = .{ .offset = r.end, .anchor = if (r.start == r.end) null else r.start, .preferred_col = self.buffer.offsetToPos(r.end).col };
         return true;
     }
 
@@ -1471,7 +1544,7 @@ test "document external change detection and reload" {
     var doc = try Document.init(t.allocator);
     defer doc.deinit();
     try doc.open(t.io, path);
-    try t.expect(doc.disk_mtime != null);
+    try t.expect(doc.disk_stamp != null);
     try t.expect(!doc.checkExternalChange(t.io));
 
     // Rewrite behind the editor's back until the mtime visibly moves
@@ -1769,7 +1842,7 @@ test "save and Save As failures preserve bytes and all saved metadata" {
     try doc.openWithEncoding(t.io, path, .windows1252);
     try doc.insertAtCursor("edit ");
     const revision = doc.history.saved_revision;
-    const stamp = doc.disk_mtime;
+    const stamp = doc.disk_stamp;
     for (std.enums.values(text_file.FailureStage)) |stage| {
         text_file.testing_failure = stage;
         defer text_file.testing_failure = null;
@@ -1779,7 +1852,7 @@ test "save and Save As failures preserve bytes and all saved metadata" {
         try t.expectEqualStrings("café.txt", doc.display_name);
         try t.expectEqualDeep(format, doc.format);
         try t.expectEqual(revision, doc.history.saved_revision);
-        try t.expectEqual(stamp, doc.disk_mtime);
+        try t.expectEqual(stamp, doc.disk_stamp);
         try t.expect(doc.dirty);
         const old = try tmp.dir.readFileAlloc(t.io, "café.txt", t.allocator, .limited(100));
         defer t.allocator.free(old);
@@ -1822,7 +1895,7 @@ test "malformed and binary opens and reloads preserve the entire document" {
     const cursors = try t.allocator.dupe(Cursor, doc.cursors.cursors.items);
     defer t.allocator.free(cursors);
     const revision = doc.history.current_revision;
-    const stamp = doc.disk_mtime;
+    const stamp = doc.disk_stamp;
     for ([_][]const u8{ "\xff\xfe\x00\xd8", "\xff\xfe\x00\x00", "\xff\xfe\x00" }) |bytes| {
         try text_file.atomicWrite(t.allocator, t.io, path, bytes);
         if (doc.reloadFromDisk(t.io)) |_| return error.ExpectedFailure else |_| {}
@@ -1830,7 +1903,7 @@ test "malformed and binary opens and reloads preserve the entire document" {
         try t.expectEqualStrings(before, doc.buffer.slice(0, doc.buffer.byteLen()));
         try t.expectEqualSlices(Cursor, cursors, doc.cursors.cursors.items);
         try t.expectEqual(revision, doc.history.current_revision);
-        try t.expectEqual(stamp, doc.disk_mtime);
+        try t.expectEqual(stamp, doc.disk_stamp);
         try t.expectEqual(@as(usize, 2), doc.scroll_top);
         try t.expectEqual(@as(usize, 3), doc.scroll_left);
         try t.expect(doc.dirty and doc.crlf);

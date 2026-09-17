@@ -104,7 +104,16 @@ pub const Cursor = struct {
     /// interior (i.e. after any edit), on every Ctrl+Arrow.
     pub fn moveWordRight(self: *Cursor, buf: *const Buffer) void {
         const len = buf.byteLen();
-        var off = self.offset;
+        var off = floorBoundary(buf, self.offset);
+        // Stop at a line end when approaching it, then cross one complete
+        // newline on the next command. CRLF must never be split.
+        if (buf.byteAt(off) == '\n' or
+            (buf.byteAt(off) == '\r' and buf.byteAt(off + 1) == '\n'))
+        {
+            self.offset = nextBoundary(buf, off);
+            self.preferred_col = buf.offsetToPos(self.offset).col;
+            return;
+        }
         // Skip current word chars
         while (off < len and isWordChar(buf.byteAt(off).?)) off += 1;
         // Skip non-word, non-newline chars (whitespace, punctuation)
@@ -114,7 +123,7 @@ pub const Cursor = struct {
             off += 1;
         }
         self.offset = floorBoundary(buf, off);
-        self.preferred_col = buf.offsetToPos(off).col;
+        self.preferred_col = buf.offsetToPos(self.offset).col;
     }
 
     /// Move left by one word.

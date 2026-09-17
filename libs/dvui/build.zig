@@ -69,6 +69,7 @@ pub fn linkSdl3(
     sdl3_options: *std.Build.Step.Options,
     opts: DvuiModuleOptions,
 ) void {
+    const sdl_optimize = opts.b.option(std.builtin.OptimizeMode, "sdl-optimize", "Optimization mode for the SDL C library") orelse opts.optimize;
     if (opts.b.systemIntegrationOption("sdl3", .{})) {
         // SDL3 from system
         sdl3_options.addOption(std.SemanticVersion, "version", .{ .major = 3, .minor = 0, .patch = 0 });
@@ -86,7 +87,7 @@ pub fn linkSdl3(
         const sdl3_dep = if (cross_win_msvc)
             opts.b.lazyDependency("sdl3", .{
                 .target = opts.target,
-                .optimize = opts.optimize,
+                .optimize = sdl_optimize,
                 .system_include_path = opts.sdl3_system_include_path,
                 .system_framework_path = opts.sdl3_system_framework_path,
                 .library_path = opts.sdl3_library_path,
@@ -98,12 +99,13 @@ pub fn linkSdl3(
         else
             opts.b.lazyDependency("sdl3", .{
                 .target = opts.target,
-                .optimize = opts.optimize,
+                .optimize = sdl_optimize,
                 .system_include_path = opts.sdl3_system_include_path,
                 .system_framework_path = opts.sdl3_system_framework_path,
                 .library_path = opts.sdl3_library_path,
             });
         if (sdl3_dep) |sdl3| {
+            @import("tools/sdl_software_patch.zig").apply(opts.b, sdl3);
             if (opts.target.result.abi.isAndroid()) {
                 sdl_mod.addIncludePath(sdl3.artifact("SDL3").getEmittedIncludeTree());
                 addAndroidLibC(sdl_mod, opts);

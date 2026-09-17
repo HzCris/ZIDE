@@ -24,6 +24,8 @@ pub const Command = struct {
     /// from Lua via zide.command — dispatch routes through lua_api instead
     /// of `execute`, and name/description are owned by the registry.
     lua_ref: ?i32 = null,
+    /// Name and description are borrowed from the snippet registry.
+    snippet: bool = false,
 };
 
 /// Placeholder for Lua-backed commands; never invoked (execute() routes
@@ -33,6 +35,8 @@ fn cmdLuaStub(_: *Editor, _: ?[]const u8) void {}
 /// Registry of named commands. All editor actions go through this.
 pub const CommandRegistry = struct {
     commands: std.StringHashMapUnmanaged(Command),
+    /// Owned Lua overrides; the underlying built-in/snippet stays registered.
+    lua_commands: std.StringHashMapUnmanaged(Command) = .empty,
     allocator: Allocator,
     /// Cached sorted command names (invalidated on register).
     cached_names: ?[][]const u8 = null,
@@ -46,6 +50,12 @@ pub const CommandRegistry = struct {
 
     pub fn deinit(self: *CommandRegistry) void {
         self.invalidateCache();
+        var iter = self.lua_commands.valueIterator();
+        while (iter.next()) |cmd| {
+            self.allocator.free(cmd.name);
+            self.allocator.free(cmd.description);
+        }
+        self.lua_commands.deinit(self.allocator);
         self.commands.deinit(self.allocator);
     }
 
@@ -61,12 +71,18 @@ pub const CommandRegistry = struct {
 
     /// Look up a command by name.
     pub fn get(self: *const CommandRegistry, name: []const u8) ?*const Command {
-        return self.commands.getPtr(name);
+        return self.lua_commands.getPtr(name) orelse self.commands.getPtr(name);
     }
 
     /// Execute a command by name. Returns false if command not found.
     pub fn execute(self: *const CommandRegistry, editor: *Editor, name: []const u8, args: ?[]const u8) bool {
-        const cmd = self.commands.getPtr(name) orelse return false;
+        editor.validateSnippetState();
+        defer editor.validateSnippetState();
+        const cmd = self.get(name) orelse return false;
+        if (cmd.snippet) {
+            editor.insertSnippetCommand(name);
+            return true;
+        }
         if (cmd.lua_ref) |r| {
             lua_api.callLuaCommand(editor, r, args);
             return true;
@@ -75,23 +91,41 @@ pub const CommandRegistry = struct {
         return true;
     }
 
+    pub fn registerSnippet(self: *CommandRegistry, name: []const u8, description: []const u8) !void {
+        if (self.commands.get(name)) |old| {
+            if (!old.snippet) return error.CommandConflict;
+        } else if (self.lua_commands.contains(name)) return error.CommandConflict;
+        try self.commands.ensureUnusedCapacity(self.allocator, 1);
+        _ = self.commands.remove(name);
+        self.commands.putAssumeCapacity(name, .{ .name = name, .description = description, .execute = cmdLuaStub, .snippet = true });
+        self.invalidateCache();
+    }
+
+    pub fn removeSnippet(self: *CommandRegistry, name: []const u8) void {
+        if (self.commands.get(name)) |cmd| if (cmd.snippet) {
+            _ = self.commands.remove(name);
+            self.invalidateCache();
+        };
+    }
+
     /// Register a Lua-backed command. Takes ownership of `name` and
     /// `description` (allocated with this registry's allocator) on
     /// success; on error the caller still owns them. Returns the previous
     /// Lua ref when replacing a Lua command — the caller must unref it.
     /// Replacing a built-in is allowed (Lite XL style) and logged.
     pub fn registerLua(self: *CommandRegistry, name: []const u8, description: []const u8, lua_ref: i32) !?i32 {
+        // Complete the only fallible step before releasing the old entry.
+        try self.lua_commands.ensureUnusedCapacity(self.allocator, 1);
+        self.invalidateCache();
         var prev_ref: ?i32 = null;
-        if (self.commands.fetchRemove(name)) |kv| {
-            if (kv.value.lua_ref) |r| {
-                prev_ref = r;
-                self.allocator.free(kv.value.name);
-                self.allocator.free(kv.value.description);
-            } else {
-                std.log.warn("zide.command: '{s}' overrides a built-in command", .{name});
-            }
+        if (self.lua_commands.fetchRemove(name)) |kv| {
+            prev_ref = kv.value.lua_ref;
+            self.allocator.free(kv.value.name);
+            self.allocator.free(kv.value.description);
+        } else if (self.commands.contains(name)) {
+            std.log.warn("zide.command: '{s}' overrides an existing command", .{name});
         }
-        try self.commands.put(self.allocator, name, .{
+        self.lua_commands.putAssumeCapacity(name, .{
             .name = name,
             .description = description,
             .execute = cmdLuaStub,
@@ -102,36 +136,31 @@ pub const CommandRegistry = struct {
     }
 
     /// Remove all Lua-backed commands, freeing their owned strings.
-    /// Appends their registry refs to `refs_out`; the caller unrefs them
-    /// (the registry has no Lua state of its own).
-    pub fn removeLuaCommands(self: *CommandRegistry, refs_out: *std.ArrayList(i32)) void {
-        var keys: std.ArrayList([]const u8) = .empty;
-        defer keys.deinit(self.allocator);
-        var it = self.commands.iterator();
-        while (it.next()) |entry| {
-            if (entry.value_ptr.lua_ref != null) {
-                keys.append(self.allocator, entry.key_ptr.*) catch return;
-            }
+    /// Release references synchronously without allocating during cleanup.
+    /// The callback must not mutate this registry.
+    pub fn removeLuaCommands(self: *CommandRegistry, context: anytype, comptime release_ref: fn (@TypeOf(context), i32) void) void {
+        self.invalidateCache();
+        var it = self.lua_commands.valueIterator();
+        while (it.next()) |cmd| {
+            release_ref(context, cmd.lua_ref.?);
+            self.allocator.free(cmd.name);
+            self.allocator.free(cmd.description);
         }
-        for (keys.items) |key| {
-            const kv = self.commands.fetchRemove(key) orelse continue;
-            if (kv.value.lua_ref) |r| refs_out.append(self.allocator, r) catch {};
-            self.allocator.free(kv.value.name);
-            self.allocator.free(kv.value.description);
-        }
-        if (keys.items.len > 0) self.invalidateCache();
+        self.lua_commands.clearRetainingCapacity();
     }
 
     /// Get a sorted list of all command names (for command palette).
     /// Returns a cached slice — caller must NOT free it.
     pub fn allNames(self: *CommandRegistry) ![][]const u8 {
         if (self.cached_names) |names| return names;
-        var names = try std.ArrayList([]const u8).initCapacity(self.allocator, self.commands.count());
+        var names = try std.ArrayList([]const u8).initCapacity(self.allocator, self.count());
         errdefer names.deinit(self.allocator);
         var iter = self.commands.iterator();
         while (iter.next()) |entry| {
-            names.appendAssumeCapacity(entry.key_ptr.*);
+            if (!self.lua_commands.contains(entry.key_ptr.*)) names.appendAssumeCapacity(entry.key_ptr.*);
         }
+        var overrides = self.lua_commands.keyIterator();
+        while (overrides.next()) |name| names.appendAssumeCapacity(name.*);
         std.mem.sort([]const u8, names.items, {}, struct {
             fn lessThan(_: void, a: []const u8, b: []const u8) bool {
                 return std.mem.order(u8, a, b) == .lt;
@@ -155,12 +184,59 @@ pub const CommandRegistry = struct {
 
     /// Number of registered commands.
     pub fn count(self: *const CommandRegistry) usize {
-        return self.commands.count();
+        var total = self.commands.count();
+        var iter = self.lua_commands.keyIterator();
+        while (iter.next()) |name| if (!self.commands.contains(name.*)) {
+            total += 1;
+        };
+        return total;
     }
 };
 
+test "command override allocation failures preserve the existing command and palette" {
+    const old_level = std.testing.log_level;
+    std.testing.log_level = .err;
+    defer std.testing.log_level = old_level;
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, struct {
+        fn probe(a: Allocator) !void {
+            var registry = CommandRegistry.init(a);
+            defer registry.deinit();
+            try registry.register("base", "Built-in", cmdLuaStub);
+            _ = try registry.allNames();
+            const name = try a.dupe(u8, "base");
+            const description = a.dupe(u8, "Override") catch |err| {
+                a.free(name);
+                return err;
+            };
+            _ = registry.registerLua(name, description, 42) catch |err| {
+                a.free(name);
+                a.free(description);
+                try std.testing.expect(registry.get("base").?.lua_ref == null);
+                try std.testing.expectEqual(@as(usize, 1), registry.count());
+                try std.testing.expectEqualStrings("base", registry.cached_names.?[0]);
+                return err;
+            };
+            try std.testing.expectEqual(@as(?i32, 42), registry.get("base").?.lua_ref);
+            var released: usize = 0;
+            registry.removeLuaCommands(&released, struct {
+                fn release(count: *usize, ref: i32) void {
+                    std.debug.assert(ref == 42);
+                    count.* += 1;
+                }
+            }.release);
+            try std.testing.expectEqual(@as(usize, 1), released);
+            try std.testing.expect(registry.get("base").?.lua_ref == null);
+            try std.testing.expectEqualStrings("Built-in", registry.get("base").?.description);
+        }
+    }.probe, .{});
+}
+
 /// Register all built-in editor commands.
 pub fn registerBuiltins(registry: *CommandRegistry) !void {
+    try registry.register("snippet_expand", "Expand the exact snippet trigger before the cursor", cmdSnippetExpand);
+    try registry.register("snippet_next", "Visit the next snippet placeholder", cmdSnippetNext);
+    try registry.register("snippet_previous", "Visit the previous snippet placeholder", cmdSnippetPrevious);
+    try registry.register("snippet_cancel", "End snippet navigation", cmdSnippetCancel);
     try registry.register("recover_documents", "Recover unsaved documents from a previous instance", cmdRecover);
     try registry.register("run_task", "Choose and run a registered task", cmdRunTask);
     try registry.register("task_output", "Show the latest task output", cmdTaskOutput);
@@ -339,6 +415,20 @@ fn cmdCursorEnd(editor: *Editor, _: ?[]const u8) void {
         c.moveEnd(&doc.buffer);
     }
     doc.cursors.mergeCursors();
+}
+
+fn cmdSnippetExpand(editor: *Editor, _: ?[]const u8) void {
+    _ = editor.expandSnippet(true);
+}
+fn cmdSnippetNext(editor: *Editor, _: ?[]const u8) void {
+    _ = editor.navigateSnippet(false);
+}
+fn cmdSnippetPrevious(editor: *Editor, _: ?[]const u8) void {
+    _ = editor.navigateSnippet(true);
+}
+fn cmdSnippetCancel(editor: *Editor, _: ?[]const u8) void {
+    editor.activeDoc().cancelSnippet(true);
+    editor.clearCompletionItems();
 }
 
 fn cmdInsertChar(editor: *Editor, args: ?[]const u8) void {

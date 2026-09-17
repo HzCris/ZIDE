@@ -4,10 +4,381 @@ const Editor = @import("editor.zig").Editor;
 const lsp = @import("lsp.zig");
 const terminal = @import("terminal.zig");
 
+test "regression: pending close follows its document after earlier tabs close" {
+    for ([_]Editor.CloseChoice{ .cancel, .discard, .save }) |choice| {
+        var tmp = t.tmpDir(.{});
+        defer tmp.cleanup();
+        const root = try tmp.dir.realPathFileAlloc(t.io, ".", t.allocator);
+        defer t.allocator.free(root);
+        const path = try std.fs.path.join(t.allocator, &.{ root, "saved.txt" });
+        defer t.allocator.free(path);
+        var editor = try Editor.init(t.allocator, t.io);
+        defer editor.deinit();
+        editor.lsp_enabled = false;
+        const target = try editor.newDocument();
+        const target_id = target.id;
+        try target.insertAtCursor("target draft");
+        const other = try editor.newDocument();
+        const other_id = other.id;
+        try other.insertAtCursor("other draft");
+        try t.expect(!editor.requestCloseDoc(1));
+        _ = editor.closeDocAt(0);
+        const outcome = editor.resolveCloseDoc(choice);
+        try t.expect(editor.confirm_close_doc == null);
+        switch (choice) {
+            .cancel => {
+                try t.expectEqual(Editor.CloseOutcome.kept, outcome);
+                try t.expect(editor.documents.items[editor.docIndexForId(target_id).?].dirty);
+            },
+            .discard => {
+                try t.expectEqual(Editor.CloseOutcome.closed, outcome);
+                try t.expect(editor.docIndexForId(target_id) == null);
+            },
+            .save => {
+                try t.expectEqual(Editor.CloseOutcome.needs_path, outcome);
+                editor.startSaveAs(target_id, null);
+                editor.switchToDoc(editor.docIndexForId(other_id).?);
+                try t.expectEqual(Editor.SaveOutcome.saved, editor.finishSaveAs(path));
+                try t.expect(editor.docIndexForId(target_id) == null);
+                const disk = try tmp.dir.readFileAlloc(t.io, "saved.txt", t.allocator, .limited(100));
+                defer t.allocator.free(disk);
+                try t.expectEqualStrings("target draft", disk);
+            },
+        }
+        const surviving = &editor.documents.items[editor.docIndexForId(other_id).?];
+        try t.expect(surviving.dirty);
+        try t.expectEqualStrings("other draft", surviving.buffer.slice(0, surviving.buffer.byteLen()));
+    }
+}
+
+test "regression: closing a pending target cannot close its replacement" {
+    var editor = try Editor.init(t.allocator, t.io);
+    defer editor.deinit();
+    editor.lsp_enabled = false;
+    try editor.activeDoc().insertAtCursor("target");
+    try t.expect(!editor.requestCloseDoc(0));
+    _ = editor.closeDocAt(0);
+    const replacement_id = editor.activeDoc().id;
+    try editor.activeDoc().insertAtCursor("replacement");
+    try t.expectEqual(Editor.CloseOutcome.kept, editor.resolveCloseDoc(.discard));
+    try t.expectEqual(replacement_id, editor.activeDoc().id);
+    try t.expect(editor.activeDoc().dirty);
+}
+
+test "regression: a delayed formatting save closes only the confirmed document" {
+    var tmp = t.tmpDir(.{});
+    defer tmp.cleanup();
+    try writeFile(tmp.dir, "target.zig", "original");
+    const path = try tmp.dir.realPathFileAlloc(t.io, "target.zig", t.allocator);
+    defer t.allocator.free(path);
+    var editor = try Editor.init(t.allocator, t.io);
+    defer editor.deinit();
+    editor.lsp_enabled = false;
+    const target = try editor.openFile(path);
+    const id = target.id;
+    try target.insertAtCursor("edited ");
+    const request: lsp.Request = .{ .method = .format_document, .doc_id = id, .version = target.buffer.version, .serial = 1 };
+    const other = try editor.newDocument();
+    const other_id = other.id;
+    try other.insertAtCursor("other draft");
+    // Model an already pending format operation, with no external process.
+    const client = try t.allocator.create(lsp.LspClient);
+    client.* = lsp.LspClient.init(t.allocator, t.io);
+    editor.lsp_clients.append(t.allocator, client) catch |err| {
+        client.deinit();
+        t.allocator.destroy(client);
+        return err;
+    };
+    client.config = try lsp.ServerConfig.fromArgv(t.allocator, &.{"zig"}, &.{"test-server"});
+    client.capabilities.format_document = true;
+    var pending = request;
+    pending.generation = client.generation;
+    editor.lsp_tools.format_on_save = true;
+    editor.lsp_tools.formatting = pending;
+    editor.lsp_tools.save = .{ .id = id, .options = .{}, .owned_path = null };
+    try t.expect(!editor.requestCloseDoc(editor.docIndexForId(id).?));
+    _ = editor.closeDocAt(0);
+    try t.expectEqual(Editor.CloseOutcome.kept, editor.resolveCloseDoc(.save));
+    try t.expectEqual(@as(?u64, id), editor.close_after_save_id);
+    editor.switchToDoc(editor.docIndexForId(other_id).?);
+    editor.lsp_tools.response(&editor, client, pending, "{\"result\":[]}");
+    try t.expect(editor.docIndexForId(id) == null);
+    const surviving = &editor.documents.items[editor.docIndexForId(other_id).?];
+    try t.expect(surviving.dirty);
+    try t.expectEqualStrings("other draft", surviving.buffer.slice(0, surviving.buffer.byteLen()));
+    const disk = try tmp.dir.readFileAlloc(t.io, "target.zig", t.allocator, .limited(100));
+    defer t.allocator.free(disk);
+    try t.expectEqualStrings("edited original", disk);
+}
+
+test "regression: same-mtime changes in size or identity protect local edits" {
+    const text_file = @import("text_file.zig");
+    var tmp = t.tmpDir(.{});
+    defer tmp.cleanup();
+    try writeFile(tmp.dir, "file.txt", "original");
+    const path = try tmp.dir.realPathFileAlloc(t.io, "file.txt", t.allocator);
+    defer t.allocator.free(path);
+    for ([_]bool{ false, true }) |replace_identity| {
+        for ([_]bool{ false, true }) |dirty| {
+            try writeFile(tmp.dir, "file.txt", "original");
+            var editor = try Editor.init(t.allocator, t.io);
+            defer editor.deinit();
+            editor.lsp_enabled = false;
+            try editor.openIntoActive(path);
+            const doc = editor.activeDoc();
+            const original = doc.disk_stamp.?;
+            if (dirty) try doc.insertAtCursor("local ");
+            const external = if (replace_identity) "external" else "external with different size";
+            if (replace_identity) {
+                try text_file.atomicWrite(t.allocator, t.io, path, external);
+            } else try writeFile(tmp.dir, "file.txt", external);
+            {
+                const file = try tmp.dir.openFile(t.io, "file.txt", .{ .mode = .read_write });
+                defer file.close(t.io);
+                try file.setTimestamps(t.io, .{ .modify_timestamp = .{ .new = .{ .nanoseconds = original.mtime } } });
+            }
+            const current = (try text_file.Stamp.read(t.io, path)).?;
+            try t.expectEqual(original.mtime, current.mtime);
+            try t.expect(!std.meta.eql(original, current));
+            try t.expect(doc.checkExternalChange(t.io));
+            if (dirty) {
+                try t.expectEqual(Editor.SaveOutcome.conflict, editor.saveDocument(doc.id, .{ .interactive = false, .skip_format = true }));
+                try t.expectEqualStrings("local original", doc.buffer.slice(0, doc.buffer.byteLen()));
+                const disk = try tmp.dir.readFileAlloc(t.io, "file.txt", t.allocator, .limited(100));
+                defer t.allocator.free(disk);
+                try t.expectEqualStrings(external, disk);
+                try t.expectEqual(Editor.SaveOutcome.saved, editor.saveDocument(doc.id, .{ .overwrite = true, .skip_format = true }));
+                try t.expect(!doc.checkExternalChange(t.io));
+            } else {
+                editor.pollExternalChanges();
+                try t.expectEqualStrings(external, doc.buffer.slice(0, doc.buffer.byteLen()));
+                try t.expect(!doc.dirty and !doc.checkExternalChange(t.io));
+            }
+        }
+    }
+}
+
+test "regression: word commands cross complete newlines and preserve undo" {
+    var editor = try Editor.init(t.allocator, t.io);
+    defer editor.deinit();
+    const doc = editor.activeDoc();
+    for ([_][]const u8{ "\n", "\r\n" }) |eol| {
+        const original = try std.mem.concat(t.allocator, u8, &.{ "é", eol, eol, "word" });
+        defer t.allocator.free(original);
+        try doc.loadText(original);
+        _ = editor.execAction("cursor_word_right");
+        try t.expectEqual(@as(usize, 2), doc.cursors.primary().offset);
+        _ = editor.execAction("cursor_word_right_select");
+        try t.expectEqualStrings(eol, doc.selectedText().?);
+        _ = editor.execAction("cursor_right");
+        doc.cursors.primary().* = .{ .offset = 2 };
+        _ = editor.execAction("delete_word_forward");
+        const joined = try std.mem.concat(t.allocator, u8, &.{ "é", eol, "word" });
+        defer t.allocator.free(joined);
+        try t.expectEqualStrings(joined, doc.buffer.slice(0, doc.buffer.byteLen()));
+        try t.expect(try doc.undoAction());
+        try t.expectEqualStrings(original, doc.buffer.slice(0, doc.buffer.byteLen()));
+        doc.cursors.primary().* = .{ .offset = 2 + eol.len };
+        _ = editor.execAction("cursor_word_right");
+        try t.expectEqual(2 + 2 * eol.len, doc.cursors.primary().offset);
+        doc.cursors.primary().moveToEnd(&doc.buffer);
+        _ = editor.execAction("delete_word_forward");
+        try t.expectEqualStrings(original, doc.buffer.slice(0, doc.buffer.byteLen()));
+    }
+}
+
 fn writeFile(dir: std.Io.Dir, path: []const u8, text: []const u8) !void {
     const f = try dir.createFile(t.io, path, .{});
     defer f.close(t.io);
     try f.writeStreamingAll(t.io, text);
+}
+
+fn finishSearch(editor: *Editor) !void {
+    var tries: usize = 0;
+    while (editor.search.searching and tries < 500) : (tries += 1) {
+        _ = editor.search.drain();
+        if (editor.search.searching) try std.Io.sleep(t.io, .fromMilliseconds(10), .awake);
+    }
+    try t.expect(!editor.search.searching);
+}
+
+test "regression: stale search refresh preserves Unicode and the original query" {
+    var tmp = t.tmpDir(.{});
+    defer tmp.cleanup();
+    try writeFile(tmp.dir, "file.txt", "aaX\r\n");
+    const path = try tmp.dir.realPathFileAlloc(t.io, "file.txt", t.allocator);
+    defer t.allocator.free(path);
+    const root = try tmp.dir.realPathFileAlloc(t.io, ".", t.allocator);
+    defer t.allocator.free(root);
+    var editor = try Editor.init(t.allocator, t.io);
+    defer editor.deinit();
+    editor.lsp_enabled = false;
+    try t.expect(editor.setFiletreeRoot(root));
+    try editor.openIntoActive(path);
+    editor.search.appendText("X");
+    editor.searchStart();
+    const doc = editor.activeDoc();
+    try doc.replaceRange(1, 2, "é");
+    @memcpy(editor.search.query_buf[0..4], "long");
+    editor.search.query_len = 4;
+    editor.searchOpenSelected();
+    try t.expectEqualStrings("X", doc.selectedText().?);
+    try t.expectEqual(@as(u32, 3), editor.search.matches.items[0].col);
+    _ = editor.execAction("delete_forward");
+    try t.expectEqualStrings("aé\r\n", doc.buffer.slice(0, doc.buffer.byteLen()));
+    try t.expect(std.unicode.utf8ValidateSlice(doc.buffer.slice(0, doc.buffer.byteLen())));
+    try t.expect(try doc.undoAction());
+    try t.expectEqualStrings("aéX\r\n", doc.buffer.slice(0, doc.buffer.byteLen()));
+    editor.searchArmReplace();
+    try t.expect(!editor.search.confirm_armed);
+    try finishSearch(&editor);
+    try doc.loadText("aé\r\n");
+    doc.cursors.primary().* = .{ .anchor = 0, .offset = 1 };
+    editor.searchCycleResult(true);
+    try t.expectEqualStrings("a", doc.selectedText().?);
+    try t.expectEqual(@as(usize, 0), editor.search.matches.items.len);
+    try t.expectEqual(@as(usize, 0), editor.search.resultFileCount());
+    try t.expect(std.mem.indexOf(u8, editor.status_message, "no longer exists") != null);
+}
+
+test "regression: search filters protect excluded open buffers in both replacement scopes" {
+    const search = @import("search.zig");
+    for ([_]search.ReplaceScope{ .open_only, .all }) |scope| {
+        var tmp = t.tmpDir(.{});
+        defer tmp.cleanup();
+        try tmp.dir.createDir(t.io, "src", .default_dir);
+        for ([_][]const u8{ "src/keep.txt", "src/excluded.txt", "src/other.zig", "src/closed.txt" }) |p| try writeFile(tmp.dir, p, "needle");
+        const root = try tmp.dir.realPathFileAlloc(t.io, ".", t.allocator);
+        defer t.allocator.free(root);
+        var editor = try Editor.init(t.allocator, t.io);
+        defer editor.deinit();
+        editor.lsp_enabled = false;
+        try t.expect(editor.setFiletreeRoot(root));
+        for ([_][]const u8{ "src/keep.txt", "src/excluded.txt", "src/other.zig" }) |p| {
+            const path = try std.fs.path.join(t.allocator, &.{ root, p });
+            defer t.allocator.free(path);
+            const doc = try editor.openFile(path);
+            try doc.insertAtCursor("dirty ");
+        }
+        const sp = &editor.search;
+        sp.appendText("needle");
+        sp.field = .filter;
+        sp.appendText("*.txt");
+        sp.field = .exclude;
+        sp.appendText("src\\excluded");
+        sp.field = .replace;
+        sp.appendText("changed");
+        editor.searchStart();
+        try finishSearch(&editor);
+        try t.expectEqual(@as(usize, 2), sp.matches.items.len);
+        const targets = sp.replaceTargets(&editor);
+        try t.expectEqual(@as(usize, 1), targets.open);
+        try t.expectEqual(@as(usize, 1), targets.disk);
+        const result = sp.executeReplace(&editor, scope);
+        try t.expectEqual(@as(usize, if (scope == .all) 2 else 1), result.count);
+        for (editor.documents.items) |*doc| {
+            const path = doc.file_path orelse continue;
+            const expected = if (std.mem.endsWith(u8, path, "keep.txt")) "dirty changed" else "dirty needle";
+            try t.expectEqualStrings(expected, doc.buffer.slice(0, doc.buffer.byteLen()));
+        }
+        for ([_][]const u8{ "src/keep.txt", "src/excluded.txt", "src/other.zig", "src/closed.txt" }) |p| {
+            const disk = try tmp.dir.readFileAlloc(t.io, p, t.allocator, .limited(100));
+            defer t.allocator.free(disk);
+            try t.expectEqualStrings(if (scope == .all and std.mem.endsWith(u8, p, "closed.txt")) "changed" else "needle", disk);
+        }
+        sp.field = .filter;
+        sp.appendText("x");
+        try t.expect(!sp.criteriaCurrent());
+        try t.expectEqual(@as(usize, 0), sp.executeReplace(&editor, .all).count);
+        try t.expectEqual(@as(usize, 0), sp.replaceTargets(&editor).open);
+    }
+}
+
+test "regression: disk search refresh selects its document across Lua open hooks" {
+    const zlua = @import("zlua");
+    var tmp = t.tmpDir(.{});
+    defer tmp.cleanup();
+    try writeFile(tmp.dir, "file.txt", "aaX");
+    const root = try tmp.dir.realPathFileAlloc(t.io, ".", t.allocator);
+    defer t.allocator.free(root);
+    var lua = try zlua.Lua.init(t.allocator);
+    defer lua.deinit();
+    lua.openLibs();
+    var editor = try Editor.init(t.allocator, t.io);
+    defer editor.deinit();
+    editor.lsp_enabled = false;
+    @import("lua_settings.zig").registerApi(lua, &editor);
+    try lua.doString("zide.on('open', function() zide.exec('prev_doc') end)");
+    try t.expect(editor.setFiletreeRoot(root));
+    editor.search.appendText("X");
+    editor.searchStart();
+    try finishSearch(&editor);
+    try t.expectEqual(@as(usize, 1), editor.search.matches.items.len);
+    try writeFile(tmp.dir, "file.txt", "a😀X");
+    editor.searchOpenSelected();
+    try t.expect(editor.activeDoc().file_path != null);
+    try t.expectEqualStrings("X", editor.activeDoc().selectedText().?);
+    try t.expectEqual(@as(u32, 5), editor.search.matches.items[0].col);
+}
+
+test "regression: search refresh prefers the following equidistant match outside the workspace" {
+    var tmp = t.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDir(t.io, "project", .default_dir);
+    try writeFile(tmp.dir, "outside.txt", "--X--");
+    const root = try tmp.dir.realPathFileAlloc(t.io, "project", t.allocator);
+    defer t.allocator.free(root);
+    const path = try tmp.dir.realPathFileAlloc(t.io, "outside.txt", t.allocator);
+    defer t.allocator.free(path);
+    var editor = try Editor.init(t.allocator, t.io);
+    defer editor.deinit();
+    editor.lsp_enabled = false;
+    try t.expect(editor.setFiletreeRoot(root));
+    try editor.openIntoActive(path);
+    editor.search.appendText("X");
+    editor.search.field = .filter;
+    editor.search.appendText("*.txt");
+    editor.searchStart();
+    try finishSearch(&editor);
+    try t.expectEqual(@as(usize, 1), editor.search.matches.items.len);
+    try editor.activeDoc().loadText("X---X");
+    editor.searchOpenSelected();
+    try t.expectEqual(@as(usize, 4), editor.activeDoc().cursors.primary().anchor.?);
+    try t.expectEqualStrings("X", editor.activeDoc().selectedText().?);
+    editor.search.field = .exclude;
+    editor.search.appendText("outside.txt");
+    editor.searchStart();
+    try finishSearch(&editor);
+    try t.expectEqual(@as(usize, 0), editor.search.matches.items.len);
+}
+
+test "regression: refreshing search during streaming preserves path IDs and the cap" {
+    const search = @import("search.zig");
+    var tmp = t.tmpDir(.{});
+    defer tmp.cleanup();
+    try writeFile(tmp.dir, "open.txt", "X");
+    try writeFile(tmp.dir, "closed.txt", "X X X X");
+    const root = try tmp.dir.realPathFileAlloc(t.io, ".", t.allocator);
+    defer t.allocator.free(root);
+    const path = try tmp.dir.realPathFileAlloc(t.io, "open.txt", t.allocator);
+    defer t.allocator.free(path);
+    var editor = try Editor.init(t.allocator, t.io);
+    defer editor.deinit();
+    editor.lsp_enabled = false;
+    try t.expect(editor.setFiletreeRoot(root));
+    try editor.openIntoActive(path);
+    editor.search.appendText("X");
+    editor.searchStart();
+    const many = try t.allocator.alloc(u8, search.max_matches * 2 + 2);
+    defer t.allocator.free(many);
+    for (many, 0..) |*ch, i| ch.* = if (i % 2 == 0) 'X' else '\n';
+    try editor.activeDoc().loadText(many);
+    editor.searchOpenSelected();
+    try finishSearch(&editor);
+    try t.expectEqual(@as(usize, search.max_matches), editor.search.matches.items.len);
+    try t.expect(editor.search.capped);
+    for (editor.search.matches.items) |m| try t.expect(m.path_idx < editor.search.paths.items.len);
+    try t.expectEqual(@as(usize, 1), editor.search.resultFileCount());
 }
 
 test "EditorConfig nested roots, invalidation and Save As transformations remain undoable" {

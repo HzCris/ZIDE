@@ -5,6 +5,9 @@ editor written in Zig that you turn into an IDE with Lua (languages, language
 servers, settings, keys, extensions). See `Documentation.md` for everything
 the editor does; this file is about building and installing it.
 
+ZIDE pairs familiar, non-modal editing with the extension capability of a
+Lua-driven editor, while keeping the core small and the GUI lightweight.
+
 ## Build
 
 Needs Zig 0.16.0. One command builds both frontends:
@@ -18,6 +21,14 @@ git pull && zig build          # should just work
 `zide` is the hybrid binary: typed in a terminal it opens the TUI there,
 launched from the desktop it opens the GUI. `zide-tui` is TUI-only.
 Add `-Doptimize=ReleaseSafe` for a release build.
+
+Debug builds keep ZIDE's Zig code debuggable and compile SDL's CPU pixel loops
+with optimizations. Use `-Dsdl-optimize=Debug` when debugging SDL itself.
+
+Run `./scripts/check.ps1` on Windows or `bash scripts/check.sh` on Linux to
+build both frontends and run core/GUI tests in Debug and ReleaseSafe. Set
+`ZIG` to select a Zig 0.16.0 executable. Prerequisites and logs are described
+in [the validation guide](tests/VALIDATION.md).
 
 ## Opening a project
 

@@ -28,6 +28,8 @@ pub const Match = struct {
     line: u32,
     /// Byte column of the match start within the (raw) line.
     col: u32,
+    /// Length from the query that produced this match, independent of inputs.
+    len: u32,
     /// Owned trimmed display line.
     excerpt: []u8,
     /// Byte offset of excerpt[0] within the raw line (leading trim) — lets
@@ -38,6 +40,59 @@ pub const Match = struct {
 pub const Field = enum { query, replace, filter, exclude, results };
 
 pub const ReplaceScope = enum { all, open_only };
+
+const SearchSpec = struct {
+    root: []u8,
+    needle: []u8,
+    filter: []u8,
+    exclude: []u8,
+    case_sensitive: bool,
+    whole_word: bool,
+
+    fn capture(sp: *const SearchPanel, root_path: []const u8) !SearchSpec {
+        const a = sp.allocator;
+        const root = try text_file.pathKey(a, sp.io, if (root_path.len == 0) "." else root_path);
+        errdefer a.free(root);
+        const needle = try a.dupe(u8, sp.query());
+        errdefer a.free(needle);
+        const filter = try a.dupe(u8, sp.filter());
+        errdefer a.free(filter);
+        const exclude = try a.dupe(u8, sp.exclude());
+        normalizePathSeparators(root);
+        normalizeSeparators(filter);
+        normalizeSeparators(exclude);
+        return .{ .root = root, .needle = needle, .filter = filter, .exclude = exclude, .case_sensitive = sp.case_sensitive, .whole_word = sp.whole_word };
+    }
+
+    fn deinit(self: SearchSpec, a: std.mem.Allocator) void {
+        a.free(self.root);
+        a.free(self.needle);
+        a.free(self.filter);
+        a.free(self.exclude);
+    }
+};
+
+fn normalizeSeparators(path: []u8) void {
+    for (path) |*ch| if (ch.* == '\\') {
+        ch.* = '/';
+    };
+}
+
+fn normalizePathSeparators(path: []u8) void {
+    if (@import("builtin").os.tag == .windows) normalizeSeparators(path);
+}
+
+fn normalizedEql(a: []const u8, b: []const u8) bool {
+    if (a.len != b.len) return false;
+    for (a, b) |x, y| if ((if (x == '\\') '/' else x) != (if (y == '\\') '/' else y)) return false;
+    return true;
+}
+
+fn pathAllowed(path: []const u8, include: []const u8, exclude: []const u8) bool {
+    return filterMatch(path, include) and (exclude.len == 0 or !filterMatch(path, exclude));
+}
+
+const BufferSource = struct { id: u64, version: u64 };
 
 pub const SearchPanel = struct {
     allocator: std.mem.Allocator,
@@ -64,6 +119,9 @@ pub const SearchPanel = struct {
     /// Owned root-joined paths, one entry per file with matches.
     paths: std.ArrayList([]u8) = .empty,
     matches: std.ArrayList(Match) = .empty,
+    spec: ?SearchSpec = null,
+    /// Disk results have no entry until validated against an opened buffer.
+    sources: std.AutoHashMapUnmanaged(u32, BufferSource) = .empty,
     selected: usize = 0,
     /// First visible result row (frontends clamp during draw).
     scroll: usize = 0,
@@ -97,6 +155,7 @@ pub const SearchPanel = struct {
         self.clearResults();
         self.paths.deinit(self.allocator);
         self.matches.deinit(self.allocator);
+        self.sources.deinit(self.allocator);
         self.pending_paths.deinit(self.allocator);
         self.pending_matches.deinit(self.allocator);
     }
@@ -112,6 +171,32 @@ pub const SearchPanel = struct {
     }
     pub fn exclude(self: *const SearchPanel) []const u8 {
         return self.exclude_buf[0..self.exclude_len];
+    }
+
+    pub fn criteriaCurrent(self: *const SearchPanel) bool {
+        const spec = self.spec orelse return false;
+        return std.mem.eql(u8, spec.needle, self.query()) and normalizedEql(spec.filter, self.filter()) and
+            normalizedEql(spec.exclude, self.exclude()) and spec.case_sensitive == self.case_sensitive and spec.whole_word == self.whole_word;
+    }
+
+    /// Paths are canonicalized once when collecting results, avoiding disk
+    /// probes in the confirmation row on every GUI frame.
+    fn pathEligible(self: *const SearchPanel, absolute: []const u8) bool {
+        const spec = self.spec orelse return false;
+        const root = std.mem.trimEnd(u8, spec.root, "/");
+        const rel = if (absolute.len > root.len and absolute[root.len] == '/' and
+            filetree_mod.normPathEql(absolute[0..root.len], root)) absolute[root.len + 1 ..] else absolute;
+        return pathAllowed(rel, spec.filter, spec.exclude);
+    }
+
+    pub fn resultFileCount(self: *const SearchPanel) usize {
+        var count: usize = 0;
+        var previous: ?u32 = null;
+        for (self.matches.items) |m| {
+            if (previous == null or previous.? != m.path_idx) count += 1;
+            previous = m.path_idx;
+        }
+        return count;
     }
 
     /// Append typed text to the focused input field.
@@ -178,6 +263,7 @@ pub const SearchPanel = struct {
         self.generation +%= 1;
         const needle = self.query();
         if (needle.len == 0) return;
+        self.spec = SearchSpec.capture(self, editor.filetree_root orelse "") catch return;
 
         const ctx = self.allocator.create(WorkerCtx) catch return;
         ctx.* = .{
@@ -196,7 +282,7 @@ pub const SearchPanel = struct {
             ok = false;
             break :blk &.{};
         };
-        const root: []const u8 = editor.filetree_root orelse "";
+        const root: []const u8 = self.spec.?.root;
         ctx.root = self.allocator.dupe(u8, root) catch blk: {
             ok = false;
             break :blk &.{};
@@ -233,16 +319,21 @@ pub const SearchPanel = struct {
         for (editor.documents.items) |*doc| {
             if (doc.preview) continue;
             const p = doc.file_path orelse continue;
-            if (text_file.pathKey(self.allocator, self.io, p)) |dup| {
-                ctx.open_paths.append(self.allocator, dup) catch {
-                    self.allocator.free(dup);
-                    ok = false;
-                };
-            } else |_| {
+            const key = text_file.pathKey(self.allocator, self.io, p) catch {
                 ok = false;
-            }
+                continue;
+            };
+            normalizePathSeparators(key);
+            ctx.open_paths.append(self.allocator, key) catch {
+                self.allocator.free(key);
+                ok = false;
+                continue;
+            };
+            if (!self.pathEligible(key)) continue;
             const text = doc.buffer.slice(0, doc.buffer.byteLen());
-            self.searchOpenDoc(p, text, needle);
+            const first_path = self.paths.items.len;
+            self.searchOpenDoc(key, text, needle);
+            if (self.paths.items.len > first_path) self.sources.put(self.allocator, @intCast(first_path), .{ .id = doc.id, .version = doc.buffer.version }) catch {};
             self.files_searched_open += 1;
             self.files_searched = self.files_searched_open;
         }
@@ -282,12 +373,24 @@ pub const SearchPanel = struct {
         var changed = false;
         self.mutex.lockUncancelable(self.io);
         if (self.pending_paths.items.len > 0 or self.pending_matches.items.len > 0) changed = true;
-        for (self.pending_paths.items) |p| {
-            self.paths.append(self.allocator, p) catch self.allocator.free(p);
-        }
+        // Path indexes are assigned by the worker. Transfer a batch only once
+        // all capacity exists, so allocation failure cannot shift those IDs.
+        self.paths.ensureUnusedCapacity(self.allocator, self.pending_paths.items.len) catch {
+            self.mutex.unlock(self.io);
+            return false;
+        };
+        const available = max_matches -| self.matches.items.len;
+        self.matches.ensureUnusedCapacity(self.allocator, @min(available, self.pending_matches.items.len)) catch {
+            self.mutex.unlock(self.io);
+            return false;
+        };
+        self.paths.appendSliceAssumeCapacity(self.pending_paths.items);
         self.pending_paths.clearRetainingCapacity();
         for (self.pending_matches.items) |m| {
-            self.matches.append(self.allocator, m) catch self.allocator.free(m.excerpt);
+            if (self.matches.items.len < max_matches) self.matches.appendAssumeCapacity(m) else {
+                self.allocator.free(m.excerpt);
+                self.capped = true;
+            }
         }
         self.pending_matches.clearRetainingCapacity();
         if (self.files_skipped != self.pending_skipped) {
@@ -318,6 +421,9 @@ pub const SearchPanel = struct {
 
     /// Free all result state (not the input fields).
     pub fn clearResults(self: *SearchPanel) void {
+        if (self.spec) |spec| spec.deinit(self.allocator);
+        self.spec = null;
+        self.sources.clearRetainingCapacity();
         for (self.paths.items) |p| self.allocator.free(p);
         self.paths.clearRetainingCapacity();
         for (self.matches.items) |m| self.allocator.free(m.excerpt);
@@ -362,6 +468,7 @@ pub const SearchPanel = struct {
                     .path_idx = @intCast(self.paths.items.len - 1),
                     .line = line_no,
                     .col = @intCast(at),
+                    .len = @intCast(needle.len),
                     .excerpt = excerpt.text,
                     .excerpt_off = excerpt.off,
                 }) catch {
@@ -373,18 +480,107 @@ pub const SearchPanel = struct {
         }
     }
 
+    /// Replace one file's matches atomically. Path slots are never removed:
+    /// the background worker may already have assigned subsequent indexes.
+    fn refreshFile(self: *SearchPanel, path_idx: u32, doc: *Document) !void {
+        const source: BufferSource = .{ .id = doc.id, .version = doc.buffer.version };
+        if (self.sources.get(path_idx)) |previous| if (std.meta.eql(previous, source)) return;
+        const spec = self.spec orelse return error.NoSearch;
+        if (path_idx >= self.paths.items.len) return error.NoSearch;
+        var other_count: usize = 0;
+        for (self.matches.items) |m| if (m.path_idx != path_idx) {
+            other_count += 1;
+        };
+        var fresh: std.ArrayList(Match) = .empty;
+        defer {
+            for (fresh.items) |m| self.allocator.free(m.excerpt);
+            fresh.deinit(self.allocator);
+        }
+        var capped = false;
+        if (self.pathEligible(self.paths.items[path_idx])) {
+            const text = doc.buffer.slice(0, doc.buffer.byteLen());
+            var lines = std.mem.splitScalar(u8, text, '\n');
+            var line_no: u32 = 0;
+            scan: while (lines.next()) |line| : (line_no += 1) {
+                var from: usize = 0;
+                while (findInText(line, spec.needle, spec.case_sensitive, spec.whole_word, from)) |at| {
+                    from = at + spec.needle.len;
+                    const offset = doc.buffer.posToOffset(line_no, at);
+                    const cursor = @import("cursor.zig");
+                    if (cursor.floorBoundary(&doc.buffer, offset) != offset or
+                        cursor.floorBoundary(&doc.buffer, offset + spec.needle.len) != offset + spec.needle.len) continue;
+                    if (other_count + fresh.items.len >= max_matches) {
+                        capped = true;
+                        break :scan;
+                    }
+                    const excerpt = try makeExcerpt(self.allocator, line, at, spec.needle.len);
+                    errdefer self.allocator.free(excerpt.text);
+                    try fresh.append(self.allocator, .{ .path_idx = path_idx, .line = line_no, .col = @intCast(at), .len = @intCast(spec.needle.len), .excerpt = excerpt.text, .excerpt_off = excerpt.off });
+                }
+            }
+        }
+        try self.matches.ensureTotalCapacity(self.allocator, other_count + fresh.items.len);
+        var kept: usize = 0;
+        for (self.matches.items) |m| {
+            if (m.path_idx == path_idx) self.allocator.free(m.excerpt) else {
+                self.matches.items[kept] = m;
+                kept += 1;
+            }
+        }
+        self.matches.items.len = kept;
+        self.matches.appendSliceAssumeCapacity(fresh.items);
+        fresh.clearRetainingCapacity();
+        std.mem.sort(Match, self.matches.items, {}, struct {
+            fn less(_: void, a: Match, b: Match) bool {
+                if (a.path_idx != b.path_idx) return a.path_idx < b.path_idx;
+                if (a.line != b.line) return a.line < b.line;
+                return a.col < b.col;
+            }
+        }.less);
+        self.sources.put(self.allocator, path_idx, source) catch {};
+        self.capped = self.capped or capped;
+        self.confirm_armed = false;
+        self.selected = @min(self.selected, self.matches.items.len -| 1);
+        self.scroll = @min(self.scroll, self.matches.items.len -| 1);
+    }
+
+    pub fn refreshedMatch(self: *SearchPanel, old: Match, doc: *Document) !?Match {
+        try self.refreshFile(old.path_idx, doc);
+        const origin = @import("cursor.zig").lineOffset(&doc.buffer, old.line, old.col);
+        var nearest: ?usize = null;
+        var distance: usize = std.math.maxInt(usize);
+        for (self.matches.items, 0..) |m, i| {
+            if (m.path_idx != old.path_idx) continue;
+            const offset = doc.buffer.posToOffset(m.line, m.col);
+            const delta = if (offset >= origin) offset - origin else origin - offset;
+            if (delta < distance or (delta == distance and offset >= origin)) {
+                nearest = i;
+                distance = delta;
+            }
+        }
+        const selected = nearest orelse return null;
+        self.selected = selected;
+        return self.matches.items[selected];
+    }
+
     /// Execute Replace All over the current result set. Open documents get
     /// one undoable edit group each (buffers stay dirty, user saves);
     /// closed files are rewritten on disk when scope == .all.
     pub fn executeReplace(self: *SearchPanel, editor: anytype, scope: ReplaceScope) struct { files: usize, count: usize, failed: usize } {
         self.confirm_armed = false;
+        if (!self.criteriaCurrent() or self.searching) return .{ .files = 0, .count = 0, .failed = 0 };
         const needle = self.query();
         const repl = self.replacement();
         var files: usize = 0;
         var total: usize = 0;
         var failed: usize = 0;
         if (needle.len == 0) return .{ .files = 0, .count = 0, .failed = 0 };
-        for (self.paths.items) |p| {
+        var previous: ?u32 = null;
+        for (self.matches.items) |m| {
+            if (previous == m.path_idx) continue;
+            previous = m.path_idx;
+            const p = self.paths.items[m.path_idx];
+            if (!self.pathEligible(p)) continue;
             var open_doc: ?*Document = null;
             for (editor.documents.items) |*doc| {
                 if (doc.preview) continue;
@@ -418,7 +614,13 @@ pub const SearchPanel = struct {
     pub fn replaceTargets(self: *SearchPanel, editor: anytype) struct { open: usize, disk: usize } {
         var open: usize = 0;
         var disk: usize = 0;
-        for (self.paths.items) |p| {
+        if (!self.criteriaCurrent()) return .{ .open = 0, .disk = 0 };
+        var previous: ?u32 = null;
+        for (self.matches.items) |m| {
+            if (previous == m.path_idx) continue;
+            previous = m.path_idx;
+            const p = self.paths.items[m.path_idx];
+            if (!self.pathEligible(p)) continue;
             var is_open = false;
             for (editor.documents.items) |*doc| {
                 if (doc.preview) continue;
@@ -643,8 +845,7 @@ fn searchDiskFile(ctx: *WorkerCtx, dir: std.Io.Dir, prefix: []const u8, name: []
     const sp = ctx.sp;
     var rel_buf: [1024]u8 = undefined;
     const rel = std.fmt.bufPrint(&rel_buf, "{s}{s}", .{ prefix, name }) catch return;
-    if (!filterMatch(rel, ctx.filter)) return;
-    if (ctx.exclude.len > 0 and filterMatch(rel, ctx.exclude)) return;
+    if (!pathAllowed(rel, ctx.filter, ctx.exclude)) return;
 
     // Full (root-joined) path — what results store and openOrFocus uses.
     var full_buf: [1200]u8 = undefined;
@@ -694,6 +895,7 @@ fn searchDiskFile(ctx: *WorkerCtx, dir: std.Io.Dir, prefix: []const u8, name: []
                 .path_idx = ctx.base_path_idx + ctx.emitted_paths,
                 .line = line_no,
                 .col = @intCast(at),
+                .len = @intCast(ctx.needle.len),
                 .excerpt = excerpt.text,
                 .excerpt_off = excerpt.off,
             }) catch {
