@@ -248,7 +248,7 @@ Windows terminals commonly intercept Alt combos (Windows Terminal binds Alt+arro
 - Bracketed paste on Windows: vaxis's Windows reader forwards no paste markers, so a paste made by the terminal arrives as typed keys
 - Terminal scrollback (the emulator keeps no scrolled-off rows — the GUI shares this gap)
 
-Cross-frontend gaps are tracked in [Suggestions-2026-09-30.md](../references/Suggestions-2026-09-30.md) (verified backlog: navigation back/forward, code folding, matching-bracket highlight, LSP references/signature help/symbols, regex search, Open Folder dialog and recent projects, dockable/multiple terminals, and more).
+Cross-frontend gaps are tracked in [TODO.md](TODO.md) (verified backlog: navigation back/forward, code folding, matching-bracket highlight, LSP references/signature help/symbols, regex search, Open Folder dialog and recent projects, dockable/multiple terminals, and more).
 
 ---
 
@@ -341,7 +341,7 @@ Cross-frontend gaps are tracked in [Suggestions-2026-09-30.md](../references/Sug
 - Terminal scrollback (the emulator keeps no scrolled-off rows; the TUI shares this)
 - Terminal selection and copy/paste (Ctrl+Shift+C / Ctrl+Shift+V currently reach the shell as ^C/^V)
 
-Cross-frontend gaps are tracked in [Suggestions-2026-09-30.md](../references/Suggestions-2026-09-30.md).
+Cross-frontend gaps are tracked in [TODO.md](TODO.md).
 
 ---
 

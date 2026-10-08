@@ -1,9 +1,11 @@
-# ZIDE Feature Suggestions — 2026-09-30
+# ZIDE TODO — the feature backlog
 
-A consolidated backlog, written down so nothing lives only in a chat log. Three sources merged:
-the 2026-09-30 feature review (every "missing" claim checked against the code that day), the
-user-requested terminal items from the same conversation, and the feature list from the end of
-`BugScan-2026-09-28.md`. Items marked **DONE** are shipped; everything else is not started.
+The one place where not-yet-built features live, so nothing survives only in a chat log. Add new
+ideas here with a date; mark an item **DONE** (with the date) when it ships. Started 2026-09-30 as
+a consolidated suggestions list from three sources: that day's feature review (every "missing"
+claim checked against the code), the user-requested terminal items from the same conversation,
+and the feature list at the end of the 2026-09-28 bug scan (that report has since been deleted;
+every finding in it was fixed on 2026-09-29). Anything not marked DONE is not started.
 
 One honesty note: the bug-scan list was written before the 2026-09-29 fix round, so sub-items
 that referenced scan bug IDs (selection indent, multi-cursor copy/cut distribution, GUI terminal
