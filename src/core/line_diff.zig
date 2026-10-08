@@ -1,16 +1,27 @@
 //! Bounded Myers line diff for the buffer-versus-index gutter.
 const std = @import("std");
 pub const Mark = enum(u2) { none, added, modified, deleted };
-const Line = struct { text: []const u8 };
+/// A line's content without its terminator, so "\r\n" and "\n" compare
+/// equal: the index blob is LF while a core.autocrlf working copy (the
+/// buffer) is CRLF. A lone '\r' (not before '\n') stays part of the text.
+const Line = struct {
+    text: []const u8,
+    terminated: bool,
+
+    fn eql(a: Line, b: Line) bool {
+        return a.terminated == b.terminated and std.mem.eql(u8, a.text, b.text);
+    }
+};
 fn lines(a: std.mem.Allocator, text: []const u8) ![]Line {
     var result: std.ArrayList(Line) = .empty;
     errdefer result.deinit(a);
     var start: usize = 0;
     for (text, 0..) |byte, i| if (byte == '\n') {
-        try result.append(a, .{ .text = text[start .. i + 1] });
+        const end = if (i > start and text[i - 1] == '\r') i - 1 else i;
+        try result.append(a, .{ .text = text[start..end], .terminated = true });
         start = i + 1;
     };
-    if (start < text.len) try result.append(a, .{ .text = text[start..] });
+    if (start < text.len) try result.append(a, .{ .text = text[start..], .terminated = false });
     return result.toOwnedSlice(a);
 }
 
@@ -24,10 +35,10 @@ pub fn compare(a: std.mem.Allocator, before: []const u8, after: []const u8) ![]M
     errdefer a.free(marks);
     @memset(marks, .none);
     var prefix: usize = 0;
-    while (prefix < @min(old.len, new.len) and std.mem.eql(u8, old[prefix].text, new[prefix].text)) prefix += 1;
+    while (prefix < @min(old.len, new.len) and old[prefix].eql(new[prefix])) prefix += 1;
     var old_end = old.len;
     var new_end = new.len;
-    while (old_end > prefix and new_end > prefix and std.mem.eql(u8, old[old_end - 1].text, new[new_end - 1].text)) {
+    while (old_end > prefix and new_end > prefix and old[old_end - 1].eql(new[new_end - 1])) {
         old_end -= 1;
         new_end -= 1;
     }
@@ -67,7 +78,7 @@ pub fn compare(a: std.mem.Allocator, before: []const u8, after: []const u8) ![]M
             const idx: usize = @intCast(offset + k);
             var x = if (k == -signed or (k != signed and v[idx - 1] < v[idx + 1])) v[idx + 1] else v[idx - 1] + 1;
             var y = x - k;
-            while (x < n and y < m and std.mem.eql(u8, old[prefix + @as(usize, @intCast(x))].text, new[prefix + @as(usize, @intCast(y))].text)) {
+            while (x < n and y < m and old[prefix + @as(usize, @intCast(x))].eql(new[prefix + @as(usize, @intCast(y))])) {
                 x += 1;
                 y += 1;
             }
@@ -132,4 +143,37 @@ test "gutter diff distinguishes insertions deletions replacements and distant ch
     const empty = try compare(t.allocator, "", "x");
     defer t.allocator.free(empty);
     try t.expectEqualSlices(Mark, &.{.added}, empty);
+}
+
+test "gutter diff ignores CRLF against an LF index blob (core.autocrlf)" {
+    const t = std.testing;
+    const same = try compare(t.allocator, "a\nb\nc\n", "a\r\nb\r\nc\r\n");
+    defer t.allocator.free(same);
+    try t.expectEqualSlices(Mark, &.{ .none, .none, .none, .none }, same);
+    const mixed = try compare(t.allocator, "a\r\nb\n", "a\nb\r\n");
+    defer t.allocator.free(mixed);
+    try t.expectEqualSlices(Mark, &.{ .none, .none, .none }, mixed);
+    // Real edits still show, in CRLF documents too.
+    const edited = try compare(t.allocator, "a\nb\nc\n", "a\r\nX\r\nc\r\nd\r\n");
+    defer t.allocator.free(edited);
+    try t.expectEqualSlices(Mark, &.{ .none, .modified, .none, .added, .none }, edited);
+    // A lone '\r' and a missing final newline are content changes.
+    const cr = try compare(t.allocator, "a\nb", "a\r\nb\r");
+    defer t.allocator.free(cr);
+    try t.expectEqualSlices(Mark, &.{ .none, .modified }, cr);
+    const eof = try compare(t.allocator, "a\nb\n", "a\r\nb");
+    defer t.allocator.free(eof);
+    try t.expectEqualSlices(Mark, &.{ .none, .modified }, eof);
+    // Large CRLF files no longer hit DiffTooComplex (every line differed).
+    var before: std.ArrayList(u8) = .empty;
+    defer before.deinit(t.allocator);
+    var after: std.ArrayList(u8) = .empty;
+    defer after.deinit(t.allocator);
+    for (0..800) |i| {
+        try before.print(t.allocator, "line {d}\n", .{i});
+        try after.print(t.allocator, "line {d}\r\n", .{i});
+    }
+    const big = try compare(t.allocator, before.items, after.items);
+    defer t.allocator.free(big);
+    for (big) |mark| try t.expectEqual(Mark.none, mark);
 }

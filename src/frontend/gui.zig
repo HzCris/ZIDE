@@ -4,17 +4,24 @@ const build_options = @import("build_options");
 const dvui = if (build_options.has_gui) @import("dvui") else struct {};
 const Editor = @import("../core/editor.zig").Editor;
 const Document = @import("../core/document.zig").Document;
+const Buffer = @import("../core/buffer.zig").Buffer;
 const LayoutNode = @import("../core/layout.zig").LayoutNode;
 const Layout = @import("../core/layout.zig").Layout;
 const ThemeColor = @import("../core/theme.zig").ThemeColor;
 const theme_mod = @import("../core/theme.zig");
 const syntax = @import("../core/syntax.zig");
 const search_mod = @import("../core/search.zig");
+const brackets = @import("../core/brackets.zig");
 const lsp = @import("../core/lsp.zig");
 const terminal_mod = @import("../core/terminal.zig");
 const filetree_mod = @import("../core/filetree.zig");
 const FileTree = filetree_mod.FileTree;
 const fileicons = @import("../core/fileicons.zig");
+const cursor_mod = @import("../core/cursor.zig");
+const keybind = @import("../core/keybind.zig");
+const lua_settings = @import("../core/lua_settings.zig");
+const lua_api = @import("../core/lua_api.zig");
+const jobs = @import("../core/jobs.zig");
 
 /// Convert a ThemeColor to a dvui.Color.
 fn toDvui(c: ThemeColor) dvui.Color {
@@ -263,9 +270,6 @@ pub const WinUi = struct {
     theme_gen_applied: u32 = 0,
     /// Hash of the last window title pushed to SDL.
     title_hash: u64 = 0,
-    /// dvui.windowNaturalScale() of this window (drop coordinates are
-    /// window points, mouse coordinates physical pixels).
-    natural_scale: f32 = 1,
     /// One-frame flag: the active pane retakes dvui focus (after a tab click).
     refocus_editor: bool = false,
 
@@ -285,6 +289,9 @@ pub const WinUi = struct {
     /// When true, the user explicitly scrolled (wheel) so
     /// ensureCursorVisible is skipped. Cleared when the cursor moves.
     scroll_pinned: bool = false,
+    /// A chord on Space ran this frame (Ctrl+Space = completion): Windows
+    /// also delivers a plain " " text event for it, which must not type.
+    swallow_space: bool = false,
     /// Editor-pane scrollbar state (mirrors the file tree's pill scrollbar).
     editor_sb_drag: bool = false,
     editor_sb_pane: u8 = 0,
@@ -417,24 +424,40 @@ pub fn loadMonoFont(g: *GuiState, editor: *Editor, io: std.Io) void {
     g.mono_font_owned = true;
 }
 
-/// Register the mono font under `custom_mono_family` in `win`'s font
-/// database and (re)apply the editor theme so font_mono resolves to it.
-/// Every dvui.Window (the primary and each child) needs this once.
+/// Register the mono font under `custom_mono_family` in the PRIMARY
+/// window's font database and (re)apply the editor theme so font_mono
+/// resolves to it. Runs once at startup, before any child window exists:
+/// when the user's font can't be registered, every window falls back to
+/// the bundled font (the user's bytes are freed while nothing holds them).
 pub fn applyWindowFonts(win: *dvui.Window, g: *GuiState, editor: *Editor) void {
-    // The bytes stay owned by GuiState (shared by every window) — a null
-    // allocator tells dvui not to free them.
+    registerMonoFont(win, g, true);
+    win.theme = dvuiThemeForPreset(editor.theme_name, true, editor.mono_font_size);
+}
+
+/// applyWindowFonts for a child window: a registration failure falls back
+/// to the bundled font in that window only — the primary and the other
+/// children still draw with the user's bytes, so they are never freed here.
+fn applyChildWindowFonts(win: *dvui.Window, g: *GuiState, editor: *Editor) void {
+    registerMonoFont(win, g, false);
+    win.theme = dvuiThemeForPreset(editor.theme_name, true, editor.mono_font_size);
+}
+
+/// The bytes stay owned by GuiState (shared by every window) — a null
+/// allocator tells dvui not to free them. `global_fallback` (primary only)
+/// switches GuiState to the bundled font when the user's font fails.
+fn registerMonoFont(win: *dvui.Window, g: *GuiState, global_fallback: bool) void {
     win.addFont(custom_mono_family, g.mono_font_bytes, null) catch |err| {
         std.log.warn("Failed to register mono font: {} — falling back to bundled font", .{err});
-        if (g.mono_font_owned) {
+        if (!g.mono_font_owned) return; // the bundled font itself failed
+        if (global_fallback) {
             g.allocator.free(g.mono_font_bytes);
             g.mono_font_bytes = bundled_mono_ttf;
             g.mono_font_owned = false;
-            win.addFont(custom_mono_family, g.mono_font_bytes, null) catch |err2| {
-                std.log.warn("Failed to register bundled mono font: {}", .{err2});
-            };
         }
+        win.addFont(custom_mono_family, bundled_mono_ttf, null) catch |err2| {
+            std.log.warn("Failed to register bundled mono font: {}", .{err2});
+        };
     };
-    win.theme = dvuiThemeForPreset(editor.theme_name, true, editor.mono_font_size);
 }
 
 /// Render a single frame of the GUI. Returns false to quit.
@@ -460,7 +483,6 @@ pub fn frame(editor: *Editor, g: *GuiState) bool {
     // Primary window section.
     win_ui = g.primary();
     cur_win = 0;
-    win_ui.natural_scale = dvui.windowNaturalScale();
     applyThemeIfStale(editor);
 
     // --- Global keyboard shortcuts (before widgets consume events) ---
@@ -468,13 +490,6 @@ pub fn frame(editor: *Editor, g: *GuiState) bool {
 
     // Check if quit was requested via keybind/command
     if (!editor.running) return false;
-
-    // Keyboard focus left the file tree (Esc/Enter/Ctrl+B/...) — hand
-    // dvui focus back to the active editor pane this frame.
-    if (filetree_was_focused and !editor.filetree_focused) {
-        filetree_release_focus = true;
-    }
-    filetree_was_focused = editor.filetree_focused;
 
     // File tree edge-drag resize (uses last frame's panel rect).
     if (editor.filetree_visible and editor.filetree != null) {
@@ -508,6 +523,9 @@ pub fn frame(editor: *Editor, g: *GuiState) bool {
 
     editor.serviceTick(std.Io.Clock.now(.awake, editor.io).nanoseconds);
 
+    // After the keybinds and serviceTick's focus repair, before any pane.
+    trackKeyboardOwner(editor);
+
     menuBar(editor);
     modalDialogs(editor);
     tabBar(editor);
@@ -521,7 +539,9 @@ pub fn frame(editor: *Editor, g: *GuiState) bool {
             (e.evt == .app and e.evt.app.action == .quit);
         if (wants_quit) {
             e.handled = true;
-            editor.focusWindow(0);
+            // The prompt shows in the primary window; a side panel there
+            // keeps the keyboard if it had it.
+            if (editor.active_window != 0) editor.focusWindow(0);
             _ = editor.execAction("quit");
             dvui.refresh(null, @src(), null);
         }
@@ -530,13 +550,10 @@ pub fn frame(editor: *Editor, g: *GuiState) bool {
     // --- Secondary windows ---
     childWindows(editor, g);
 
-    // Structural actions raised from inside a pane (palette, terminal key
-    // passthrough) run only now: the split widgets hold pointers into the
+    // Work raised from inside a pane (the palette, terminal key
+    // passthrough) runs only now: the split widgets hold pointers into the
     // layout tree while the panes render.
-    if (deferred_action) |action| {
-        deferred_action = null;
-        execGuiAction(editor, action);
-    }
+    runDeferred(editor);
 
     // A window to reap or create, or a theme to apply, needs another frame
     // even without input.
@@ -569,6 +586,7 @@ fn dispatchGlobalKeys(editor: *Editor) void {
 
     // --- Global keyboard shortcuts (before widgets consume events) ---
     // Process keybinds here so DVUI widgets (menus, etc.) cannot consume them first.
+    win_ui.swallow_space = false;
     for (dvui.events()) |*e| {
         if (e.handled) continue;
         if (e.evt != .key) continue;
@@ -577,77 +595,114 @@ fn dispatchGlobalKeys(editor: *Editor) void {
 
         // F-keys are never text input, so they go through the keybind map
         // even unmodified (f12 = goto definition, f6 = focus pane, ...).
-        const is_fkey = switch (key.code) {
-            .f1, .f2, .f3, .f4, .f5, .f6, .f7, .f8, .f9, .f10, .f11, .f12 => true,
-            else => false,
-        };
+        if (!(key.mod.control() or key.mod.alt() or isFKey(key.code))) continue;
 
-        if (key.mod.control() or key.mod.alt() or is_fkey) {
-            // Tab switching always works (even during modals)
-            if (key.mod.control() and key.code == .tab) {
-                e.handled = true;
-                if (key.mod.shift()) editor.prevDoc() else editor.nextDoc();
-                continue;
-            }
-
-            // When terminal pane is focused, only handle ctrl+backtick here;
-            // all other keys are routed to the terminal by handleTerminalKeyEvents.
-            if (editor.activePaneIsTerminal()) {
-                continue;
-            }
-
-            // Keybinds only in normal mode (not during find/replace/palette)
-            if (guiMode(editor) == .normal) {
-                // Skip modifier-only keys
-                if (key.code == .left_shift or key.code == .right_shift or
-                    key.code == .left_control or key.code == .right_control or
-                    key.code == .left_alt or key.code == .right_alt or
-                    key.code == .left_command or key.code == .right_command) continue;
-
-                // Tree-focused Ctrl+C/X/V operate on files, not on the
-                // document behind the panel.
-                if (editor.filetree_focused and key.mod.control() and
-                    !key.mod.alt() and !key.mod.shift())
-                {
-                    const tree_op: ?[]const u8 = switch (key.code) {
-                        .c => "filetree_copy",
-                        .x => "filetree_cut",
-                        .v => "filetree_paste",
-                        else => null,
-                    };
-                    if (tree_op) |op| {
-                        e.handled = true;
-                        _ = editor.execCommand(op, null);
-                        continue;
-                    }
-                }
-
-                var kbuf: [64]u8 = undefined;
-                const key_str = dvuiKeyToStr(key, &kbuf);
-                if (key_str.len > 0) {
-                    if (editor.lookupKeybind(key_str)) |action| {
-                        e.handled = true;
-                        win_ui.scroll_pinned = false;
-                        execGuiAction(editor, action);
-                        continue;
-                    }
-                    // Fallback without shift
-                    if (key.mod.shift()) {
-                        var kbuf2: [64]u8 = undefined;
-                        const fallback_str = dvuiKeyToStrNoShift(key, &kbuf2);
-                        if (fallback_str.len > 0) {
-                            if (editor.lookupKeybind(fallback_str)) |action| {
-                                e.handled = true;
-                                win_ui.scroll_pinned = false;
-                                execGuiAction(editor, action);
-                                continue;
-                            }
-                        }
-                    }
-                }
-            }
+        // Tab switching always works (even during modals). Through
+        // execAction, which ends quick-open first like every command.
+        if (key.mod.control() and key.code == .tab) {
+            e.handled = true;
+            _ = editor.execAction(if (key.mod.shift()) "prev_doc" else "next_doc");
+            continue;
         }
+
+        // A terminal pane that owns the keyboard gets every other chord;
+        // handleTerminalKeyEvents hands the pane/window management ones
+        // back (terminalPassthroughAction). A side panel focused over a
+        // terminal owns the keyboard instead, so its chords run here.
+        if (editor.keyboardOwner() == .terminal) continue;
+
+        // Keybinds only in normal mode (not during find/replace/palette)
+        if (guiMode(editor) != .normal) continue;
+        if (isModifierKey(key.code)) continue;
+
+        const action = chordAction(editor, key, false) orelse continue;
+        e.handled = true;
+        win_ui.scroll_pinned = false;
+        if (key.code == .space) win_ui.swallow_space = true;
+        // A focused side panel takes the clipboard and word-delete chords
+        // (the tree copies files, the search panel edits its field): they
+        // must never edit the document behind it.
+        if (!editor.panelAction(action)) execGuiAction(editor, action);
     }
+}
+
+/// The action bound to a key event: the exact chord, else (for a Shift
+/// chord on a symbol or F-key, never on a letter: Ctrl+Shift+Z is not
+/// undo) the chord without Shift. `passthrough_only` limits the lookup to
+/// the chords a focused terminal pane must not swallow.
+fn chordAction(editor: *Editor, key: dvui.Event.Key, passthrough_only: bool) ?[]const u8 {
+    var buf: [64]u8 = undefined;
+    const combo = dvuiKeyToStr(key, &buf);
+    if (combo.len == 0) return null;
+    if (comboAction(editor, combo, passthrough_only)) |action| return action;
+    if (!key.mod.shift() or !keybind.allowsShiftFallback(combo)) return null;
+    var buf2: [64]u8 = undefined;
+    return comboAction(editor, dvuiKeyToStrNoShift(key, &buf2), passthrough_only);
+}
+
+fn comboAction(editor: *Editor, combo: []const u8, passthrough_only: bool) ?[]const u8 {
+    return if (passthrough_only) editor.terminalPassthroughAction(combo) else editor.lookupKeybind(combo);
+}
+
+fn isFKey(code: dvui.enums.Key) bool {
+    return switch (code) {
+        .f1, .f2, .f3, .f4, .f5, .f6, .f7, .f8, .f9, .f10, .f11, .f12 => true,
+        else => false,
+    };
+}
+
+/// Shift, Ctrl, Alt or Cmd pressed on its own.
+fn isModifierKey(code: dvui.enums.Key) bool {
+    return switch (code) {
+        .left_shift, .right_shift, .left_control, .right_control, .left_alt, .right_alt, .left_command, .right_command => true,
+        else => false,
+    };
+}
+
+/// Ctrl, Alt or Cmd held: a chord, never a prompt's answer letter.
+fn hasCommandMod(mod: dvui.enums.Mod) bool {
+    return mod.control() or mod.alt() or mod.command();
+}
+
+/// The keyboard owner (and where it was) as of the last frame. When it
+/// changes and lands on an editor pane (Escape or Enter in a side panel,
+/// Ctrl+B, F6 to another pane, a window switch, a command), that pane
+/// takes dvui focus (filetree_release_focus): its movement and typing
+/// handlers are gated on holding it. Null before the first frame, so the
+/// editor pane also starts out with the keyboard.
+const OwnerSeen = struct { owner: Editor.KeyboardOwner, window: usize, pane: u8 };
+var owner_seen: ?OwnerSeen = null;
+
+fn trackKeyboardOwner(editor: *Editor) void {
+    const now: OwnerSeen = .{ .owner = editor.keyboardOwner(), .window = editor.active_window, .pane = editor.activePaneId() };
+    if (owner_seen) |seen| {
+        if (std.meta.eql(seen, now)) return;
+    }
+    owner_seen = now;
+    if (now.owner == .editor) filetree_release_focus = true;
+}
+
+/// Key and text events go to the file tree: normal mode (as the current
+/// window sees it) and the tree owns the keyboard.
+fn treeTakesKeys(editor: *const Editor) bool {
+    return guiMode(editor) == .normal and editor.keyboardOwner() == .filetree;
+}
+
+/// Key and text events go to the search panel.
+fn searchTakesKeys(editor: *const Editor) bool {
+    return guiMode(editor) == .normal and editor.keyboardOwner() == .search;
+}
+
+/// Key and text events go to the focused terminal pane.
+fn terminalTakesKeys(editor: *const Editor) bool {
+    return guiMode(editor) == .normal and editor.keyboardOwner() == .terminal;
+}
+
+/// Key and text events go to the focused editor pane: modal prompts live
+/// in it, and in normal mode it must own the keyboard (a side panel never
+/// shares it).
+fn editorTakesKeys(editor: *const Editor) bool {
+    return guiMode(editor) != .normal or editor.keyboardOwner() == .editor;
 }
 
 /// Menu bar of the current window.
@@ -661,6 +716,7 @@ fn menuBar(editor: *Editor) void {
             .name = "menubar",
         });
         defer hbox.deinit();
+        dismissFinderOnBarPress(editor, hbox.data().rectScale().r);
 
         var m = dvui.menu(@src(), .horizontal, .{});
         defer m.deinit();
@@ -677,6 +733,23 @@ fn menuBar(editor: *Editor) void {
                 openFileDialog(editor);
                 m.close();
             }
+            if (dvui.menuItemLabel(@src(), "Open Folder      Ctrl+Shift+O", .{}, .{ .expand = .horizontal }) != null) {
+                openFolderDialog(editor);
+                m.close();
+            }
+            if (dvui.menuItemLabel(@src(), "Recent Projects", .{ .submenu = true }, .{ .expand = .horizontal })) |r2| {
+                var rw = dvui.floatingMenu(@src(), .{ .from = r2 }, .{});
+                defer rw.deinit();
+                editor.ensureRecentProjects();
+                if (editor.recent_projects.items.len == 0) dvui.labelNoFmt(@src(), "(none yet)", .{}, .{});
+                for (editor.recent_projects.items, 0..) |path, idx| {
+                    if (dvui.menuItemLabel(@src(), path, .{}, .{ .expand = .horizontal, .id_extra = idx }) != null) {
+                        editor.chooseRecentProject(idx);
+                        m.close();
+                        break;
+                    }
+                }
+            }
             if (dvui.menuItemLabel(@src(), "Save             Ctrl+S", .{}, .{ .expand = .horizontal }) != null) {
                 save(editor);
                 m.close();
@@ -687,6 +760,10 @@ fn menuBar(editor: *Editor) void {
             }
             if (dvui.menuItemLabel(@src(), "Close Tab        Ctrl+W", .{}, .{ .expand = .horizontal }) != null) {
                 _ = editor.execAction("close_tab"); // asks about unsaved changes
+                m.close();
+            }
+            if (dvui.menuItemLabel(@src(), "Reopen Closed Tab Ctrl+Shift+T", .{}, .{ .expand = .horizontal }) != null) {
+                _ = editor.execAction("reopen_closed_tab");
                 m.close();
             }
             if (dvui.menuItemLabel(@src(), "Exit             Ctrl+Q", .{}, .{ .expand = .horizontal }) != null) {
@@ -709,20 +786,21 @@ fn menuBar(editor: *Editor) void {
                 _ = editor.execCommand("redo", null);
                 m.close();
             }
+            // Like their keys: a focused side panel takes them.
             if (dvui.menuItemLabel(@src(), "Cut              Ctrl+X", .{}, .{ .expand = .horizontal }) != null) {
-                _ = editor.execCommand("cut", null);
+                if (!editor.panelAction("cut")) _ = editor.execCommand("cut", null);
                 m.close();
             }
             if (dvui.menuItemLabel(@src(), "Copy             Ctrl+C", .{}, .{ .expand = .horizontal }) != null) {
-                _ = editor.execCommand("copy", null);
+                if (!editor.panelAction("copy")) _ = editor.execCommand("copy", null);
                 m.close();
             }
             if (dvui.menuItemLabel(@src(), "Paste            Ctrl+V", .{}, .{ .expand = .horizontal }) != null) {
-                _ = editor.execCommand("paste", null);
+                if (!editor.panelAction("paste")) _ = editor.execCommand("paste", null);
                 m.close();
             }
             if (dvui.menuItemLabel(@src(), "Select All       Ctrl+A", .{}, .{ .expand = .horizontal }) != null) {
-                _ = editor.execCommand("select_all", null);
+                if (!editor.panelAction("select_all")) _ = editor.execCommand("select_all", null);
                 m.close();
             }
             if (dvui.menuItemLabel(@src(), "Toggle Comment   Ctrl+/", .{}, .{ .expand = .horizontal }) != null) {
@@ -752,7 +830,8 @@ fn menuBar(editor: *Editor) void {
                 m.close();
             }
             if (dvui.menuItemLabel(@src(), "File Tree        Ctrl+B", .{}, .{ .expand = .horizontal }) != null) {
-                editor.toggleFiletree();
+                // Like Ctrl+B: from a secondary window this raises the primary.
+                execGuiAction(editor, "toggle_filetree");
                 m.close();
             }
             if (dvui.menuItemLabel(@src(), "Reveal in Tree", .{}, .{ .expand = .horizontal }) != null) {
@@ -760,11 +839,11 @@ fn menuBar(editor: *Editor) void {
                 m.close();
             }
             if (dvui.menuItemLabel(@src(), "Next Tab         Ctrl+Tab", .{}, .{ .expand = .horizontal }) != null) {
-                editor.nextDoc();
+                _ = editor.execAction("next_doc");
                 m.close();
             }
             if (dvui.menuItemLabel(@src(), "Prev Tab         Ctrl+Shift+Tab", .{}, .{ .expand = .horizontal }) != null) {
-                editor.prevDoc();
+                _ = editor.execAction("prev_doc");
                 m.close();
             }
             if (dvui.menuItemLabel(@src(), "Split Vertical   Alt+\\", .{}, .{ .expand = .horizontal }) != null) {
@@ -854,18 +933,47 @@ fn menuBar(editor: *Editor) void {
 /// The editor mode as seen by the current window: the Settings dialog is
 /// modal only for the window it is open in — everywhere else the mode reads
 /// as normal so keys, clicks and the shell keep working there.
-fn guiMode(editor: *Editor) Editor.Mode {
+fn guiMode(editor: *const Editor) Editor.Mode {
     if (editor.mode == .settings and editor.windows.items[cur_win].id != editor.settings_window_id) return .normal;
     return editor.mode;
 }
 
+/// Quick-open ends when the menu bar or the tab bar of its window is
+/// pressed: a menu command or a tab switch acts on real documents, never
+/// on the view behind the preview. The press itself stays unhandled so
+/// the bar still gets it.
+fn dismissFinderOnBarPress(editor: *Editor, bar: dvui.Rect.Physical) void {
+    if (editor.mode != .file_finder or cur_win != editor.active_window) return;
+    for (dvui.events()) |*e| {
+        if (e.handled or e.evt != .mouse) continue;
+        const me = e.evt.mouse;
+        if (me.action != .press or me.floating_win != dvui.subwindowCurrentId()) continue;
+        if (bar.contains(me.p)) {
+            editor.finderCancel();
+            return;
+        }
+    }
+}
+
 fn modalDialogs(editor: *Editor) void {
     if (cur_win == editor.active_window) {
+        // zide.exec("file_open") and the palette land in this mode (Ctrl+O
+        // opens the dialog directly): answer with the native picker. The
+        // mode goes first: opening may start the encoding prompt.
+        if (editor.mode == .file_open) {
+            editor.setMode(.normal);
+            openFileDialog(editor);
+        }
+        if (editor.mode == .folder_open) {
+            editor.setMode(.normal);
+            openFolderDialog(editor);
+        }
         if (editor.mode == .save_as) saveAs(editor);
         if (editor.mode == .recovery_picker) recoveryDialog(editor);
         if (editor.mode == .tool_panel or editor.mode == .task_save_prompt or editor.mode == .git_stage_prompt) toolDialog(editor);
         if (editor.mode == .lsp_panel or editor.mode == .symbol_rename or editor.mode == .workspace_preview) lspDialog(editor);
         if (editor.mode == .encoding_picker or editor.mode == .confirm_reopen or editor.mode == .confirm_encoding) encodingDialog(editor);
+        if (editor.mode == .recent_projects) recentProjectsDialog(editor);
     }
     // --- Settings dialog (modal floating window) ---
     // Declared before the panes so its widgets consume their events first;
@@ -904,8 +1012,9 @@ fn tabBar(editor: *Editor) void {
     }
     tabDragPrePass(editor);
 
-    var close_tab_idx: ?usize = null;
-    var to_new_window_idx: ?usize = null;
+    // Clicks, drops, closes and moves are collected during the loop and
+    // applied after it: each one edits the tab list the loop walks.
+    var acts: TabBarActions = .{};
 
     var tab_box = dvui.box(@src(), .{ .dir = .horizontal }, .{
         .expand = .horizontal,
@@ -917,6 +1026,7 @@ fn tabBar(editor: *Editor) void {
     const bar_rs = tab_box.data().rectScale();
     td.bar_rect = bar_rs.r;
     const scale = bar_rs.s;
+    dismissFinderOnBarPress(editor, bar_rs.r);
 
     for (this_win.tabs.items) |i| {
         if (i >= editor.documents.items.len) continue;
@@ -948,7 +1058,7 @@ fn tabBar(editor: *Editor) void {
         const label_rect = lbox.data().rectScale().r;
         dvui.labelNoFmt(@src(), label, .{}, .{ .id_extra = @intCast(i), .gravity_y = 0.5 });
         lbox.deinit();
-        tabHandleMouse(editor, i, label_rect, scale);
+        tabHandleMouse(editor, i, label_rect, scale, &acts);
 
         // Right-click menu — the guaranteed path to a new window
         {
@@ -958,11 +1068,11 @@ fn tabBar(editor: *Editor) void {
                 var fw = dvui.floatingMenu(@src(), .{ .from = dvui.Rect.Natural.fromPoint(cp) }, .{});
                 defer fw.deinit();
                 if (dvui.menuItemLabel(@src(), "Move to New Window", .{}, .{ .expand = .horizontal }) != null) {
-                    to_new_window_idx = i;
+                    acts.new_window = doc.id;
                     fw.close();
                 }
                 if (dvui.menuItemLabel(@src(), "Close Tab", .{}, .{ .expand = .horizontal }) != null) {
-                    close_tab_idx = i;
+                    acts.close = doc.id;
                     fw.close();
                 }
             }
@@ -976,21 +1086,40 @@ fn tabBar(editor: *Editor) void {
             .margin = .{ .x = 0, .y = 0, .w = 2, .h = 0 },
             .padding = .{ .x = 2, .y = 0, .w = 2, .h = 0 },
         })) {
-            close_tab_idx = i;
+            acts.close = doc.id;
         }
     }
 
-    // Deferred until the iteration is complete. Closing goes by index —
-    // switching first would hijack a focused terminal pane's content — and a
-    // document with unsaved changes gets the Save / Discard / Cancel prompt.
-    if (close_tab_idx) |idx| {
-        _ = editor.requestCloseDoc(idx);
-    } else if (to_new_window_idx) |idx| {
-        if (editor.multi_window_supported) {
-            editor.showDocInNewWindow(idx);
-        } else {
+    applyTabBarActions(editor, acts);
+}
+
+/// Tab-bar actions of one frame, by document id (an earlier action, or the
+/// quick-open preview going away, can shift the indices).
+const TabBarActions = struct {
+    /// Plain click: show the document in this window.
+    show: ?u64 = null,
+    /// Drag released off the bar at `p`.
+    drop: ?struct { id: u64, p: dvui.Point.Physical } = null,
+    close: ?u64 = null,
+    new_window: ?u64 = null,
+};
+
+/// Run what the tab loop collected, after it finished.
+fn applyTabBarActions(editor: *Editor, acts: TabBarActions) void {
+    if (acts.show) |id| if (editor.docIndexForId(id)) |idx| {
+        editor.showDocIn(cur_win, idx);
+        win_ui.refocus_editor = true;
+    };
+    if (acts.drop) |d| if (editor.docIndexForId(d.id)) |idx| tabDrop(editor, idx, d.p);
+    // Closing goes by document, not by switching to it first (that would
+    // hijack a focused terminal pane's content); a document with unsaved
+    // changes gets the Save / Discard / Cancel prompt.
+    if (acts.close) |id| {
+        if (editor.docIndexForId(id)) |idx| _ = editor.requestCloseDoc(idx);
+    } else if (acts.new_window) |id| {
+        if (!editor.multi_window_supported) {
             editor.status_message = "This build has no extra windows (SDL3 renderer backend needed)";
-        }
+        } else if (editor.docIndexForId(id)) |idx| editor.showDocInNewWindow(idx);
     }
 }
 
@@ -1033,8 +1162,9 @@ fn tabDragPrePass(editor: *Editor) void {
 
 /// Raw mouse handling for one tab label: press arms, motion drags, release
 /// clicks or drops. One state machine per window (win_ui.tab_drag), in event
-/// order — a press and its release in the same frame both resolve here.
-fn tabHandleMouse(editor: *Editor, doc_idx: usize, r: dvui.Rect.Physical, scale: f32) void {
+/// order — a press and its release in the same frame both resolve here. A
+/// click or drop is recorded in `acts` (tabBar applies it after its loop).
+fn tabHandleMouse(editor: *Editor, doc_idx: usize, r: dvui.Rect.Physical, scale: f32, acts: *TabBarActions) void {
     const td = &win_ui.tab_drag;
     for (dvui.events()) |*e| {
         if (e.handled) continue;
@@ -1073,12 +1203,12 @@ fn tabHandleMouse(editor: *Editor, doc_idx: usize, r: dvui.Rect.Physical, scale:
                 e.handled = true;
                 const was_dragging = td.state == .dragging;
                 td.state = .idle;
+                const id = editor.documents.items[doc_idx].id;
                 if (was_dragging) {
-                    tabDrop(editor, doc_idx, me.p);
+                    acts.drop = .{ .id = id, .p = me.p };
                 } else {
                     // A plain click shows the document in this window
-                    editor.showDocIn(cur_win, doc_idx);
-                    win_ui.refocus_editor = true;
+                    acts.show = id;
                 }
             },
             .position => {
@@ -1268,7 +1398,9 @@ fn statusBar(editor: *Editor) void {
                 const me = e.evt.mouse;
                 if (me.action == .press and me.button == .left and enc_rect.contains(me.p)) {
                     e.handle(@src(), swd);
-                    editor.focusWindow(cur_win);
+                    // The picker acts on this window's document; switching
+                    // windows only when needed keeps a side panel's keyboard.
+                    if (editor.active_window != cur_win) editor.focusWindow(cur_win);
                     editor.startEncoding(.choose);
                 }
             }
@@ -1323,7 +1455,7 @@ fn editorArea(editor: *Editor, side_panels: bool) void {
 }
 
 /// The split tree of the current window. `rendering_panes` is set while the
-/// paned widgets hold pointers into the layout — see deferred_action.
+/// paned widgets hold pointers into the layout — see DeferredQueue.
 fn renderPanes(editor: *Editor) void {
     rendering_panes = true;
     defer rendering_panes = false;
@@ -1334,8 +1466,11 @@ fn renderPanes(editor: *Editor) void {
 /// pane is a terminal: routes key/text events to the modal handlers and
 /// draws the overlay over the whole editor area.
 fn windowLevelModal(editor: *Editor, wd: *dvui.WidgetData) void {
+    const mode = editor.mode;
     for (dvui.events()) |*e| {
         if (e.handled) continue;
+        // A key that closed or switched the prompt ends its input.
+        if (editor.mode != mode) break;
         switch (e.evt) {
             .key => |key| {
                 if (key.action != .down and key.action != .repeat) continue;
@@ -1344,7 +1479,8 @@ fn windowLevelModal(editor: *Editor, wd: *dvui.WidgetData) void {
             },
             .text => |te| switch (te.action) {
                 .value => |val| {
-                    if (val.txt.len > 0) {
+                    // `selected` = uncommitted IME composition, not text.
+                    if (val.txt.len > 0 and !val.selected) {
                         e.handle(@src(), wd);
                         handleModalText(editor, val.txt);
                     }
@@ -1363,22 +1499,78 @@ fn windowLevelModal(editor: *Editor, wd: *dvui.WidgetData) void {
 /// the layout tree until it deinits; a split/close in between would leave
 /// them dangling).
 var rendering_panes: bool = false;
-/// A structural action raised from inside a pane, executed by frame() after
-/// every window finished rendering.
-var deferred_action: ?[]const u8 = null;
 
-/// Actions that mutate a layout tree (split/close panes, terminals, moving
-/// panes between windows) — never run them while the panes render.
-fn isStructuralAction(action: []const u8) bool {
-    const names = [_][]const u8{
-        "split_vertical",  "split_horizontal",    "close_pane",         "toggle_terminal",
-        "close_terminal",  "open_terminal_right", "open_in_new_window", "move_pane_to_new_window",
-        "detach_terminal", "close_window",
+/// Work raised from inside a pane that must wait until every window has
+/// rendered: ANY command can split or close panes (a Lua one through
+/// zide.exec), so the palette's Enter and a terminal's passthrough chord
+/// both land here, in order. Names are copied: a command that runs first
+/// may free the registry or keymap strings a later entry pointed into.
+const DeferredQueue = struct {
+    const capacity = 4;
+    const max_name = 256;
+
+    const Kind = enum {
+        /// execGuiAction (keybind action names; GUI dialogs for save/open).
+        action,
+        /// Editor.execCommand (what the palette runs).
+        command,
     };
-    for (names) |n| {
-        if (std.mem.eql(u8, action, n)) return true;
+    const Entry = struct {
+        kind: Kind,
+        len: usize,
+        buf: [max_name]u8,
+
+        fn name(self: *const Entry) []const u8 {
+            return self.buf[0..self.len];
+        }
+    };
+
+    entries: [capacity]Entry = undefined,
+    len: usize = 0,
+
+    /// False when the queue is full or the name too long (not queued).
+    fn push(self: *DeferredQueue, kind: Kind, name: []const u8) bool {
+        if (self.len == capacity or name.len > max_name) return false;
+        const e = &self.entries[self.len];
+        e.kind = kind;
+        e.len = name.len;
+        @memcpy(e.buf[0..name.len], name);
+        self.len += 1;
+        return true;
     }
-    return false;
+
+    /// The oldest entry, copied out, or null when empty.
+    fn pop(self: *DeferredQueue) ?Entry {
+        if (self.len == 0) return null;
+        const first = self.entries[0];
+        std.mem.copyForwards(Entry, self.entries[0 .. self.len - 1], self.entries[1..self.len]);
+        self.len -= 1;
+        return first;
+    }
+};
+var deferred: DeferredQueue = .{};
+
+/// Queue `name` for frame()'s end (see DeferredQueue); a full queue drops
+/// it and says so rather than run it under the split widgets.
+fn deferRun(editor: *Editor, kind: DeferredQueue.Kind, name: []const u8) void {
+    if (!deferred.push(kind, name)) lua_api.setStatusText(editor, "Not run (too many at once): ", name);
+}
+
+/// Drain the deferred queue (after every window rendered) and draw its
+/// effect (a split, the find bar) without waiting for more input.
+fn runDeferred(editor: *Editor) void {
+    var ran = false;
+    // Nothing queues while no pane renders; the bound just rules out a spin.
+    var budget: usize = DeferredQueue.capacity;
+    while (budget > 0) : (budget -= 1) {
+        const entry = deferred.pop() orelse break;
+        ran = true;
+        switch (entry.kind) {
+            .action => execGuiAction(editor, entry.name()),
+            .command => _ = editor.execCommand(entry.name(), null),
+        }
+    }
+    if (ran) dvui.refresh(null, @src(), null);
 }
 
 /// Actions whose UI lives in the primary window only.
@@ -1496,7 +1688,7 @@ fn childWindows(editor: *Editor, g: *GuiState) void {
             if (!ui.created) {
                 // The child copied the parent's theme before it had the mono
                 // font: register the font and re-theme before any widget.
-                applyWindowFonts(child_dvui, g, editor);
+                applyChildWindowFonts(child_dvui, g, editor);
                 ui.theme_gen_applied = editor.theme_revision;
                 ui.sdl_window_id = c.SDL_GetWindowID(child_backend.window);
                 // Every child presents on its own; vsync per child would
@@ -1516,7 +1708,6 @@ fn childWindows(editor: *Editor, g: *GuiState) void {
                 }
             }
             applyThemeIfStale(editor);
-            ui.natural_scale = dvui.windowNaturalScale();
 
             dispatchGlobalKeys(editor);
             processFileDrops(editor);
@@ -1583,14 +1774,13 @@ fn renderLayout(editor: *Editor, node_idx: u8) void {
 /// GUI scroll offset (in rows) for the file tree panel.
 var filetree_scroll: usize = 0;
 
-/// One-frame flag: keyboard focus just left the file tree, so the active
-/// editor pane must take dvui focus back — its movement/typing handlers
-/// are gated on holding dvui widget focus, which the panel grabbed on
-/// click. Without this, Escape "worked" but the editor stayed deaf.
+/// One-frame flag: the keyboard just came back to an editor pane (from the
+/// tree, the search panel, another pane or window — trackKeyboardOwner, or
+/// the tree's own Escape/Enter), so the active editor pane takes dvui focus
+/// back: its movement/typing handlers are gated on holding dvui widget
+/// focus, which a panel grabbed on click. Without this, Escape "worked" but
+/// the editor stayed deaf.
 var filetree_release_focus: bool = false;
-/// Previous-frame filetree_focused, to catch command-driven transitions
-/// (Ctrl+B hide, etc.) as well as the tree's own Esc/Enter.
-var filetree_was_focused: bool = false;
 /// Panel content rect + scale from the last draw — the resize drag runs
 /// at the top of frame() (before any pane consumes events), so it works
 /// the same whichever side the panel docks on.
@@ -1688,9 +1878,7 @@ fn processFileDrops(editor: *Editor) void {
     if (!build_options.has_gui) return;
     if (win_ui.drop_count == 0) return;
     defer win_ui.drop_count = 0;
-    // Drop coordinates are window points; the primary's panel scale and a
-    // child's natural scale are the same physical/logical factor.
-    const scale = if (cur_win == 0) filetree_panel_scale else win_ui.natural_scale;
+    const scale = windowPointScale();
     for (win_ui.drop_slots[0..win_ui.drop_count]) |*s| {
         const path = s.path[0..s.len];
         var handled = false;
@@ -1721,7 +1909,7 @@ fn processFileDrops(editor: *Editor) void {
                 d.close(editor.io);
                 _ = editor.setFiletreeRoot(path);
             } else |_| {
-                _ = editor.openOrFocus(path) catch |err| {
+                _ = editor.navOpen(path) catch |err| {
                     if (err == error.BinaryFile) {
                         guiNotify(editor, "Not opened: binary or unsupported text encoding", .{});
                     } else {
@@ -1731,6 +1919,17 @@ fn processFileDrops(editor: *Editor) void {
             }
         }
     }
+}
+
+/// Physical pixels per SDL window coordinate in the current window: the
+/// factor the SDL backend maps mouse events with (pixel size / window
+/// size), which drop coordinates need too. Not rs.s, which also folds in
+/// the display's content scale (at 125%/150% a drop landed on the wrong
+/// tree row, or missed the panel and opened a folder as the root).
+fn windowPointScale() f32 {
+    const b = dvui.currentWindow().backend;
+    const w = b.windowSize().w;
+    return if (w > 0) b.pixelSize().w / w else 1.0;
 }
 
 /// File tree side panel — custom row rendering in the editorPane style
@@ -1757,7 +1956,7 @@ fn filetreePanel(editor: *Editor) void {
         }
     }
     // The `/` search only lives while the tree owns the keyboard.
-    if (!editor.filetree_focused) filetree_search_active = false;
+    if (editor.keyboardOwner() != .filetree) filetree_search_active = false;
 
     const panel_w = std.math.clamp(editor.filetree_width, 120, 600);
     var pbox = dvui.box(@src(), .{ .dir = .vertical }, .{
@@ -1786,20 +1985,17 @@ fn filetreePanel(editor: *Editor) void {
     const header_h = m.rows_y - area.y;
     const visible_rows = m.visible_rows;
 
-    // SDL only delivers .text events while someone declares a text-input
-    // region, and the editor pane only does that for itself — without
-    // this, `/` search never receives its query characters.
-    if (editor.filetree_focused and guiMode(editor) == .normal) {
-        dvui.wantTextInput(area.toNatural());
-    }
-
     // Input first — clicks/keys can expand or collapse rows, so every
     // count and clamp below must see the post-input state (a stale
     // row_count here was an index-out-of-bounds panic on collapse).
     handleFiletreeMouse(editor, ft, wd, m);
-    if (editor.filetree_focused and guiMode(editor) == .normal and !editor.completion_active) {
-        handleFiletreeKeys(editor, ft, wd, visible_rows);
-    }
+    if (treeTakesKeys(editor)) handleFiletreeKeys(editor, ft, wd, visible_rows);
+    // SDL only delivers .text events while someone declares a text-input
+    // region, and the editor pane only does that for itself — without
+    // this, `/` search never receives its query characters. Declared
+    // after the input: a click may just have given the tree the keyboard.
+    if (treeTakesKeys(editor)) dvui.wantTextInput(area.toNatural());
+    const tree_focused = editor.keyboardOwner() == .filetree;
 
     // Reveal/create/nav flagged the selection for scroll-into-view.
     if (ft.scroll_to_selected) {
@@ -1851,7 +2047,7 @@ fn filetreePanel(editor: *Editor) void {
             else => {},
         }
     }
-    const hdr_color = if (editor.filetree_focused) header_fg else dim;
+    const hdr_color = if (tree_focused) header_fg else dim;
     const up_sz = @min(header_h - 4 * scale, 13 * scale);
     renderIconTinted("ft_up", dvui.entypo.level_up, .{
         .x = area.x + 6 * scale,
@@ -1942,7 +2138,7 @@ fn filetreePanel(editor: *Editor) void {
         }
         if (row == ft.selected) {
             // Dimmed bar when the tree doesn't own the keyboard.
-            const bar = if (editor.filetree_focused) sel_bg else sel_bg.opacity(0.45);
+            const bar = if (tree_focused) sel_bg else sel_bg.opacity(0.45);
             fillBar(area, y - area.y, line_height, bar);
         }
         if (filetree_dnd_active) {
@@ -2087,7 +2283,6 @@ fn handleFiletreeResize(editor: *Editor, prect: dvui.Rect.Physical, scale: f32) 
                     e.handled = true;
                     filetree_resizing = false;
                     // Persist the chosen width
-                    const lua_settings = @import("../core/lua_settings.zig");
                     var buf: [32]u8 = undefined;
                     const num = std.fmt.bufPrint(&buf, "{d}", .{@as(i64, @intFromFloat(editor.filetree_width))}) catch "";
                     if (num.len > 0) lua_settings.writeSettingToFile("filetree_width", num) catch {};
@@ -2431,11 +2626,14 @@ fn handleFiletreeMouse(editor: *Editor, ft: *FileTree, wd: *dvui.WidgetData, m: 
                             .row => |tr| ft.nodes.items[ft.visible.items[tr]].name,
                         };
                         const drag_n: usize = if (filetree_dnd_paths) |p| p.len else 1;
+                        // File names are arbitrary bytes: setStatusText
+                        // makes them safe to draw.
+                        var msg_buf: [600]u8 = undefined;
                         const msg = if (drag_n > 1)
-                            std.fmt.bufPrint(&editor.status_buf, "Move {d} items -> {s}", .{ drag_n, tgt_name }) catch ""
+                            std.fmt.bufPrint(&msg_buf, "Move {d} items -> {s}", .{ drag_n, tgt_name }) catch ""
                         else
-                            std.fmt.bufPrint(&editor.status_buf, "Move {s} -> {s}", .{ src_name, tgt_name }) catch "";
-                        editor.status_message = msg;
+                            std.fmt.bufPrint(&msg_buf, "Move {s} -> {s}", .{ src_name, tgt_name }) catch "";
+                        lua_api.setStatusText(editor, "", msg);
                     }
                 }
                 continue;
@@ -2517,12 +2715,12 @@ fn handleFiletreeMouse(editor: *Editor, ft: *FileTree, wd: *dvui.WidgetData, m: 
                         ft.root_selected = false;
                         ft.selected = r;
                     }
-                    editor.filetree_focused = true;
+                    _ = editor.takeKeyboardFocus(.filetree);
                     continue;
                 }
                 e.handle(@src(), wd);
                 dvui.focusWidget(wd.id, null, e.num);
-                editor.filetree_focused = true;
+                _ = editor.takeKeyboardFocus(.filetree);
                 if (guiMode(editor) != .normal) continue;
                 // Scrollbar band: drag the thumb, or page toward the click.
                 if (me.p.y >= rows_y and me.p.x >= m.sb_x) {
@@ -2632,17 +2830,20 @@ fn handleFiletreeMouse(editor: *Editor, ft: *FileTree, wd: *dvui.WidgetData, m: 
     }
 }
 
-/// Keys while the tree owns the keyboard (filetree_focused, normal mode).
-/// Ctrl/Alt chords are left for the global keybind map.
+/// Keys while the tree owns the keyboard (treeTakesKeys). Ctrl/Alt/Cmd
+/// chords are left for the global keybind map.
 fn handleFiletreeKeys(editor: *Editor, ft: *FileTree, wd: *dvui.WidgetData, visible_rows: usize) void {
     for (dvui.events()) |*e| {
         if (e.handled) continue;
+        // A key can hand the keyboard away (Enter opens a file, Escape,
+        // `d` opens the delete prompt): the rest is not the tree's.
+        if (!treeTakesKeys(editor)) break;
         switch (e.evt) {
             .key => |key| {
                 if (key.action != .down and key.action != .repeat) continue;
                 // Keep the "press p" hint visible while a move is pending
                 if (editor.filetree_move_src == null) editor.status_message = "";
-                if (key.mod.control() or key.mod.alt()) continue;
+                if (hasCommandMod(key.mod)) continue;
                 if (filetree_search_active) {
                     switch (key.code) {
                         .escape, .enter => {
@@ -2711,7 +2912,7 @@ fn handleFiletreeKeys(editor: *Editor, ft: *FileTree, wd: *dvui.WidgetData, visi
                             }
                         } else {
                             openFiletreeFile(editor, ft, idx);
-                            editor.filetree_focused = false;
+                            _ = editor.takeKeyboardFocus(.pane);
                             filetree_release_focus = true;
                         }
                     },
@@ -2756,6 +2957,10 @@ fn handleFiletreeKeys(editor: *Editor, ft: *FileTree, wd: *dvui.WidgetData, visi
                         e.handle(@src(), wd);
                         editor.filetreeRootUp();
                     },
+                    .o => {
+                        e.handle(@src(), wd);
+                        editor.filetreeOpenSelectedAsRoot();
+                    },
                     .escape => {
                         e.handle(@src(), wd);
                         // A pending move mark cancels first, then a multi
@@ -2766,7 +2971,7 @@ fn handleFiletreeKeys(editor: *Editor, ft: *FileTree, wd: *dvui.WidgetData, visi
                         } else if (ft.multi.count() > 0) {
                             ft.clearMulti();
                         } else {
-                            editor.filetree_focused = false;
+                            _ = editor.takeKeyboardFocus(.pane);
                             filetree_release_focus = true;
                         }
                     },
@@ -2779,6 +2984,8 @@ fn handleFiletreeKeys(editor: *Editor, ft: *FileTree, wd: *dvui.WidgetData, visi
                 // the document behind the panel.
                 switch (te.action) {
                     .value => |val| {
+                        // Uncommitted IME composition is not typed text.
+                        if (val.selected) continue;
                         e.handle(@src(), wd);
                         if (filetree_search_active) {
                             for (val.txt) |ch| {
@@ -2815,7 +3022,7 @@ fn guiNotify(editor: *Editor, comptime fmt: []const u8, args: anytype) void {
 fn openFiletreeFile(editor: *Editor, ft: *FileTree, idx: u32) void {
     const abs = ft.absPathAlloc(editor.allocator, idx) catch return;
     defer editor.allocator.free(abs);
-    _ = editor.openOrFocus(abs) catch |err| {
+    _ = editor.navOpen(abs) catch |err| {
         if (err == error.BinaryFile) {
             guiNotify(editor, "Not opened: binary or unsupported text encoding", .{});
         } else {
@@ -2826,8 +3033,8 @@ fn openFiletreeFile(editor: *Editor, ft: *FileTree, idx: u32) void {
 
 /// Clickable delete confirmation (mode == .filetree_prompt with kind ==
 /// .delete_confirm). Declared from frame() before the panes, like the
-/// settings dialog, so its buttons see events first. The y/n/Enter/Esc
-/// keys keep working through the modal key path.
+/// settings dialog, so its buttons see events first. Keys go through the
+/// modal key path: only `y` (or the Delete button) deletes.
 fn filetreeDeleteDialog(editor: *Editor) void {
     if (!build_options.has_gui) return;
     var float = dvui.floatingWindow(@src(), .{ .modal = true }, .{ .min_size_content = .{ .w = 340 } });
@@ -2844,7 +3051,7 @@ fn filetreeDeleteDialog(editor: *Editor) void {
     else
         std.fmt.bufPrint(&buf, "Delete {s}?", .{editor.filetree_prompt_target orelse ""}) catch "Delete?";
     dvui.labelNoFmt(@src(), what, .{}, .{});
-    dvui.labelNoFmt(@src(), "Folders delete recursively. (y/n works too)", .{}, .{
+    dvui.labelNoFmt(@src(), "Folders delete recursively. Press y to delete; Enter, n or Esc cancels.", .{}, .{
         .color_text = toDvui(editor.theme.overlay_hint),
     });
 
@@ -2944,6 +3151,10 @@ fn filetreeContextMenu(editor: *Editor, area: dvui.Rect.Physical) void {
             _ = editor.execCommand("filetree_reveal_explorer", null);
             fw.close();
         }
+        if (dvui.menuItemLabel(@src(), "Open as Root       o", .{}, .{ .expand = .horizontal }) != null) {
+            editor.filetreeOpenSelectedAsRoot();
+            fw.close();
+        }
         if (dvui.menuItemLabel(@src(), "Up One Folder      u", .{}, .{ .expand = .horizontal }) != null) {
             editor.filetreeRootUp();
             fw.close();
@@ -2954,9 +3165,7 @@ fn filetreeContextMenu(editor: *Editor, area: dvui.Rect.Physical) void {
             "Move Tree to Left";
         if (dvui.menuItemLabel(@src(), side_label, .{}, .{ .expand = .horizontal }) != null) {
             editor.filetree_side = if (editor.filetree_side == .left) .right else .left;
-            const lua_settings = @import("../core/lua_settings.zig");
-            const quoted: []const u8 = if (editor.filetree_side == .right) "\"right\"" else "\"left\"";
-            lua_settings.writeSettingToFile("filetree_side", quoted) catch {};
+            lua_settings.writeStringSettingToFile("filetree_side", @tagName(editor.filetree_side)) catch {};
             fw.close();
         }
         if (dvui.menuItemLabel(@src(), "Refresh            R", .{}, .{ .expand = .horizontal }) != null) {
@@ -2995,9 +3204,10 @@ var search_sticky: ?usize = null;
 /// Docked workspace search & replace panel (bottom strip), VS Code-style:
 /// bordered input boxes with placeholders and inline Aa/W toggle chips,
 /// results grouped under file headers (icon + name + dir + count) with the
-/// match highlighted inside each excerpt. Keyboard focus follows
-/// editor.search_focused (same model as the file tree); global ctrl/fkey
-/// chords are handled by frame()'s dispatcher before this runs.
+/// match highlighted inside each excerpt. It takes keys while it owns the
+/// keyboard (Editor.keyboardOwner() == .search — same model as the file
+/// tree); global ctrl/fkey chords are handled by frame()'s dispatcher
+/// before this runs (the clipboard ones through Editor.panelAction).
 fn searchPanelGui(editor: *Editor) void {
     if (!build_options.has_gui) return;
     const sp = &editor.search;
@@ -3042,7 +3252,6 @@ fn searchPanelGui(editor: *Editor) void {
     const sel_bg = toDvui(editor.theme.selection);
     const accent = toDvui(editor.theme.cursor);
     const box_bg = toDvui(editor.theme.gutter_bg);
-    const focused = editor.search_focused;
 
     // Geometry: search on row 1, replace + include share row 2,
     // exclude on row 3
@@ -3081,8 +3290,7 @@ fn searchPanelGui(editor: *Editor) void {
             .press => {
                 if (!inside or me.button != .left) continue;
                 e.handle(@src(), wd);
-                editor.search_focused = true;
-                editor.filetree_focused = false;
+                _ = editor.takeKeyboardFocus(.search);
                 // Toggle chips (inside the search box) first
                 if (me.p.y >= chip_y and me.p.y < chip_y + chip_h) {
                     if (me.p.x >= chip_case_x and me.p.x < chip_case_x + chip_w) {
@@ -3153,11 +3361,14 @@ fn searchPanelGui(editor: *Editor) void {
         }
     }
 
-    // --- Keys/text while the panel owns the keyboard ---
-    if (focused) {
-        dvui.wantTextInput(area.toNatural());
+    // --- Keys/text while the panel owns the keyboard (read after the
+    //     clicks above: a click on the panel takes it) ---
+    if (searchTakesKeys(editor)) {
         handleSearchKeysGui(editor, wd);
+        // Still the owner after the keys (Escape hides the panel)?
+        if (searchTakesKeys(editor)) dvui.wantTextInput(area.toNatural());
     }
+    const focused = editor.keyboardOwner() == .search;
 
     // --- Rebuild the grouped display list AFTER all input (input can
     //     restart the search and replace the match lists) ---
@@ -3304,8 +3515,8 @@ fn searchPanelGui(editor: *Editor) void {
                     }
                     end = @min(m.excerpt.len, start + span);
                     if (end == m.excerpt.len) trail = false;
-                    start = utf8Floor(m.excerpt, start);
-                    end = utf8Floor(m.excerpt, end);
+                    start = text_input.floor(m.excerpt, start);
+                    end = text_input.floor(m.excerpt, end);
                 }
                 if (lead) {
                     renderOverlayText(font, "…", x, ry, render_rs, dim);
@@ -3454,36 +3665,41 @@ fn drawSearchChip(font: dvui.Font, rs: dvui.RectScale, x: f32, y: f32, w: f32, h
     renderOverlayText(font, label, x + (w - tw) / 2, y + (h - lh) / 2, rs, if (on) fg else dim);
 }
 
-/// Move a byte index back to the start of its UTF-8 sequence so windowed
-/// slicing never cuts a codepoint in half.
-fn utf8Floor(s: []const u8, idx: usize) usize {
-    var i = @min(idx, s.len);
-    while (i > 0 and i < s.len and (s[i] & 0xC0) == 0x80) i -= 1;
-    return i;
-}
-
 /// Keys while the search panel owns the keyboard (mirrors the TUI handler;
-/// ctrl/fkey chords were already taken by frame()'s global dispatcher).
+/// ctrl/fkey chords were already taken by frame()'s global dispatcher —
+/// the clipboard and word-delete ones through Editor.panelAction).
 fn handleSearchKeysGui(editor: *Editor, wd: *dvui.WidgetData) void {
     const sp = &editor.search;
+    // The letter that answered the Replace prompt: its text event must not
+    // also land in the Replace field.
+    var answer_letter: ?u8 = null;
     for (dvui.events()) |*e| {
         if (e.handled) continue;
+        // Escape hides the panel, Enter on a result opens it: the rest of
+        // the input is not the panel's.
+        if (!searchTakesKeys(editor)) break;
         switch (e.evt) {
             .key => |key| {
                 if (key.action != .down and key.action != .repeat) continue;
                 if (sp.confirm_armed) {
+                    // Only a plain letter answers (Ctrl+A is select-all,
+                    // never "replace all on disk").
+                    if (hasCommandMod(key.mod)) continue;
                     switch (key.code) {
                         .a => {
                             e.handle(@src(), wd);
                             editor.searchExecuteReplace(.all);
+                            answer_letter = 'a';
                         },
                         .o => {
                             e.handle(@src(), wd);
                             editor.searchExecuteReplace(.open_only);
+                            answer_letter = 'o';
                         },
                         .c, .escape => {
                             e.handle(@src(), wd);
                             sp.confirm_armed = false;
+                            if (key.code == .c) answer_letter = 'c';
                         },
                         else => {},
                     }
@@ -3505,7 +3721,7 @@ fn handleSearchKeysGui(editor: *Editor, wd: *dvui.WidgetData) void {
                     }
                     continue;
                 }
-                if (key.mod.control()) continue; // global chords
+                if (key.mod.control() or key.mod.command()) continue; // global chords
                 switch (key.code) {
                     .escape => {
                         e.handle(@src(), wd);
@@ -3554,10 +3770,14 @@ fn handleSearchKeysGui(editor: *Editor, wd: *dvui.WidgetData) void {
             .text => |te| {
                 switch (te.action) {
                     .value => |val| {
-                        if (val.txt.len > 0) {
-                            e.handle(@src(), wd);
-                            sp.appendText(val.txt);
+                        // `selected` = uncommitted IME composition.
+                        if (val.txt.len == 0 or val.selected) continue;
+                        e.handle(@src(), wd);
+                        if (answer_letter) |letter| {
+                            answer_letter = null;
+                            if (val.txt.len == 1 and std.ascii.toLower(val.txt[0]) == letter) continue;
                         }
+                        sp.appendText(val.txt);
                     },
                     else => {},
                 }
@@ -3611,10 +3831,6 @@ fn editorPane(editor: *Editor, pane_id: u8) void {
         editor.page_size = visible_lines - 1;
     }
 
-    // Estimate visible columns for horizontal scroll (approximate with 'M' width)
-    const m_width = font.textSize("M").w * scale;
-    const visible_cols: usize = if (m_width > 0 and area.w > 0) @intFromFloat(@floor(area.w / m_width)) else 80;
-
     // --- Line number gutter width (needed for mouse + rendering) ---
     const line_count_for_gutter = doc.buffer.lineCount();
     const gutter_digits_early = guiLineNumberDigits(line_count_for_gutter, editor.gutter_min_digits);
@@ -3627,8 +3843,9 @@ fn editorPane(editor: *Editor, pane_id: u8) void {
     const text_area_w_logical = @max(0.0, area.w - gutter_total_width) / scale;
     if (is_active_pane) editor.text_width = if (text_area_w_logical > 0) @intFromFloat(text_area_w_logical) else 80;
 
-    // Take dvui focus back from the file tree panel when keyboard focus
-    // returned to the editor (movement/typing below is is_focused-gated).
+    // Take dvui focus back when the keyboard returned to this editor pane
+    // (from a side panel, another pane or window, a tab click): movement
+    // and typing below are is_focused-gated.
     if (is_active_pane and (filetree_release_focus or win_ui.refocus_editor)) {
         filetree_release_focus = false;
         win_ui.refocus_editor = false;
@@ -3636,9 +3853,9 @@ fn editorPane(editor: *Editor, pane_id: u8) void {
     }
 
     // --- Handle keyboard events (before rendering) — only for the focused
-    // pane, and not while the file tree owns the keyboard. Modal prompts
+    // pane, and not while a side panel owns the keyboard. Modal prompts
     // (mode != .normal) still route through here. ---
-    if (is_active_pane and !((editor.filetree_focused or editor.search_focused) and guiMode(editor) == .normal)) {
+    if (is_active_pane and editorTakesKeys(editor)) {
         _ = handleGuiKeyEvents(editor, wd);
 
         // Re-fetch doc after key events — close_tab may have changed/freed the active document
@@ -3703,21 +3920,26 @@ fn editorPane(editor: *Editor, pane_id: u8) void {
         if (do_wrap) {
             guiEnsureCursorVisibleWrapped(doc, font, text_area_w_logical, visible_lines, tab_width);
         } else {
-            doc.ensureCursorVisible(visible_lines, visible_cols);
+            guiEnsureCursorVisibleNoWrap(doc, font, text_area_w_logical, visible_lines, tab_width);
         }
     }
 
-    // --- Request text input from SDL — only for the focused pane ---
+    // --- Request text input from SDL — only for the focused pane that
+    // takes keys (never under a side panel that owns the keyboard) ---
     // Settings is excluded: the DVUI dialog's own text entries request
     // input and focus; grabbing it here would steal their focus each frame.
     const focused = if (dvui.focusedWidgetId()) |fid| fid == wd.id else false;
-    if (is_active_pane) {
+    const takes_keys = is_active_pane and editorTakesKeys(editor);
+    if (takes_keys) {
         const needs_text = focused or (editor.mode != .normal and editor.mode != .settings);
         if (needs_text) {
             dvui.wantTextInput(area.toNatural());
             if (!focused) dvui.focusWidget(wd.id, null, 0);
         }
     }
+    // Carets show where typing goes: not while a side panel owns the
+    // keyboard, even though this pane may still hold dvui focus.
+    const show_carets = focused and takes_keys;
 
     // Full editor area for rendering (includes gutter).
     // win_ui.drag_area is the text-only area (for mouse mapping), but we render
@@ -3755,6 +3977,8 @@ fn editorPane(editor: *Editor, pane_id: u8) void {
     const text_color = toDvui(editor.theme.text);
     const sel_color = toDvui(editor.theme.selection);
     const caret_color = toDvui(editor.theme.cursor);
+    // The bracket under the caret and its partner (outlined where carets show).
+    const bracket_pair: ?brackets.Pair = if (show_carets) brackets.matchAtCaret(&doc.buffer, doc.cursors.primaryConst().offset) else null;
     const gutter_text_color = toDvui(editor.theme.gutter_text);
     const gutter_active_color = toDvui(editor.theme.gutter_text_active);
     const gutter_bg_color = toDvui(editor.theme.gutter_bg);
@@ -3784,22 +4008,27 @@ fn editorPane(editor: *Editor, pane_id: u8) void {
 
     // Text area width in pixels (for wrap measurement)
     const text_area_w = @max(0.0, text_clip_rect.w);
-    // Text area width in approximate columns (for ensureCursorVisible fallback)
-    const text_cols: usize = if (char_width > 0 and text_area_w > 0) @intFromFloat(@floor(text_area_w / char_width)) else 80;
 
     // Wrap continuation marker style
     const wrap_marker_color = toDvui(editor.theme.wrap_marker);
 
     // --- Render lines (gutter + text in two clips) ---
+    // Every column below is snapped to a code-point boundary of the drawn
+    // line before it slices text for dvui (which decodes with `catch
+    // unreachable`): the last line of defence against a tokenizer, Lua or
+    // server column that lands inside a UTF-8 sequence.
     var line_idx: usize = doc.scroll_top;
     var y: f32 = render_area.y;
+    const lang_opt = if (editor.syntax_highlighting) doc.language else null;
 
     while (line_idx < line_count and y < render_area.y + render_area.h) {
+        // Tokenizer state first: ensureLineState reads earlier lines, and a
+        // lineContent slice may alias the buffer's one shared scratch.
+        const line_state: syntax.LineState = if (lang_opt != null) doc.ensureLineState(line_idx) else .normal;
         const orig_line = doc.buffer.lineContent(line_idx);
         const line_start_offset = doc.buffer.line_starts.items[line_idx];
         var tab_exp_buf: [16384]u8 = undefined;
-        const line_text = expandTabs(orig_line, tab_width, &tab_exp_buf);
-        const has_tabs = line_text.ptr != orig_line.ptr;
+        const line_text = displayLine(orig_line, tab_width, &tab_exp_buf);
         const needs_wrap = do_wrap and line_text.len > 0 and @as(f32, @floatFromInt(line_text.len)) * char_width > text_area_w;
 
         // Pre-compute expanded selection ranges on this line (constant across
@@ -3821,33 +4050,25 @@ fn editorPane(editor: *Editor, pane_id: u8) void {
             else
                 0;
             const past_eol = sel.end > line_start_offset + orig_line.len;
-            const s_exp = if (has_tabs) bufColToExpCol(orig_line, s_in, tab_width) else s_in;
-            const e_exp = if (past_eol)
-                line_text.len + 1
-            else if (has_tabs)
-                bufColToExpCol(orig_line, e_in, tab_width)
-            else
-                e_in;
+            const s_exp = displayCol(orig_line, line_text, s_in, tab_width);
+            const e_exp = if (past_eol) line_text.len + 1 else displayCol(orig_line, line_text, e_in, tab_width);
             line_sels[line_sel_count] = .{ .start = s_exp, .end = e_exp, .to_eol = past_eol };
             line_sel_count += 1;
         }
 
         // Pre-compute expanded column for primary cursor on this line
-        const cursor_on_line = focused and cursor_pos.line == line_idx;
-        const cursor_exp: usize = if (cursor_on_line)
-            (if (has_tabs) bufColToExpCol(orig_line, cursor_pos.col, tab_width) else cursor_pos.col)
-        else
-            0;
+        const cursor_on_line = show_carets and cursor_pos.line == line_idx;
+        const cursor_exp: usize = if (cursor_on_line) displayCol(orig_line, line_text, cursor_pos.col, tab_width) else 0;
 
         // Pre-compute expanded columns for secondary cursors on this line
         var sc_exp_cols: [64]usize = undefined;
         var sc_count: usize = 0;
-        if (focused and doc.cursors.count() > 1) {
+        if (show_carets and doc.cursors.count() > 1) {
             for (doc.cursors.cursors.items[1..]) |sc| {
                 const sc_pos = doc.buffer.offsetToPos(sc.offset);
                 if (sc_pos.line != line_idx) continue;
                 if (sc_count >= 64) break;
-                sc_exp_cols[sc_count] = if (has_tabs) bufColToExpCol(orig_line, sc_pos.col, tab_width) else sc_pos.col;
+                sc_exp_cols[sc_count] = displayCol(orig_line, line_text, sc_pos.col, tab_width);
                 sc_count += 1;
             }
         }
@@ -3859,13 +4080,12 @@ fn editorPane(editor: *Editor, pane_id: u8) void {
         var exp_ends: [syntax.MAX_SPANS]usize = undefined;
         const lang_name: ?[]const u8 = if (doc.language) |l| l.name else null;
         // syntax_highlighting=false: skip tokenizing → plain text render
-        if (if (editor.syntax_highlighting) doc.language else null) |lang| {
-            const state = doc.ensureLineState(line_idx);
-            const result = syntax.tokenizeLine(orig_line, lang, state, &span_buf);
+        if (lang_opt) |lang| {
+            const result = syntax.tokenizeLine(orig_line, lang, line_state, &span_buf);
             span_count = result.count;
             for (0..span_count) |si| {
-                exp_starts[si] = if (has_tabs) bufColToExpCol(orig_line, span_buf[si].start, tab_width) else span_buf[si].start;
-                exp_ends[si] = if (has_tabs) bufColToExpCol(orig_line, span_buf[si].end, tab_width) else span_buf[si].end;
+                exp_starts[si] = displayCol(orig_line, line_text, span_buf[si].start, tab_width);
+                exp_ends[si] = displayCol(orig_line, line_text, span_buf[si].end, tab_width);
             }
         }
 
@@ -3951,25 +4171,30 @@ fn editorPane(editor: *Editor, pane_id: u8) void {
                 // For wrapped rows, x is always text_area_x (no scroll)
                 const row_x = if (needs_wrap) text_area_x else base_x;
 
-                // Selection highlights (every cursor's, pre-computed above)
+                // Selection highlights (every cursor's, pre-computed above).
+                // A selection that runs on past the line end also covers the
+                // end of its last row, up to the text area's edge — blank
+                // lines and a selection that starts at the line end included.
+                const last_row = row_end >= line_text.len;
                 for (line_sels[0..line_sel_count]) |ls| {
-                    if (ls.start < row_end and ls.end > row_start) {
-                        const sel_byte_start = if (ls.start > row_start) ls.start - row_start else 0;
-                        const sel_byte_end = if (ls.end < row_end) ls.end - row_start else segment.len;
+                    const in_row = ls.start < row_end and ls.end > row_start;
+                    const at_eol = ls.to_eol and last_row and ls.start >= row_start and ls.start <= row_end;
+                    if (!in_row and !at_eol) continue;
+                    const sel_byte_start = if (ls.start > row_start) ls.start - row_start else 0;
+                    const sel_byte_end = if (ls.end < row_end) ls.end - row_start else segment.len;
 
-                        const sx_start = font.textSize(segment[0..sel_byte_start]).w * scale;
-                        const sx_end = font.textSize(segment[0..@min(sel_byte_end, segment.len)]).w * scale;
+                    const sx_start = font.textSize(segment[0..@min(sel_byte_start, segment.len)]).w * scale;
+                    const sx_end = font.textSize(segment[0..@min(sel_byte_end, segment.len)]).w * scale;
 
-                        // Selection continuing past this line fills to the edge
-                        const sw = if (ls.to_eol and row_end >= line_text.len)
-                            text_area_w - sx_start
-                        else
-                            sx_end - sx_start;
+                    // Selection continuing past this line fills to the edge
+                    const sw = if (ls.to_eol and last_row)
+                        (text_area_x + text_area_w) - (row_x + sx_start)
+                    else
+                        sx_end - sx_start;
 
-                        if (sw > 0) {
-                            const sr: dvui.Rect.Physical = .{ .x = row_x + sx_start, .y = y, .w = sw, .h = line_height };
-                            sr.fill(.{}, .{ .color = sel_color, .fade = 0.3 });
-                        }
+                    if (sw > 0) {
+                        const sr: dvui.Rect.Physical = .{ .x = row_x + sx_start, .y = y, .w = sw, .h = line_height };
+                        sr.fill(.{}, .{ .color = sel_color, .fade = 0.3 });
                     }
                 }
 
@@ -3982,7 +4207,10 @@ fn editorPane(editor: *Editor, pane_id: u8) void {
                         var draw_x: f32 = row_x;
                         for (0..span_count) |si| {
                             if (exp_ends[si] <= row_start or exp_starts[si] >= row_end) continue;
-                            const vis_start = if (exp_starts[si] > row_start) exp_starts[si] - row_start else 0;
+                            // Span edges are boundaries (displayCol); an
+                            // overlapping or out-of-order span never draws
+                            // text a second time.
+                            const vis_start = @max(seg_pos, if (exp_starts[si] > row_start) exp_starts[si] - row_start else 0);
                             const vis_end = if (exp_ends[si] < row_end) exp_ends[si] - row_start else segment.len;
                             // Gap before span → default text color
                             if (vis_start > seg_pos) {
@@ -4032,28 +4260,47 @@ fn editorPane(editor: *Editor, pane_id: u8) void {
                     }
                 }
 
-                // Diagnostic underlines
+                // Matching-bracket highlight: an outline in the caret color
+                // around the bracket under the caret and its partner (a fill
+                // would fight the selection tint).
+                if (bracket_pair) |pair| {
+                    for ([_]usize{ pair.open, pair.close }) |off| {
+                        if (off < line_start_offset or off >= line_start_offset + orig_line.len) continue;
+                        const exp = displayCol(orig_line, line_text, off - line_start_offset, tab_width);
+                        if (exp < row_start or exp >= row_end) continue;
+                        const local = exp - row_start;
+                        const bx = font.textSize(segment[0..local]).w * scale;
+                        const bw = font.textSize(segment[local .. local + 1]).w * scale;
+                        const br: dvui.Rect.Physical = .{ .x = row_x + bx, .y = y, .w = bw, .h = line_height };
+                        br.stroke(.{}, .{ .thickness = 1 * scale, .color = caret_color, .closed = true });
+                    }
+                }
+
+                // Diagnostic underlines. Their columns are byte columns of
+                // the buffer line from servers, Lua and task matchers —
+                // possibly off a boundary or past the end (a file that was
+                // not open when they arrived was never snapped) — so they
+                // map through displayCol like everything drawn here.
                 var diag_it = doc.diagIter();
                 while (diag_it.next()) |diag| {
-                    if (diag.start_line == line_idx) {
-                        // Compute underline range within this row
-                        const ul_start = if (diag.start_col > row_start) diag.start_col - @as(u32, @intCast(row_start)) else 0;
-                        const ul_end_col = if (diag.end_line == line_idx) diag.end_col else @as(u32, @intCast(segment.len));
-                        const ul_end = if (ul_end_col > row_start) ul_end_col - @as(u32, @intCast(row_start)) else 0;
-                        const clamped_start = @min(ul_start, segment.len);
-                        const clamped_end = @min(ul_end, segment.len);
-                        if (clamped_end > clamped_start) {
-                            const ux_start = font.textSize(segment[0..clamped_start]).w * scale;
-                            const ux_end = font.textSize(segment[0..clamped_end]).w * scale;
-                            const ul_rect: dvui.Rect.Physical = .{
-                                .x = row_x + ux_start,
-                                .y = y + line_height - 2 * scale,
-                                .w = ux_end - ux_start,
-                                .h = 2 * scale,
-                            };
-                            ul_rect.fill(.{}, .{ .color = diagnosticColor(diag.severity), .fade = 0.8 });
-                        }
-                    }
+                    if (diag.start_line != line_idx) continue;
+                    const d_start = displayCol(orig_line, line_text, diag.start_col, tab_width);
+                    const d_end = if (diag.end_line == line_idx)
+                        displayCol(orig_line, line_text, diag.end_col, tab_width)
+                    else
+                        line_text.len; // runs on past this line
+                    const ul_start = @max(d_start, row_start) - row_start;
+                    const ul_end = @min(d_end, row_end) -| row_start;
+                    if (ul_end <= ul_start) continue;
+                    const ux_start = font.textSize(segment[0..ul_start]).w * scale;
+                    const ux_end = font.textSize(segment[0..ul_end]).w * scale;
+                    const ul_rect: dvui.Rect.Physical = .{
+                        .x = row_x + ux_start,
+                        .y = y + line_height - 2 * scale,
+                        .w = ux_end - ux_start,
+                        .h = 2 * scale,
+                    };
+                    ul_rect.fill(.{}, .{ .color = diagnosticColor(diag.severity), .fade = 0.8 });
                 }
 
                 // Cursor (using pre-computed expanded col, with blink)
@@ -4133,8 +4380,6 @@ fn editorPane(editor: *Editor, pane_id: u8) void {
         }
     }
 
-    _ = text_cols; // used for future scroll adjustment
-
     // --- Focused pane indicator (subtle border highlight) ---
     if (is_active_pane and (winLayout(editor, cur_win).paneCount() > 1 or editor.windows.items.len > 1)) {
         const focus_color = toDvui(editor.theme.selection);
@@ -4167,12 +4412,69 @@ fn editorPane(editor: *Editor, pane_id: u8) void {
         drawModalOverlay(editor, render_area, render_rs, scale);
     }
 
+    // --- Signature help (above the caret line), then the completion popup on top ---
+    if (is_active_pane and pane_doc_idx < editor.documents.items.len and editor.documents.items[pane_doc_idx].id == editor.signature_doc_id and editor.signatureVisible()) {
+        drawSignatureHelpGui(editor, render_area, font, line_height, scale);
+    }
     // --- Completion popup (renders on top, only in active pane) ---
     if (is_active_pane and editor.completion_active and editor.completion_items.items.len > 0 and
         editor.completion_doc_idx == pane_doc_idx)
     {
         drawCompletionPopupGui(editor, render_area, font, line_height, scale);
     }
+}
+
+/// The signature of the call at the caret: the label with the active
+/// parameter highlighted, and a documentation line under it when there is
+/// one. Sits above the caret line (below it when there is no room).
+fn drawSignatureHelpGui(editor: *Editor, render_area: dvui.Rect.Physical, font: dvui.Font, line_height: f32, scale: f32) void {
+    if (!build_options.has_gui) return;
+    const sig = editor.signature orelse return;
+    const pad: f32 = 4 * scale;
+    const doc = editor.activeDoc();
+    const cursor_pos = doc.buffer.offsetToPos(doc.cursors.primaryConst().offset);
+    const tab_width = editor.tabWidthFor(doc);
+    const gutter_digits = guiLineNumberDigits(doc.lineCount(), editor.gutter_min_digits);
+    const char_w = font.textSize("0").w * scale;
+    const gutter_w = @as(f32, @floatFromInt(gutter_digits + 1)) * char_w + 8 * scale;
+    const line_text = doc.lineContent(cursor_pos.line);
+    var visual_col: usize = 0;
+    var byte_col: usize = 0;
+    while (byte_col < cursor_pos.col and byte_col < line_text.len) : (byte_col += 1) {
+        if (line_text[byte_col] == '\t') {
+            visual_col = (visual_col / tab_width + 1) * tab_width;
+        } else {
+            visual_col += 1;
+        }
+    }
+    const rows: f32 = if (sig.doc.len > 0) 2 else 1;
+    const popup_h = rows * line_height + pad * 2;
+    const label_w = font.textSize(sig.label).w * scale;
+    const doc_w: f32 = if (sig.doc.len > 0) font.textSize(sig.doc).w * scale else 0;
+    const popup_w = @min(@max(label_w, doc_w) + pad * 2, render_area.w);
+    const cursor_x = render_area.x + gutter_w + @as(f32, @floatFromInt(visual_col)) * char_w;
+    const popup_x = @max(render_area.x, @min(cursor_x, render_area.x + render_area.w - popup_w));
+    const cursor_y_rel: f32 = if (cursor_pos.line >= doc.scroll_top) @as(f32, @floatFromInt(cursor_pos.line - doc.scroll_top)) * line_height else 0;
+    var popup_y = render_area.y + cursor_y_rel - popup_h;
+    if (popup_y < render_area.y) popup_y = render_area.y + cursor_y_rel + line_height;
+    const bg = toDvui(editor.theme.overlay_bg);
+    const fg = toDvui(editor.theme.overlay_fg);
+    const dim = toDvui(editor.theme.overlay_dim);
+    const highlight = toDvui(editor.theme.overlay_selection);
+    const box: dvui.Rect.Physical = .{ .x = popup_x, .y = popup_y, .w = popup_w, .h = popup_h };
+    box.fill(.{}, .{ .color = bg, .fade = 1.0 });
+    const rs: dvui.RectScale = .{ .r = box, .s = scale };
+    const text_y = popup_y + pad;
+    const x0 = popup_x + pad;
+    const param = sig.label[sig.param_start..sig.param_end];
+    if (param.len > 0) {
+        const before_w = font.textSize(sig.label[0..sig.param_start]).w * scale;
+        const param_w = font.textSize(param).w * scale;
+        const bar: dvui.Rect.Physical = .{ .x = x0 + before_w, .y = text_y, .w = param_w, .h = line_height };
+        bar.fill(.{}, .{ .color = highlight, .fade = 1.0 });
+    }
+    renderOverlayText(font, sig.label, x0, text_y, rs, fg);
+    if (sig.doc.len > 0) renderOverlayText(font, sig.doc, x0, text_y + line_height, rs, dim);
 }
 
 /// Render a terminal pane in the GUI using the cell grid.
@@ -4247,9 +4549,13 @@ fn terminalPane(editor: *Editor, pane_id: u8, term_idx: usize) void {
         }
     }
 
-    // Handle keyboard input for terminal — not while a modal is open,
-    // otherwise unconsumed keys would be typed into the shell.
-    if (is_active_pane and guiMode(editor) == .normal) {
+    // Keyboard input for the terminal — only while it owns the keyboard:
+    // not under a modal (unconsumed keys would be typed into the shell)
+    // and not while the file tree or search panel is focused over it.
+    // Printable characters arrive as text events, which SDL only sends
+    // while someone declares a text-input region.
+    if (is_active_pane and terminalTakesKeys(editor)) {
+        dvui.wantTextInput(area.toNatural());
         if (handleTerminalKeyEvents(editor, term, wd)) return; // terminal was freed
     }
 
@@ -4366,8 +4672,10 @@ fn terminalPane(editor: *Editor, pane_id: u8, term_idx: usize) void {
         }
     }
 
-    // Draw cursor — measure text prefix up to cursor column for accurate positioning
-    if (is_active_pane and t_cursor_visible and !t_exited) {
+    // Draw cursor — measure text prefix up to cursor column for accurate
+    // positioning. Only while typing goes here (a side panel focused over
+    // the terminal owns the keyboard).
+    if (is_active_pane and editor.keyboardOwner() == .terminal and t_cursor_visible and !t_exited) {
         var prefix_buf: [512]u8 = undefined;
         var prefix_len: usize = 0;
         for (0..@as(usize, t_cursor_col)) |c| {
@@ -4419,94 +4727,71 @@ fn terminalPane(editor: *Editor, pane_id: u8, term_idx: usize) void {
     }
 }
 
-/// Handle keyboard events when a terminal pane is focused.
-/// Returns true if the terminal was closed and caller should stop using `term`.
+/// Keys and text for the focused terminal pane while it owns the keyboard
+/// (terminalTakesKeys). Printable characters come from `.text` events only,
+/// so the OS keyboard layout decides what a key types (Shift+7 on a German
+/// layout is `/`; AltGr and dead keys work); key events carry the special
+/// keys and the Ctrl/Alt chords. Returns true if the terminal was closed
+/// and the caller must stop using `term`.
 fn handleTerminalKeyEvents(editor: *Editor, term: *terminal_mod.Terminal, wd: *dvui.WidgetData) bool {
     if (!build_options.has_gui) return false;
 
-    for (dvui.events()) |*e| {
+    const events = dvui.events();
+    for (events, 0..) |*e, i| {
         if (e.handled) continue;
+        if (!terminalTakesKeys(editor)) break;
 
         switch (e.evt) {
             .key => |key| {
                 if (key.action != .down and key.action != .repeat) continue;
-
-                // Skip modifier-only keys
-                if (key.code == .left_shift or key.code == .right_shift or
-                    key.code == .left_control or key.code == .right_control or
-                    key.code == .left_alt or key.code == .right_alt or
-                    key.code == .left_command or key.code == .right_command) continue;
+                if (isModifierKey(key.code)) continue;
 
                 // Pane / window / terminal management chords (ctrl+` toggle,
                 // ctrl+alt+q close, ctrl+alt+` detach, F6 focus, ...) are not
                 // typed into the shell. They mutate the layout, so they run
-                // after the panes finished rendering (deferred_action).
-                if (key.mod.control() or key.mod.alt()) {
-                    var kbuf: [64]u8 = undefined;
-                    var action = editor.terminalPassthroughAction(dvuiKeyToStr(key, &kbuf));
-                    if (action == null and key.mod.shift()) {
-                        var kbuf2: [64]u8 = undefined;
-                        action = editor.terminalPassthroughAction(dvuiKeyToStrNoShift(key, &kbuf2));
-                    }
-                    if (action) |a| {
+                // after the panes finished rendering (DeferredQueue).
+                if (key.mod.control() or key.mod.alt() or isFKey(key.code)) {
+                    if (chordAction(editor, key, true)) |action| {
                         e.handle(@src(), wd);
-                        deferred_action = a;
+                        deferRun(editor, .action, action);
                         continue;
                     }
                 }
 
-                // Special keys (arrows, enter, backspace, etc.)
+                var out: [16]u8 = undefined;
+                // Special keys (arrows, F-keys, enter, backspace, etc.) with
+                // modifiers — arrows in the program's cursor-key mode.
                 const special_cp: u21 = mapDvuiKey(key.code);
                 if (special_cp != 0) {
                     e.handle(@src(), wd);
-                    var out: [16]u8 = undefined;
-                    const n = terminal_mod.Terminal.encodeKey(
-                        special_cp,
-                        key.mod.control(),
-                        key.mod.alt(),
-                        key.mod.shift(),
-                        &out,
-                    );
-                    if (n > 0) {
-                        term.writeInput(out[0..n]);
-                    }
+                    const n = encodeSpecialKey(term, special_cp, key.mod.control(), key.mod.alt(), key.mod.shift(), &out);
+                    if (n > 0) term.writeInput(out[0..n]);
                     continue;
                 }
 
-                // Printable character keys (letters, digits, punctuation)
-                if (dvuiKeyToChar(key.code, key.mod.shift())) |cp| {
-                    e.handle(@src(), wd);
-                    var out: [16]u8 = undefined;
-                    // For ctrl+letter, use the base (lowercase) char
-                    const base_cp: u21 = if (key.mod.control())
-                        (dvuiKeyToChar(key.code, false) orelse cp)
-                    else
-                        cp;
-                    const n = terminal_mod.Terminal.encodeKey(
-                        base_cp,
-                        key.mod.control(),
-                        key.mod.alt(),
-                        false,
-                        &out,
-                    );
-                    if (n > 0) {
-                        term.writeInput(out[0..n]);
-                    }
-                    continue;
-                }
+                // Printable keys type through their text event. A Ctrl or
+                // Alt chord has none and is encoded here from the key's
+                // unshifted character, unless the keystroke typed one after
+                // all (AltGr; Ctrl+Alt on Windows) — then its text wins.
+                const base = printableKeyChar(key.code) orelse continue;
+                const text_ev = keystrokeText(events, i);
+                const route = terminalKeyRoute(key.mod.control(), key.mod.alt(), text_ev != null);
+                if (route == .text) continue;
+                e.handle(@src(), wd);
+                if (route == .chord_drop_text) text_ev.?.handled = true;
+                const cp: u21 = if (key.mod.shift() and !key.mod.control()) std.ascii.toUpper(base) else base;
+                const n = terminal_mod.Terminal.encodeKey(cp, key.mod.control(), key.mod.alt(), false, &out);
+                if (n > 0) term.writeInput(out[0..n]);
             },
-            .text => |te| {
-                // Fallback for characters not covered by dvuiKeyToChar
-                // (e.g. international input methods)
-                switch (te.action) {
-                    .value => |val| {
-                        if (val.txt.len > 0) {
-                            e.handle(@src(), wd);
-                            term.writeInput(val.txt);
-                        }
-                    },
-                    else => {},
-                }
+            .text => |te| switch (te.action) {
+                .value => |val| {
+                    // IME composition updates are not final text; control
+                    // characters come as key events.
+                    if (val.selected or !isTypedText(val.txt)) continue;
+                    e.handle(@src(), wd);
+                    term.writeInput(val.txt);
+                },
+                else => {},
             },
             else => {},
         }
@@ -4514,7 +4799,50 @@ fn handleTerminalKeyEvents(editor: *Editor, term: *terminal_mod.Terminal, wd: *d
     return false;
 }
 
-/// Map DVUI key enum to a codepoint for terminal key encoding.
+/// How the terminal treats a printable key-down (handleTerminalKeyEvents).
+const TermKeyRoute = enum {
+    /// Its text event types it: a plain or Shift key, or a character that
+    /// AltGr (or Ctrl+Alt on Windows) produced.
+    text,
+    /// Encode the Ctrl/Alt chord from the key event.
+    chord,
+    /// Encode the Ctrl chord and drop the keystroke's text event (Windows
+    /// types a ' ' with Ctrl+Space that must not follow its NUL).
+    chord_drop_text,
+};
+
+fn terminalKeyRoute(ctrl: bool, alt: bool, has_text: bool) TermKeyRoute {
+    if (!ctrl and !alt) return .text;
+    if (alt) return if (has_text) .text else .chord;
+    return if (has_text) .chord_drop_text else .chord;
+}
+
+/// The final text event a keystroke produced, if any: SDL queues it right
+/// behind the key-down, before the next key event.
+fn keystrokeText(events: []dvui.Event, key_index: usize) ?*dvui.Event {
+    for (events[key_index + 1 ..]) |*e| {
+        switch (e.evt) {
+            .text => |te| return if (!e.handled and te.action == .value and !te.action.value.selected) e else null,
+            .key => return null,
+            else => {},
+        }
+    }
+    return null;
+}
+
+/// Text a key typed: no control bytes (those arrive as key events).
+fn isTypedText(txt: []const u8) bool {
+    if (txt.len == 0) return false;
+    for (txt) |b| {
+        if (b < 0x20 or b == 0x7f) return false;
+    }
+    return true;
+}
+
+/// Map DVUI key enum to a codepoint for terminal key encoding (the keys
+/// that never arrive as text); 0 for any other key. Space is printable: it
+/// types through its text event, and Ctrl/Alt+Space go through
+/// printableKeyChar.
 fn mapDvuiKey(key: dvui.enums.Key) u21 {
     return switch (key) {
         .up => 0xF700,
@@ -4531,62 +4859,28 @@ fn mapDvuiKey(key: dvui.enums.Key) u21 {
         .tab => 0x09,
         .backspace => 0x08,
         .escape => 0x1B,
-        .space => ' ',
+        .f1, .f2, .f3, .f4, .f5, .f6, .f7, .f8, .f9, .f10, .f11, .f12 => terminal_mod.key_f1 + @as(u21, @intCast(@intFromEnum(key) - @intFromEnum(dvui.enums.Key.f1))),
         else => 0,
     };
 }
 
-/// Map DVUI key code to a printable character, handling shift for US keyboard layout.
-fn dvuiKeyToChar(key: dvui.enums.Key, shift: bool) ?u21 {
-    return switch (key) {
-        .a => if (shift) @as(u21, 'A') else 'a',
-        .b => if (shift) @as(u21, 'B') else 'b',
-        .c => if (shift) @as(u21, 'C') else 'c',
-        .d => if (shift) @as(u21, 'D') else 'd',
-        .e => if (shift) @as(u21, 'E') else 'e',
-        .f => if (shift) @as(u21, 'F') else 'f',
-        .g => if (shift) @as(u21, 'G') else 'g',
-        .h => if (shift) @as(u21, 'H') else 'h',
-        .i => if (shift) @as(u21, 'I') else 'i',
-        .j => if (shift) @as(u21, 'J') else 'j',
-        .k => if (shift) @as(u21, 'K') else 'k',
-        .l => if (shift) @as(u21, 'L') else 'l',
-        .m => if (shift) @as(u21, 'M') else 'm',
-        .n => if (shift) @as(u21, 'N') else 'n',
-        .o => if (shift) @as(u21, 'O') else 'o',
-        .p => if (shift) @as(u21, 'P') else 'p',
-        .q => if (shift) @as(u21, 'Q') else 'q',
-        .r => if (shift) @as(u21, 'R') else 'r',
-        .s => if (shift) @as(u21, 'S') else 's',
-        .t => if (shift) @as(u21, 'T') else 't',
-        .u => if (shift) @as(u21, 'U') else 'u',
-        .v => if (shift) @as(u21, 'V') else 'v',
-        .w => if (shift) @as(u21, 'W') else 'w',
-        .x => if (shift) @as(u21, 'X') else 'x',
-        .y => if (shift) @as(u21, 'Y') else 'y',
-        .z => if (shift) @as(u21, 'Z') else 'z',
-        .zero => if (shift) @as(u21, ')') else '0',
-        .one => if (shift) @as(u21, '!') else '1',
-        .two => if (shift) @as(u21, '@') else '2',
-        .three => if (shift) @as(u21, '#') else '3',
-        .four => if (shift) @as(u21, '$') else '4',
-        .five => if (shift) @as(u21, '%') else '5',
-        .six => if (shift) @as(u21, '^') else '6',
-        .seven => if (shift) @as(u21, '&') else '7',
-        .eight => if (shift) @as(u21, '*') else '8',
-        .nine => if (shift) @as(u21, '(') else '9',
-        .minus => if (shift) @as(u21, '_') else '-',
-        .equal => if (shift) @as(u21, '+') else '=',
-        .left_bracket => if (shift) @as(u21, '{') else '[',
-        .right_bracket => if (shift) @as(u21, '}') else ']',
-        .backslash => if (shift) @as(u21, '|') else '\\',
-        .semicolon => if (shift) @as(u21, ':') else ';',
-        .apostrophe => if (shift) @as(u21, '"') else '\'',
-        .comma => if (shift) @as(u21, '<') else ',',
-        .period => if (shift) @as(u21, '>') else '.',
-        .slash => if (shift) @as(u21, '?') else '/',
-        .grave => if (shift) @as(u21, '~') else '`',
-        else => null,
+/// Terminal.encodeKey, in application cursor-key mode (DECCKM: ncurses
+/// programs expect ESC O A for Up) when the program switched it on.
+fn encodeSpecialKey(term: *terminal_mod.Terminal, key: u21, ctrl: bool, alt: bool, shift: bool, out: *[16]u8) u8 {
+    return terminal_mod.Terminal.encodeKeyMode(key, ctrl, alt, shift, term.appCursorKeys(), out);
+}
+
+/// The unshifted character of a printable key, for the terminal's Ctrl/Alt
+/// chords (Ctrl+C → ETX, Alt+b → ESC b). Plain typing never uses this: the
+/// layout's text events do.
+fn printableKeyChar(code: dvui.enums.Key) ?u8 {
+    return switch (code) {
+        .space => ' ',
+        .backslash => '\\',
+        else => {
+            const name = key_name_map.get(@tagName(code)) orelse return null;
+            return if (name.len == 1) name[0] else null;
+        },
     };
 }
 
@@ -4664,8 +4958,8 @@ fn handleMouseEvents(editor: *Editor, pane_id: u8, wd: *dvui.WidgetData, area: d
                     // act on the selection). Deliberately left unhandled: the
                     // pane's ContextWidget (created after this) consumes the
                     // press and opens the context menu.
+                    // Focusing the pane takes the keyboard from the side panels.
                     editor.focusPaneIn(cur_win, pane_id);
-                    editor.filetree_focused = false;
                     const offset = screenToOffset(doc, area, font, line_height, scale, me.p, tab_width, do_wrap);
                     const c = doc.cursors.primary();
                     const inside_selection = if (c.selectionRange()) |r|
@@ -4685,9 +4979,9 @@ fn handleMouseEvents(editor: *Editor, pane_id: u8, wd: *dvui.WidgetData, area: d
                 dvui.focusWidget(wd.id, null, e.num);
                 win_ui.scroll_pinned = false;
 
-                // Focus this pane on click (and take focus back from the tree)
+                // Focus this pane on click (it takes the keyboard back from
+                // the tree and the search panel)
                 editor.focusPaneIn(cur_win, pane_id);
-                editor.filetree_focused = false;
 
                 // Scrollbar band: drag the thumb, or page toward the click.
                 if (me.p.x >= area.x + area.w - editor_sb_band * scale) {
@@ -4726,7 +5020,7 @@ fn handleMouseEvents(editor: *Editor, pane_id: u8, wd: *dvui.WidgetData, area: d
                         win_ui.block_anchor_line = p.line;
                         win_ui.block_anchor_col = p.col;
                     } else {
-                        doc.cursors.addCursor(offset) catch {};
+                        addCursorAt(doc, offset);
                     }
                     continue;
                 }
@@ -4920,6 +5214,8 @@ fn handleMouseEvents(editor: *Editor, pane_id: u8, wd: *dvui.WidgetData, area: d
 }
 
 /// Find word boundaries around a byte offset (for double-click selection).
+/// Every byte of a non-ASCII character is a word byte (cursor.isWordByte),
+/// so `café` selects whole and a boundary never splits a character.
 fn wordBoundaryAt(doc: *Document, offset: usize) struct { start: usize, end: usize } {
     const buf_len = doc.buffer.byteLen();
     const content = doc.buffer.slice(0, buf_len);
@@ -4927,19 +5223,19 @@ fn wordBoundaryAt(doc: *Document, offset: usize) struct { start: usize, end: usi
 
     const pos = @min(offset, content.len -| 1);
 
-    if (isWordCharGui(content[pos])) {
+    if (cursor_mod.isWordByte(content[pos])) {
         // Inside a word — expand both directions
         var start = pos;
-        while (start > 0 and isWordCharGui(content[start - 1])) start -= 1;
+        while (start > 0 and cursor_mod.isWordByte(content[start - 1])) start -= 1;
         var end = pos;
-        while (end < content.len and isWordCharGui(content[end])) end += 1;
+        while (end < content.len and cursor_mod.isWordByte(content[end])) end += 1;
         return .{ .start = start, .end = end };
     } else {
         // On whitespace/punctuation — select the run of non-word chars
         var start = pos;
-        while (start > 0 and !isWordCharGui(content[start - 1]) and content[start - 1] != '\n') start -= 1;
+        while (start > 0 and !cursor_mod.isWordByte(content[start - 1]) and content[start - 1] != '\n') start -= 1;
         var end = pos;
-        while (end < content.len and !isWordCharGui(content[end]) and content[end] != '\n') end += 1;
+        while (end < content.len and !cursor_mod.isWordByte(content[end]) and content[end] != '\n') end += 1;
         return .{ .start = start, .end = end };
     }
 }
@@ -4953,10 +5249,6 @@ fn lineBoundaryAt(doc: *const Document, offset: usize) struct { start: usize, en
     else
         doc.buffer.byteLen();
     return .{ .start = line_start, .end = line_end };
-}
-
-fn isWordCharGui(byte: u8) bool {
-    return std.ascii.isAlphanumeric(byte) or byte == '_';
 }
 
 /// Convert a screen position (physical pixels) to a byte offset in the buffer.
@@ -4979,7 +5271,7 @@ fn screenToOffset(doc: *Document, area: dvui.Rect.Physical, font: dvui.Font, lin
     while (line_idx < line_count) {
         const orig_line = doc.buffer.lineContent(line_idx);
         var exp_buf: [16384]u8 = undefined;
-        const line_text = expandTabs(orig_line, tab_width, &exp_buf);
+        const line_text = displayLine(orig_line, tab_width, &exp_buf);
         const needs_wrap = do_wrap and line_text.len > 0 and @as(f32, @floatFromInt(line_text.len)) * (char_width / scale) > text_area_w;
 
         var byte_pos: usize = 0;
@@ -4996,7 +5288,7 @@ fn screenToOffset(doc: *Document, area: dvui.Rect.Physical, font: dvui.Font, lin
                 const rel_x = p.x - area.x + scroll_x_px;
                 if (rel_x <= 0 or segment.len == 0) {
                     const buf_col = expColToBufCol(orig_line, row_start, tab_width);
-                    return @import("../core/cursor.zig").lineOffset(&doc.buffer, line_idx, buf_col);
+                    return cursor_mod.lineOffset(&doc.buffer, line_idx, buf_col);
                 }
 
                 const target_x = rel_x / scale;
@@ -5004,7 +5296,7 @@ fn screenToOffset(doc: *Document, area: dvui.Rect.Physical, font: dvui.Font, lin
                 _ = font.textSizeEx(segment, .{ .max_width = target_x, .end_idx = &end_idx, .end_metric = .nearest });
                 // Convert expanded position back to buffer position
                 const buf_col = expColToBufCol(orig_line, row_start + end_idx, tab_width);
-                return @import("../core/cursor.zig").lineOffset(&doc.buffer, line_idx, buf_col);
+                return cursor_mod.lineOffset(&doc.buffer, line_idx, buf_col);
             }
 
             visual_rows_consumed += 1;
@@ -5040,7 +5332,7 @@ fn handleGuiKeyEvents(editor: *Editor, wd: *dvui.WidgetData) bool {
                 if (key.code == .escape) {
                     e.handle(@src(), wd);
                     handled_any = true;
-                    editor.mode = .normal;
+                    editor.setMode(.normal);
                     // The dialog subwindow disappears next frame — refocus
                     // the base window so editor keys work immediately.
                     dvui.focusSubwindow(null, null);
@@ -5049,8 +5341,13 @@ fn handleGuiKeyEvents(editor: *Editor, wd: *dvui.WidgetData) bool {
             return handled_any;
         }
 
+        const mode = editor.mode;
         for (dvui.events()) |*e| {
             if (e.handled) continue;
+            // A key that closed or switched the prompt ends its input: the
+            // rest never reaches the next prompt (a second `s` staging
+            // after "save and stage", say).
+            if (editor.mode != mode) break;
             switch (e.evt) {
                 .key => |key| {
                     if (key.action != .down and key.action != .repeat) continue;
@@ -5061,7 +5358,8 @@ fn handleGuiKeyEvents(editor: *Editor, wd: *dvui.WidgetData) bool {
                 .text => |te| {
                     switch (te.action) {
                         .value => |val| {
-                            if (val.txt.len > 0) {
+                            // `selected` = uncommitted IME composition.
+                            if (val.txt.len > 0 and !val.selected) {
                                 e.handle(@src(), wd);
                                 handled_any = true;
                                 handleModalText(editor, val.txt);
@@ -5180,10 +5478,17 @@ fn handleGuiKeyEvents(editor: *Editor, wd: *dvui.WidgetData) bool {
                 if (!is_focused) continue;
                 switch (te.action) {
                     .value => |val| {
-                        // Filter control chars (Tab, Enter, etc.) — handled as key events
-                        if (val.txt.len > 0 and val.txt[0] >= 32) {
+                        // Filter control chars (Tab, Enter, etc.) — handled
+                        // as key events — and uncommitted IME composition
+                        // (`selected`): only the committed text is typed.
+                        if (val.txt.len > 0 and val.txt[0] >= 32 and !val.selected) {
                             e.handle(@src(), wd);
                             handled_any = true;
+                            // Windows types a " " for Ctrl+Space; the chord already ran.
+                            if (win_ui.swallow_space and std.mem.eql(u8, val.txt, " ")) {
+                                win_ui.swallow_space = false;
+                                continue;
+                            }
                             _ = editor.execCommand("insert_char", val.txt);
                         }
                     },
@@ -5215,11 +5520,25 @@ fn handleGuiSnippetOrCompletionKey(editor: *Editor, key: dvui.Event.Key) bool {
             editor.completion_selected = (editor.completion_selected + 1) % count;
         },
         else => {
-            editor.clearCompletionItems();
+            // Letters, digits, `_` and the server's trigger characters keep
+            // the popup: their text event refilters or re-requests it.
+            if (!completionKeepsOnKey(editor, key)) editor.clearCompletionItems();
             return false;
         },
     }
     return true;
+}
+
+/// A key-down that will type an identifier byte or a completion trigger
+/// character (its text event follows). Chords never count.
+fn completionKeepsOnKey(editor: *Editor, key: dvui.Event.Key) bool {
+    if (hasCommandMod(key.mod)) return false;
+    return switch (key.code) {
+        .a, .b, .c, .d, .e, .f, .g, .h, .i, .j, .k, .l, .m, .n, .o, .p, .q, .r, .s, .t, .u, .v, .w, .x, .y, .z, .zero, .one, .two, .three, .four, .five, .six, .seven, .eight, .nine => true,
+        .minus => key.mod.shift(), // '_'
+        .period => editor.completionKeepsOnByte('.'),
+        else => false,
+    };
 }
 
 /// Execute an action with GUI-specific overrides (native file dialogs).
@@ -5244,6 +5563,10 @@ fn execGuiAction(editor: *Editor, action: []const u8) void {
         openFileDialog(editor);
         return;
     }
+    if (std.mem.eql(u8, action, "open_folder")) {
+        openFolderDialog(editor);
+        return;
+    }
     // Visual-row-aware multi-cursor add when word wrap is on
     if (editor.wordWrapFor(editor.activeDoc())) {
         if (std.mem.eql(u8, action, "add_cursor_above")) {
@@ -5259,181 +5582,63 @@ fn execGuiAction(editor: *Editor, action: []const u8) void {
     _ = editor.execAction(action);
 }
 
-/// Convert a DVUI key event to a keybind map string (e.g. "ctrl+s", "alt+up").
-fn dvuiKeyToStr(key: dvui.Event.Key, buf: *[64]u8) []const u8 {
-    var pos: usize = 0;
+/// Keybind key name (contract 6 vocabulary: a-z, 0-9, f1-f12, the named
+/// keys and `[ ] ; ' , . / - =` and backtick) for each dvui key tag.
+/// Plain strings, so the core test build — which has no dvui — can check
+/// the table; the comptime block below checks every tag against dvui's
+/// enum in GUI builds.
+const key_name_pairs = .{
+    .{ "a", "a" },            .{ "b", "b" },             .{ "c", "c" },                 .{ "d", "d" },
+    .{ "e", "e" },            .{ "f", "f" },             .{ "g", "g" },                 .{ "h", "h" },
+    .{ "i", "i" },            .{ "j", "j" },             .{ "k", "k" },                 .{ "l", "l" },
+    .{ "m", "m" },            .{ "n", "n" },             .{ "o", "o" },                 .{ "p", "p" },
+    .{ "q", "q" },            .{ "r", "r" },             .{ "s", "s" },                 .{ "t", "t" },
+    .{ "u", "u" },            .{ "v", "v" },             .{ "w", "w" },                 .{ "x", "x" },
+    .{ "y", "y" },            .{ "z", "z" },             .{ "zero", "0" },              .{ "one", "1" },
+    .{ "two", "2" },          .{ "three", "3" },         .{ "four", "4" },              .{ "five", "5" },
+    .{ "six", "6" },          .{ "seven", "7" },         .{ "eight", "8" },             .{ "nine", "9" },
+    .{ "f1", "f1" },          .{ "f2", "f2" },           .{ "f3", "f3" },               .{ "f4", "f4" },
+    .{ "f5", "f5" },          .{ "f6", "f6" },           .{ "f7", "f7" },               .{ "f8", "f8" },
+    .{ "f9", "f9" },          .{ "f10", "f10" },         .{ "f11", "f11" },             .{ "f12", "f12" },
+    .{ "up", "up" },          .{ "down", "down" },       .{ "left", "left" },           .{ "right", "right" },
+    .{ "home", "home" },      .{ "end", "end" },         .{ "page_up", "page_up" },     .{ "page_down", "page_down" },
+    .{ "insert", "insert" },  .{ "delete", "delete" },   .{ "backspace", "backspace" }, .{ "tab", "tab" },
+    .{ "enter", "enter" },    .{ "escape", "escape" },   .{ "space", "space" },         .{ "backslash", "backslash" },
+    .{ "left_bracket", "[" }, .{ "right_bracket", "]" }, .{ "semicolon", ";" },         .{ "apostrophe", "'" },
+    .{ "comma", "," },        .{ "period", "." },        .{ "slash", "/" },             .{ "minus", "-" },
+    .{ "equal", "=" },        .{ "grave", "`" },
+};
+const key_name_map = std.StaticStringMap([]const u8).initComptime(key_name_pairs);
 
-    if (key.mod.control()) {
-        @memcpy(buf[pos .. pos + 5], "ctrl+");
-        pos += 5;
-    }
-    if (key.mod.alt()) {
-        @memcpy(buf[pos .. pos + 4], "alt+");
-        pos += 4;
-    }
-    if (key.mod.shift()) {
-        @memcpy(buf[pos .. pos + 6], "shift+");
-        pos += 6;
-    }
-
-    const name: ?[]const u8 = switch (key.code) {
-        .up => "up",
-        .down => "down",
-        .left => "left",
-        .right => "right",
-        .home => "home",
-        .end => "end",
-        .page_up => "page_up",
-        .page_down => "page_down",
-        .backspace => "backspace",
-        .delete => "delete",
-        .tab => "tab",
-        .enter => "enter",
-        .escape => "escape",
-        .slash => "/",
-        .backslash => "backslash",
-        .minus => "-",
-        .equal => "=",
-        .space => "space",
-        .comma => ",",
-        .grave => "`",
-        .a => "a",
-        .b => "b",
-        .c => "c",
-        .d => "d",
-        .e => "e",
-        .f => "f",
-        .g => "g",
-        .h => "h",
-        .i => "i",
-        .j => "j",
-        .k => "k",
-        .l => "l",
-        .m => "m",
-        .n => "n",
-        .o => "o",
-        .p => "p",
-        .q => "q",
-        .r => "r",
-        .s => "s",
-        .t => "t",
-        .u => "u",
-        .v => "v",
-        .w => "w",
-        .x => "x",
-        .y => "y",
-        .z => "z",
-        .f1 => "f1",
-        .f2 => "f2",
-        .f3 => "f3",
-        .f4 => "f4",
-        .f5 => "f5",
-        .f6 => "f6",
-        .f7 => "f7",
-        .f8 => "f8",
-        .f9 => "f9",
-        .f10 => "f10",
-        .f11 => "f11",
-        .f12 => "f12",
-        else => null,
-    };
-
-    if (name) |n| {
-        if (pos + n.len <= 64) {
-            @memcpy(buf[pos .. pos + n.len], n);
-            pos += n.len;
+comptime {
+    if (build_options.has_gui) {
+        for (key_name_pairs) |pair| {
+            if (!@hasField(dvui.enums.Key, pair[0])) @compileError("no dvui key named " ++ pair[0]);
         }
-        return buf[0..pos];
     }
+}
 
-    return buf[0..0];
+/// Convert a DVUI key event to a keybind map string (e.g. "ctrl+s",
+/// "alt+up", "ctrl+1"); empty for a key with no keybind name.
+fn dvuiKeyToStr(key: dvui.Event.Key, buf: *[64]u8) []const u8 {
+    return comboString(key.mod.control(), key.mod.alt(), key.mod.shift(), @tagName(key.code), buf);
 }
 
 /// Same as dvuiKeyToStr but without the shift modifier.
 fn dvuiKeyToStrNoShift(key: dvui.Event.Key, buf: *[64]u8) []const u8 {
-    var pos: usize = 0;
+    return comboString(key.mod.control(), key.mod.alt(), false, @tagName(key.code), buf);
+}
 
-    if (key.mod.control()) {
-        @memcpy(buf[pos .. pos + 5], "ctrl+");
-        pos += 5;
-    }
-    if (key.mod.alt()) {
-        @memcpy(buf[pos .. pos + 4], "alt+");
-        pos += 4;
-    }
-    // Skip shift
-
-    const name: ?[]const u8 = switch (key.code) {
-        .up => "up",
-        .down => "down",
-        .left => "left",
-        .right => "right",
-        .home => "home",
-        .end => "end",
-        .page_up => "page_up",
-        .page_down => "page_down",
-        .backspace => "backspace",
-        .delete => "delete",
-        .tab => "tab",
-        .enter => "enter",
-        .escape => "escape",
-        .slash => "/",
-        .backslash => "backslash",
-        .minus => "-",
-        .equal => "=",
-        .space => "space",
-        .comma => ",",
-        .grave => "`",
-        .a => "a",
-        .b => "b",
-        .c => "c",
-        .d => "d",
-        .e => "e",
-        .f => "f",
-        .g => "g",
-        .h => "h",
-        .i => "i",
-        .j => "j",
-        .k => "k",
-        .l => "l",
-        .m => "m",
-        .n => "n",
-        .o => "o",
-        .p => "p",
-        .q => "q",
-        .r => "r",
-        .s => "s",
-        .t => "t",
-        .u => "u",
-        .v => "v",
-        .w => "w",
-        .x => "x",
-        .y => "y",
-        .z => "z",
-        .f1 => "f1",
-        .f2 => "f2",
-        .f3 => "f3",
-        .f4 => "f4",
-        .f5 => "f5",
-        .f6 => "f6",
-        .f7 => "f7",
-        .f8 => "f8",
-        .f9 => "f9",
-        .f10 => "f10",
-        .f11 => "f11",
-        .f12 => "f12",
-        else => null,
-    };
-
-    if (name) |n| {
-        if (pos + n.len <= 64) {
-            @memcpy(buf[pos .. pos + n.len], n);
-            pos += n.len;
-        }
-        return buf[0..pos];
-    }
-
-    return buf[0..0];
+/// `ctrl+alt+shift+` (the canonical order) plus the key name of dvui key
+/// tag `tag`, or "" when the key has no name.
+fn comboString(ctrl: bool, alt: bool, shift: bool, tag: []const u8, buf: *[64]u8) []const u8 {
+    const name = key_name_map.get(tag) orelse return buf[0..0];
+    var w: std.Io.Writer = .fixed(buf);
+    if (ctrl) w.writeAll("ctrl+") catch return buf[0..0];
+    if (alt) w.writeAll("alt+") catch return buf[0..0];
+    if (shift) w.writeAll("shift+") catch return buf[0..0];
+    w.writeAll(name) catch return buf[0..0];
+    return w.buffered();
 }
 
 /// Open a native OS file dialog and open the selected file.
@@ -5446,6 +5651,7 @@ fn openFileDialog(editor: *Editor) void {
 
     if (path) |p| {
         defer editor.allocator.free(p);
+        editor.recordNavPoint();
         _ = editor.openFile(p) catch |err| {
             if (err == error.EncodingRequired) return;
             if (err == error.BinaryFile) {
@@ -5455,6 +5661,61 @@ fn openFileDialog(editor: *Editor) void {
             }
         };
     }
+}
+
+/// Native folder picker for `open_folder`: the choice becomes the project.
+fn openFolderDialog(editor: *Editor) void {
+    if (!build_options.has_gui) return;
+    const path = dvui.dialogNativeFolderSelect(editor.allocator, .{ .title = "Open Folder" }) catch return;
+    if (path) |p| {
+        defer editor.allocator.free(p);
+        if (!editor.openProject(p)) guiNotify(editor, "{s}", .{editor.status_message});
+    }
+}
+
+fn handleRecentProjectsKeyGui(editor: *Editor, key: dvui.Event.Key) void {
+    if (hasCommandMod(key.mod)) return;
+    const count = editor.recent_projects.items.len;
+    switch (key.code) {
+        .escape => editor.cancelRecentProjects(),
+        .up => editor.recent_selected -|= 1,
+        .down, .tab => if (count > 0) {
+            editor.recent_selected = (editor.recent_selected + 1) % count;
+        },
+        .enter => editor.chooseRecentProject(editor.recent_selected),
+        else => {},
+    }
+}
+
+/// The `recent_projects` picker: one button per remembered folder.
+fn recentProjectsDialog(editor: *Editor) void {
+    var open = true;
+    var dialog = dvui.floatingWindow(@src(), .{ .modal = true, .open_flag = &open }, .{ .min_size_content = .{ .w = 480 } });
+    defer {
+        dialog.deinit();
+        if (!open) editor.cancelRecentProjects();
+        if (editor.mode != .recent_projects or !open) dvui.focusSubwindow(null, null);
+    }
+    dialog.dragAreaSet(dvui.windowHeader("Recent projects", "", &open));
+    var box = dvui.box(@src(), .{ .dir = .vertical }, .{ .expand = .horizontal, .padding = dvui.Rect.all(10) });
+    defer box.deinit();
+    for (dvui.events()) |*e| {
+        if (e.handled or e.evt != .key or e.evt.key.action == .up) continue;
+        handleRecentProjectsKeyGui(editor, e.evt.key);
+        e.handle(@src(), box.data());
+        if (editor.mode != .recent_projects) return;
+    }
+    for (editor.recent_projects.items, 0..) |path, idx| {
+        if (dvui.button(@src(), path, .{}, .{
+            .id_extra = idx,
+            .expand = .horizontal,
+            .style = if (idx == editor.recent_selected) .highlight else .control,
+        })) {
+            editor.chooseRecentProject(idx);
+            return;
+        }
+    }
+    if (dvui.button(@src(), "Cancel", .{}, .{})) editor.cancelRecentProjects();
 }
 
 /// Save the current document (or prompt Save As if no path).
@@ -5516,8 +5777,71 @@ fn guiWrapAdvanceRow(line: []const u8, font: dvui.Font, max_width: f32, start_po
     return start_pos + end_idx;
 }
 
-/// Move cursor up or down by one visual (wrapped) row in the GUI.
-/// Uses `preferred_col` to store the pixel x position for stable vertical movement.
+/// Sticky column for Up/Down with word wrap on (Design 7): the pixel x each
+/// cursor aims for, remembered with the offset it was placed at. While a
+/// cursor still sits where the last vertical move (or add-cursor) put it
+/// and the text is unchanged, the next move reuses that x, through short
+/// lines and wrapped rows, instead of re-measuring from the caret. Any
+/// other move, an edit or another document starts over from the caret.
+const VerticalMotion = struct {
+    const max_cursors = 64;
+
+    doc_id: u64 = 0,
+    version: u64 = 0,
+    count: usize = 0,
+    offsets: [max_cursors]usize = undefined,
+    targets: [max_cursors]f32 = undefined,
+
+    /// The remembered x for cursor `index` sitting at `offset`, if valid.
+    fn target(self: *const VerticalMotion, doc_id: u64, version: u64, index: usize, offset: usize) ?f32 {
+        if (self.doc_id != doc_id or self.version != version) return null;
+        if (index >= self.count or self.offsets[index] != offset) return null;
+        return self.targets[index];
+    }
+
+    /// Forget everything; later records are for `doc_id` at `version`.
+    fn reset(self: *VerticalMotion, doc_id: u64, version: u64) void {
+        self.* = .{ .doc_id = doc_id, .version = version };
+    }
+
+    /// Remember that cursor `index` was placed at `offset` aiming for `x`.
+    fn remember(self: *VerticalMotion, index: usize, offset: usize, x: f32) void {
+        if (index >= max_cursors) return;
+        // Skipped indices get an offset no cursor can have.
+        while (self.count <= index) : (self.count += 1) self.offsets[self.count] = std.math.maxInt(usize);
+        self.offsets[index] = offset;
+        self.targets[index] = x;
+    }
+};
+var vertical_motion: VerticalMotion = .{};
+
+/// offsetAtVisual row argument: the line's last visual row.
+const last_visual_row = std.math.maxInt(usize);
+
+/// Visual row of the caret at (`line`, byte `col`) within its wrapped line,
+/// its pixel x (logical units) in that row, and the line's row count.
+fn caretVisual(buf: *Buffer, line: usize, col: usize, font: dvui.Font, text_w: f32, tw: usize) struct { row: usize, x: f32, rows: usize } {
+    const orig = buf.lineContent(line);
+    var eb: [16384]u8 = undefined;
+    const shown = displayLine(orig, tw, &eb);
+    const v = guiWrapColToVisual(shown, font, text_w, displayCol(orig, shown, col, tw));
+    return .{ .row = v.row, .x = v.px, .rows = guiWrapLineRows(shown, font, text_w) };
+}
+
+/// Buffer offset of the caret stop nearest pixel x on visual `row` of
+/// `line` (last_visual_row = its last row), on a character boundary.
+fn offsetAtVisual(buf: *Buffer, line: usize, row: usize, x: f32, font: dvui.Font, text_w: f32, tw: usize) usize {
+    const orig = buf.lineContent(line);
+    var eb: [16384]u8 = undefined;
+    const shown = displayLine(orig, tw, &eb);
+    const r = if (row == last_visual_row) guiWrapLineRows(shown, font, text_w) - 1 else row;
+    const exp_col = guiWrapVisualToCol(shown, font, text_w, r, x);
+    return cursor_mod.lineOffset(buf, line, expColToBufCol(orig, exp_col, tw));
+}
+
+/// Move every cursor up or down by one visual (wrapped) row. Each keeps
+/// its sticky pixel x (VerticalMotion): Down through a short line comes
+/// back out at the column it went in at.
 fn guiMoveVisualVertical(editor: *Editor, direction: enum { up, down }, extend_selection: bool) void {
     if (!build_options.has_gui) return;
 
@@ -5528,18 +5852,14 @@ fn guiMoveVisualVertical(editor: *Editor, direction: enum { up, down }, extend_s
     const tw = editor.tabWidthFor(doc);
     const text_w: f32 = @floatFromInt(editor.text_width);
 
-    for (doc.cursors.cursors.items) |*c| {
+    // Where each cursor landed and the x it aims for, by pre-merge index.
+    const Placed = struct { offset: usize, x: f32 };
+    var placed: [VerticalMotion.max_cursors]Placed = undefined;
+    var placed_n: usize = 0;
+    for (doc.cursors.cursors.items, 0..) |*c, ci| {
         const pos = buf.offsetToPos(c.offset);
-        const orig_cur = buf.lineContent(pos.line);
-        var exp_buf1: [16384]u8 = undefined;
-        const cur_line = expandTabs(orig_cur, tw, &exp_buf1);
-        const exp_col = bufColToExpCol(orig_cur, pos.col, tw);
-
-        const wrap_info = guiWrapColToVisual(cur_line, font, text_w, exp_col);
-        const cur_rows = guiWrapLineRows(cur_line, font, text_w);
-        // Use the cursor's actual pixel X within its visual row, not the
-        // byte column from line start which is a different unit entirely.
-        const preferred_px: usize = @intFromFloat(wrap_info.px);
+        const here = caretVisual(buf, pos.line, pos.col, font, text_w, tw);
+        const x = vertical_motion.target(doc.id, buf.version, ci, c.offset) orelse here.x;
 
         if (extend_selection) {
             if (c.anchor == null) c.anchor = c.offset;
@@ -5548,37 +5868,38 @@ fn guiMoveVisualVertical(editor: *Editor, direction: enum { up, down }, extend_s
         }
 
         switch (direction) {
-            .up => {
-                if (wrap_info.row > 0) {
-                    const target_exp = guiWrapVisualToCol(cur_line, font, text_w, wrap_info.row - 1, preferred_px);
-                    c.offset = @import("../core/cursor.zig").lineOffset(buf, pos.line, expColToBufCol(orig_cur, target_exp, tw));
-                } else if (pos.line > 0) {
-                    const orig_prev = buf.lineContent(pos.line - 1);
-                    var exp_buf2: [16384]u8 = undefined;
-                    const prev_line = expandTabs(orig_prev, tw, &exp_buf2);
-                    const prev_rows = guiWrapLineRows(prev_line, font, text_w);
-                    const target_exp = guiWrapVisualToCol(prev_line, font, text_w, prev_rows - 1, preferred_px);
-                    c.offset = @import("../core/cursor.zig").lineOffset(buf, pos.line - 1, expColToBufCol(orig_prev, target_exp, tw));
-                }
+            .up => if (here.row > 0) {
+                c.offset = offsetAtVisual(buf, pos.line, here.row - 1, x, font, text_w, tw);
+            } else if (pos.line > 0) {
+                c.offset = offsetAtVisual(buf, pos.line - 1, last_visual_row, x, font, text_w, tw);
             },
-            .down => {
-                if (wrap_info.row + 1 < cur_rows) {
-                    const target_exp = guiWrapVisualToCol(cur_line, font, text_w, wrap_info.row + 1, preferred_px);
-                    c.offset = @import("../core/cursor.zig").lineOffset(buf, pos.line, expColToBufCol(orig_cur, target_exp, tw));
-                } else if (pos.line + 1 < total_lines) {
-                    const orig_next = buf.lineContent(pos.line + 1);
-                    var exp_buf2: [16384]u8 = undefined;
-                    const next_line = expandTabs(orig_next, tw, &exp_buf2);
-                    const target_exp = guiWrapVisualToCol(next_line, font, text_w, 0, preferred_px);
-                    c.offset = @import("../core/cursor.zig").lineOffset(buf, pos.line + 1, expColToBufCol(orig_next, target_exp, tw));
-                }
+            .down => if (here.row + 1 < here.rows) {
+                c.offset = offsetAtVisual(buf, pos.line, here.row + 1, x, font, text_w, tw);
+            } else if (pos.line + 1 < total_lines) {
+                c.offset = offsetAtVisual(buf, pos.line + 1, 0, x, font, text_w, tw);
             },
+        }
+        if (ci < placed.len) {
+            placed[ci] = .{ .offset = c.offset, .x = x };
+            placed_n = ci + 1;
         }
     }
     doc.cursors.mergeCursors();
+    // Merging sorts and dedups the secondaries: re-key by landing offset.
+    vertical_motion.reset(doc.id, buf.version);
+    for (doc.cursors.cursors.items, 0..) |c, ci| {
+        for (placed[0..placed_n]) |p| {
+            if (p.offset == c.offset) {
+                vertical_motion.remember(ci, c.offset, p.x);
+                break;
+            }
+        }
+    }
 }
 
-/// Add a new cursor one visual (wrapped) row above or below the outermost cursor.
+/// Add a cursor one visual (wrapped) row above or below the outermost
+/// cursor, at that cursor's sticky x (so repeated adds keep their column
+/// through short lines), on a character boundary.
 fn guiAddCursorVisual(editor: *Editor, direction: enum { up, down }) void {
     if (!build_options.has_gui) return;
 
@@ -5591,129 +5912,96 @@ fn guiAddCursorVisual(editor: *Editor, direction: enum { up, down }) void {
 
     // Find the outermost cursor in the given direction
     var edge_idx: usize = 0;
-    var edge_line: usize = if (direction == .up) std.math.maxInt(usize) else 0;
-    var edge_wrap_row: usize = 0;
+    var edge_line: usize = 0;
+    var edge_row: usize = 0;
     for (doc.cursors.cursors.items, 0..) |c, i| {
         const pos = buf.offsetToPos(c.offset);
-        const orig_line = buf.lineContent(pos.line);
-        var exp_buf: [16384]u8 = undefined;
-        const exp_line = expandTabs(orig_line, tw, &exp_buf);
-        const wrap_info = guiWrapColToVisual(exp_line, font, text_w, bufColToExpCol(orig_line, pos.col, tw));
-        switch (direction) {
-            .up => if (pos.line < edge_line or (pos.line == edge_line and wrap_info.row < edge_wrap_row)) {
-                edge_line = pos.line;
-                edge_wrap_row = wrap_info.row;
-                edge_idx = i;
-            },
-            .down => if (pos.line > edge_line or (pos.line == edge_line and wrap_info.row > edge_wrap_row)) {
-                edge_line = pos.line;
-                edge_wrap_row = wrap_info.row;
-                edge_idx = i;
-            },
+        const row = caretVisual(buf, pos.line, pos.col, font, text_w, tw).row;
+        const outer = i == 0 or switch (direction) {
+            .up => pos.line < edge_line or (pos.line == edge_line and row < edge_row),
+            .down => pos.line > edge_line or (pos.line == edge_line and row > edge_row),
+        };
+        if (outer) {
+            edge_idx = i;
+            edge_line = pos.line;
+            edge_row = row;
         }
     }
 
-    const ref_cursor = doc.cursors.cursors.items[edge_idx];
-    const orig_line = buf.lineContent(edge_line);
-    var exp_buf1: [16384]u8 = undefined;
-    const cur_line = expandTabs(orig_line, tw, &exp_buf1);
-    const ref_pos = buf.offsetToPos(ref_cursor.offset);
-    const ref_exp_col = bufColToExpCol(orig_line, ref_pos.col, tw);
-    const ref_wrap = guiWrapColToVisual(cur_line, font, text_w, ref_exp_col);
-    const preferred_px: usize = @intFromFloat(ref_wrap.px);
+    const ref = doc.cursors.cursors.items[edge_idx];
+    const ref_pos = buf.offsetToPos(ref.offset);
+    const here = caretVisual(buf, ref_pos.line, ref_pos.col, font, text_w, tw);
+    const x = vertical_motion.target(doc.id, buf.version, edge_idx, ref.offset) orelse here.x;
+    const new_offset = switch (direction) {
+        .up => if (here.row > 0)
+            offsetAtVisual(buf, ref_pos.line, here.row - 1, x, font, text_w, tw)
+        else if (ref_pos.line > 0)
+            offsetAtVisual(buf, ref_pos.line - 1, last_visual_row, x, font, text_w, tw)
+        else
+            return,
+        .down => if (here.row + 1 < here.rows)
+            offsetAtVisual(buf, ref_pos.line, here.row + 1, x, font, text_w, tw)
+        else if (ref_pos.line + 1 < total_lines)
+            offsetAtVisual(buf, ref_pos.line + 1, 0, x, font, text_w, tw)
+        else
+            return,
+    };
+    const before = doc.cursors.count();
+    addCursorAt(doc, new_offset);
+    if (doc.cursors.count() == before) return;
+    // The new cursor is the next add's edge: it aims for the same x.
+    if (vertical_motion.doc_id != doc.id or vertical_motion.version != buf.version) vertical_motion.reset(doc.id, buf.version);
+    vertical_motion.remember(edge_idx, ref.offset, x);
+    vertical_motion.remember(doc.cursors.count() - 1, new_offset, x);
+}
 
-    switch (direction) {
-        .up => {
-            if (edge_wrap_row > 0) {
-                const target_exp = guiWrapVisualToCol(cur_line, font, text_w, edge_wrap_row - 1, preferred_px);
-                const new_offset = buf.posToOffset(edge_line, expColToBufCol(orig_line, target_exp, tw));
-                doc.cursors.addCursor(new_offset) catch {};
-            } else if (edge_line > 0) {
-                const orig_prev = buf.lineContent(edge_line - 1);
-                var exp_buf2: [16384]u8 = undefined;
-                const prev_line = expandTabs(orig_prev, tw, &exp_buf2);
-                const prev_rows = guiWrapLineRows(prev_line, font, text_w);
-                const target_exp = guiWrapVisualToCol(prev_line, font, text_w, prev_rows - 1, preferred_px);
-                const new_offset = buf.posToOffset(edge_line - 1, expColToBufCol(orig_prev, target_exp, tw));
-                doc.cursors.addCursor(new_offset) catch {};
-            }
-        },
-        .down => {
-            const cur_rows = guiWrapLineRows(cur_line, font, text_w);
-            if (edge_wrap_row + 1 < cur_rows) {
-                const target_exp = guiWrapVisualToCol(cur_line, font, text_w, edge_wrap_row + 1, preferred_px);
-                const new_offset = buf.posToOffset(edge_line, expColToBufCol(orig_line, target_exp, tw));
-                doc.cursors.addCursor(new_offset) catch {};
-            } else if (edge_line + 1 < total_lines) {
-                const orig_next = buf.lineContent(edge_line + 1);
-                var exp_buf2: [16384]u8 = undefined;
-                const next_line = expandTabs(orig_next, tw, &exp_buf2);
-                const target_exp = guiWrapVisualToCol(next_line, font, text_w, 0, preferred_px);
-                const new_offset = buf.posToOffset(edge_line + 1, expColToBufCol(orig_next, target_exp, tw));
-                doc.cursors.addCursor(new_offset) catch {};
-            }
-        },
+/// CursorSet.addCursor plus the new cursor's sticky byte column (addCursor
+/// leaves it at 0, so the next Up/Down with wrap off snapped it to column 0).
+fn addCursorAt(doc: *Document, offset: usize) void {
+    const before = doc.cursors.count();
+    doc.cursors.addCursor(offset) catch return;
+    if (doc.cursors.count() > before) {
+        doc.cursors.cursors.items[doc.cursors.count() - 1].preferred_col = doc.buffer.offsetToPos(offset).col;
     }
 }
 
-/// Find which visual wrap row a byte column falls on, and its pixel x offset within that row.
+/// Which visual wrap row byte column `byte_col` of display line `line`
+/// falls on, and its pixel x (logical units, measured) within that row.
 fn guiWrapColToVisual(line: []const u8, font: dvui.Font, max_width: f32, byte_col: usize) struct { row: usize, px: f32 } {
-    if (line.len == 0 or max_width <= 0) return .{ .row = 0, .px = 0 };
-
-    var visual_row: usize = 0;
-    var pos: usize = 0;
-
-    while (pos < line.len) {
-        const row_start = pos;
-        pos = guiWrapAdvanceRow(line, font, max_width, pos);
-
-        if (byte_col < pos or pos >= line.len) {
-            const clamped = @min(byte_col, pos);
-            const effective_start = @min(row_start, clamped);
-            const char_w = font.textSize("M").w;
-            const px: f32 = @as(f32, @floatFromInt(clamped - effective_start)) * char_w;
-            return .{ .row = visual_row, .px = px };
+    const col = text_input.floor(line, byte_col);
+    var row_start: usize = 0;
+    var row: usize = 0;
+    if (max_width > 0) {
+        while (row_start < line.len) {
+            const row_end = guiWrapAdvanceRow(line, font, max_width, row_start);
+            // A column at a wrap point starts the next row (the line's
+            // end stays on the last one).
+            if (col < row_end or row_end >= line.len) break;
+            row_start = row_end;
+            row += 1;
         }
-        visual_row += 1;
     }
-    return .{ .row = visual_row, .px = 0 };
+    return .{ .row = row, .px = font.textSize(line[row_start..@max(row_start, col)]).w };
 }
 
-/// Convert a visual wrap row and preferred pixel x to a byte column.
-fn guiWrapVisualToCol(line: []const u8, font: dvui.Font, max_width: f32, target_row: usize, preferred_px: usize) usize {
-    if (line.len == 0 or max_width <= 0) return 0;
-
-    var pos: usize = 0;
+/// Byte column of display line `line` nearest pixel x `px` on visual row
+/// `target_row` (the last row if the line has fewer), measured with the
+/// font, on a character boundary. A wrapped row never returns its end,
+/// which is the next row's start.
+fn guiWrapVisualToCol(line: []const u8, font: dvui.Font, max_width: f32, target_row: usize, px: f32) usize {
+    if (line.len == 0) return 0;
+    var row_start: usize = 0;
+    var row_end = if (max_width > 0) guiWrapAdvanceRow(line, font, max_width, 0) else line.len;
     var row: usize = 0;
-
-    // Advance to the target row
-    while (row < target_row and pos < line.len) {
-        pos = guiWrapAdvanceRow(line, font, max_width, pos);
-        row += 1;
+    while (row < target_row and row_end < line.len) : (row += 1) {
+        row_start = row_end;
+        row_end = guiWrapAdvanceRow(line, font, max_width, row_start);
     }
-
-    // Now find the byte offset within this row that's closest to preferred_px
-    const row_start = pos;
-    const row_end = guiWrapAdvanceRow(line, font, max_width, pos);
-    const segment = line[row_start..row_end];
-    if (segment.len == 0) return row_start;
-
-    // Monospace: convert pixel x to column via division
-    const char_w = font.textSize("M").w;
-    const end_idx: usize = if (char_w > 0)
-        @min(@as(usize, @intFromFloat(@round(@as(f32, @floatFromInt(preferred_px)) / char_w))), segment.len)
-    else
-        segment.len;
-
-    const result = row_start + end_idx;
-    // For non-final rows, ensure we don't return the start of the next row
-    // so that guiWrapColToVisual maps back to this row, not the next.
-    if (result >= row_end and row_end < line.len and end_idx > 0) {
-        var adj = end_idx - 1;
-        while (adj > 0 and (segment[adj] & 0xC0) == 0x80) adj -= 1;
-        return row_start + adj;
-    }
-    return result;
+    var end_idx: usize = 0;
+    _ = font.textSizeEx(line[row_start..row_end], .{ .max_width = @max(px, 0), .end_idx = &end_idx, .end_metric = .nearest });
+    const col = row_start + end_idx;
+    if (col >= row_end and row_end < line.len and col > row_start) return text_input.floor(line, col - 1);
+    return col;
 }
 
 /// Count how many visual rows a line occupies with pixel-based wrapping.
@@ -5746,15 +6034,14 @@ fn guiEnsureCursorVisibleWrapped(doc: *Document, font: dvui.Font, text_area_w_lo
     var line_idx: usize = doc.scroll_top;
     while (line_idx < cursor_pos.line and line_idx < total_lines) : (line_idx += 1) {
         var eb: [16384]u8 = undefined;
-        const exp = expandTabs(doc.buffer.lineContent(line_idx), tab_width, &eb);
-        visual_rows += guiWrapLineRows(exp, font, text_area_w_logical);
+        const shown = displayLine(doc.buffer.lineContent(line_idx), tab_width, &eb);
+        visual_rows += guiWrapLineRows(shown, font, text_area_w_logical);
     }
     // Add cursor's row within its wrapped line
     const orig_cur = doc.buffer.lineContent(cursor_pos.line);
     var eb2: [16384]u8 = undefined;
-    const cur_line = expandTabs(orig_cur, tab_width, &eb2);
-    const exp_col = bufColToExpCol(orig_cur, cursor_pos.col, tab_width);
-    const wrap_pos = guiWrapColToVisual(cur_line, font, text_area_w_logical, exp_col);
+    const cur_line = displayLine(orig_cur, tab_width, &eb2);
+    const wrap_pos = guiWrapColToVisual(cur_line, font, text_area_w_logical, displayCol(orig_cur, cur_line, cursor_pos.col, tab_width));
     const cursor_visual_row = visual_rows + wrap_pos.row;
 
     // If cursor is visible, done
@@ -5767,10 +6054,38 @@ fn guiEnsureCursorVisibleWrapped(doc: *Document, font: dvui.Font, text_area_w_lo
     while (new_top > 0 and rows_needed < target_row) {
         new_top -= 1;
         var eb3: [16384]u8 = undefined;
-        const exp = expandTabs(doc.buffer.lineContent(new_top), tab_width, &eb3);
-        rows_needed += guiWrapLineRows(exp, font, text_area_w_logical);
+        const shown = displayLine(doc.buffer.lineContent(new_top), tab_width, &eb3);
+        rows_needed += guiWrapLineRows(shown, font, text_area_w_logical);
     }
     doc.scroll_top = new_top;
+}
+
+/// Keep the caret visible with word wrap off: vertically by whole lines,
+/// horizontally inside the TEXT area (the gutter covers the pane's left
+/// part) by the caret's measured x on the drawn line. scroll_left counts
+/// 'M' cells as the renderer draws it; byte columns drift from those over
+/// tabs and multi-byte characters.
+fn guiEnsureCursorVisibleNoWrap(doc: *Document, font: dvui.Font, text_area_w_logical: f32, visible_lines: usize, tab_width: usize) void {
+    const pos = doc.cursorPos();
+    if (pos.line < doc.scroll_top) {
+        doc.scroll_top = pos.line;
+    } else if (visible_lines > 0 and pos.line >= doc.scroll_top + visible_lines) {
+        doc.scroll_top = pos.line - visible_lines + 1;
+    }
+
+    const cell_w = font.textSize("M").w;
+    if (cell_w <= 0) return;
+    const orig = doc.buffer.lineContent(pos.line);
+    var eb: [16384]u8 = undefined;
+    const shown = displayLine(orig, tab_width, &eb);
+    const caret_x = font.textSize(shown[0..displayCol(orig, shown, pos.col, tab_width)]).w;
+    const caret_cell: usize = @intFromFloat(@floor(caret_x / cell_w));
+    const visible_cells: usize = @max(1, @as(usize, @intFromFloat(@floor(@max(0, text_area_w_logical) / cell_w))));
+    if (caret_cell < doc.scroll_left) {
+        doc.scroll_left = caret_cell;
+    } else if (caret_cell >= doc.scroll_left + visible_cells) {
+        doc.scroll_left = caret_cell - visible_cells + 1;
+    }
 }
 
 // ===========================================================================
@@ -5778,7 +6093,9 @@ fn guiEnsureCursorVisibleWrapped(doc: *Document, font: dvui.Font, text_area_w_lo
 // ===========================================================================
 
 /// Expand tab characters to spaces for display.  Returns input unchanged if
-/// there are no tabs (zero-copy fast path).
+/// there are no tabs (zero-copy fast path). A line that doesn't fit `buf`
+/// is cut at a character boundary: a cut inside a UTF-8 sequence made the
+/// line undrawable.
 fn expandTabs(input: []const u8, tab_width: usize, buf: []u8) []const u8 {
     if (std.mem.indexOfScalar(u8, input, '\t') == null) return input;
     const tw = if (tab_width == 0) 4 else tab_width;
@@ -5787,17 +6104,71 @@ fn expandTabs(input: []const u8, tab_width: usize, buf: []u8) []const u8 {
         if (ch == '\t') {
             const spaces = tw - (out % tw);
             for (0..spaces) |_| {
-                if (out >= buf.len) return buf[0..out];
+                if (out >= buf.len) return dropPartialTail(buf[0..out]);
                 buf[out] = ' ';
                 out += 1;
             }
         } else {
-            if (out >= buf.len) return buf[0..out];
+            if (out >= buf.len) return dropPartialTail(buf[0..out]);
             buf[out] = ch;
             out += 1;
         }
     }
     return buf[0..out];
+}
+
+/// `text` without a trailing incomplete UTF-8 sequence (a copy cut short).
+fn dropPartialTail(text: []const u8) []const u8 {
+    var i = text.len;
+    var seen: usize = 0;
+    while (i > 0 and seen < 4) : (seen += 1) {
+        i -= 1;
+        if (text[i] & 0xC0 == 0x80) continue; // continuation: find its lead
+        const need = std.unicode.utf8ByteSequenceLength(text[i]) catch return text;
+        return if (i + need > text.len) text[0..i] else text;
+    }
+    return text;
+}
+
+/// A buffer line as the editor pane draws and measures it: tabs expanded
+/// (expandTabs) and every byte that is not valid UTF-8 shown as '?' — one
+/// byte for one byte, so all column math still lines up. dvui decodes text
+/// with `catch unreachable`: nothing invalid may reach it.
+fn displayLine(orig: []const u8, tab_width: usize, buf: []u8) []const u8 {
+    const line = expandTabs(orig, tab_width, buf);
+    if (std.unicode.utf8ValidateSlice(line)) return line;
+    const n = @min(line.len, buf.len);
+    if (line.ptr != buf.ptr) @memcpy(buf[0..n], line[0..n]);
+    sanitizeUtf8(buf[0..n]);
+    return buf[0..n];
+}
+
+/// Byte column `col` of buffer line `orig` as a column of its drawn text
+/// `shown` (displayLine): tabs expanded, clamped to the drawn text and
+/// floored to a character boundary, so it can slice text for dvui.
+fn displayCol(orig: []const u8, shown: []const u8, col: usize, tab_width: usize) usize {
+    return text_input.floor(shown, bufColToExpCol(orig, col, tab_width));
+}
+
+/// Replace, in place, every byte that doesn't belong to a valid UTF-8
+/// sequence with '?'.
+fn sanitizeUtf8(bytes: []u8) void {
+    var i: usize = 0;
+    while (i < bytes.len) {
+        const n: usize = std.unicode.utf8ByteSequenceLength(bytes[i]) catch 0;
+        if (n == 0 or i + n > bytes.len or !decodes(bytes[i..][0..n])) {
+            bytes[i] = '?';
+            i += 1;
+            continue;
+        }
+        i += n;
+    }
+}
+
+/// Whether `seq` (one lead byte's worth) decodes as dvui will decode it.
+fn decodes(seq: []const u8) bool {
+    _ = std.unicode.utf8Decode(seq) catch return false;
+    return true;
 }
 
 /// Convert a byte column in the original (tab-containing) text to the
@@ -5853,16 +6224,18 @@ fn handleModalKey(editor: *Editor, key: dvui.Event.Key) void {
         .find => handleFindKeyGui(editor, key),
         .find_replace => handleFindReplaceKeyGui(editor, key),
         .command_palette => handlePaletteKeyGui(editor, key),
+        .picker => handlePickerKeyGui(editor, key),
         .file_finder => handleFinderKeyGui(editor, key),
         .confirm_quit => handleConfirmQuitKeyGui(editor, key),
         .confirm_close => handleConfirmCloseKeyGui(editor, key),
         .confirm_overwrite => handleConfirmOverwriteKeyGui(editor, key),
         .encoding_picker, .confirm_reopen, .confirm_encoding => handleEncodingKeyGui(editor, key),
+        .recent_projects => handleRecentProjectsKeyGui(editor, key),
         .recovery_picker => handleRecoveryKeyGui(editor, key),
         .lsp_panel, .symbol_rename, .workspace_preview => handleLspKeyGui(editor, key),
         .tool_panel, .task_save_prompt, .git_stage_prompt => handleToolKeyGui(editor, key),
         .settings => {}, // DVUI dialog handles its own input (settingsDialog)
-        .file_open, .save_as => {}, // handled by native dialogs in GUI
+        .file_open, .folder_open, .save_as => {}, // handled by native dialogs in GUI
         .filetree_prompt => handleFiletreePromptKeyGui(editor, key),
         .normal => {},
     }
@@ -5904,6 +6277,7 @@ fn handleModalText(editor: *Editor, txt: []const u8) void {
             text_input.append(&editor.palette_buf, &editor.palette_buf_len, txt);
             editor.palette_selected = 0;
         },
+        .picker => editor.pickerTyped(txt),
         .file_finder => {
             text_input.append(&editor.finder_buf, &editor.finder_buf_len, txt);
             editor.finderRefresh();
@@ -5914,16 +6288,16 @@ fn handleModalText(editor: *Editor, txt: []const u8) void {
 
 fn handleGotoLineKey(editor: *Editor, key: dvui.Event.Key) void {
     switch (key.code) {
-        .escape => editor.mode = .normal,
+        .escape => editor.setMode(.normal),
         .enter => {
             if (editor.goto_buf_len > 0) {
                 const num_str = editor.goto_buf[0..editor.goto_buf_len];
                 const line_num = std.fmt.parseInt(usize, num_str, 10) catch 0;
                 if (line_num > 0) {
-                    editor.activeDoc().gotoLine(line_num);
+                    editor.jumpToLine(line_num);
                 }
             }
-            editor.mode = .normal;
+            editor.setMode(.normal);
         },
         .backspace => {
             if (editor.goto_buf_len > 0) editor.goto_buf_len -= 1;
@@ -5935,7 +6309,7 @@ fn handleGotoLineKey(editor: *Editor, key: dvui.Event.Key) void {
 fn handleFindKeyGui(editor: *Editor, key: dvui.Event.Key) void {
     switch (key.code) {
         .escape => {
-            editor.mode = .normal;
+            editor.setMode(.normal);
             editor.status_message = "";
         },
         .enter => {
@@ -5958,7 +6332,7 @@ fn handleFindReplaceKeyGui(editor: *Editor, key: dvui.Event.Key) void {
     }
     switch (key.code) {
         .escape => {
-            editor.mode = .normal;
+            editor.setMode(.normal);
             editor.status_message = "";
         },
         .tab => {
@@ -6021,13 +6395,13 @@ fn handleFinderKeyGui(editor: *Editor, key: dvui.Event.Key) void {
 fn handlePaletteKeyGui(editor: *Editor, key: dvui.Event.Key) void {
     switch (key.code) {
         .escape => {
-            editor.mode = .normal;
+            editor.setMode(.normal);
             editor.palette_selected = 0;
         },
         .enter => {
             const filter = editor.palette_buf[0..editor.palette_buf_len];
             const names = editor.commands.allNames() catch {
-                editor.mode = .normal;
+                editor.setMode(.normal);
                 return;
             };
             // Find the Nth matching item (palette_selected)
@@ -6035,13 +6409,14 @@ fn handlePaletteKeyGui(editor: *Editor, key: dvui.Event.Key) void {
             for (names) |name| {
                 if (filter.len > 0 and !guiFuzzyMatch(name, filter)) continue;
                 if (idx == editor.palette_selected) {
-                    editor.mode = .normal;
+                    editor.setMode(.normal);
                     editor.palette_selected = 0;
-                    // This runs inside the focused pane: structural commands
-                    // wait until the panes finished rendering. Theme commands
-                    // bump editor.theme_revision themselves.
-                    if (rendering_panes and isStructuralAction(name)) {
-                        deferred_action = name;
+                    // Inside the focused pane EVERY command waits until
+                    // the panes finished rendering: any of them — a Lua
+                    // one through zide.exec — can split or close panes.
+                    // Theme commands bump editor.theme_revision themselves.
+                    if (rendering_panes) {
+                        deferRun(editor, .command, name);
                     } else {
                         _ = editor.execCommand(name, null);
                     }
@@ -6049,7 +6424,7 @@ fn handlePaletteKeyGui(editor: *Editor, key: dvui.Event.Key) void {
                 }
                 idx += 1;
             }
-            editor.mode = .normal;
+            editor.setMode(.normal);
             editor.palette_selected = 0;
         },
         .tab, .down => {
@@ -6068,14 +6443,33 @@ fn handlePaletteKeyGui(editor: *Editor, key: dvui.Event.Key) void {
     }
 }
 
+/// Keys in picker mode (printable input arrives via handleModalText).
+fn handlePickerKeyGui(editor: *Editor, key: dvui.Event.Key) void {
+    switch (key.code) {
+        .escape => editor.pickerCancel(),
+        .enter => editor.pickerConfirm(),
+        .tab, .down => editor.picker.move(1),
+        .up => editor.picker.move(-1),
+        .page_down => editor.picker.move(10),
+        .page_up => editor.picker.move(-10),
+        .backspace => editor.pickerBackspace(),
+        else => {},
+    }
+}
+
 /// Keys for the file-tree prompt (create / rename / delete confirm).
 /// Printable input arrives via handleModalText; this handles the rest.
 fn handleFiletreePromptKeyGui(editor: *Editor, key: dvui.Event.Key) void {
     if (editor.filetree_prompt_kind == .delete_confirm) {
-        switch (key.code) {
-            .y, .enter => editor.applyFiletreePrompt(),
-            .n, .escape => editor.cancelFiletreePrompt(),
-            else => {},
+        // Deleting is recursive and permanent: only a fresh, unmodified
+        // `y` (not a held key's repeat, not Enter typed for something
+        // else) confirms; any other key cancels. A chord (Ctrl+Y, ...) or
+        // a modifier on its own does neither.
+        if (hasCommandMod(key.mod) or isModifierKey(key.code)) return;
+        if (key.code == .y and key.action == .down and !key.mod.shift()) {
+            editor.applyFiletreePrompt();
+        } else {
+            editor.cancelFiletreePrompt();
         }
         return;
     }
@@ -6091,6 +6485,7 @@ fn handleFiletreePromptKeyGui(editor: *Editor, key: dvui.Event.Key) void {
 
 /// Confirm Overwrite mode (disk changed under a save).
 fn handleConfirmOverwriteKeyGui(editor: *Editor, key: dvui.Event.Key) void {
+    if (hasCommandMod(key.mod)) return; // only plain letters answer (Ctrl+R is not "reload")
     switch (key.code) {
         .o => editor.resolveOverwrite(.overwrite),
         .r => editor.resolveOverwrite(.reload),
@@ -6103,6 +6498,7 @@ fn handleConfirmOverwriteKeyGui(editor: *Editor, key: dvui.Event.Key) void {
 /// an untitled document runs the native Save As dialog and closes the tab
 /// only if that wrote the file.
 fn handleConfirmCloseKeyGui(editor: *Editor, key: dvui.Event.Key) void {
+    if (hasCommandMod(key.mod)) return; // only plain letters answer
     switch (key.code) {
         .s => {
             if (editor.resolveCloseDoc(.save) != .needs_path) return;
@@ -6124,10 +6520,11 @@ fn handleConfirmCloseKeyGui(editor: *Editor, key: dvui.Event.Key) void {
 }
 
 fn handleConfirmQuitKeyGui(editor: *Editor, key: dvui.Event.Key) void {
+    if (hasCommandMod(key.mod)) return; // Ctrl+D is not "discard"
     switch (key.code) {
         .s => editor.saveAllAndQuit(),
         .d => editor.discardAndQuit(),
-        .c, .escape => editor.mode = .normal,
+        .c, .escape => editor.setMode(.normal),
         else => {},
     }
 }
@@ -6153,9 +6550,12 @@ const settings_defs = [_]SettingDef{
     .{ .key = "use_tabs", .label = "Use Tabs", .kind = .boolean, .desc = "Insert tabs instead of spaces" },
     .{ .key = "word_wrap", .label = "Word Wrap", .kind = .boolean, .desc = "Soft-wrap long lines in display" },
     .{ .key = "auto_close_brackets", .label = "Auto Close Brackets", .kind = .boolean, .desc = "Auto-close brackets and quotes" },
+    .{ .key = "completion_auto", .label = "Auto Completion Popup", .kind = .boolean, .desc = "Open completions while typing (off = Ctrl+Space only)" },
+    .{ .key = "signature_help_auto", .label = "Auto Signature Help", .kind = .boolean, .desc = "Show the call signature after ( and , (off = Ctrl+Shift+Space only)" },
     .{ .key = "auto_save", .label = "Auto Save", .kind = .boolean, .desc = "Auto-save dirty documents periodically" },
     .{ .key = "auto_save_interval_ms", .label = "Auto Save Interval (ms)", .kind = .number, .desc = "Delay before auto-save (500-300000)", .min = 500, .max = 300000 },
     .{ .key = "gutter_min_digits", .label = "Gutter Min Digits", .kind = .number, .desc = "Minimum width of line number gutter (1-10)", .min = 1, .max = 10 },
+    .{ .key = "completion_min_chars", .label = "Completion Min Chars", .kind = .number, .desc = "Identifier characters typed before the popup opens by itself (1-8)", .min = 1, .max = 8 },
     .{ .key = "page_size", .label = "Page Size", .kind = .number, .desc = "Lines to scroll on Page Up/Down (5-200)", .min = 5, .max = 200 },
     .{ .key = "click_clears_cursors", .label = "Click Clears Cursors", .kind = .boolean, .desc = "Left-click clears secondary cursors" },
     .{ .key = "session_persistence", .label = "Session Persistence", .kind = .boolean, .desc = "Reopen last session's files when launched bare" },
@@ -6191,7 +6591,6 @@ var settings_text_prefill: bool = true;
 /// and the get/apply helpers below.
 fn settingsDialog(editor: *Editor) void {
     if (!build_options.has_gui) return;
-    const lua_settings = @import("../core/lua_settings.zig");
 
     var open = true;
     var float = dvui.floatingWindow(@src(), .{ .modal = true, .open_flag = &open }, .{
@@ -6200,7 +6599,7 @@ fn settingsDialog(editor: *Editor) void {
     defer {
         float.deinit();
         if (!open) {
-            editor.mode = .normal;
+            editor.setMode(.normal);
             // Return keyboard focus to the base window so the editor pane
             // regains key handling without requiring a click.
             dvui.focusSubwindow(null, null);
@@ -6330,9 +6729,7 @@ fn settingsDialog(editor: *Editor) void {
                         switchTheme(editor, def.choices[choice]);
                     } else if (std.mem.eql(u8, def.key, "filetree_side")) {
                         editor.filetree_side = if (std.mem.eql(u8, def.choices[choice], "right")) .right else .left;
-                        var val_buf: [16]u8 = undefined;
-                        const quoted = std.fmt.bufPrint(&val_buf, "\"{s}\"", .{def.choices[choice]}) catch "";
-                        if (quoted.len > 0) lua_settings.writeSettingToFile(def.key, quoted) catch {};
+                        lua_settings.writeStringSettingToFile(def.key, def.choices[choice]) catch {};
                     }
                 }
             },
@@ -6369,10 +6766,12 @@ fn getSettingText(editor: *const Editor, key: []const u8) []const u8 {
 fn applySettingText(editor: *Editor, key: []const u8, val: []const u8) void {
     if (std.mem.eql(u8, key, "filetree_root")) {
         if (editor.setFiletreeRoot(val)) {
-            const lua_settings = @import("../core/lua_settings.zig");
-            var buf: [600]u8 = undefined;
-            const quoted = std.fmt.bufPrint(&buf, "\"{s}\"", .{std.mem.trim(u8, val, " \t")}) catch return;
-            lua_settings.writeSettingToFile(key, quoted) catch {};
+            // Written as a quoted Lua string literal: a Windows path spliced
+            // in raw ("C:\Users\...", where \U is an invalid escape) kept
+            // init.lua from loading at all on the next launch.
+            lua_settings.writeStringSettingToFile(key, std.mem.trim(u8, val, " \t")) catch |err| {
+                guiNotify(editor, "File tree root not saved to init.lua: {s}", .{@errorName(err)});
+            };
         }
     }
 }
@@ -6384,6 +6783,8 @@ fn getSettingBool(editor: *const Editor, key: []const u8) bool {
     if (std.mem.eql(u8, key, "use_tabs")) return editor.use_tabs;
     if (std.mem.eql(u8, key, "word_wrap")) return editor.word_wrap;
     if (std.mem.eql(u8, key, "auto_close_brackets")) return editor.auto_close_brackets;
+    if (std.mem.eql(u8, key, "completion_auto")) return editor.completion_auto;
+    if (std.mem.eql(u8, key, "signature_help_auto")) return editor.signature_help_auto;
     if (std.mem.eql(u8, key, "auto_save")) return editor.auto_save;
     if (std.mem.eql(u8, key, "click_clears_cursors")) return editor.click_clears_cursors;
     if (std.mem.eql(u8, key, "session_persistence")) return editor.session_persistence;
@@ -6404,6 +6805,8 @@ fn applySettingBool(editor: *Editor, key: []const u8, val: bool) void {
     if (std.mem.eql(u8, key, "use_tabs")) editor.use_tabs = val;
     if (std.mem.eql(u8, key, "word_wrap")) editor.word_wrap = val;
     if (std.mem.eql(u8, key, "auto_close_brackets")) editor.auto_close_brackets = val;
+    if (std.mem.eql(u8, key, "completion_auto")) editor.completion_auto = val;
+    if (std.mem.eql(u8, key, "signature_help_auto")) editor.signature_help_auto = val;
     if (std.mem.eql(u8, key, "auto_save")) editor.auto_save = val;
     if (std.mem.eql(u8, key, "click_clears_cursors")) editor.click_clears_cursors = val;
     if (std.mem.eql(u8, key, "session_persistence")) editor.session_persistence = val;
@@ -6429,6 +6832,7 @@ fn getSettingNumber(editor: *const Editor, key: []const u8) i64 {
     if (std.mem.eql(u8, key, "tab_width")) return @intCast(editor.tab_width);
     if (std.mem.eql(u8, key, "auto_save_interval_ms")) return @intCast(editor.auto_save_interval_ms);
     if (std.mem.eql(u8, key, "gutter_min_digits")) return @intCast(editor.gutter_min_digits);
+    if (std.mem.eql(u8, key, "completion_min_chars")) return @intCast(editor.completion_min_chars);
     if (std.mem.eql(u8, key, "page_size")) return @intCast(editor.page_size);
     if (std.mem.eql(u8, key, "max_undo_history")) return @intCast(editor.max_undo_history);
     if (std.mem.eql(u8, key, "filetree_width")) return @intFromFloat(editor.filetree_width);
@@ -6447,6 +6851,9 @@ fn applySettingNumber(editor: *Editor, key: []const u8, val: i64) void {
     }
     if (std.mem.eql(u8, key, "gutter_min_digits")) {
         if (val >= 1 and val <= 10) editor.gutter_min_digits = @intCast(val);
+    }
+    if (std.mem.eql(u8, key, "completion_min_chars")) {
+        if (val >= 1 and val <= 8) editor.completion_min_chars = @intCast(val);
     }
     if (std.mem.eql(u8, key, "page_size")) {
         if (val >= 5 and val <= 200) editor.page_size = @intCast(val);
@@ -6481,7 +6888,6 @@ fn getSettingEnum(editor: *const Editor, key: []const u8) []const u8 {
 
 /// Open init.lua in the editor as a document.
 fn openSettingsFile(editor: *Editor) void {
-    const lua_settings = @import("../core/lua_settings.zig");
     const config_path = lua_settings.getConfigPathAlways() orelse return;
 
     // Ensure directory and file exist
@@ -6498,35 +6904,19 @@ fn openSettingsFile(editor: *Editor) void {
     _ = editor.openFile(config_path) catch {};
 }
 
-/// Switch the active GUI theme. Updates editor colors, DVUI chrome, and persists to init.lua.
+/// Switch the GUI theme (Preferences menu, Settings dialog) through the
+/// `gui_theme_<name>` command: editor colors, dvui chrome in every window
+/// (theme_revision → applyThemeIfStale), init.lua, and a re-run of
+/// syntax-theme.lua and the syn_theme_<lang>.lua files, whose colors a
+/// bare preset switch dropped (C9).
 fn switchTheme(editor: *Editor, name: []const u8) void {
-    const lua_settings = @import("../core/lua_settings.zig");
-    if (std.mem.eql(u8, name, "dark")) {
-        editor.theme = theme_mod.gui_dark;
-        editor.syntax_theme = theme_mod.syn_gui_dark;
-        editor.theme_name = "dark";
-    } else if (std.mem.eql(u8, name, "light")) {
-        editor.theme = theme_mod.gui_light;
-        editor.syntax_theme = theme_mod.syn_gui_light;
-        editor.theme_name = "light";
-    } else if (std.mem.eql(u8, name, "high_contrast")) {
-        editor.theme = theme_mod.gui_high_contrast;
-        editor.syntax_theme = theme_mod.syn_gui_high_contrast;
-        editor.theme_name = "high_contrast";
-    } else return;
-
-    // Every window re-applies its dvui chrome theme (applyThemeIfStale)
-    editor.theme_revision +%= 1;
-
-    // Persist choice to init.lua
-    var val_buf: [32]u8 = undefined;
-    const quoted = std.fmt.bufPrint(&val_buf, "\"{s}\"", .{name}) catch return;
-    lua_settings.writeSettingToFile("theme", quoted) catch {};
+    var buf: [48]u8 = undefined;
+    const command = std.fmt.bufPrint(&buf, "gui_theme_{s}", .{name}) catch return;
+    _ = editor.execCommand(command, null);
 }
 
 /// Open the GUI theme override file in the editor. Creates a commented template if it doesn't exist.
 fn openThemeFile(editor: *Editor) void {
-    const lua_settings = @import("../core/lua_settings.zig");
     const dir = lua_settings.getConfigDir() orelse return;
     var path_buf: [512]u8 = undefined;
     const path = std.fmt.bufPrint(&path_buf, "{s}/themes/gui-theme.lua", .{dir}) catch return;
@@ -6540,7 +6930,6 @@ fn openThemeFile(editor: *Editor) void {
 
 /// Open the ZIDE config folder in the OS file explorer.
 fn openThemeFolder(io: std.Io) void {
-    const lua_settings = @import("../core/lua_settings.zig");
     const config_dir = lua_settings.getConfigDir() orelse return;
 
     // Build themes/ subdirectory path
@@ -6564,7 +6953,9 @@ fn openThemeFolder(io: std.Io) void {
     const opener: [:0]const u8 = if (builtin.os.tag == .windows) "explorer" else if (builtin.os.tag == .macos) "open" else "xdg-open";
 
     const argv = [_][]const u8{ opener, dir_z };
-    _ = std.process.spawn(io, .{ .argv = &argv }) catch return;
+    // Under the process-wide spawn lock: Windows children inherit every
+    // inheritable pipe end that exists while one is created.
+    _ = jobs.spawnLocked(io, .{ .argv = &argv }) catch return;
 }
 
 /// Memoized find match count. The overlay queries this every frame while
@@ -6572,15 +6963,17 @@ fn openThemeFolder(io: std.Io) void {
 /// full scratch copy when the gap was interior) per rendered frame.
 var match_cache_count: usize = 0;
 var match_cache_version: u64 = 0;
-var match_cache_doc: usize = 0;
+/// Document id, not address: after a close, another document can sit at
+/// the same address with the same buffer version.
+var match_cache_doc: ?u64 = null;
 var match_cache_needle: [256]u8 = undefined;
 var match_cache_needle_len: usize = 0;
 
 /// Count total occurrences of needle in the document buffer.
 fn guiCountMatches(editor: *Editor, needle: []const u8) usize {
     const doc = editor.activeDoc();
-    const doc_key = @intFromPtr(doc);
-    if (doc_key == match_cache_doc and
+    const doc_key = doc.id;
+    if (match_cache_doc == doc_key and
         doc.buffer.version == match_cache_version and
         needle.len == match_cache_needle_len and
         std.mem.eql(u8, match_cache_needle[0..match_cache_needle_len], needle))
@@ -6893,15 +7286,45 @@ fn drawModalOverlay(editor: *Editor, render_area: dvui.Rect.Physical, render_rs:
                 shown += 1;
             }
         },
+        .picker => {
+            const p = &editor.picker;
+            const max_items: usize = 10;
+            const rows = @min(p.count(), max_items);
+            const shown_rows = @max(rows, 1); // one row for the hint / "(no matches)"
+            const h = lh * @as(f32, @floatFromInt(2 + shown_rows)) + pad * @as(f32, @floatFromInt(3 + shown_rows));
+            fillBar(render_area, 0, h, bg);
+            renderOverlayText(font, p.title(), render_area.x + pad, render_area.y + pad, render_rs, dim);
+            var input_buf: [300]u8 = undefined;
+            const input_txt = std.fmt.bufPrint(&input_buf, "> {s}_", .{p.filter()}) catch "> ";
+            renderOverlayText(font, input_txt, render_area.x + pad, render_area.y + pad + lh + pad, render_rs, fg);
+            const sel_highlight = toDvui(editor.theme.overlay_selection);
+            var item_y: f32 = render_area.y + (pad + lh) * 2 + pad;
+            if (rows == 0) {
+                renderOverlayText(font, if (p.items.items.len == 0) p.empty_hint else "(no matches)", render_area.x + pad + pad, item_y, render_rs, dim);
+            }
+            const first = p.firstVisible(max_items);
+            var i: usize = first;
+            while (i < p.count() and i < first + max_items) : (i += 1) {
+                const item = p.itemAt(i);
+                var row_buf: [512]u8 = undefined;
+                const full_txt = if (item.detail.len > 0) std.fmt.bufPrint(&row_buf, "{s}   {s}", .{ item.label, item.detail }) catch item.label else item.label;
+                const row_txt = fitOverlayText(font, full_txt, render_area.w - pad * 4, scale);
+                if (i == p.selected) {
+                    const bar: dvui.Rect.Physical = .{ .x = render_area.x, .y = item_y, .w = render_area.w, .h = lh + pad };
+                    bar.fill(.{}, .{ .color = sel_highlight, .fade = 1.0 });
+                    renderOverlayText(font, row_txt, render_area.x + pad + pad, item_y, render_rs, fg);
+                } else {
+                    renderOverlayText(font, row_txt, render_area.x + pad + pad, item_y, render_rs, dim);
+                }
+                item_y += lh + pad;
+            }
+        },
         .file_finder => {
             const filter = editor.finder_buf[0..editor.finder_buf_len];
-            const max_items: usize = 8;
-            const match_count = @min(editor.finder_matches.items.len, max_items);
-            if (match_count > 0) {
-                if (editor.finder_selected >= match_count) editor.finder_selected = match_count - 1;
-            } else {
-                editor.finder_selected = 0;
-            }
+            // The rows scrolled so the selection shows; drawing never moves
+            // the selection (the core keeps it in range).
+            const range = editor.finderVisibleRange(8);
+            const match_count = range.end - range.start;
             // Compact top-centered dropdown with an OPAQUE background — the
             // whole point is reading the live preview around and below it,
             // so no full-width bar and no translucent overlay_bg here.
@@ -6939,9 +7362,9 @@ fn drawModalOverlay(editor: *Editor, render_area: dvui.Rect.Physical, render_rs:
             renderOverlayText(font, input_txt, panel.x + pad, panel.y + pad, render_rs, fg);
             const sel_highlight = toDvui(editor.theme.overlay_selection);
             var item_y: f32 = panel.y + pad + row_h;
-            for (editor.finder_matches.items[0..match_count], 0..) |fi, shown| {
+            for (editor.finder_matches.items[range.start..range.end], range.start..) |fi, row| {
                 const path = editor.finder_files.items[fi];
-                if (shown == editor.finder_selected) {
+                if (row == editor.finder_selected) {
                     const bar: dvui.Rect.Physical = .{ .x = inner.x, .y = item_y, .w = inner.w, .h = row_h };
                     bar.fill(.{}, .{ .color = sel_highlight, .fade = 1.0 });
                     renderOverlayText(font, path, panel.x + pad + pad, item_y, render_rs, fg);
@@ -6986,6 +7409,17 @@ fn fillBar(area: dvui.Rect.Physical, y_offset: f32, height: f32, color: dvui.Col
     rect.fill(.{}, .{ .color = color, .fade = 1.0 });
 }
 
+/// The longest prefix of `text` (on a character boundary) that fits in
+/// `max_w` physical pixels — overlay rows must not run off the window.
+fn fitOverlayText(font: dvui.Font, text: []const u8, max_w: f32, scale: f32) []const u8 {
+    var end = text.len;
+    while (end > 0 and font.textSize(text[0..end]).w * scale > max_w) {
+        end -= 1;
+        while (end > 0 and (text[end] & 0xC0) == 0x80) end -= 1;
+    }
+    return text[0..end];
+}
+
 fn renderOverlayText(font: dvui.Font, text: []const u8, x: f32, y: f32, rs: dvui.RectScale, color: dvui.Color) void {
     dvui.renderText(.{
         .font = font,
@@ -6997,6 +7431,7 @@ fn renderOverlayText(font: dvui.Font, text: []const u8, x: f32, y: f32, rs: dvui
 }
 
 fn handleEncodingKeyGui(editor: *Editor, key: dvui.Event.Key) void {
+    if (hasCommandMod(key.mod)) return; // only plain keys answer (Ctrl+S is not "save")
     switch (editor.mode) {
         .encoding_picker => switch (key.code) {
             .escape => editor.cancelEncoding(),
@@ -7021,6 +7456,8 @@ fn handleEncodingKeyGui(editor: *Editor, key: dvui.Event.Key) void {
 }
 
 fn handleToolKeyGui(editor: *Editor, key: dvui.Event.Key) void {
+    // Plain keys only: Ctrl+S must not stage, Ctrl+R rerun, Ctrl+U unstage.
+    if (hasCommandMod(key.mod)) return;
     if (editor.mode == .git_stage_prompt) {
         switch (key.code) {
             .s => editor.git.resolveStage(editor, true),
@@ -7039,7 +7476,7 @@ fn handleToolKeyGui(editor: *Editor, key: dvui.Event.Key) void {
         return;
     }
     switch (key.code) {
-        .escape => editor.mode = .normal,
+        .escape => editor.setMode(.normal),
         .enter => editor.tool_panel.activate(editor),
         .up => editor.tool_panel.move(editor, false),
         .down => editor.tool_panel.move(editor, true),
@@ -7062,7 +7499,7 @@ fn toolDialog(editor: *Editor) void {
     defer {
         dialog.deinit();
         if (!open and editor.mode == mode) {
-            if (mode == .task_save_prompt) editor.tasks.resolveSave(editor, .cancel) else if (mode == .git_stage_prompt) editor.git.resolveStage(editor, false) else editor.mode = .normal;
+            if (mode == .task_save_prompt) editor.tasks.resolveSave(editor, .cancel) else if (mode == .git_stage_prompt) editor.git.resolveStage(editor, false) else editor.setMode(.normal);
             dvui.focusSubwindow(null, null);
         }
     }
@@ -7091,7 +7528,7 @@ fn toolDialog(editor: *Editor) void {
                 if (dvui.button(@src(), "Rerun (R)", .{}, .{})) state.action(editor, 'r');
                 if (dvui.button(@src(), "Stop (S)", .{}, .{})) state.action(editor, 's');
             },
-            .tasks => {},
+            .tasks, .references => {},
             .changes => {
                 if (dvui.button(@src(), "Working tree diff (Enter)", .{}, .{})) state.activate(editor);
                 if (dvui.button(@src(), "Staged diff (D)", .{}, .{})) state.action(editor, 'd');
@@ -7120,7 +7557,9 @@ fn toolDialog(editor: *Editor) void {
                 var selected_buf: [4120]u8 = undefined;
                 const display = std.fmt.bufPrint(&selected_buf, "{s}{s}", .{ if (index == state.selected) "> " else "  ", label }) catch label;
                 if (dvui.button(@src(), display, .{}, .{ .id_extra = index, .expand = .horizontal })) {
-                    state.selected = index;
+                    // select() also records the Changes row's path, so a
+                    // refresh can't retarget S/U to another file.
+                    state.select(editor, index);
                     if (state.kind != .changes) state.activate(editor);
                     break;
                 }
@@ -7129,17 +7568,23 @@ fn toolDialog(editor: *Editor) void {
         if (dvui.button(@src(), "Close (Esc)", .{}, .{})) open = false;
     }
     for (dvui.events()) |*event| {
-        if (event.handled) continue;
-        if (event.evt == .key and event.evt.key.action != .up) {
-            handleToolKeyGui(editor, event.evt.key);
-            event.handle(@src(), box.data());
-        }
+        if (event.handled or event.evt != .key) continue;
+        const key = event.evt.key;
+        if (key.action == .up) continue;
+        // Tab stays dvui's focus navigation between the dialog's buttons,
+        // and a chord is not a dialog key.
+        if (key.code == .tab or hasCommandMod(key.mod)) continue;
+        handleToolKeyGui(editor, key);
+        event.handle(@src(), box.data());
+        // A key that closed or switched the dialog ends its input (a
+        // second `s` after "save and stage" must not stage again).
+        if (editor.mode != mode) break;
     }
 }
 
 fn handleLspKeyGui(editor: *Editor, key: dvui.Event.Key) void {
     if (key.code == .escape) {
-        if (editor.mode == .workspace_preview) editor.lsp_tools.resolvePreview(editor, false) else editor.mode = .normal;
+        if (editor.mode == .workspace_preview) editor.lsp_tools.resolvePreview(editor, false) else editor.setMode(.normal);
     } else if (editor.mode == .workspace_preview and key.code == .enter) editor.lsp_tools.resolvePreview(editor, true);
 }
 
@@ -7150,7 +7595,7 @@ fn lspDialog(editor: *Editor) void {
     defer {
         dialog.deinit();
         if (!open) {
-            if (mode == .workspace_preview) editor.lsp_tools.resolvePreview(editor, false) else editor.mode = .normal;
+            if (mode == .workspace_preview) editor.lsp_tools.resolvePreview(editor, false) else editor.setMode(.normal);
         }
         if (editor.mode != mode) dvui.focusSubwindow(null, null);
     }
@@ -7180,7 +7625,7 @@ fn lspDialog(editor: *Editor) void {
     }
     if (mode == .workspace_preview and dvui.button(@src(), "Apply edits (Enter)", .{}, .{})) editor.lsp_tools.resolvePreview(editor, true);
     if (dvui.button(@src(), if (mode == .lsp_panel) "Close (Esc)" else "Cancel (Esc)", .{}, .{})) {
-        if (mode == .workspace_preview) editor.lsp_tools.resolvePreview(editor, false) else editor.mode = .normal;
+        if (mode == .workspace_preview) editor.lsp_tools.resolvePreview(editor, false) else editor.setMode(.normal);
     }
     for (dvui.events()) |*event| {
         if (event.handled or event.evt != .key or event.evt.key.action == .up) continue;
@@ -7191,6 +7636,7 @@ fn lspDialog(editor: *Editor) void {
 }
 
 fn handleRecoveryKeyGui(editor: *Editor, key: dvui.Event.Key) void {
+    if (hasCommandMod(key.mod)) return; // Ctrl+D is not "discard all"
     switch (key.code) {
         .r => editor.resolveRecovery(.recover),
         .d => editor.resolveRecovery(.discard),
@@ -7306,7 +7752,7 @@ test "GUI snippets: hidden window dispatches Tab text Shift-Tab and Escape in or
     try t.expect(handleGuiKeyEvents(&editor, box.data()));
     try t.expect(doc.snippet_session == null);
     try t.expectEqualStrings("😀 tail", doc.buffer.slice(0, doc.buffer.byteLen()));
-    editor.search_focused = true;
+    _ = editor.takeKeyboardFocus(.search);
     try t.expect(!handleGuiSnippetOrCompletionKey(&editor, .{ .code = .tab, .action = .down, .mod = .none }));
 }
 
@@ -7355,23 +7801,23 @@ test "GUI tools smoke: hover, rename, workspace preview and recovery dialogs" {
     defer editor.deinit();
     cur_win = 0;
     editor.lsp_tools.hover = try t.allocator.dupe(u8, "café: i32\nUnicode documentation 😀");
-    editor.mode = .lsp_panel;
+    editor.setMode(.lsp_panel);
     lspDialog(&editor);
     _ = try ui.window.end(.{});
     try ui.window.begin(100 * std.time.ns_per_ms);
-    editor.mode = .symbol_rename;
+    editor.setMode(.symbol_rename);
     @memcpy(editor.lsp_tools.name[0..5], "value");
     lspDialog(&editor);
     _ = try ui.window.end(.{});
     try ui.window.begin(200 * std.time.ns_per_ms);
-    editor.mode = .workspace_preview;
+    editor.setMode(.workspace_preview);
     editor.lsp_tools.preview = .{ .allocator = t.allocator };
     lspDialog(&editor);
     handleLspKeyGui(&editor, .{ .code = .escape, .action = .down, .mod = .none });
     try t.expect(editor.lsp_tools.preview == null);
     _ = try ui.window.end(.{});
     try ui.window.begin(300 * std.time.ns_per_ms);
-    editor.mode = .recovery_picker;
+    editor.setMode(.recovery_picker);
     recoveryDialog(&editor);
     handleRecoveryKeyGui(&editor, .{ .code = .escape, .action = .down, .mod = .none });
     try t.expectEqual(Editor.Mode.normal, editor.mode);
@@ -7421,7 +7867,7 @@ test "GUI software profile: editor and settings at desktop resolution" {
     };
     for (profiles, 0..) |profile, profile_index| {
         if (profile_index == 1) try editor.activeDoc().loadText("const result = try renderer.drawText(\"Software: café 界\");\n" ** 80);
-        editor.mode = profile.mode;
+        editor.setMode(profile.mode);
         var samples: [60]u64 = undefined;
         var submission: [60]u64 = undefined;
         var presentation: [60]u64 = undefined;
@@ -7507,4 +7953,153 @@ test "GUI GPU smoke: native backend initializes and draws a text frame" {
     try window.begin(0);
     dvui.labelNoFmt(@src(), "ZIDE GPU: café 界", .{}, .{});
     _ = try window.end(.{});
+}
+
+// ---------------------------------------------------------------------------
+// Pure helpers (no window: these run in `zig build test`, whose build has no
+// dvui; the "GUI " tests above need `zig build test-gui`).
+// ---------------------------------------------------------------------------
+
+test "gui keybind names: digits, punctuation and insert reach the keymap" {
+    const t = std.testing;
+    var buf: [64]u8 = undefined;
+    try t.expectEqualStrings("ctrl+1", comboString(true, false, false, "one", &buf));
+    try t.expectEqualStrings("ctrl+[", comboString(true, false, false, "left_bracket", &buf));
+    try t.expectEqualStrings("ctrl+alt+shift+;", comboString(true, true, true, "semicolon", &buf));
+    try t.expectEqualStrings("alt+.", comboString(false, true, false, "period", &buf));
+    try t.expectEqualStrings("ctrl+'", comboString(true, false, false, "apostrophe", &buf));
+    try t.expectEqualStrings("insert", comboString(false, false, false, "insert", &buf));
+    try t.expectEqualStrings("shift+f6", comboString(false, false, true, "f6", &buf));
+    // Keys without a keybind name produce nothing (the dispatcher skips them).
+    try t.expectEqualStrings("", comboString(true, false, false, "left_shift", &buf));
+    try t.expectEqualStrings("", comboString(false, false, false, "kp_enter", &buf));
+    // Every name the GUI sends is one the keymap accepts ...
+    for (key_name_map.values()) |name| try t.expect(keybind.isKnownKey(name));
+    // ... and the whole shared vocabulary can be sent.
+    const vocabulary = [_][]const u8{
+        "0",         "1",     "2",     "3",      "4",       "5",         "6",      "7",
+        "8",         "9",     "f1",    "f2",     "f3",      "f4",        "f5",     "f6",
+        "f7",        "f8",    "f9",    "f10",    "f11",     "f12",       "up",     "down",
+        "left",      "right", "home",  "end",    "page_up", "page_down", "insert", "delete",
+        "backspace", "tab",   "enter", "escape", "space",   "backslash", "[",      "]",
+        ";",         "'",     ",",     ".",      "/",       "-",         "=",      "`",
+    };
+    for (vocabulary) |name| {
+        var found = false;
+        for (key_name_map.values()) |v| found = found or std.mem.eql(u8, v, name);
+        try t.expect(found);
+    }
+    for ('a'..'z' + 1) |c| {
+        const letter = [_]u8{@intCast(c)};
+        try t.expectEqualStrings(&letter, key_name_map.get(&letter).?);
+    }
+}
+
+test "gui deferred queue: runs in order, owns its names, refuses overflow" {
+    const t = std.testing;
+    var q: DeferredQueue = .{};
+    var name_buf = "split_vertical".*;
+    try t.expect(q.push(.command, &name_buf));
+    // The queue copied the name: the source may be freed or reused.
+    @memcpy(name_buf[0..5], "XXXXX");
+    try t.expect(q.push(.action, "toggle_terminal"));
+    try t.expect(q.push(.command, "a"));
+    try t.expect(q.push(.command, "b"));
+    try t.expect(!q.push(.command, "one too many"));
+    const long = [_]u8{'x'} ** (DeferredQueue.max_name + 1);
+    var q2: DeferredQueue = .{};
+    try t.expect(!q2.push(.command, &long));
+    try t.expect(q2.pop() == null);
+
+    const first = q.pop().?;
+    try t.expectEqual(DeferredQueue.Kind.command, first.kind);
+    try t.expectEqualStrings("split_vertical", first.name());
+    const second = q.pop().?;
+    try t.expectEqual(DeferredQueue.Kind.action, second.kind);
+    try t.expectEqualStrings("toggle_terminal", second.name());
+    try t.expectEqualStrings("a", q.pop().?.name());
+    try t.expectEqualStrings("b", q.pop().?.name());
+    try t.expect(q.pop() == null);
+    try t.expect(q.push(.command, "again"));
+}
+
+test "gui display lines: snapped columns, tab expansion cut on a boundary, invalid bytes as '?'" {
+    const t = std.testing;
+    var buf: [64]u8 = undefined;
+
+    // A char-literal span that ends inside `é` (C1) or past the line (`'\`
+    // at the end of a line) is snapped before it can slice text for dvui.
+    const lit = "c = 'é';";
+    const shown = displayLine(lit, 4, &buf);
+    try t.expect(shown.ptr == lit.ptr); // valid, no tabs: drawn as is
+    try t.expectEqual(@as(usize, 5), displayCol(lit, shown, 6, 4)); // inside é → its start
+    try t.expectEqual(@as(usize, 7), displayCol(lit, shown, 7, 4));
+    try t.expectEqual(lit.len, displayCol(lit, shown, 99, 4));
+
+    // Tabs expand; byte columns map onto the expanded text.
+    const tabbed = "\tx\té";
+    const exp = displayLine(tabbed, 4, &buf);
+    try t.expectEqualStrings("    x   é", exp);
+    try t.expectEqual(@as(usize, 4), displayCol(tabbed, exp, 1, 4));
+    try t.expectEqual(@as(usize, 8), displayCol(tabbed, exp, 3, 4));
+    try t.expectEqual(@as(usize, 8), displayCol(tabbed, exp, 4, 4)); // inside é
+
+    // A line too long for the buffer is cut before a character it can't
+    // hold whole (D18): 6 bytes of room, and the emoji would need 5 to 8.
+    var small: [6]u8 = undefined;
+    const cut = expandTabs("\tx😀", 4, &small);
+    try t.expectEqualStrings("    x", cut);
+    try t.expect(std.unicode.utf8ValidateSlice(cut));
+    try t.expectEqualStrings("ab", dropPartialTail("ab\xe2\x82"));
+    try t.expectEqualStrings("ab\xe2\x82\xac", dropPartialTail("ab\xe2\x82\xac"));
+
+    // Bytes that aren't UTF-8 draw as '?', one for one, so columns hold.
+    const bad = "a\xffb\xe2\x82c\xed\xa0\x80d";
+    const safe = displayLine(bad, 4, &buf);
+    try t.expectEqual(bad.len, safe.len);
+    try t.expect(std.unicode.utf8ValidateSlice(safe));
+    try t.expectEqualStrings("a?b??c???d", safe);
+    const bad_tab = "\t\xc3";
+    try t.expectEqualStrings("    ?", displayLine(bad_tab, 4, &buf));
+}
+
+test "gui terminal keys: printable keys type through text, chords from the key" {
+    const t = std.testing;
+    // Plain and Shift keys: the layout's text event types the character.
+    try t.expectEqual(TermKeyRoute.text, terminalKeyRoute(false, false, true));
+    try t.expectEqual(TermKeyRoute.text, terminalKeyRoute(false, false, false));
+    // AltGr (and Ctrl+Alt on Windows) typed a character: the text wins.
+    try t.expectEqual(TermKeyRoute.text, terminalKeyRoute(false, true, true));
+    try t.expectEqual(TermKeyRoute.text, terminalKeyRoute(true, true, true));
+    // Alt+b, Ctrl+Alt+a with no character: encoded from the key.
+    try t.expectEqual(TermKeyRoute.chord, terminalKeyRoute(false, true, false));
+    try t.expectEqual(TermKeyRoute.chord, terminalKeyRoute(true, true, false));
+    // Ctrl+C sends ETX; Ctrl+Space's stray ' ' must not follow its NUL.
+    try t.expectEqual(TermKeyRoute.chord, terminalKeyRoute(true, false, false));
+    try t.expectEqual(TermKeyRoute.chord_drop_text, terminalKeyRoute(true, false, true));
+
+    try t.expect(isTypedText("a"));
+    try t.expect(isTypedText("€ ö ß"));
+    try t.expect(!isTypedText(""));
+    try t.expect(!isTypedText("\r"));
+    try t.expect(!isTypedText("a\x1b"));
+    try t.expect(!isTypedText("\x7f"));
+}
+
+test "gui vertical motion: the sticky x holds only where the last move left the cursor" {
+    const t = std.testing;
+    var vm: VerticalMotion = .{};
+    try t.expect(vm.target(1, 7, 0, 10) == null);
+    vm.reset(1, 7);
+    vm.remember(0, 10, 42.5);
+    vm.remember(2, 30, 8); // index 1 skipped: never matches
+    try t.expectEqual(@as(?f32, 42.5), vm.target(1, 7, 0, 10));
+    try t.expectEqual(@as(?f32, 8), vm.target(1, 7, 2, 30));
+    try t.expect(vm.target(1, 7, 1, std.math.maxInt(usize) - 1) == null);
+    try t.expect(vm.target(1, 7, 0, 11) == null); // the cursor moved since
+    try t.expect(vm.target(1, 8, 0, 10) == null); // the text changed
+    try t.expect(vm.target(2, 7, 0, 10) == null); // another document
+    try t.expect(vm.target(1, 7, 3, 10) == null); // no record for that cursor
+    vm.remember(VerticalMotion.max_cursors, 5, 1); // past the table: ignored
+    try t.expect(vm.target(1, 7, VerticalMotion.max_cursors, 5) == null);
 }

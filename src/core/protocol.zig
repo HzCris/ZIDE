@@ -1,5 +1,7 @@
 //! Managed, bounded Content-Length stdio transport for LSP and DAP.
-//! All pipe I/O runs off the editor thread; overflow is an explicit failure.
+//! All pipe I/O runs off the editor thread. A full outgoing queue is an
+//! explicit failure; a full incoming queue stalls the reader (back-pressure)
+//! and only a consumer that stops taking messages ends the session.
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const jobs = @import("jobs.zig");
@@ -9,8 +11,15 @@ pub const max_frame = 16 * 1024 * 1024;
 pub const Queue = struct {
     messages: std.ArrayList([]u8) = .empty,
     bytes: usize = 0,
+    pub const max_messages = 256;
+    pub const max_bytes = 32 * 1024 * 1024;
+
+    /// Whether one more message of `len` bytes fits under both limits.
+    pub fn hasRoom(self: *const Queue, len: usize) bool {
+        return self.messages.items.len < max_messages and len <= max_bytes - self.bytes;
+    }
     pub fn push(self: *Queue, allocator: Allocator, message: []u8) !void {
-        if (self.messages.items.len >= 256 or self.bytes + message.len > 32 * 1024 * 1024) return error.ProtocolOverflow;
+        if (!self.hasRoom(message.len)) return error.ProtocolOverflow;
         try self.messages.append(allocator, message);
         self.bytes += message.len;
     }
@@ -35,13 +44,21 @@ pub const Peer = struct {
     future: ?std.Io.Future(void) = null,
     mutex: std.Io.Mutex = .init,
     outgoing_ready: std.Io.Event = .unset,
+    /// Set by `take`; the reader waits on it while `incoming` is full.
+    incoming_space: std.Io.Event = .unset,
     incoming: Queue = .{},
     outgoing: Queue = .{},
     stderr_text: std.ArrayList(u8) = .empty,
     failure: ?anyerror = null,
     done: bool = false,
     closing: bool = false,
+    /// Called from the peer's threads — and from `send` on the editor
+    /// thread — never while `mutex` is held: a wake may block.
     wake: ?*const fn () void = null,
+    /// How long the reader waits for room in a full `incoming` queue before
+    /// declaring the consumer stuck (`ProtocolOverflow`). Generous: a
+    /// blocking native file dialog stalls the GUI thread legitimately.
+    consumer_timeout_ms: i64 = 30_000,
 
     pub fn start(allocator: Allocator, io: std.Io, argv: []const []const u8, cwd: ?[]const u8, wake: ?*const fn () void) !*Peer {
         if (argv.len == 0 or argv[0].len == 0) return error.MissingProgram;
@@ -54,6 +71,14 @@ pub const Peer = struct {
         self.argv = args;
         if (cwd) |path| self.cwd = try self.arena.allocator().dupe(u8, path);
         self.future = try io.concurrent(run, .{self});
+        return self;
+    }
+
+    /// A peer with no process behind it (tests and fakes): `send` queues
+    /// into `outgoing`, and messages pushed into `incoming` come out of `take`.
+    pub fn detached(allocator: Allocator, io: std.Io) !*Peer {
+        const self = try allocator.create(Peer);
+        self.* = .{ .allocator = allocator, .io = io, .arena = std.heap.ArenaAllocator.init(allocator), .argv = &.{}, .cwd = null };
         return self;
     }
 
@@ -99,43 +124,89 @@ pub const Peer = struct {
         const frame = try std.fmt.allocPrint(self.allocator, "Content-Length: {d}\r\n\r\n{s}", .{ body.len, body });
         errdefer self.allocator.free(frame);
         self.mutex.lockUncancelable(self.io);
-        defer self.mutex.unlock(self.io);
-        if (self.closing or self.done or self.failure != null) return error.NotRunning;
+        if (self.closing or self.done or self.failure != null) {
+            self.mutex.unlock(self.io);
+            return error.NotRunning;
+        }
+        // The editor thread must never block here: a full outgoing queue fails.
         self.outgoing.push(self.allocator, frame) catch |err| {
             self.failure = err;
-            if (self.wake) |wake| wake();
+            const wake = self.wake;
+            self.mutex.unlock(self.io);
+            if (wake) |f| f();
             return err;
         };
         self.outgoing_ready.set(self.io);
+        self.mutex.unlock(self.io);
     }
 
     pub fn take(self: *Peer) ?[]u8 {
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
-        return self.incoming.pop();
+        const message = self.incoming.pop() orelse return null;
+        self.incoming_space.set(self.io);
+        return message;
+    }
+
+    /// Messages are waiting for `take`.
+    pub fn hasIncoming(self: *Peer) bool {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        return self.incoming.messages.items.len > 0;
     }
 
     fn failed(self: *Peer, err: anyerror) void {
         self.mutex.lockUncancelable(self.io);
-        defer self.mutex.unlock(self.io);
-        if (!self.closing) {
+        const wake = if (self.closing) null else blk: {
             self.failure = err;
-            if (self.wake) |wake| wake();
-        }
+            break :blk self.wake;
+        };
+        self.mutex.unlock(self.io);
+        if (wake) |f| f();
     }
 
     fn run(self: *Peer) void {
         self.runProcess() catch |err| self.failed(err);
         self.mutex.lockUncancelable(self.io);
         self.done = true;
-        if (self.wake) |wake| wake();
+        const wake = self.wake;
         self.mutex.unlock(self.io);
+        if (wake) |f| f();
+    }
+
+    /// Queue one message read from the server (ownership passes to the
+    /// queue; freed here on failure). A full queue applies back-pressure:
+    /// the reader stops reading — the server blocks on its stdout pipe —
+    /// until `take` makes room. Only a consumer that takes nothing for
+    /// `consumer_timeout_ms` fails the session.
+    fn deliver(self: *Peer, message: []u8) !void {
+        errdefer self.allocator.free(message);
+        const deadline: std.Io.Clock.Timestamp = .fromNow(self.io, .{ .raw = .fromMilliseconds(self.consumer_timeout_ms), .clock = .awake });
+        while (true) {
+            self.mutex.lockUncancelable(self.io);
+            const room = self.incoming.hasRoom(message.len);
+            if (room) {
+                self.incoming.push(self.allocator, message) catch |err| {
+                    self.mutex.unlock(self.io);
+                    return err;
+                };
+            } else self.incoming_space.reset(); // only this thread waits on it
+            const wake = self.wake;
+            self.mutex.unlock(self.io);
+            if (wake) |f| f();
+            if (room) return;
+            if (deadline.durationFromNow(self.io).raw.nanoseconds <= 0) return error.ProtocolOverflow;
+            self.incoming_space.waitTimeout(self.io, .{ .deadline = deadline }) catch |err| switch (err) {
+                error.Timeout => {}, // deadline or a spurious wakeup: check again
+                error.Canceled => |e| return e,
+            };
+        }
     }
 
     fn runProcess(self: *Peer) !void {
         var group = try jobs.ProcessGroup.init();
         defer group.deinit();
-        var child = try std.process.spawn(self.io, .{
+        var child = try jobs.spawnLocked(self.io, .{
             .argv = self.argv,
             .cwd = if (self.cwd) |path| .{ .path = path } else .inherit,
             .stdin = .pipe,
@@ -153,14 +224,7 @@ pub const Peer = struct {
         var stderr_reader = try self.io.concurrent(readStderr, .{ self, child.stderr.? });
         defer stderr_reader.cancel(self.io);
         var reader: FrameReader = .{ .io = self.io, .file = child.stdout.? };
-        while (true) {
-            const message = try reader.read(self.allocator);
-            errdefer self.allocator.free(message);
-            self.mutex.lockUncancelable(self.io);
-            defer self.mutex.unlock(self.io);
-            try self.incoming.push(self.allocator, message);
-            if (self.wake) |wake| wake();
-        }
+        while (true) try self.deliver(try reader.read(self.allocator));
     }
 
     fn readStderr(self: *Peer, file: std.Io.File) void {
@@ -266,4 +330,110 @@ test "protocol framing and queue overflow fail explicitly without losing earlier
     const first = queue.pop().?;
     defer t.allocator.free(first);
     try t.expectEqualStrings("original", first);
+}
+
+fn queuedIncoming(peer: *Peer) usize {
+    peer.mutex.lockUncancelable(peer.io);
+    defer peer.mutex.unlock(peer.io);
+    return peer.incoming.messages.items.len;
+}
+
+const TestProducer = struct {
+    fn run(peer: *Peer, count: usize, result: *?anyerror) void {
+        for (0..count) |i| {
+            var buf: [24]u8 = undefined;
+            const text = std.fmt.bufPrint(&buf, "{d}", .{i}) catch unreachable;
+            const message = peer.allocator.dupe(u8, text) catch |err| {
+                result.* = err;
+                return;
+            };
+            peer.deliver(message) catch |err| {
+                result.* = err;
+                return;
+            };
+        }
+    }
+};
+
+test "a full incoming queue stalls the reader instead of failing a busy session" {
+    const t = std.testing;
+    const peer = try Peer.detached(t.allocator, t.io);
+    defer peer.deinit();
+    var result: ?anyerror = null;
+    var producer = try t.io.concurrent(TestProducer.run, .{ peer, 300, &result });
+    defer producer.cancel(t.io);
+    // Consumer busy for a while: the reader fills the queue, then waits.
+    const start = std.Io.Clock.now(.awake, t.io).nanoseconds;
+    while (queuedIncoming(peer) < Queue.max_messages and std.Io.Clock.now(.awake, t.io).nanoseconds - start < 5 * std.time.ns_per_s) {
+        try std.Io.sleep(t.io, .fromMilliseconds(2), .awake);
+    }
+    try std.Io.sleep(t.io, .fromMilliseconds(50), .awake);
+    try t.expectEqual(@as(usize, Queue.max_messages), queuedIncoming(peer));
+    try t.expect(result == null and peer.errorState() == null);
+    // Slow drain: every message arrives, in order, and the session survives.
+    var received: usize = 0;
+    while (received < 300 and std.Io.Clock.now(.awake, t.io).nanoseconds - start < 20 * std.time.ns_per_s) {
+        const message = peer.take() orelse {
+            try std.Io.sleep(t.io, .fromMilliseconds(1), .awake);
+            continue;
+        };
+        defer t.allocator.free(message);
+        var buf: [24]u8 = undefined;
+        try t.expectEqualStrings(try std.fmt.bufPrint(&buf, "{d}", .{received}), message);
+        received += 1;
+        if (received % 64 == 0) try std.Io.sleep(t.io, .fromMilliseconds(10), .awake);
+    }
+    producer.await(t.io);
+    try t.expectEqual(@as(usize, 300), received);
+    try t.expect(result == null and peer.errorState() == null and !peer.stopped());
+}
+
+test "only a consumer that stops taking messages overflows the incoming queue" {
+    const t = std.testing;
+    const peer = try Peer.detached(t.allocator, t.io);
+    defer peer.deinit();
+    peer.consumer_timeout_ms = 30;
+    var result: ?anyerror = null;
+    TestProducer.run(peer, Queue.max_messages + 1, &result);
+    try t.expectEqual(@as(?anyerror, error.ProtocolOverflow), result);
+    // Nothing already queued is lost (the rejected message is freed).
+    try t.expectEqual(@as(usize, Queue.max_messages), queuedIncoming(peer));
+    const first = peer.take().?;
+    defer t.allocator.free(first);
+    try t.expectEqualStrings("0", first);
+}
+
+/// Wake probe: counts wakes that ran while their caller still held the
+/// peer mutex (tryLock fails then — the probe runs on the locking thread).
+const WakeProbe = struct {
+    var peer: ?*Peer = null;
+    var calls: usize = 0;
+    var under_lock: usize = 0;
+
+    fn wake() void {
+        calls += 1;
+        const p = peer orelse return;
+        if (p.mutex.tryLock()) p.mutex.unlock(p.io) else under_lock += 1;
+    }
+};
+
+test "peer wakes run after the peer mutex is released" {
+    const t = std.testing;
+    const peer = try Peer.detached(t.allocator, t.io);
+    defer peer.deinit();
+    peer.wake = &WakeProbe.wake;
+    WakeProbe.peer = peer;
+    WakeProbe.calls = 0;
+    WakeProbe.under_lock = 0;
+    defer WakeProbe.peer = null;
+    try peer.deliver(try t.allocator.dupe(u8, "message"));
+    for (0..Queue.max_messages) |_| try peer.send("x");
+    try t.expectError(error.ProtocolOverflow, peer.send("x")); // outgoing never blocks
+    try t.expectEqual(@as(?anyerror, error.ProtocolOverflow), peer.errorState());
+    peer.failed(error.EndOfStream);
+    try t.expectEqual(@as(usize, 3), WakeProbe.calls);
+    try t.expectEqual(@as(usize, 0), WakeProbe.under_lock);
+    const message = peer.take().?;
+    defer t.allocator.free(message);
+    try t.expectEqualStrings("message", message);
 }

@@ -262,7 +262,7 @@ fn optStrEql(a: ?[]const u8, b: ?[]const u8) bool {
 
 var next_generation = std.atomic.Value(u64).init(1);
 
-pub const RequestMethod = enum { initialize, completion, goto_definition, hover, prepare_rename, rename, format_document, format_selection, shutdown };
+pub const RequestMethod = enum { initialize, completion, goto_definition, hover, references, document_symbol, workspace_symbol, signature_help, prepare_rename, rename, format_document, format_selection, shutdown };
 pub const Request = struct {
     method: RequestMethod,
     doc_id: ?u64 = null,
@@ -278,7 +278,38 @@ pub const Capabilities = struct {
     prepare_rename: bool = false,
     format_document: bool = false,
     format_selection: bool = false,
+    completion: bool = false,
+    references: bool = false,
+    document_symbol: bool = false,
+    workspace_symbol: bool = false,
+    signature_help: bool = false,
+    /// `completionProvider.triggerCharacters` (single-byte ones, up to 16).
+    completion_triggers: [16]u8 = undefined,
+    completion_trigger_len: u8 = 0,
+    /// `signatureHelpProvider.triggerCharacters` + `retriggerCharacters`.
+    signature_triggers: [8]u8 = undefined,
+    signature_trigger_len: u8 = 0,
+
+    pub fn isCompletionTrigger(self: *const Capabilities, b: u8) bool {
+        return std.mem.indexOfScalar(u8, self.completion_triggers[0..self.completion_trigger_len], b) != null;
+    }
+
+    pub fn isSignatureTrigger(self: *const Capabilities, b: u8) bool {
+        return std.mem.indexOfScalar(u8, self.signature_triggers[0..self.signature_trigger_len], b) != null;
+    }
 };
+
+/// Collect the single-byte strings of a `triggerCharacters`-style array.
+fn collectTriggerChars(value: ?std.json.Value, out: []u8, len: *u8) void {
+    const array = value orelse return;
+    if (array != .array) return;
+    for (array.array.items) |item| {
+        if (item != .string or item.string.len != 1) continue;
+        if (len.* >= out.len) return;
+        out[len.*] = item.string[0];
+        len.* += 1;
+    }
+}
 fn capability(value: std.json.Value, name: []const u8) bool {
     if (value != .object) return false;
     const property = value.object.get(name) orelse return false;
@@ -434,7 +465,10 @@ pub const LspClient = struct {
         const id = try self.sendRequest(method, params);
         var tracked = context;
         tracked.generation = self.generation;
-        tracked.deadline = std.Io.Clock.now(.awake, self.io).nanoseconds + 10 * std.time.ns_per_s;
+        // Slow starters (jdtls, rust-analyzer on a cold cache) need longer
+        // than a feature request to answer `initialize`.
+        const seconds: i128 = if (context.method == .initialize) 60 else 10;
+        tracked.deadline = std.Io.Clock.now(.awake, self.io).nanoseconds + seconds * std.time.ns_per_s;
         self.pending.putAssumeCapacity(id, tracked);
         return id;
     }
@@ -477,6 +511,32 @@ pub const LspClient = struct {
         };
         if (caps.object.get("renameProvider")) |rename| {
             if (rename == .object) self.capabilities.prepare_rename = capability(rename, "prepareProvider");
+        }
+        self.capabilities.completion = capability(caps, "completionProvider");
+        self.capabilities.references = capability(caps, "referencesProvider");
+        self.capabilities.document_symbol = capability(caps, "documentSymbolProvider");
+        self.capabilities.workspace_symbol = capability(caps, "workspaceSymbolProvider");
+        self.capabilities.signature_help = capability(caps, "signatureHelpProvider");
+        if (caps.object.get("signatureHelpProvider")) |provider| {
+            if (provider == .object) {
+                collectTriggerChars(provider.object.get("triggerCharacters"), &self.capabilities.signature_triggers, &self.capabilities.signature_trigger_len);
+                collectTriggerChars(provider.object.get("retriggerCharacters"), &self.capabilities.signature_triggers, &self.capabilities.signature_trigger_len);
+            }
+        }
+        if (caps.object.get("completionProvider")) |provider| {
+            if (provider == .object) {
+                if (provider.object.get("triggerCharacters")) |triggers| {
+                    if (triggers == .array) {
+                        for (triggers.array.items) |item| {
+                            if (item != .string or item.string.len != 1) continue;
+                            const n = self.capabilities.completion_trigger_len;
+                            if (n >= self.capabilities.completion_triggers.len) break;
+                            self.capabilities.completion_triggers[n] = item.string[0];
+                            self.capabilities.completion_trigger_len = n + 1;
+                        }
+                    }
+                }
+            }
         }
         self.position_encoding = .utf16;
         if (caps.object.get("positionEncoding")) |encoding| {
@@ -650,15 +710,20 @@ pub const LspClient = struct {
 
     // ----- Message polling (called from main thread) -----
 
+    /// Messages handled per tick, so a burst can't stall a frame.
+    pub const max_messages_per_poll = 64;
+
     pub fn pollMessages(self: *LspClient, editor: anytype) void {
-        var count: usize = 0;
         const peer = self.peer orelse return;
-        while (peer.take()) |message| {
+        for (0..max_messages_per_poll) |_| {
+            const message = peer.take() orelse return;
             defer self.allocator.free(message);
             self.dispatchMessage(message, editor);
-            count += 1;
-            if (count > 64) break; // Limit per frame to avoid stalls
         }
+        // Cap hit. The reader only wakes the loop for NEW messages, so the
+        // rest would wait for the next input event or the 1.5 s poll: skip
+        // the frontend's next sleep instead and let the next tick continue.
+        if (peer.hasIncoming()) editor.deadlines.run_again = true;
     }
 
     fn dispatchMessage(self: *LspClient, json_bytes: []const u8, editor: anytype) void {
@@ -730,7 +795,7 @@ pub const LspClient = struct {
             .goto_definition => {
                 if (context.doc_id == null or (editor.activeDoc().id == context.doc_id.? and (context.cursor == null or editor.activeDoc().cursors.primary().offset == context.cursor.?))) self.handleDefinitionResponse(json_bytes, editor);
             },
-            .hover, .prepare_rename, .rename, .format_document, .format_selection => editor.lsp_tools.response(editor, self, context, json_bytes),
+            .hover, .references, .document_symbol, .workspace_symbol, .signature_help, .prepare_rename, .rename, .format_document, .format_selection => editor.lsp_tools.response(editor, self, context, json_bytes),
             .shutdown => {},
         }
     }
@@ -895,6 +960,8 @@ pub const LspClient = struct {
                 freeCompletionEntry(self.allocator, item);
             };
         }
+        editor.completion_stale = false;
+        std.log.info("LSP[{s}] completion: {d} items, {d} match the typed prefix", .{ self.name(), items.len, editor.completion_items.items.len });
     }
 
     fn handleDefinitionResponse(self: *LspClient, json_bytes: []const u8, editor: anytype) void {
@@ -932,12 +999,9 @@ pub const LspClient = struct {
     fn jumpToLocation(self: *LspClient, loc: DefinitionLocation, editor: anytype) void {
         const file_path = uriToPath(self.allocator, loc.uri) catch return;
         defer self.allocator.free(file_path);
-
-        const doc = editor.openOrFocus(file_path) catch return;
-        const byte = @import("workspace_edit.zig").offset(doc, loc.range.start, self.position_encoding) catch return;
-        doc.gotoLine(loc.range.start.line + 1);
-        doc.cursors.primary().offset = byte;
-        doc.cursors.primary().preferred_col = doc.buffer.offsetToPos(byte).col;
+        // Opened by lsp_tools.tick after the poll loop: an `open` hook may
+        // restart servers and free this client mid-dispatch.
+        editor.lsp_tools.queueDefinition(editor, file_path, loc.range.start, self.position_encoding);
     }
 };
 
@@ -1004,17 +1068,19 @@ pub fn utf16ColToByte(line: []const u8, utf16_col: u32) usize {
     return i;
 }
 
-/// Checked conversion for edits: never clamp an invalid server position.
+/// Server position → byte column for edits and locations. A column past the
+/// end of the line means the end of the line (LSP 3.17); a column inside a
+/// surrogate pair, or text that is not UTF-8, is rejected, never guessed.
 pub fn checkedUtf16ColToByte(line: []const u8, column: u32) !usize {
     var units: u32 = 0;
     var off: usize = 0;
     while (units < column) {
-        if (off >= line.len) return error.InvalidCompletionEdit;
-        const len = std.unicode.utf8ByteSequenceLength(line[off]) catch return error.InvalidCompletionEdit;
-        if (len > line.len - off) return error.InvalidCompletionEdit;
-        const cp = std.unicode.utf8Decode(line[off..][0..len]) catch return error.InvalidCompletionEdit;
+        if (off >= line.len) return line.len;
+        const len = std.unicode.utf8ByteSequenceLength(line[off]) catch return error.InvalidRange;
+        if (len > line.len - off) return error.InvalidRange;
+        const cp = std.unicode.utf8Decode(line[off..][0..len]) catch return error.InvalidRange;
         const width: u32 = if (cp >= 0x10000) 2 else 1;
-        if (width > column - units) return error.InvalidCompletionEdit;
+        if (width > column - units) return error.InvalidRange;
         units += width;
         off += len;
     }
@@ -1310,6 +1376,12 @@ test "utf16 column conversion" {
     // Clamping: past end of line
     try std.testing.expectEqual(@as(u32, 2), byteColToUtf16("ab", 99));
     try std.testing.expectEqual(@as(usize, 2), utf16ColToByte("ab", 99));
+
+    // Server positions: past the end means the line end (LSP 3.17); a column
+    // inside a surrogate pair is rejected.
+    try std.testing.expectEqual(@as(usize, 2), try checkedUtf16ColToByte("ab", 99));
+    try std.testing.expectEqual(@as(usize, 5), try checkedUtf16ColToByte(emoji, 3));
+    try std.testing.expectError(error.InvalidRange, checkedUtf16ColToByte(emoji, 2));
 }
 
 test "ServerConfig defaults, lookup, equality, display name" {
@@ -1438,6 +1510,172 @@ test "LSP negotiates capabilities and rejects unsupported position encodings" {
     try t.expectError(error.UnsupportedPositionEncoding, client.negotiate("{\"result\":{\"capabilities\":{\"positionEncoding\":\"utf-32\"}}}"));
 }
 
+test "a references reply fills the References view with excerpts and opens on Enter" {
+    const t = std.testing;
+    const Editor = @import("editor.zig").Editor;
+    var tmp = t.tmpDir(.{});
+    defer tmp.cleanup();
+    {
+        const f = try tmp.dir.createFile(t.io, "target.zig", .{});
+        defer f.close(t.io);
+        try f.writeStreamingAll(t.io, "const a = 1;\n    const b = a;\nconst c = a;\n");
+    }
+    const root = try tmp.dir.realPathFileAlloc(t.io, ".", t.allocator);
+    defer t.allocator.free(root);
+    const target = try std.fs.path.join(t.allocator, &.{ root, "target.zig" });
+    defer t.allocator.free(target);
+    const uri = try pathToUri(t.allocator, target);
+    defer t.allocator.free(uri);
+
+    var editor = try Editor.init(t.allocator, t.io);
+    defer editor.deinit();
+    editor.lsp_enabled = false;
+    var client = LspClient.init(t.allocator, t.io);
+    defer client.deinit();
+    const doc = editor.activeDoc();
+    try doc.insertAtCursor("a");
+    editor.lsp_tools.references_symbol[0] = 'a';
+    editor.lsp_tools.references_symbol_len = 1;
+    try client.pending.put(1, .{ .method = .references, .generation = client.generation, .doc_id = doc.id, .version = doc.buffer.version, .cursor = doc.cursors.primary().offset, .serial = editor.lsp_tools.serial });
+    const reply = try std.fmt.allocPrint(t.allocator, "{{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":[{{\"uri\":\"{s}\",\"range\":{{\"start\":{{\"line\":1,\"character\":14}},\"end\":{{\"line\":1,\"character\":15}}}}}},{{\"uri\":\"{s}\",\"range\":{{\"start\":{{\"line\":2,\"character\":10}},\"end\":{{\"line\":2,\"character\":11}}}}}}]}}", .{ uri, uri });
+    defer t.allocator.free(reply);
+    client.dispatchMessage(reply, &editor);
+    try t.expectEqual(@as(usize, 2), editor.lsp_tools.references.items.len);
+    try t.expectEqual(Editor.Mode.tool_panel, editor.mode);
+    try t.expectEqual(@import("tool_panel.zig").Kind.references, editor.tool_panel.kind);
+    try t.expectEqualStrings("const b = a;", editor.lsp_tools.references.items[0].excerpt);
+    var row_buf: [512]u8 = undefined;
+    const row = editor.tool_panel.row(&editor, 0, &row_buf);
+    try t.expect(std.mem.indexOf(u8, row, "target.zig:2:15") != null);
+    try t.expect(std.mem.indexOf(u8, row, "const b = a;") != null);
+    var title_buf: [256]u8 = undefined;
+    try t.expect(std.mem.startsWith(u8, editor.tool_panel.title(&editor, &title_buf), "References to a: 2"));
+    // Enter opens the location (a recorded jump).
+    editor.tool_panel.activate(&editor);
+    try t.expectEqual(Editor.Mode.normal, editor.mode);
+    try t.expect(editor.pathsEqual(editor.activeDoc().file_path.?, target));
+    try t.expectEqual(@as(usize, 1), editor.activeDoc().buffer.offsetToPos(editor.activeDoc().cursors.primary().offset).line);
+    // An empty reply reports and leaves the editor alone.
+    try client.pending.put(2, .{ .method = .references, .generation = client.generation, .doc_id = editor.activeDoc().id, .version = editor.activeDoc().buffer.version, .cursor = editor.activeDoc().cursors.primary().offset, .serial = editor.lsp_tools.serial });
+    client.dispatchMessage("{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":[]}", &editor);
+    try t.expectEqualStrings("No references found", editor.status_message);
+    try t.expectEqual(Editor.Mode.normal, editor.mode);
+    try t.expectEqual(@as(usize, 0), editor.lsp_tools.references.items.len);
+}
+
+test "document and workspace symbol replies fill the picker; Enter jumps" {
+    const t = std.testing;
+    const Editor = @import("editor.zig").Editor;
+    var tmp = t.tmpDir(.{});
+    defer tmp.cleanup();
+    {
+        const f = try tmp.dir.createFile(t.io, "target.zig", .{});
+        defer f.close(t.io);
+        try f.writeStreamingAll(t.io, "pub fn main() void {\n    var inner = 1;\n}\nconst Editor = struct {};\n");
+    }
+    const root = try tmp.dir.realPathFileAlloc(t.io, ".", t.allocator);
+    defer t.allocator.free(root);
+    const target = try std.fs.path.join(t.allocator, &.{ root, "target.zig" });
+    defer t.allocator.free(target);
+    const uri = try pathToUri(t.allocator, target);
+    defer t.allocator.free(uri);
+
+    var editor = try Editor.init(t.allocator, t.io);
+    defer editor.deinit();
+    editor.lsp_enabled = false;
+    var client = LspClient.init(t.allocator, t.io);
+    defer client.deinit();
+    const doc = try editor.openFile(target);
+    // Document symbols: a hierarchical reply becomes rows with the parent in the detail.
+    try client.pending.put(1, .{ .method = .document_symbol, .generation = client.generation, .doc_id = doc.id, .version = doc.buffer.version, .serial = editor.lsp_tools.serial });
+    client.dispatchMessage("{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":[{\"name\":\"main\",\"kind\":12,\"range\":{\"start\":{\"line\":0,\"character\":0},\"end\":{\"line\":2,\"character\":1}},\"selectionRange\":{\"start\":{\"line\":0,\"character\":7},\"end\":{\"line\":0,\"character\":11}},\"children\":[{\"name\":\"inner\",\"kind\":13,\"range\":{\"start\":{\"line\":1,\"character\":4},\"end\":{\"line\":1,\"character\":18}},\"selectionRange\":{\"start\":{\"line\":1,\"character\":8},\"end\":{\"line\":1,\"character\":13}}}]},{\"name\":\"Editor\",\"kind\":23,\"range\":{\"start\":{\"line\":3,\"character\":0},\"end\":{\"line\":3,\"character\":25}},\"selectionRange\":{\"start\":{\"line\":3,\"character\":6},\"end\":{\"line\":3,\"character\":12}}}]}", &editor);
+    try t.expectEqual(Editor.Mode.picker, editor.mode);
+    try t.expectEqual(@as(usize, 3), editor.picker.count());
+    try t.expectEqualStrings("main", editor.picker.itemAt(0).label);
+    try t.expectEqualStrings("function", editor.picker.itemAt(0).detail);
+    try t.expectEqualStrings("inner", editor.picker.itemAt(1).label);
+    try t.expectEqualStrings("variable in main", editor.picker.itemAt(1).detail);
+    editor.pickerTyped("in"); // "inner" by prefix, "main" by subsequence
+    try t.expectEqual(@as(usize, 2), editor.picker.count());
+    try t.expectEqualStrings("inner", editor.picker.itemAt(0).label);
+    editor.pickerTyped("n");
+    try t.expectEqual(@as(usize, 1), editor.picker.count());
+    editor.pickerConfirm();
+    try t.expectEqual(Editor.Mode.normal, editor.mode);
+    const after = editor.activeDoc().buffer.offsetToPos(editor.activeDoc().cursors.primary().offset);
+    try t.expectEqual(@as(usize, 1), after.line);
+    try t.expectEqual(@as(usize, 8), after.col);
+    // Workspace symbols: the picker opens empty; a reply for the typed query fills it.
+    editor.lsp_tools.beginWorkspaceSymbols(&editor);
+    try t.expectEqual(Editor.Mode.picker, editor.mode);
+    try t.expectEqual(@as(usize, 0), editor.picker.count());
+    editor.picker.typeText("Ed"); // the filter alone: no server to ask here
+    try client.pending.put(2, .{ .method = .workspace_symbol, .generation = client.generation, .doc_id = editor.activeDoc().id, .version = editor.activeDoc().buffer.version, .serial = editor.lsp_tools.serial });
+    const reply = try std.fmt.allocPrint(t.allocator, "{{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":[{{\"name\":\"Editor\",\"kind\":23,\"location\":{{\"uri\":\"{s}\",\"range\":{{\"start\":{{\"line\":3,\"character\":6}},\"end\":{{\"line\":3,\"character\":12}}}}}},\"containerName\":\"target.zig\"}}]}}", .{uri});
+    defer t.allocator.free(reply);
+    client.dispatchMessage(reply, &editor);
+    try t.expectEqual(@as(usize, 1), editor.picker.count());
+    try t.expectEqualStrings("Editor", editor.picker.itemAt(0).label);
+    try t.expect(std.mem.indexOf(u8, editor.picker.itemAt(0).detail, "struct") != null);
+    editor.pickerConfirm();
+    try t.expectEqual(Editor.Mode.normal, editor.mode);
+    try t.expectEqual(@as(usize, 3), editor.activeDoc().buffer.offsetToPos(editor.activeDoc().cursors.primary().offset).line);
+}
+
+test "LSP negotiation keeps the completion trigger characters" {
+    const t = std.testing;
+    var client = LspClient.init(t.allocator, t.io);
+    defer client.deinit();
+    try client.negotiate("{\"result\":{\"capabilities\":{\"completionProvider\":{\"triggerCharacters\":[\".\",\"@\",\"->\"]}}}}");
+    try t.expect(client.capabilities.completion);
+    try t.expect(client.capabilities.isCompletionTrigger('.'));
+    try t.expect(client.capabilities.isCompletionTrigger('@'));
+    try t.expect(!client.capabilities.isCompletionTrigger('-')); // multi-byte triggers are skipped
+    try t.expect(!client.capabilities.isCompletionTrigger('x'));
+    try client.negotiate("{\"result\":{\"capabilities\":{\"completionProvider\":true}}}");
+    try t.expect(client.capabilities.completion);
+    try t.expect(!client.capabilities.isCompletionTrigger('.'));
+    try client.negotiate("{\"result\":{\"capabilities\":{\"signatureHelpProvider\":{\"triggerCharacters\":[\"(\"],\"retriggerCharacters\":[\",\"]}}}}");
+    try t.expect(client.capabilities.signature_help);
+    try t.expect(client.capabilities.isSignatureTrigger('('));
+    try t.expect(client.capabilities.isSignatureTrigger(','));
+    try t.expect(!client.capabilities.isSignatureTrigger(')'));
+}
+
+test "a signature help reply shows the active parameter; ')' and leaving the line hide it" {
+    const t = std.testing;
+    const Editor = @import("editor.zig").Editor;
+    var editor = try Editor.init(t.allocator, t.io);
+    defer editor.deinit();
+    editor.lsp_enabled = false;
+    var client = LspClient.init(t.allocator, t.io);
+    defer client.deinit();
+    const doc = editor.activeDoc();
+    try doc.insertAtCursor("one\nfoo(a, ");
+    try client.pending.put(1, .{ .method = .signature_help, .generation = client.generation, .doc_id = doc.id, .version = doc.buffer.version, .cursor = doc.cursors.primary().offset, .serial = editor.lsp_tools.serial });
+    client.dispatchMessage("{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"signatures\":[{\"label\":\"fn foo(a: u8, b: []const u8) void\",\"documentation\":{\"kind\":\"markdown\",\"value\":\"Does foo.\\nMore.\"},\"parameters\":[{\"label\":\"a: u8\"},{\"label\":[14,27],\"documentation\":\"the b parameter\"}]}],\"activeSignature\":0,\"activeParameter\":1}}", &editor);
+    const sig = editor.signature.?;
+    try t.expectEqualStrings("fn foo(a: u8, b: []const u8) void", sig.label);
+    try t.expectEqual(@as(usize, 14), sig.param_start);
+    try t.expectEqual(@as(usize, 27), sig.param_end);
+    try t.expectEqualStrings("the b parameter", sig.doc);
+    try t.expect(editor.signatureVisible());
+    // Typing ')' closes it.
+    _ = editor.execCommand("insert_char", ")");
+    try t.expect(editor.signature == null);
+    // A string parameter label is located in the signature; the
+    // signature's own documentation stands in; another line drops it.
+    try client.pending.put(2, .{ .method = .signature_help, .generation = client.generation, .doc_id = doc.id, .version = doc.buffer.version, .cursor = doc.cursors.primary().offset, .serial = editor.lsp_tools.serial });
+    client.dispatchMessage("{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{\"signatures\":[{\"label\":\"fn bar(x: i32) void\",\"documentation\":\"Bar it.\",\"parameters\":[{\"label\":\"x: i32\"}]}]}}", &editor);
+    try t.expectEqualStrings("fn bar(x: i32) void", editor.signature.?.label);
+    try t.expectEqual(@as(usize, 7), editor.signature.?.param_start);
+    try t.expectEqual(@as(usize, 13), editor.signature.?.param_end);
+    try t.expectEqualStrings("Bar it.", editor.signature.?.doc);
+    doc.gotoLine(1);
+    try t.expect(!editor.signatureVisible());
+    try t.expect(editor.signature == null);
+}
+
 test "LSP drops stale and out-of-order feature replies; timeout aborts formatting save" {
     const t = std.testing;
     const Editor = @import("editor.zig").Editor;
@@ -1474,6 +1712,146 @@ test "LSP drops stale and out-of-order feature replies; timeout aborts formattin
     client.expireRequests(&editor, 1);
     try t.expectEqual(@as(usize, 0), client.pending.count());
     try t.expect(editor.lsp_tools.save == null and doc.dirty);
+
+    // Formatting numbers its requests on its own counter: a hover that
+    // expires with the same serial leaves the formatting save alone.
+    const format_request: Request = .{ .method = .format_document, .generation = client.generation, .doc_id = doc.id, .version = doc.buffer.version, .serial = 7 };
+    editor.lsp_tools.formatting = format_request;
+    editor.lsp_tools.save = .{ .id = doc.id, .options = .{ .interactive = false }, .owned_path = null };
+    var expiring = format_request;
+    expiring.method = .hover;
+    try client.pending.put(5, expiring);
+    client.expireRequests(&editor, 1);
+    try t.expect(editor.lsp_tools.formatting != null and editor.lsp_tools.save != null);
+    // The formatting reply applies its edits but saves only from `tick`,
+    // after polling: a save runs Lua hooks that may stop this very client.
+    try client.pending.put(6, format_request);
+    client.dispatchMessage("{\"jsonrpc\":\"2.0\",\"id\":6,\"result\":null}", &editor);
+    try t.expect(editor.lsp_tools.formatting == null and editor.lsp_tools.save != null);
+    try t.expectEqual(@as(?u64, doc.id), editor.lsp_tools.pending_post_format_save);
+    try t.expect(doc.dirty);
+    editor.lsp_tools.tick(&editor); // untitled: the quiet save needs a path
+    try t.expect(editor.lsp_tools.pending_post_format_save == null and editor.lsp_tools.save == null);
+    try t.expect(doc.dirty);
+}
+
+test "a goto-definition reply jumps from lsp_tools.tick, never inside message dispatch" {
+    const t = std.testing;
+    const Editor = @import("editor.zig").Editor;
+    var tmp = t.tmpDir(.{});
+    defer tmp.cleanup();
+    {
+        const f = try tmp.dir.createFile(t.io, "target.zig", .{});
+        defer f.close(t.io);
+        try f.writeStreamingAll(t.io, "const a = 1;\nconst é = 2;\n");
+    }
+    const root = try tmp.dir.realPathFileAlloc(t.io, ".", t.allocator);
+    defer t.allocator.free(root);
+    const target = try std.fs.path.join(t.allocator, &.{ root, "target.zig" });
+    defer t.allocator.free(target);
+    const uri = try pathToUri(t.allocator, target);
+    defer t.allocator.free(uri);
+
+    var editor = try Editor.init(t.allocator, t.io);
+    defer editor.deinit();
+    editor.lsp_enabled = false;
+    var client = LspClient.init(t.allocator, t.io);
+    defer client.deinit();
+    const doc = editor.activeDoc();
+    try doc.insertAtCursor("use(a)");
+    try client.pending.put(1, .{ .method = .goto_definition, .generation = client.generation, .doc_id = doc.id, .version = doc.buffer.version, .cursor = doc.cursors.primary().offset });
+    // Line 1, UTF-16 column 8: after "const é " (é is one unit, two bytes).
+    const reply = try std.fmt.allocPrint(t.allocator, "{{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":[{{\"uri\":\"{s}\",\"range\":{{\"start\":{{\"line\":1,\"character\":8}},\"end\":{{\"line\":1,\"character\":9}}}}}}]}}", .{uri});
+    defer t.allocator.free(reply);
+    client.dispatchMessage(reply, &editor);
+    // Nothing opened inside dispatch: an `open` hook could restart servers
+    // and free this very client.
+    try t.expectEqual(@as(usize, 1), editor.documents.items.len);
+    try t.expect(editor.lsp_tools.pending_definition != null);
+
+    editor.lsp_tools.tick(&editor);
+    try t.expect(editor.lsp_tools.pending_definition == null);
+    const opened = editor.activeDoc();
+    try t.expect(editor.pathsEqual(opened.file_path.?, target));
+    try t.expectEqual(@as(usize, "const a = 1;\n".len + "const é ".len), opened.cursors.primary().offset);
+
+    // A reply still queued when the editor goes away is freed with it.
+    try client.pending.put(2, .{ .method = .goto_definition, .generation = client.generation, .doc_id = opened.id, .version = opened.buffer.version, .cursor = opened.cursors.primary().offset });
+    const again = try std.fmt.allocPrint(t.allocator, "{{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{{\"uri\":\"{s}\",\"range\":{{\"start\":{{\"line\":0,\"character\":0}},\"end\":{{\"line\":0,\"character\":1}}}}}}}}", .{uri});
+    defer t.allocator.free(again);
+    client.dispatchMessage(again, &editor);
+    try t.expect(editor.lsp_tools.pending_definition != null);
+}
+
+test "navigate_back returns from a goto-definition jump into another file" {
+    const t = std.testing;
+    const Editor = @import("editor.zig").Editor;
+    var tmp = t.tmpDir(.{});
+    defer tmp.cleanup();
+    {
+        const f = try tmp.dir.createFile(t.io, "target.zig", .{});
+        defer f.close(t.io);
+        try f.writeStreamingAll(t.io, "const a = 1;\nconst b = 2;\n");
+    }
+    const root = try tmp.dir.realPathFileAlloc(t.io, ".", t.allocator);
+    defer t.allocator.free(root);
+    const target = try std.fs.path.join(t.allocator, &.{ root, "target.zig" });
+    defer t.allocator.free(target);
+    const uri = try pathToUri(t.allocator, target);
+    defer t.allocator.free(uri);
+
+    var editor = try Editor.init(t.allocator, t.io);
+    defer editor.deinit();
+    editor.lsp_enabled = false;
+    var client = LspClient.init(t.allocator, t.io);
+    defer client.deinit();
+    const doc = editor.activeDoc();
+    const origin_id = doc.id;
+    try doc.insertAtCursor("first\nuse(a)\n");
+    doc.gotoLine(2);
+    try client.pending.put(1, .{ .method = .goto_definition, .generation = client.generation, .doc_id = doc.id, .version = doc.buffer.version, .cursor = doc.cursors.primary().offset });
+    const reply = try std.fmt.allocPrint(t.allocator, "{{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":[{{\"uri\":\"{s}\",\"range\":{{\"start\":{{\"line\":1,\"character\":6}},\"end\":{{\"line\":1,\"character\":7}}}}}}]}}", .{uri});
+    defer t.allocator.free(reply);
+    client.dispatchMessage(reply, &editor);
+    editor.lsp_tools.tick(&editor);
+    const opened = editor.activeDoc();
+    try t.expect(editor.pathsEqual(opened.file_path.?, target));
+    try t.expectEqual(@as(usize, 1), opened.buffer.offsetToPos(opened.cursors.primary().offset).line);
+    const target_id = opened.id;
+
+    // Back lands on the line the jump left; forward re-jumps.
+    try t.expect(editor.execAction("navigate_back"));
+    try t.expectEqual(origin_id, editor.activeDoc().id);
+    try t.expectEqual(@as(usize, 1), editor.activeDoc().buffer.offsetToPos(editor.activeDoc().cursors.primary().offset).line);
+    try t.expect(editor.execAction("navigate_forward"));
+    try t.expectEqual(target_id, editor.activeDoc().id);
+    try t.expectEqual(@as(usize, 1), editor.activeDoc().buffer.offsetToPos(editor.activeDoc().cursors.primary().offset).line);
+}
+
+test "LSP message bursts past the per-tick cap skip the next sleep" {
+    const t = std.testing;
+    const Editor = @import("editor.zig").Editor;
+    var editor = try Editor.init(t.allocator, t.io);
+    defer editor.deinit();
+    editor.lsp_enabled = false;
+    var client = LspClient.init(t.allocator, t.io);
+    defer client.deinit();
+    client.peer = try protocol.Peer.detached(t.allocator, t.io);
+    const peer = client.peer.?;
+    for (0..LspClient.max_messages_per_poll + 36) |_| {
+        const message = try t.allocator.dupe(u8, "{\"jsonrpc\":\"2.0\",\"method\":\"$/progress\",\"params\":{}}");
+        peer.incoming.push(t.allocator, message) catch |err| {
+            t.allocator.free(message);
+            return err;
+        };
+    }
+    client.pollMessages(&editor);
+    try t.expectEqual(@as(usize, 36), peer.incoming.messages.items.len);
+    try t.expect(editor.deadlines.run_again);
+    try t.expectEqual(@as(u32, 0), editor.deadlines.waitMicros(std.Io.Clock.now(.awake, t.io).nanoseconds));
+    try t.expect(!editor.deadlines.run_again);
+    client.pollMessages(&editor);
+    try t.expect(!peer.hasIncoming() and !editor.deadlines.run_again);
 }
 
 test "LSP integration: ZLS hover, prepare rename, multi-location edit and formatting" {

@@ -131,27 +131,27 @@ pub const lang_zig = LanguageDef{
     .name = "zig",
     .extensions = &.{ "zig", "zon" },
     .keywords = &.{
-        "addrspace",  "align",       "allowzero",   "and",        "anyframe",
-        "anytype",    "asm",         "async",        "await",      "break",
-        "callconv",   "catch",       "comptime",     "const",      "continue",
-        "defer",      "else",        "enum",         "errdefer",   "error",
-        "export",     "extern",      "fn",           "for",        "if",
-        "inline",     "linksection", "noalias",      "nosuspend",  "opaque",
-        "or",         "orelse",      "packed",       "pub",        "resume",
-        "return",     "struct",      "suspend",      "switch",     "test",
-        "threadlocal", "try",        "union",        "unreachable", "var",
-        "volatile",   "while",
+        "addrspace",   "align",       "allowzero", "and",         "anyframe",
+        "anytype",     "asm",         "async",     "await",       "break",
+        "callconv",    "catch",       "comptime",  "const",       "continue",
+        "defer",       "else",        "enum",      "errdefer",    "error",
+        "export",      "extern",      "fn",        "for",         "if",
+        "inline",      "linksection", "noalias",   "nosuspend",   "opaque",
+        "or",          "orelse",      "packed",    "pub",         "resume",
+        "return",      "struct",      "suspend",   "switch",      "test",
+        "threadlocal", "try",         "union",     "unreachable", "var",
+        "volatile",    "while",
     },
     .types = &.{
-        "void",          "bool",          "noreturn",    "type",
-        "anyerror",      "anyopaque",     "comptime_int", "comptime_float",
-        "u8",            "u16",           "u32",          "u64",
-        "u128",          "usize",         "i8",           "i16",
-        "i32",           "i64",           "i128",         "isize",
-        "f16",           "f32",           "f64",          "f80",
-        "f128",          "c_char",        "c_short",      "c_ushort",
-        "c_int",         "c_uint",        "c_long",       "c_ulong",
-        "c_longlong",    "c_ulonglong",   "c_longdouble",
+        "void",       "bool",        "noreturn",     "type",
+        "anyerror",   "anyopaque",   "comptime_int", "comptime_float",
+        "u8",         "u16",         "u32",          "u64",
+        "u128",       "usize",       "i8",           "i16",
+        "i32",        "i64",         "i128",         "isize",
+        "f16",        "f32",         "f64",          "f80",
+        "f128",       "c_char",      "c_short",      "c_ushort",
+        "c_int",      "c_uint",      "c_long",       "c_ulong",
+        "c_longlong", "c_ulonglong", "c_longdouble",
     },
     .constants = &.{ "true", "false", "null", "undefined" },
     .builtins = &.{}, // Zig builtins use @ prefix, detected automatically
@@ -245,9 +245,10 @@ pub fn tokenizeLine(
             continue;
         }
 
-        // Line comment — consumes rest of line
+        // Line comment — consumes rest of line (unless a longer block opener
+        // that starts with it matches here, see longerBlockOpenerAt)
         if (lang.line_comment) |lc| {
-            if (prefixAt(line, i, lc)) {
+            if (prefixAt(line, i, lc) and !longerBlockOpenerAt(lang, line, i, lc.len)) {
                 addCommentSpans(&count, spans_buf, line, i, line.len);
                 return .{ .count = count, .state = .normal };
             }
@@ -273,12 +274,14 @@ pub fn tokenizeLine(
 
         // Zig-style multiline string prefix (\\)
         if (ch == '\\' and i + 1 < line.len and line[i + 1] == '\\') {
-            addSpan(&count, spans_buf, i, line.len, .string);
+            addSpan(&count, spans_buf, line, i, line.len, .string);
             return .{ .count = count, .state = .normal };
         }
 
-        // String literal
-        if (std.mem.indexOfScalar(u8, lang.string_delimiters, ch) != null) {
+        // String literal. Only ASCII delimiters count: a non-ASCII byte in a
+        // Lua-registered delimiter list would match inside a multi-byte
+        // character and start a span in the middle of it.
+        if (ch < 0x80 and std.mem.indexOfScalar(u8, lang.string_delimiters, ch) != null) {
             const start = i;
             i += 1;
             while (i < line.len) : (i += 1) {
@@ -291,21 +294,16 @@ pub fn tokenizeLine(
                     break;
                 }
             }
-            addSpan(&count, spans_buf, start, i, .string);
+            addSpan(&count, spans_buf, line, start, i, .string);
             continue;
         }
 
-        // Char literal
+        // Char literal — scanned by whole code points and clamped to the
+        // line ('é' used to end the span inside the character)
         if (lang.has_char_literals and ch == '\'') {
             const start = i;
-            i += 1;
-            if (i < line.len and line[i] == '\\') {
-                i += 2; // skip escape sequence
-            } else if (i < line.len) {
-                i += 1; // skip char content
-            }
-            if (i < line.len and line[i] == '\'') i += 1; // closing '
-            addSpan(&count, spans_buf, start, i, .char_literal);
+            i = charLiteralEnd(line, i);
+            addSpan(&count, spans_buf, line, start, i, .char_literal);
             continue;
         }
 
@@ -315,7 +313,7 @@ pub fn tokenizeLine(
                 const start = i;
                 i += 1;
                 while (i < line.len and isIdentChar(line[i])) : (i += 1) {}
-                addSpan(&count, spans_buf, start, i, .builtin);
+                addSpan(&count, spans_buf, line, start, i, .builtin);
                 continue;
             }
         }
@@ -326,7 +324,7 @@ pub fn tokenizeLine(
                 const start = i;
                 i += 1;
                 while (i < line.len and isIdentChar(line[i])) : (i += 1) {}
-                addSpan(&count, spans_buf, start, i, .preprocessor);
+                addSpan(&count, spans_buf, line, start, i, .preprocessor);
                 continue;
             }
         }
@@ -341,7 +339,7 @@ pub fn tokenizeLine(
                 }
             }
             while (i < line.len and (std.ascii.isAlphanumeric(line[i]) or line[i] == '_' or line[i] == '.')) : (i += 1) {}
-            addSpan(&count, spans_buf, start, i, .number);
+            addSpan(&count, spans_buf, line, start, i, .number);
             continue;
         }
 
@@ -365,7 +363,7 @@ pub fn tokenizeLine(
                 .text;
 
             if (token_type != .text) {
-                addSpan(&count, spans_buf, start, i, token_type);
+                addSpan(&count, spans_buf, line, start, i, token_type);
             }
             continue;
         }
@@ -374,13 +372,13 @@ pub fn tokenizeLine(
         if (isOperator(ch)) {
             const start = i;
             while (i < line.len and isOperator(line[i])) : (i += 1) {}
-            addSpan(&count, spans_buf, start, i, .operator);
+            addSpan(&count, spans_buf, line, start, i, .operator);
             continue;
         }
 
         // Punctuation (single char)
         if (isPunctuation(ch)) {
-            addSpan(&count, spans_buf, i, i + 1, .punctuation);
+            addSpan(&count, spans_buf, line, i, i + 1, .punctuation);
             i += 1;
             continue;
         }
@@ -396,15 +394,72 @@ pub fn tokenizeLine(
 // Helpers
 // ---------------------------------------------------------------------------
 
-fn addSpan(count: *usize, buf: []HighlightSpan, start: usize, end: usize, token: TokenType) void {
-    if (count.* < buf.len and end > start) {
-        buf[count.*] = .{
-            .start = @intCast(@min(start, std.math.maxInt(u16))),
-            .end = @intCast(@min(end, std.math.maxInt(u16))),
-            .token = token,
-        };
-        count.* += 1;
+/// Record a span of `line`. Both edges are clamped to the line (and to the
+/// u16 span fields) and floored to UTF-8 code-point boundaries: renderers
+/// draw every span as its own string, so an edge inside a sequence hands
+/// them invalid UTF-8 (the GUI's text shaping panics on it). This holds
+/// whatever a scanning path computed.
+fn addSpan(count: *usize, buf: []HighlightSpan, line: []const u8, start: usize, end: usize, token: TokenType) void {
+    if (count.* >= buf.len) return;
+    const limit = @min(line.len, std.math.maxInt(u16));
+    const e = floorCodePoint(line, @min(end, limit));
+    const s = floorCodePoint(line, @min(start, e));
+    if (e <= s) return;
+    buf[count.*] = .{ .start = @intCast(s), .end = @intCast(e), .token = token };
+    count.* += 1;
+}
+
+fn isContinuationByte(byte: u8) bool {
+    return byte & 0xC0 == 0x80;
+}
+
+/// Largest code-point boundary ≤ `idx` (which must be ≤ `line.len`). Steps
+/// back at most three bytes — the longest valid sequence tail — so invalid
+/// input can't make this scan the line.
+fn floorCodePoint(line: []const u8, idx: usize) usize {
+    var i = idx;
+    while (i > 0 and i < line.len and idx - i < 3 and isContinuationByte(line[i])) i -= 1;
+    return i;
+}
+
+/// Index just past the code point that starts at `i`: its lead byte plus the
+/// continuation bytes that follow (four bytes at most), clamped to
+/// `line.len`. Invalid input never skips a non-continuation byte, so the
+/// result is always `line.len` or the start of the next character.
+fn codePointEnd(line: []const u8, i: usize) usize {
+    if (i >= line.len) return line.len;
+    var j = i + 1;
+    while (j < line.len and j - i < 4 and isContinuationByte(line[j])) j += 1;
+    return j;
+}
+
+/// Index just past the char literal whose opening quote is at `open`: one
+/// code point or one escape (`\n`, `\'`, `\x41`, `\u{1F600}`, `\101`), then
+/// the closing `'` when present. An unclosed literal — or a Rust lifetime
+/// such as `'a` — ends after its first character. Never exceeds `line.len`.
+fn charLiteralEnd(line: []const u8, open: usize) usize {
+    var i = open + 1;
+    if (i >= line.len) return line.len;
+    if (line[i] == '\\') {
+        i = codePointEnd(line, i + 1); // the escaped character
+        // Multi-character escape bodies (hex digits, braces) are ASCII and
+        // run to the closing quote; only take one when that quote is there.
+        var j = i;
+        while (j < line.len and (std.ascii.isAlphanumeric(line[j]) or line[j] == '{' or line[j] == '}')) j += 1;
+        if (j < line.len and line[j] == '\'') return j + 1;
+    } else {
+        i = codePointEnd(line, i);
     }
+    if (i < line.len and line[i] == '\'') i += 1;
+    return i;
+}
+
+/// Whether `lang`'s block-comment opener starts at `pos` and is longer than
+/// `than` bytes — Lua `--[[` over `--`, Julia `#=` and Nim `#[` over `#`:
+/// the longer marker must win or the block comment is never recognised.
+fn longerBlockOpenerAt(lang: *const LanguageDef, line: []const u8, pos: usize, than: usize) bool {
+    const bcs = lang.block_comment_start orelse return false;
+    return bcs.len > than and prefixAt(line, pos, bcs);
 }
 
 /// Emit a comment region split into .comment / .todo spans so TODO-style
@@ -414,15 +469,15 @@ fn addCommentSpans(count: *usize, buf: []HighlightSpan, line: []const u8, start:
     var i = start;
     while (i < end) {
         if (todoMarkerEnd(line, i, end)) |marker_end| {
-            if (i > plain_from) addSpan(count, buf, plain_from, i, .comment);
-            addSpan(count, buf, i, marker_end, .todo);
+            if (i > plain_from) addSpan(count, buf, line, plain_from, i, .comment);
+            addSpan(count, buf, line, i, marker_end, .todo);
             plain_from = marker_end;
             i = marker_end;
         } else {
             i += 1;
         }
     }
-    if (plain_from < end) addSpan(count, buf, plain_from, end, .comment);
+    if (plain_from < end) addSpan(count, buf, line, plain_from, end, .comment);
 }
 
 /// If a TODO-style marker starts at `pos` on a word boundary, return its end.
@@ -483,11 +538,11 @@ fn tokenizeMarkdownLine(line: []const u8, state_in: LineState, spans_buf: []High
         if (fenceEnd(line, first)) |run_end| {
             if (skipMdSpace(line, run_end) >= line.len) {
                 // Closing fence
-                addSpan(&count, spans_buf, first, run_end, .operator);
+                addSpan(&count, spans_buf, line, first, run_end, .operator);
                 return .{ .count = count, .state = .normal };
             }
         }
-        addSpan(&count, spans_buf, 0, line.len, .string);
+        addSpan(&count, spans_buf, line, 0, line.len, .string);
         return .{ .count = count, .state = .in_code_fence };
     }
 
@@ -510,22 +565,22 @@ fn tokenizeMarkdownLine(line: []const u8, state_in: LineState, spans_buf: []High
     while (pos < line.len) {
         // Thematic break wins over list markers ("- - -" vs "- item")
         if (hrEnd(line, pos)) |end| {
-            addSpan(&count, spans_buf, pos, end, .operator);
+            addSpan(&count, spans_buf, line, pos, end, .operator);
             return .{ .count = count, .state = .normal };
         }
         if (line[pos] == '>') {
-            addSpan(&count, spans_buf, pos, pos + 1, .operator);
+            addSpan(&count, spans_buf, line, pos, pos + 1, .operator);
             pos = skipMdSpace(line, pos + 1);
             continue;
         }
         if (!saw_list) {
             if (listMarkerEnd(line, pos)) |end| {
-                addSpan(&count, spans_buf, pos, end, .operator);
+                addSpan(&count, spans_buf, line, pos, end, .operator);
                 saw_list = true;
                 pos = skipMdSpace(line, end);
                 // GFM task checkbox directly after the bullet
                 if (taskBoxEnd(line, pos)) |box_end| {
-                    addSpan(&count, spans_buf, pos, box_end, .constant);
+                    addSpan(&count, spans_buf, line, pos, box_end, .constant);
                     pos = skipMdSpace(line, box_end);
                 }
                 continue;
@@ -538,10 +593,10 @@ fn tokenizeMarkdownLine(line: []const u8, state_in: LineState, spans_buf: []High
     // --- Leaf blocks ---
     // Fence open (``` or ~~~, optional info string)
     if (fenceEnd(line, pos)) |run_end| {
-        addSpan(&count, spans_buf, pos, run_end, .operator);
+        addSpan(&count, spans_buf, line, pos, run_end, .operator);
         const info_start = skipMdSpace(line, run_end);
         const info_end = trimMdEnd(line);
-        if (info_end > info_start) addSpan(&count, spans_buf, info_start, info_end, .type_name);
+        if (info_end > info_start) addSpan(&count, spans_buf, line, info_start, info_end, .type_name);
         return .{ .count = count, .state = .in_code_fence };
     }
     // ATX heading: 1-6 '#' then space or end-of-line
@@ -549,13 +604,13 @@ fn tokenizeMarkdownLine(line: []const u8, state_in: LineState, spans_buf: []High
         var h = pos;
         while (h < line.len and line[h] == '#') h += 1;
         if (h - pos <= 6 and (h >= line.len or line[h] == ' ' or line[h] == '\t')) {
-            addSpan(&count, spans_buf, pos, line.len, .heading);
+            addSpan(&count, spans_buf, line, pos, line.len, .heading);
             return .{ .count = count, .state = .normal };
         }
     }
     // Table delimiter row ("| --- | :---: |") — all structural, one span
     if (tableDelimEnd(line, pos)) |end| {
-        addSpan(&count, spans_buf, pos, end, .operator);
+        addSpan(&count, spans_buf, line, pos, end, .operator);
         return .{ .count = count, .state = .normal };
     }
 
@@ -576,7 +631,7 @@ fn scanMdInline(line: []const u8, start: usize, count: *usize, spans_buf: []High
                 var run = i;
                 while (run < line.len and line[run] == '`') run += 1;
                 if (codeSpanClose(line, run, run - i)) |close_end| {
-                    addSpan(count, spans_buf, i, close_end, .string);
+                    addSpan(count, spans_buf, line, i, close_end, .string);
                     i = close_end;
                 } else {
                     // Unmatched backticks are literal
@@ -588,7 +643,7 @@ fn scanMdInline(line: []const u8, start: usize, count: *usize, spans_buf: []High
             '~' => {
                 if (i + 1 < line.len and line[i + 1] == '~') {
                     if (delimClose(line, i + 2, "~~")) |close| {
-                        addSpan(count, spans_buf, i, close + 2, .comment);
+                        addSpan(count, spans_buf, line, i, close + 2, .comment);
                         i = close + 2;
                     } else {
                         i += 2;
@@ -617,7 +672,7 @@ fn scanMdInline(line: []const u8, start: usize, count: *usize, spans_buf: []High
                         return .in_html_comment;
                     }
                 } else if (autolinkEnd(line, i)) |end| {
-                    addSpan(count, spans_buf, i, end, .link);
+                    addSpan(count, spans_buf, line, i, end, .link);
                     i = end;
                 } else {
                     i += 1;
@@ -625,7 +680,7 @@ fn scanMdInline(line: []const u8, start: usize, count: *usize, spans_buf: []High
             },
             '|' => {
                 // Table cell separator
-                addSpan(count, spans_buf, i, i + 1, .operator);
+                addSpan(count, spans_buf, line, i, i + 1, .operator);
                 i += 1;
             },
             else => i += 1,
@@ -659,7 +714,7 @@ fn emphasisSpan(line: []const u8, i: usize, ch: u8, count: *usize, spans_buf: []
         const prev_ok = prev != ' ' and prev != '\t' and prev != ch;
         const word_ok = ch != '_' or close_run >= line.len or !isIdentChar(line[close_run]);
         if (close_run - j >= want and prev_ok and word_ok) {
-            addSpan(count, spans_buf, i, close_run, if (want == 2) .strong else .emphasis);
+            addSpan(count, spans_buf, line, i, close_run, if (want == 2) .strong else .emphasis);
             return close_run;
         }
         j = close_run;
@@ -685,7 +740,7 @@ fn linkSpan(line: []const u8, i: usize, bracket: usize, count: *usize, spans_buf
         }
     } else return null;
 
-    addSpan(count, spans_buf, i, close_bracket + 1, .link);
+    addSpan(count, spans_buf, line, i, close_bracket + 1, .link);
     if (close_bracket + 1 < line.len and line[close_bracket + 1] == '(') {
         var pdepth: usize = 0;
         var k = close_bracket + 1;
@@ -696,7 +751,7 @@ fn linkSpan(line: []const u8, i: usize, bracket: usize, count: *usize, spans_buf
                 ')' => {
                     pdepth -= 1;
                     if (pdepth == 0) {
-                        addSpan(count, spans_buf, close_bracket + 1, k + 1, .comment);
+                        addSpan(count, spans_buf, line, close_bracket + 1, k + 1, .comment);
                         return k + 1;
                     }
                 },
@@ -1029,6 +1084,147 @@ test "block comment state tracking" {
     const r2 = tokenizeLine("still in comment */", &c_like, .in_block_comment, &buf);
     try std.testing.expectEqual(LineState.normal, r2.state);
     try std.testing.expectEqual(TokenType.comment, buf[0].token);
+}
+
+test "block comment opener that starts with the line comment prefix wins" {
+    const lua_like = LanguageDef{
+        .name = "lua",
+        .extensions = &.{"lua"},
+        .keywords = &.{ "local", "function", "end" },
+        .types = &.{},
+        .constants = &.{},
+        .builtins = &.{},
+        .line_comment = "--",
+        .block_comment_start = "--[[",
+        .block_comment_end = "]]",
+        .string_delimiters = "\"'",
+        .has_char_literals = false,
+        .builtin_prefix = null,
+        .preproc_prefix = null,
+        .arena = null,
+    };
+    var buf: [64]HighlightSpan = undefined;
+
+    const r1 = tokenizeLine("--[[ start of a long comment", &lua_like, .normal, &buf);
+    try std.testing.expectEqual(LineState.in_block_comment, r1.state);
+    // The next line is still inside the comment, `--` there included.
+    const r2 = tokenizeLine("local x = 1 -- still inside", &lua_like, r1.state, &buf);
+    try std.testing.expectEqual(LineState.in_block_comment, r2.state);
+    try std.testing.expectEqual(@as(usize, 1), r2.count);
+    try std.testing.expectEqual(TokenType.comment, buf[0].token);
+    // The closer ends it and code resumes.
+    const r3 = tokenizeLine("]] local y", &lua_like, r2.state, &buf);
+    try std.testing.expectEqual(LineState.normal, r3.state);
+    try std.testing.expectEqual(TokenType.comment, buf[0].token);
+    try std.testing.expectEqual(TokenType.keyword, buf[1].token);
+    // A block comment closed on its own line, then more code.
+    const r4 = tokenizeLine("x --[[ inline ]] local", &lua_like, .normal, &buf);
+    try std.testing.expectEqual(LineState.normal, r4.state);
+    try std.testing.expectEqual(TokenType.comment, buf[0].token);
+    try std.testing.expectEqual(@as(u16, 2), buf[0].start);
+    try std.testing.expectEqual(@as(u16, 16), buf[0].end);
+    try std.testing.expectEqual(TokenType.keyword, buf[r4.count - 1].token);
+    // A plain line comment is still a line comment.
+    const r5 = tokenizeLine("-- just a comment", &lua_like, .normal, &buf);
+    try std.testing.expectEqual(LineState.normal, r5.state);
+    try std.testing.expectEqual(@as(usize, 1), r5.count);
+    try std.testing.expectEqual(@as(u16, 17), buf[0].end);
+
+    // Julia: `#` line comments, `#= ... =#` block comments.
+    var julia_like = lua_like;
+    julia_like.line_comment = "#";
+    julia_like.block_comment_start = "#=";
+    julia_like.block_comment_end = "=#";
+    try std.testing.expectEqual(LineState.in_block_comment, tokenizeLine("#= open", &julia_like, .normal, &buf).state);
+    try std.testing.expectEqual(LineState.normal, tokenizeLine("# plain", &julia_like, .normal, &buf).state);
+}
+
+/// Every span is non-empty, ends within the line and starts and ends on a
+/// UTF-8 code-point boundary.
+fn expectSpansOnBoundaries(line: []const u8, spans: []const HighlightSpan) !void {
+    for (spans) |s| {
+        try std.testing.expect(s.start < s.end);
+        try std.testing.expect(s.end <= line.len);
+        for ([_]usize{ s.start, s.end }) |idx| {
+            if (idx < line.len) try std.testing.expect(!isContinuationByte(line[idx]));
+        }
+    }
+}
+
+fn charLiteralSpan(line: []const u8, lang: *const LanguageDef, nth: usize) !HighlightSpan {
+    var buf: [MAX_SPANS]HighlightSpan = undefined;
+    const r = tokenizeLine(line, lang, .normal, &buf);
+    try expectSpansOnBoundaries(line, buf[0..r.count]);
+    var seen: usize = 0;
+    for (buf[0..r.count]) |s| {
+        if (s.token != .char_literal) continue;
+        if (seen == nth) return s;
+        seen += 1;
+    }
+    return error.TestExpectedCharLiteral;
+}
+
+test "char literals are scanned by whole code points and never run past the line" {
+    const t = std.testing;
+    const Case = struct { line: []const u8, start: u16, end: u16 };
+    const cases = [_]Case{
+        .{ .line = "const c = '\xc3\xa9';", .start = 10, .end = 14 }, // 'é'
+        .{ .line = "const q = '\\'';", .start = 10, .end = 14 }, // '\''
+        .{ .line = "x = '\\", .start = 4, .end = 6 }, // '\ at end of line
+        .{ .line = "x = '", .start = 4, .end = 5 }, // lone quote at end of line
+        .{ .line = "const e = '\xf0\x9f\x98\x80';", .start = 10, .end = 16 }, // '😀'
+        .{ .line = "const u = '\\u{1F600}';", .start = 10, .end = 21 },
+        .{ .line = "const x = '\\x41';", .start = 10, .end = 16 },
+        .{ .line = "'\xc3", .start = 0, .end = 2 }, // truncated sequence
+        .{ .line = "a '\xe2\x82\xac b", .start = 2, .end = 6 }, // unclosed '€
+    };
+    for (cases) |c| {
+        const s = try charLiteralSpan(c.line, &lang_zig, 0);
+        try t.expectEqual(c.start, s.start);
+        try t.expectEqual(c.end, s.end);
+    }
+
+    // The line from src/frontend/tui.zig that crashed the GUI.
+    const tui_line = "    handleFindReplaceKey(&editor, .{ .codepoint = '\xc3\xa9', .text = \"\xc3\xa9\" });";
+    var buf: [MAX_SPANS]HighlightSpan = undefined;
+    const r = tokenizeLine(tui_line, &lang_zig, .normal, &buf);
+    try expectSpansOnBoundaries(tui_line, buf[0..r.count]);
+
+    // A Rust lifetime is not a literal running to the next quote.
+    var rust_like = lang_zig;
+    rust_like.name = "rust";
+    const lifetimes = "fn f<'a>(x: &'a str)";
+    const first = try charLiteralSpan(lifetimes, &rust_like, 0);
+    try t.expectEqual(@as(u16, 5), first.start);
+    try t.expectEqual(@as(u16, 7), first.end);
+    const second = try charLiteralSpan(lifetimes, &rust_like, 1);
+    try t.expectEqual(@as(u16, 13), second.start);
+    try t.expectEqual(@as(u16, 15), second.end);
+}
+
+test "addSpan clamps to the line and floors edges to code-point boundaries" {
+    const t = std.testing;
+    var buf: [4]HighlightSpan = undefined;
+    var count: usize = 0;
+    const line = "a\xc3\xa9b"; // a é b
+    addSpan(&count, &buf, line, 0, 99, .text); // past the end → [0,4)
+    addSpan(&count, &buf, line, 1, 2, .text); // ends inside é → empty, dropped
+    addSpan(&count, &buf, line, 2, 4, .text); // starts inside é → [1,4)
+    try t.expectEqual(@as(usize, 2), count);
+    try t.expectEqual(@as(u16, 0), buf[0].start);
+    try t.expectEqual(@as(u16, 4), buf[0].end);
+    try t.expectEqual(@as(u16, 1), buf[1].start);
+    try t.expectEqual(@as(u16, 4), buf[1].end);
+    try expectSpansOnBoundaries(line, buf[0..count]);
+
+    // A Lua-registered non-ASCII string delimiter never opens a span
+    // inside a character.
+    var odd = lang_zig;
+    odd.string_delimiters = "\xc2\xab"; // «
+    var spans: [MAX_SPANS]HighlightSpan = undefined;
+    const quoted = "x = \xc2\xabhi\xc2\xbb";
+    const r = tokenizeLine(quoted, &odd, .normal, &spans);
+    try expectSpansOnBoundaries(quoted, spans[0..r.count]);
 }
 
 test "TODO markers inside comments get their own spans" {

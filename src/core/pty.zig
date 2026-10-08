@@ -18,9 +18,16 @@ pub const Pty = struct {
     // Linux PTY
     master_fd: if (is_linux) ?std.posix.fd_t else void = if (is_linux) null else {},
     child_pid: if (is_linux) ?std.posix.pid_t else void = if (is_linux) null else {},
+    /// The reader polls the master AND the read end of this pipe; `shutdown`
+    /// closes the write end so the reader always returns, even when some
+    /// other process still holds the slave (a disowned job, `setsid`).
+    shutdown_pipe: if (is_linux) [2]std.posix.fd_t else void = if (is_linux) .{ -1, -1 } else {},
 
     const is_windows = builtin.os.tag == .windows;
     const is_linux = builtin.os.tag == .linux;
+
+    /// A pseudo console handle taken out of a Pty (`takeConsole`).
+    pub const Console = if (is_windows) ?HPCON else void;
 
     pub fn spawn(allocator: Allocator, command: []const u8, cols: u16, rows: u16) !Pty {
         if (is_windows) {
@@ -32,12 +39,45 @@ pub const Pty = struct {
         }
     }
 
+    /// Stop the child and release every handle. Call `shutdown` and join
+    /// the reader thread first.
     pub fn deinit(self: *Pty) void {
         if (is_windows) {
             self.deinitWindows();
         } else if (is_linux) {
             self.deinitLinux();
         }
+    }
+
+    /// Make a blocked `read` return (EndOfStream) for good, without closing
+    /// the handle it reads — the reader can then be joined safely. Windows:
+    /// closes the pseudo console (ConPTY then ends the output pipe); Linux:
+    /// signals the shutdown pipe.
+    pub fn shutdown(self: *Pty) void {
+        if (is_windows) {
+            closeConsole(self.takeConsole());
+        } else if (is_linux) {
+            const w = self.shutdown_pipe[1];
+            if (w >= 0) {
+                _ = std.c.close(w);
+                self.shutdown_pipe[1] = -1;
+            }
+        }
+    }
+
+    /// Take the pseudo console out of this Pty (null afterwards, so resize
+    /// and deinit skip it); pass it to `closeConsole`. Windows only — the
+    /// caller serializes against `resize`.
+    pub fn takeConsole(self: *Pty) Console {
+        if (!is_windows) return {};
+        const hpc = self.hpc;
+        self.hpc = null;
+        return hpc;
+    }
+
+    pub fn closeConsole(console: Console) void {
+        if (!is_windows) return;
+        if (console) |hpc| ClosePseudoConsole(hpc);
     }
 
     pub fn read(self: *Pty, buf: []u8) !usize {
@@ -223,8 +263,9 @@ pub const Pty = struct {
     // Linux posix PTY implementation
     // =========================================================================
 
-    // openpty/execvp aren't declared in std.c; both live in libc proper
-    // (openpty merged from libutil in glibc 2.34), so "c" externs suffice.
+    // openpty/execvpe aren't declared in std.c; both live in libc proper
+    // (openpty merged from libutil in glibc 2.34; execvpe is in glibc and
+    // musl), so "c" externs suffice.
     extern "c" fn openpty(
         amaster: *std.posix.fd_t,
         aslave: *std.posix.fd_t,
@@ -232,13 +273,61 @@ pub const Pty = struct {
         termp: ?*const anyopaque,
         winp: ?*const std.posix.winsize,
     ) c_int;
-    extern "c" fn execvp(
+    extern "c" fn execvpe(
         file: [*:0]const u8,
         argv: [*:null]const ?[*:0]const u8,
+        envp: [*:null]const ?[*:0]const u8,
     ) c_int;
+
+    /// The environment for a terminal child: ours, with TERM naming the
+    /// terminal ZIDE emulates (an inherited TERM describes the outer
+    /// terminal — kitty, tmux — whose sequences ZIDE does not parse, and a
+    /// desktop launch has none) and COLORTERM advertising truecolor unless
+    /// already set. The strings are borrowed from `environ`; only the
+    /// pointer array is allocated.
+    fn childEnvironment(allocator: Allocator) ![:null]?[*:0]const u8 {
+        var count: usize = 0;
+        while (std.c.environ[count] != null) : (count += 1) {}
+        const env = try allocator.allocSentinel(?[*:0]const u8, count + 2, null);
+        @memset(env, null);
+        var n: usize = 0;
+        var has_colorterm = false;
+        for (std.c.environ[0..count]) |entry| {
+            const e = entry orelse continue;
+            const s = std.mem.span(e);
+            if (std.mem.startsWith(u8, s, "TERM=")) continue;
+            if (std.mem.startsWith(u8, s, "COLORTERM=")) has_colorterm = true;
+            env[n] = e;
+            n += 1;
+        }
+        env[n] = "TERM=xterm-256color";
+        n += 1;
+        if (!has_colorterm) env[n] = "COLORTERM=truecolor";
+        return env;
+    }
 
     fn spawnLinux(allocator: Allocator, command: []const u8, cols: u16, rows: u16) !Pty {
         if (!is_linux) unreachable;
+
+        // Everything the child needs is prepared before fork(): the child of
+        // a multithreaded process must not allocate. It execs or _exits, so
+        // only the parent frees. (The editor passes $SHELL / bash / sh;
+        // "/bin/sh" is only the last resort for an empty command.)
+        const prog_z: [:0]u8 = if (command.len > 0)
+            try allocator.dupeZ(u8, command)
+        else
+            try allocator.dupeZ(u8, if (std.c.getenv("SHELL")) |s| std.mem.span(s) else "/bin/sh");
+        defer allocator.free(prog_z);
+        const envp = try childEnvironment(allocator);
+        defer allocator.free(envp);
+
+        // The reader's shutdown pipe (close-on-exec: no child inherits it)
+        var shutdown_pipe: [2]std.posix.fd_t = undefined;
+        if (std.c.pipe2(&shutdown_pipe, .{ .CLOEXEC = true }) != 0) return error.PipeCreationFailed;
+        errdefer {
+            _ = std.c.close(shutdown_pipe[0]);
+            _ = std.c.close(shutdown_pipe[1]);
+        }
 
         // openpty() to get master/slave pair
         var master: std.posix.fd_t = undefined;
@@ -253,11 +342,20 @@ pub const Pty = struct {
         const rc = openpty(&master, &slave, null, null, &ws);
         if (rc != 0) return error.OpenPtyFailed;
         errdefer _ = std.c.close(master);
+        // openpty's descriptors are inheritable: without close-on-exec every
+        // later child (language servers, git, tasks, other shells) would keep
+        // this terminal's master and slave open. (dup2 onto the child's
+        // stdio below clears the flag on those copies, as it should.)
+        _ = std.c.fcntl(master, std.c.F.SETFD, @as(c_int, std.c.FD_CLOEXEC));
+        _ = std.c.fcntl(slave, std.c.F.SETFD, @as(c_int, std.c.FD_CLOEXEC));
 
         // std.posix.fork/dup2/exit/getenv were removed in 0.16 — this
         // whole child setup goes through libc directly.
         const pid = std.c.fork();
-        if (pid < 0) return error.ForkFailed;
+        if (pid < 0) {
+            _ = std.c.close(slave);
+            return error.ForkFailed;
+        }
         if (pid == 0) {
             // Child process
             _ = std.c.close(master);
@@ -272,21 +370,9 @@ pub const Pty = struct {
             if (std.c.dup2(slave, 2) < 0) std.c._exit(1);
             if (slave > 2) _ = std.c.close(slave);
 
-            // Run the requested command; fall back to $SHELL (previously the
-            // command argument was silently ignored on Linux)
-            const shell: [*:0]const u8 = std.c.getenv("SHELL") orelse "/bin/bash";
-            var cmd_buf: [256]u8 = undefined;
-            const prog: [*:0]const u8 = blk: {
-                if (command.len > 0 and command.len < cmd_buf.len) {
-                    @memcpy(cmd_buf[0..command.len], command);
-                    cmd_buf[command.len] = 0;
-                    break :blk cmd_buf[0..command.len :0].ptr;
-                }
-                break :blk shell;
-            };
-            const argv = [_:null]?[*:0]const u8{ prog, null };
-            _ = execvp(prog, &argv);
-            std.c._exit(1);
+            const argv = [_:null]?[*:0]const u8{ prog_z.ptr, null };
+            _ = execvpe(prog_z.ptr, &argv, envp.ptr);
+            std.c._exit(127);
         }
 
         // Parent process
@@ -296,12 +382,22 @@ pub const Pty = struct {
             .allocator = allocator,
             .master_fd = master,
             .child_pid = pid,
+            .shutdown_pipe = shutdown_pipe,
         };
     }
 
     fn readLinux(self: *Pty, buf: []u8) !usize {
         if (!is_linux) unreachable;
         const fd = self.master_fd orelse return error.NotStarted;
+        // Wait for output or `shutdown` (poll ignores a negative fd, so a
+        // Pty without the pipe just waits on the master).
+        var fds = [_]std.posix.pollfd{
+            .{ .fd = fd, .events = std.posix.POLL.IN, .revents = 0 },
+            .{ .fd = self.shutdown_pipe[0], .events = std.posix.POLL.IN, .revents = 0 },
+        };
+        _ = std.posix.poll(&fds, -1) catch return error.EndOfStream;
+        if (fds[1].revents != 0) return error.EndOfStream;
+        // Readable, or hung up (the read then fails with EIO)
         const n = std.posix.read(fd, buf) catch return error.EndOfStream;
         if (n == 0) return error.EndOfStream;
         return n;
@@ -357,6 +453,10 @@ pub const Pty = struct {
             }
         }
         if (self.master_fd) |fd| _ = std.c.close(fd);
+        for (&self.shutdown_pipe) |*fd| {
+            if (fd.* >= 0) _ = std.c.close(fd.*);
+            fd.* = -1;
+        }
     }
 };
 

@@ -115,27 +115,41 @@ pub const Cursor = struct {
             return;
         }
         // Skip current word chars
-        while (off < len and isWordChar(buf.byteAt(off).?)) off += 1;
+        while (off < len and isWordByte(buf.byteAt(off).?)) off += 1;
         // Skip non-word, non-newline chars (whitespace, punctuation)
         while (off < len) {
             const b = buf.byteAt(off).?;
-            if (isWordChar(b) or b == '\n') break;
+            if (isWordByte(b) or b == '\n') break;
             off += 1;
         }
         self.offset = floorBoundary(buf, off);
         self.preferred_col = buf.offsetToPos(self.offset).col;
     }
 
-    /// Move left by one word.
+    /// Move left by one word, mirroring `moveWordRight`: at a line start,
+    /// cross exactly one complete line break (CRLF is never split);
+    /// otherwise skip the whitespace/punctuation before the caret, then the
+    /// word before that, never leaving the current line. Ctrl+Backspace
+    /// therefore stops at the indentation and at the line start, and from
+    /// column 0 it only joins the line with the one above.
     pub fn moveWordLeft(self: *Cursor, buf: *const Buffer) void {
-        if (self.offset == 0) return;
-        var off = self.offset - 1;
-        // Skip non-word chars backwards
-        while (off > 0 and !isWordChar(buf.byteAt(off) orelse 0)) off -= 1;
+        var off = floorBoundary(buf, self.offset);
+        if (off > 0 and buf.byteAt(off - 1) == '\n') {
+            // previousBoundary steps over the '\r' of a CRLF as well.
+            self.offset = previousBoundary(buf, off);
+            self.preferred_col = buf.offsetToPos(self.offset).col;
+            return;
+        }
+        // Skip non-word chars backwards, stopping at the line start
+        while (off > 0) {
+            const b = buf.byteAt(off - 1).?;
+            if (isWordByte(b) or b == '\n') break;
+            off -= 1;
+        }
         // Skip word chars backwards to start of word
-        while (off > 0 and isWordChar(buf.byteAt(off - 1) orelse 0)) off -= 1;
+        while (off > 0 and isWordByte(buf.byteAt(off - 1).?)) off -= 1;
         self.offset = floorBoundary(buf, off);
-        self.preferred_col = buf.offsetToPos(off).col;
+        self.preferred_col = buf.offsetToPos(self.offset).col;
     }
 
     /// Smart Home: move to first non-whitespace on the line,
@@ -414,8 +428,12 @@ pub const CursorSet = struct {
     }
 };
 
-fn isWordChar(byte: u8) bool {
-    return std.ascii.isAlphanumeric(byte) or byte == '_';
+/// Word bytes for word motion and whole-word matching: ASCII letters,
+/// digits and `_`, plus every byte of a non-ASCII code point. All bytes of
+/// a multi-byte UTF-8 sequence are >= 0x80, so word edges always fall on
+/// code-point boundaries.
+pub fn isWordByte(b: u8) bool {
+    return std.ascii.isAlphanumeric(b) or b == '_' or b >= 0x80;
 }
 
 fn utf8ByteLen(first_byte: u8) usize {
@@ -609,5 +627,55 @@ test "vertical page block and direct positions stay on UTF-8 boundaries" {
     for (cs.cursors.items) |cur| {
         try t.expectEqual(cur.offset, floorBoundary(&buf, cur.offset));
         if (cur.anchor) |a| try t.expectEqual(a, floorBoundary(&buf, a));
+    }
+}
+
+test "word motion treats non-ASCII as word characters and crosses one line break at a time" {
+    const t = std.testing;
+    try t.expect(isWordByte('a') and isWordByte('Z') and isWordByte('7') and isWordByte('_'));
+    try t.expect(isWordByte(0xc3) and isWordByte(0xa9)); // both bytes of "é"
+    try t.expect(!isWordByte(' ') and !isWordByte(';') and !isWordByte('\n') and !isWordByte('\r'));
+
+    var buf = try Buffer.init(t.allocator);
+    defer buf.deinit();
+    var c = Cursor{};
+
+    // Ctrl+Right used to stop after "hé"; the whole word is crossed now.
+    try buf.loadText("h\xc3\xa9llo");
+    c.moveWordRight(&buf);
+    try t.expectEqual(buf.byteLen(), c.offset);
+    try buf.loadText("h\xc3\xa9llo w\xc3\xb6rld");
+    c = .{};
+    c.moveWordRight(&buf);
+    try t.expectEqual(@as(usize, 7), c.offset); // start of "wörld"
+    c.moveToEnd(&buf);
+    c.moveWordLeft(&buf);
+    try t.expectEqual(@as(usize, 7), c.offset);
+    try t.expectEqual(@as(usize, 7), c.preferred_col);
+    c.moveWordLeft(&buf);
+    try t.expectEqual(@as(usize, 0), c.offset);
+    c.moveWordLeft(&buf); // start of buffer: stays
+    try t.expectEqual(@as(usize, 0), c.offset);
+
+    // Ctrl+Left from a line start crosses exactly one line break (never
+    // splitting CRLF); inside a line it stops at the word start, the
+    // indentation and the line start instead of running into the line above.
+    for ([_][]const u8{ "\n", "\r\n" }) |eol| {
+        const text = try std.mem.concat(t.allocator, u8, &.{ "    return x;", eol, eol, "}" });
+        defer t.allocator.free(text);
+        try buf.loadText(text);
+        const expected = [_]usize{
+            13 + eol.len, // start of the empty line
+            13, // end of "    return x;"
+            11, // start of "x"
+            4, // start of "return"
+            0, // line start
+        };
+        c = .{ .offset = 13 + 2 * eol.len }; // before "}"
+        for (expected) |offset| {
+            c.moveWordLeft(&buf);
+            try t.expectEqual(offset, c.offset);
+            try t.expectEqual(buf.offsetToPos(offset).col, c.preferred_col);
+        }
     }
 }

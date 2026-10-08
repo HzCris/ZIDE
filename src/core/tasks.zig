@@ -47,6 +47,10 @@ pub const Run = struct {
     job: ?u64 = null,
     exit_code: ?u8 = null,
     error_name: ?[]const u8 = null,
+    /// The first problem-matcher failure of this run (a Lua matcher's error
+    /// message, or the name of what was wrong with its result). Matching
+    /// continues with the next line; later failures are not recorded.
+    matcher_error: ?[]u8 = null,
     output: tool_output.Output = .{},
     filters: [2]tool_output.Sanitizer = .{ .{}, .{} },
     partial: [2]std.ArrayList(u8) = .{ .empty, .empty },
@@ -61,6 +65,7 @@ pub const Run = struct {
         self.config.destroy(editor);
         editor.allocator.free(self.cwd);
         editor.allocator.free(self.producer);
+        if (self.matcher_error) |text| editor.allocator.free(text);
         self.output.deinit(editor.allocator);
         for (&self.partial) |*partial| partial.deinit(editor.allocator);
         for (self.findings.items) |finding| {
@@ -196,7 +201,7 @@ pub const State = struct {
             self.pending = run.id;
             self.save_index = 0;
             self.waiting_save = false;
-            editor.mode = .task_save_prompt;
+            editor.setMode(.task_save_prompt);
         } else self.launch(editor, run);
         return run.id;
     }
@@ -226,10 +231,20 @@ pub const State = struct {
         editor.status_message = "Task started";
     }
 
+    /// Answer the task save prompt. Also Editor.setMode's leave hook for
+    /// .task_save_prompt (as .cancel), so it leaves that mode with a guarded
+    /// direct write and never calls setMode.
     pub fn resolveSave(self: *State, editor: *Editor, choice: enum { save, run, cancel }) void {
-        editor.mode = .normal;
+        if (editor.mode == .task_save_prompt) editor.mode = .normal;
         const id = self.pending orelse return;
-        const run = self.get(id) orelse return;
+        const run = self.get(id) orelse {
+            // The run is gone: release the prompt state, or every later
+            // request fails with TaskAlreadyWaitingForSave.
+            self.pending = null;
+            self.waiting_save = false;
+            self.save_ids.clearRetainingCapacity();
+            return;
+        };
         switch (choice) {
             .cancel => self.cancel(editor, id),
             .run => self.launch(editor, run),
@@ -334,7 +349,9 @@ fn consume(editor: *Editor, run: *Run, stream: usize, bytes: []const u8, done: b
     const partial = &run.partial[stream];
     for (bytes) |byte| {
         if (byte == '\n') {
-            if (!run.line_truncated[stream]) try matchLine(editor, run, std.mem.trimEnd(u8, partial.items, "\r"));
+            // matchLine never fails: a matcher error must neither skip the
+            // rest of the chunk nor glue this line onto the next one (G3).
+            if (!run.line_truncated[stream]) matchLine(editor, run, std.mem.trimEnd(u8, partial.items, "\r"));
             partial.clearRetainingCapacity();
             run.line_truncated[stream] = false;
             if (run.status != .running) return;
@@ -346,9 +363,18 @@ fn consume(editor: *Editor, run: *Run, stream: usize, bytes: []const u8, done: b
         }
     }
     if (done and partial.items.len > 0) {
-        if (!run.line_truncated[stream]) try matchLine(editor, run, std.mem.trimEnd(u8, partial.items, "\r"));
+        if (!run.line_truncated[stream]) matchLine(editor, run, std.mem.trimEnd(u8, partial.items, "\r"));
         partial.clearRetainingCapacity();
     }
+}
+
+/// Record the first problem-matcher failure of `run` (see Run.matcher_error)
+/// and say so once in the status bar.
+pub fn noteMatcherError(editor: *Editor, run: *Run, message: []const u8) void {
+    if (run.matcher_error != null) return;
+    const text = message[0..@import("text_input.zig").floor(message, 256)];
+    run.matcher_error = editor.allocator.dupe(u8, text) catch return;
+    editor.status_message = std.fmt.bufPrint(&editor.status_buf, "Task {s}: problem matcher failed (see Task Output)", .{run.config.options.name}) catch "Task problem matcher failed (see Task Output)";
 }
 
 pub const Location = struct { path: []const u8, line: u32, col: u32, severity: lsp.DiagnosticSeverity, message: []const u8 };
@@ -369,16 +395,37 @@ pub fn zigLocation(line: []const u8) ?Location {
     return null;
 }
 
-fn matchLine(editor: *Editor, run: *Run, line: []const u8) !void {
+fn matchLine(editor: *Editor, run: *Run, line: []const u8) void {
     if (run.findings.items.len >= 10_000) {
         run.truncated = true;
         return;
     }
-    if (run.config.options.zig_matcher) {
-        if (zigLocation(line)) |location| try addFinding(editor, run, location);
-    } else if (run.config.matcher_ref) |ref| {
-        try @import("task_lua.zig").match(editor, run, ref, line);
+    const result = if (run.config.options.zig_matcher)
+        addFinding(editor, run, zigLocation(line) orelse return)
+    else if (run.config.matcher_ref) |ref|
+        @import("task_lua.zig").match(editor, run, ref, line)
+    else
+        return;
+    result catch |err| noteMatcherError(editor, run, @errorName(err));
+}
+
+/// A file location on one Task Output line, found by the run's own problem
+/// matcher (Lua or zig; zig syntax for runs without one). `path` is resolved
+/// against the run's cwd and owned by the caller.
+pub const Found = struct { path: []u8, line: u32, col: u32 };
+pub fn locate(editor: *Editor, run: *Run, line: []const u8) ?Found {
+    if (run.config.matcher_ref) |ref| {
+        const state = &editor.tasks;
+        if (state.pumping) return null;
+        // Keeps `run` alive across the Lua call (request() trims history
+        // only while not pumping) and holds off tick().
+        state.pumping = true;
+        defer state.pumping = false;
+        return @import("task_lua.zig").locate(editor, ref, run.cwd, line);
     }
+    const location = zigLocation(line) orelse return null;
+    const path = std.fs.path.resolve(editor.allocator, &.{ run.cwd, location.path }) catch return null;
+    return .{ .path = path, .line = location.line, .col = location.col };
 }
 
 pub fn addFinding(editor: *Editor, run: *Run, location: Location) !void {
@@ -525,6 +572,73 @@ test "task Lua matchers own registrations, cancel old runs on reload and retain 
     try t.expectEqual(@as(u32, 2), run.findings.items[0].diagnostic.start_col);
     editor.tasks.dropExtensions(&editor);
     try t.expectEqual(@as(usize, 0), editor.tasks.configs.items.len);
+}
+
+test "a failing Lua matcher line never drops the rest of the chunk or glues onto the next one" {
+    const t = std.testing;
+    var lua = try zlua.Lua.init(t.allocator);
+    defer lua.deinit();
+    lua.openLibs();
+    var editor = try Editor.init(t.allocator, t.io);
+    defer editor.deinit();
+    @import("lua_settings.zig").registerApi(lua, &editor);
+    try lua.doString(
+        \\assert(zide.register_task({name='flaky', argv={'unused'}, problem_matcher=function(line)
+        \\  if line:sub(1, 3) == 'bad' then error('matcher exploded on ' .. line) end
+        \\  if line:sub(1, 4) == 'trap' then
+        \\    return setmetatable({}, {__index = function() error('index trap') end})
+        \\  end
+        \\  return {file='out.txt', line=1, col=1, message=line}
+        \\end}))
+    );
+    const config = try Config.create(t.allocator, editor.tasks.configs.items[0].options);
+    defer config.destroy(&editor);
+    var run: Run = .{ .id = 998, .config = config, .cwd = @constCast("."), .producer = @constCast("test"), .status = .running };
+    defer {
+        for (run.findings.items) |finding| {
+            t.allocator.free(finding.path);
+            finding.diagnostic.deinit(t.allocator);
+        }
+        run.findings.deinit(t.allocator);
+        for (&run.partial) |*partial| partial.deinit(t.allocator);
+        if (run.matcher_error) |text| t.allocator.free(text);
+    }
+    run.config.matcher_ref = editor.tasks.configs.items[0].matcher_ref; // borrowed: cleared below
+    defer run.config.matcher_ref = null;
+    try consume(&editor, &run, 0, "ok1\nbad1\nok2\n", false);
+    try t.expectEqual(@as(usize, 0), run.partial[0].items.len);
+    try t.expectEqual(@as(usize, 2), run.findings.items.len);
+    try consume(&editor, &run, 0, "trap1\nok3\nbad2\nok4", true);
+    try t.expectEqual(@as(usize, 0), run.partial[0].items.len);
+    try t.expectEqual(@as(usize, 4), run.findings.items.len);
+    for (run.findings.items, [_][]const u8{ "ok1", "ok2", "ok3", "ok4" }) |finding, text| try t.expectEqualStrings(text, finding.diagnostic.message);
+    // The first failure is kept, with the Lua message.
+    try t.expect(std.mem.indexOf(u8, run.matcher_error.?, "matcher exploded on bad1") != null);
+    try t.expect(std.mem.indexOf(u8, editor.status_message, "flaky") != null);
+    try t.expectEqual(@as(c_int, 0), lua.getTop());
+}
+
+test "resolving the save prompt of a vanished run still releases the prompt state" {
+    const t = std.testing;
+    var editor = try Editor.init(t.allocator, t.io);
+    defer editor.deinit();
+    editor.tasks.pending = 424242; // no such run
+    try editor.tasks.save_ids.append(t.allocator, 1);
+    editor.tasks.waiting_save = true;
+    editor.mode = .task_save_prompt;
+    editor.tasks.resolveSave(&editor, .cancel);
+    try t.expectEqual(Editor.Mode.normal, editor.mode);
+    try t.expect(editor.tasks.pending == null);
+    try t.expect(!editor.tasks.waiting_save);
+    try t.expectEqual(@as(usize, 0), editor.tasks.save_ids.items.len);
+    // The same through the mode change that leaves the prompt.
+    editor.tasks.pending = 424243;
+    try editor.tasks.save_ids.append(t.allocator, 2);
+    editor.mode = .task_save_prompt;
+    editor.setMode(.tool_panel);
+    try t.expectEqual(Editor.Mode.tool_panel, editor.mode);
+    try t.expect(editor.tasks.pending == null);
+    try t.expectEqual(@as(usize, 0), editor.tasks.save_ids.items.len);
 }
 
 test "Zig task integration succeeds, reports a Unicode source failure and cancels a replaced run" {

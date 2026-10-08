@@ -23,6 +23,9 @@ pub const search_mod = @import("search.zig");
 pub const text_file = @import("text_file.zig");
 const text_input = @import("text_input.zig");
 const snippets_mod = @import("snippets.zig");
+const nav_history = @import("nav_history.zig");
+const picker_mod = @import("picker.zig");
+const WalkIgnore = @import("walk_ignore.zig").WalkIgnore;
 const zlua = @import("zlua");
 
 /// The central editor state. NOT a global singleton — passed explicitly.
@@ -54,8 +57,10 @@ pub const Editor = struct {
     use_tabs: bool = false,
     tab_width: usize = 4,
 
-    /// Editor interaction mode.
+    /// Editor interaction mode. Change it only through setMode.
     mode: Mode = .normal,
+    /// setMode is running a leave-hook: a nested setMode only assigns.
+    mode_leaving: bool = false,
     /// Find/replace input buffers.
     find_buf: [256]u8 = undefined,
     find_buf_len: usize = 0,
@@ -81,13 +86,27 @@ pub const Editor = struct {
     finder_matches: std.ArrayList(u32) = .empty,
     /// Owned snapshot of the workspace root ("" = cwd) paths join against.
     finder_root: ?[]u8 = null,
-    /// A transient preview document sits at the end of `documents`.
-    finder_preview_appended: bool = false,
-    /// Active doc index to restore when the finder is cancelled.
-    finder_prev_active: usize = 0,
+    /// Id of the transient preview document (`Document.preview`), null
+    /// when there is none. Invariant P: a preview exists only while
+    /// mode == .file_finder, has no tab, is never dirty, saved or given
+    /// diagnostics, and is always found by this id — never by position.
+    finder_preview_id: ?u64 = null,
+    /// Id of the document to show again when the finder is cancelled
+    /// (null once finderCommit claims the session).
+    finder_prev_doc: ?u64 = null,
 
     /// Workspace search & replace panel state/engine (see search.zig).
     search: search_mod.SearchPanel,
+    /// Back/forward history of the positions jumps left behind.
+    nav: nav_history.History,
+    /// The generic pick-list overlay (go-to-symbol, …), shown in `Mode.picker`.
+    picker: picker_mod.Picker,
+    /// Recently closed files, newest last — `reopen_closed_tab` brings them back.
+    closed_tabs: std.ArrayList(ClosedTab) = .empty,
+    /// Recently opened project folders, newest first (persisted in the config dir).
+    recent_projects: std.ArrayList([]u8) = .empty,
+    recent_loaded: bool = false,
+    recent_selected: usize = 0,
     /// The docked results panel is shown.
     search_visible: bool = false,
     /// Keyboard focus is on the panel (frontends route keys to it, like
@@ -240,6 +259,18 @@ pub const Editor = struct {
     /// list grows; each client also owns a deep copy of its config). Started
     /// lazily by lspNotifyOpen / syncLspDocuments, retired by lspTick.
     lsp_clients: std.ArrayList(*lsp_mod.LspClient) = .empty,
+    /// The server each LSP-opened document got its didOpen from (document
+    /// id → `LspClient.generation`): its didChange/didSave/didClose go to
+    /// that server even after a newer registration takes over the language,
+    /// and stopping a server forgets only the documents it had open.
+    lsp_doc_owner: std.AutoHashMapUnmanaged(u64, u64) = .empty,
+    /// Documents whose full text does not fit one LSP frame (document id →
+    /// the `lsp_version` found too large): not sent, and not re-checked
+    /// until an edit changes the version.
+    lsp_too_large: std.AutoHashMapUnmanaged(u64, i32) = .empty,
+    /// Largest frame a full-text didOpen/didChange may take (the transport's
+    /// limit; tests lower it instead of building 16 MiB documents).
+    lsp_frame_limit: usize = @import("protocol.zig").max_frame,
     /// Wake callback copied into each client's reader thread (the TUI sets
     /// it before its loop, like terminal_wake_fn; the GUI polls every frame).
     lsp_wake_fn: ?*const fn () void = null,
@@ -274,6 +305,25 @@ pub const Editor = struct {
 
     /// Completion items from LSP.
     completion_items: std.ArrayList(EditorCompletionItem),
+    /// Every item the server sent (the owner); `completion_items` is the
+    /// prefix-filtered view the frontends draw.
+    completion_all: std.ArrayList(EditorCompletionItem) = .empty,
+    /// A re-request is in flight: the visible list is the previous reply,
+    /// kept for continuity, and must not be accepted.
+    completion_stale: bool = false,
+    /// Open the popup while typing (trigger characters and identifiers).
+    completion_auto: bool = true,
+    /// Identifier characters typed before the popup opens by itself (1–8):
+    /// raise it for languages with huge standard libraries.
+    completion_min_chars: usize = 1,
+    /// Signature help near the caret (non-modal): the active signature's
+    /// label, the active parameter's byte range in it and a documentation
+    /// line. Owned. Dropped once the caret leaves the line it was shown on.
+    signature: ?Signature = null,
+    signature_doc_id: u64 = 0,
+    signature_line: usize = 0,
+    /// Ask for signature help when a trigger character ("(" or ",") is typed.
+    signature_help_auto: bool = true,
     /// Whether the completion popup is active.
     completion_active: bool = false,
     /// Currently selected completion item index.
@@ -285,9 +335,9 @@ pub const Editor = struct {
     completion_generation: u64 = 0,
     /// Document the .confirm_overwrite prompt was opened for (tab clicks and
     /// window switches must not redirect Overwrite/Reload to another file).
-    confirm_overwrite_doc: usize = 0,
+    confirm_overwrite_doc: ?u64 = null,
     /// Document the .confirm_close prompt (closing a dirty tab) was opened
-    /// for — resolved by index, bounds-checked when answered.
+    /// for — resolved by id when answered; cancels if the document is gone.
     confirm_close_doc: ?u64 = null,
     /// Window whose Settings dialog is open (an EditorWindow.id): the dialog
     /// stays in the window it was opened from instead of following focus.
@@ -401,8 +451,12 @@ pub const Editor = struct {
         find,
         find_replace,
         file_open,
+        /// TUI prompt for `open_folder` (the GUI answers with a native dialog).
+        folder_open,
         save_as,
         command_palette,
+        /// The generic pick-list overlay (`Editor.picker`).
+        picker,
         goto_line,
         /// Fuzzy file finder (quick_open) with live preview.
         file_finder,
@@ -417,6 +471,8 @@ pub const Editor = struct {
         confirm_reopen,
         confirm_encoding,
         recovery_picker,
+        /// Pick a recently opened project folder.
+        recent_projects,
         lsp_panel,
         symbol_rename,
         workspace_preview,
@@ -468,6 +524,8 @@ pub const Editor = struct {
             .languages = .empty,
             .lang_syntax_overrides = .empty,
             .search = .{ .allocator = allocator, .io = io },
+            .nav = .init(allocator),
+            .picker = .init(allocator),
         };
         // The primary window lives as long as the editor (invariant I1).
         const primary = try allocator.create(EditorWindow);
@@ -534,6 +592,8 @@ pub const Editor = struct {
             doc.deinit();
         }
         self.documents.deinit(self.allocator);
+        self.lsp_doc_owner.deinit(self.allocator);
+        self.lsp_too_large.deinit(self.allocator);
         self.commands.deinit();
         self.snippets.deinit(self.allocator);
         self.keybinds.deinit();
@@ -556,6 +616,7 @@ pub const Editor = struct {
         }
         self.clearCompletionItems();
         self.completion_items.deinit(self.allocator);
+        self.completion_all.deinit(self.allocator);
         for (self.lsp_configs.items) |*cfg| cfg.deinit(self.allocator);
         self.lsp_configs.deinit(self.allocator);
         for (self.terminals.items) |maybe_term| {
@@ -579,6 +640,13 @@ pub const Editor = struct {
         self.finder_files.deinit(self.allocator);
         self.finder_matches.deinit(self.allocator);
         self.search.deinit();
+        self.nav.deinit();
+        self.picker.deinit();
+        self.clearSignature();
+        for (self.closed_tabs.items) |e| self.allocator.free(e.path);
+        self.closed_tabs.deinit(self.allocator);
+        for (self.recent_projects.items) |p| self.allocator.free(p);
+        self.recent_projects.deinit(self.allocator);
         if (self.filetree_prompt_target) |tgt| self.allocator.free(tgt);
         if (self.filetree_move_src) |src| self.allocator.free(src);
         for (self.filetree_move_srcs.items) |p| self.allocator.free(p);
@@ -664,6 +732,145 @@ pub const Editor = struct {
         return null;
     }
 
+    // ---- Keyboard focus (normal mode) ----
+    //
+    // In normal mode exactly one of the file tree, the search panel, the
+    // focused terminal pane and the focused editor pane owns the keyboard.
+    // The two panel flags stay plain fields (frontends read them), but only
+    // takeKeyboardFocus sets one; every way a pane takes focus clears both,
+    // and normalizeKeyboardFocus repairs direct writes once per tick.
+
+    /// Who gets keys and text in normal mode.
+    pub const KeyboardOwner = enum { editor, terminal, filetree, search };
+    /// What takeKeyboardFocus hands the keyboard to: the focused pane
+    /// (editor or terminal, whichever it is) or one of the side panels.
+    pub const FocusTarget = enum { pane, filetree, search };
+
+    /// Pure read. The side panels live in the primary window and own the
+    /// keyboard only while it is focused (the tree before the search
+    /// panel); otherwise the focused pane does.
+    pub fn keyboardOwner(self: *const Editor) KeyboardOwner {
+        if (self.active_window == 0) {
+            if (self.filetree_focused) return .filetree;
+            if (self.search_focused) return .search;
+        }
+        return if (self.activePaneIsTerminal()) .terminal else .editor;
+    }
+
+    /// THE setter of panel focus. `.pane` gives the keyboard back to the
+    /// focused pane (both panel flags cleared). A panel target focuses the
+    /// primary window, shows the panel, takes the keyboard from the other
+    /// panel and closes the editor's completion popup; false when the file
+    /// tree cannot be opened (the tree is then hidden and unfocused).
+    pub fn takeKeyboardFocus(self: *Editor, target: FocusTarget) bool {
+        switch (target) {
+            .pane => {
+                self.filetree_focused = false;
+                self.search_focused = false;
+            },
+            .filetree, .search => {
+                if (self.active_window != 0) self.focusWindow(0);
+                if (target == .filetree) {
+                    self.filetree_visible = true;
+                    if (self.ensureFiletree() == null) return false;
+                    self.search_focused = false;
+                    self.filetree_focused = true;
+                } else {
+                    self.search_visible = true;
+                    self.filetree_focused = false;
+                    self.search_focused = true;
+                }
+                self.clearCompletionItems();
+            },
+        }
+        return true;
+    }
+
+    /// Repair panel focus that a direct flag write, or a panel hidden under
+    /// it, left inconsistent: a flag whose panel is hidden (or whose tree
+    /// was never built) is cleared, both are while a secondary window is
+    /// focused, and when both are set the tree keeps the keyboard. First
+    /// thing in serviceTick.
+    pub fn normalizeKeyboardFocus(self: *Editor) void {
+        if (self.active_window != 0) {
+            self.filetree_focused = false;
+            self.search_focused = false;
+            return;
+        }
+        if (!self.filetree_visible or self.filetree == null) self.filetree_focused = false;
+        if (!self.search_visible) self.search_focused = false;
+        if (self.filetree_focused and self.search_focused) self.search_focused = false;
+    }
+
+    /// The editing chords a focused side panel takes over (panelAction).
+    const PanelChord = enum { copy, cut, paste, select_all, delete_word_backward, delete_word_forward };
+
+    /// Clipboard and word-delete chords while a side panel owns the
+    /// keyboard (normal mode): the tree copies, cuts and pastes files, the
+    /// search panel edits its focused field, and the other chords are
+    /// swallowed so the document behind the panel is never edited. True =
+    /// consumed, and the caller must not run the action; false for any
+    /// other action, for the editor and terminal owners, and in modal modes.
+    pub fn panelAction(self: *Editor, action: []const u8) bool {
+        if (self.mode != .normal) return false;
+        const chord = std.meta.stringToEnum(PanelChord, action) orelse return false;
+        switch (self.keyboardOwner()) {
+            .editor, .terminal => return false,
+            .filetree => switch (chord) {
+                .copy => self.filetreeClipCapture(false),
+                .cut => self.filetreeClipCapture(true),
+                .paste => self.filetreePaste(),
+                .select_all, .delete_word_backward, .delete_word_forward => {},
+            },
+            .search => self.searchFieldChord(chord),
+        }
+        return true;
+    }
+
+    /// The search panel's focused text field; null on the results list.
+    fn searchInputSlot(self: *Editor) ?struct { buf: []u8, len: *usize } {
+        const sp = &self.search;
+        return switch (sp.field) {
+            .query => .{ .buf = &sp.query_buf, .len = &sp.query_len },
+            .replace => .{ .buf = &sp.replace_buf, .len = &sp.replace_len },
+            .filter => .{ .buf = &sp.filter_buf, .len = &sp.filter_len },
+            .exclude => .{ .buf = &sp.exclude_buf, .len = &sp.exclude_len },
+            .results => null,
+        };
+    }
+
+    /// A panelAction chord on the search panel's focused field. The fields
+    /// are single-line with the caret at the end, so copy/cut take the whole
+    /// field, paste appends the clipboard's first line, and word delete
+    /// drops trailing spaces plus the word before them (a space is ASCII, so
+    /// the cut always lands on a UTF-8 boundary). Edits disarm a pending
+    /// Replace confirmation.
+    fn searchFieldChord(self: *Editor, chord: PanelChord) void {
+        const slot = self.searchInputSlot() orelse return;
+        const text = slot.buf[0..slot.len.*];
+        switch (chord) {
+            .copy, .cut => {
+                if (text.len > 0) self.setClipboard(text);
+                if (chord == .cut) {
+                    slot.len.* = 0;
+                    self.search.confirm_armed = false;
+                }
+            },
+            .paste => {
+                const clip = self.getClipboard();
+                self.search.appendText(clip[0 .. std.mem.indexOfAny(u8, clip, "\r\n") orelse clip.len]);
+            },
+            .delete_word_backward => {
+                var n = text.len;
+                while (n > 0 and text[n - 1] == ' ') n -= 1;
+                while (n > 0 and text[n - 1] != ' ') n -= 1;
+                slot.len.* = n;
+                self.search.confirm_armed = false;
+            },
+            .select_all, .delete_word_forward => {},
+        }
+    }
+
     /// After a document was removed from `documents` (index `removed`),
     /// fix every window: tab lists drop it and shift the indices above it;
     /// panes that showed the removed document now show `replacement`,
@@ -697,7 +904,10 @@ pub const Editor = struct {
     }
 
     /// Open a new empty document and make it active (in the focused pane).
+    /// Ends quick-open first: the new document must not land behind the
+    /// preview.
     pub fn newDocument(self: *Editor) !*Document {
+        self.finderCancel();
         var doc = try Document.init(self.allocator);
         errdefer doc.deinit();
         doc.history.max_size = self.max_undo_history;
@@ -715,6 +925,9 @@ pub const Editor = struct {
     }
 
     pub fn openFileWithEncoding(self: *Editor, path: []const u8, encoding: ?text_file.TextEncoding, interactive: bool) !*Document {
+        // Background opens (goto-definition, debugger frames, extensions)
+        // end quick-open instead of landing behind its preview.
+        self.finderCancel();
         if (try self.findDocument(path)) |idx| {
             self.switchToDoc(idx);
             return self.activeDoc();
@@ -733,15 +946,24 @@ pub const Editor = struct {
         self.active_doc_idx = idx;
         self.paneShowDoc(idx);
         const active = self.activeDoc();
-        self.resolveFormatting(active);
-        self.problems.project(active, .lsp) catch {};
-        self.problems.project(active, .lua) catch {};
-        active.detectLanguage(self);
-        self.lspNotifyOpen(active);
         const id = active.id;
         if (encoding) |enc| self.rememberEncoding(active.file_path.?, enc) catch {};
-        lua_api.fireEvent(self, .open, active);
+        self.afterOpen(active);
         return &self.documents.items[self.docIndexForId(id) orelse return error.DocumentClosed];
+    }
+
+    /// Post-open bookkeeping shared by every path that turns a file into a
+    /// real document (open, open-into-active, quick-open promotion, session
+    /// restore): language, EditorConfig rules, stored Problems, LSP didOpen,
+    /// then the extension `open` event LAST — its handlers may open or
+    /// close documents, so callers re-find `doc` by id afterwards.
+    fn afterOpen(self: *Editor, doc: *Document) void {
+        doc.detectLanguage(self);
+        self.resolveFormatting(doc);
+        self.problems.project(doc, .lsp) catch {};
+        self.problems.project(doc, .lua) catch {};
+        self.lspNotifyOpen(doc);
+        lua_api.fireEvent(self, .open, doc);
     }
 
     /// Open `path` into the current (startup-empty) document — the CLI
@@ -754,17 +976,13 @@ pub const Editor = struct {
             if (err == error.EncodingRequired or err == error.BinaryFile) self.requestOpenEncoding(path);
             return err;
         };
-        doc.detectLanguage(self);
-        self.lspNotifyOpen(doc);
-        self.resolveFormatting(doc);
-        self.problems.project(doc, .lsp) catch {};
-        self.problems.project(doc, .lua) catch {};
-        lua_api.fireEvent(self, .open, doc);
+        self.afterOpen(doc);
     }
 
     /// Open `path`, or switch to the tab that already has it open
     /// (separator-normalized compare, case-insensitive on Windows).
     pub fn openOrFocus(self: *Editor, path: []const u8) !*Document {
+        self.finderCancel();
         if (try self.findDocument(path)) |idx| {
             self.switchToDoc(idx);
             return self.activeDoc();
@@ -776,14 +994,26 @@ pub const Editor = struct {
         return @import("file_identity.zig").same(self.allocator, self.io, a, b) catch false;
     }
 
+    /// Index of the open (non-preview) document for `path`, compared by
+    /// file identity. Only an unresolvable `path` itself is an error: an
+    /// open document whose own key can't be resolved (reserved device
+    /// name, unreachable share, access denied, sharing violation) is
+    /// compared by its raw absolute path instead, so one odd tab never
+    /// blocks opening or saving every other file.
     pub fn findDocument(self: *const Editor, path: []const u8) !?usize {
         const identity = @import("file_identity.zig");
         const key = try identity.key(self.allocator, self.io, path);
         defer self.allocator.free(key);
+        var raw: ?[]u8 = null; // `path` made absolute, computed on first need
+        defer if (raw) |r| self.allocator.free(r);
         for (self.documents.items, 0..) |doc, idx| {
             const p = doc.file_path orelse continue;
             if (doc.preview) continue;
-            const doc_key = try identity.key(self.allocator, self.io, p);
+            const doc_key = identity.key(self.allocator, self.io, p) catch {
+                if (raw == null) raw = identity.absolute(self.allocator, self.io, path) catch null;
+                if (identity.equalKeys(key, p) or (raw != null and identity.equalKeys(raw.?, p))) return idx;
+                continue;
+            };
             defer self.allocator.free(doc_key);
             if (identity.equalKeys(key, doc_key)) return idx;
         }
@@ -793,9 +1023,11 @@ pub const Editor = struct {
     // ------------------------------------------------------------------
     // Fuzzy file finder (quick_open) — Ctrl+E overlay with live preview.
     // The preview shows in the pane behind the overlay; it is NOT a tab:
-    // one transient Document rides at the end of `documents`, hidden from
-    // tab bars / sessions / LSP, reused per peek, popped on cancel and
-    // promoted to a normal document on commit.
+    // one transient Document (`preview` flag, named by finder_preview_id)
+    // hidden from tab bars / sessions / LSP, reused per peek, removed when
+    // the session ends and promoted to a normal document on commit. Every
+    // way out of .file_finder goes through setMode, whose leave-hook
+    // (finderEndSession) ends the session — see invariant P on the fields.
     // ------------------------------------------------------------------
 
     const finder_max_files = 20_000;
@@ -803,43 +1035,49 @@ pub const Editor = struct {
 
     /// Enter .file_finder mode with a fresh workspace file snapshot.
     pub fn finderOpen(self: *Editor) void {
+        // A second Ctrl+E starts over, and a preview left behind by a
+        // direct `mode` write never survives into a new session.
+        self.finderCancel();
+        self.finderDropPreview();
         self.finder_skipped = 0;
         self.finderClearFiles();
         self.finder_buf_len = 0;
         self.finder_selected = 0;
-        self.finder_prev_active = self.active_doc_idx;
+        self.finder_prev_doc = self.activeDoc().id;
         const root = self.filetree_root orelse "";
         self.finder_root = self.allocator.dupe(u8, root) catch null;
         const open_root = if (root.len == 0) "." else root;
         if (std.Io.Dir.cwd().openDir(self.io, open_root, .{ .iterate = true })) |dir| {
             var d = dir;
             defer d.close(self.io);
-            self.finderWalk(d, "", 0);
+            var ignore = WalkIgnore.load(self.allocator, self.io, d);
+            defer ignore.deinit(self.allocator);
+            self.finderWalk(d, &ignore, "", 0);
         } else |_| {}
         self.finderFilter();
-        self.mode = .file_finder;
+        self.setMode(.file_finder);
     }
 
     /// Collect relative file paths under `dir`, skipping dot-entries and
-    /// zig-out, bounded by depth and finder_max_files.
-    fn finderWalk(self: *Editor, dir: std.Io.Dir, prefix: []const u8, depth: usize) void {
+    /// `ignore` names, bounded by depth and finder_max_files.
+    fn finderWalk(self: *Editor, dir: std.Io.Dir, ignore: *const WalkIgnore, prefix: []const u8, depth: usize) void {
         if (depth > 12) return;
         var it = dir.iterate();
         while (it.next(self.io) catch null) |entry| {
             if (self.finder_files.items.len >= finder_max_files) return;
             if (entry.name.len == 0 or entry.name[0] == '.') continue;
+            if (ignore.skips(entry.name, prefix.len == 0)) continue;
             switch (entry.kind) {
                 .file => {
                     const rel = std.fmt.allocPrint(self.allocator, "{s}{s}", .{ prefix, entry.name }) catch continue;
                     self.finder_files.append(self.allocator, rel) catch self.allocator.free(rel);
                 },
                 .directory => {
-                    if (std.mem.eql(u8, entry.name, "zig-out")) continue;
                     var sub = dir.openDir(self.io, entry.name, .{ .iterate = true }) catch continue;
                     defer sub.close(self.io);
                     const sub_prefix = std.fmt.allocPrint(self.allocator, "{s}{s}/", .{ prefix, entry.name }) catch continue;
                     defer self.allocator.free(sub_prefix);
-                    self.finderWalk(sub, sub_prefix, depth + 1);
+                    self.finderWalk(sub, ignore, sub_prefix, depth + 1);
                 },
                 else => {},
             }
@@ -899,13 +1137,27 @@ pub const Editor = struct {
         self.finderPreviewSelected();
     }
 
-    /// Root-joined path of the selected match (written into `buf` when the
-    /// workspace root isn't the cwd).
+    pub const FinderRange = struct { start: usize, end: usize };
+
+    /// The rows of finder_matches a list `rows` tall shows: scrolled so the
+    /// selection is always visible, so every match (up to 200) is
+    /// reachable. Frontends draw `finder_matches.items[start..end]` and
+    /// never write finder_selected — the core keeps it in range.
+    pub fn finderVisibleRange(self: *const Editor, rows: usize) FinderRange {
+        const count = self.finder_matches.items.len;
+        if (count == 0 or rows == 0) return .{ .start = 0, .end = 0 };
+        const sel = @min(self.finder_selected, count - 1);
+        const start = (sel + 1) -| rows;
+        return .{ .start = start, .end = @min(count, start + rows) };
+    }
+
+    /// Root-joined path of the selected match, always copied into `buf`
+    /// (finderClearFiles frees the snapshot the match points into).
     fn finderSelectedPath(self: *Editor, buf: []u8) ?[]const u8 {
         if (self.finder_selected >= self.finder_matches.items.len) return null;
         const rel = self.finder_files.items[self.finder_matches.items[self.finder_selected]];
         const root = self.finder_root orelse "";
-        if (root.len == 0) return rel;
+        if (root.len == 0) return std.fmt.bufPrint(buf, "{s}", .{rel}) catch null;
         return std.fmt.bufPrint(buf, "{s}/{s}", .{ root, rel }) catch null;
     }
 
@@ -915,26 +1167,32 @@ pub const Editor = struct {
         if (self.mode != .file_finder) return;
         var pbuf: [1024]u8 = undefined;
         const path = self.finderSelectedPath(&pbuf) orelse return;
-        for (self.documents.items, 0..) |*doc, idx| {
+        for (self.documents.items) |*doc| {
             if (doc.preview) continue;
             const dp = doc.file_path orelse continue;
             if (self.pathsEqual(dp, path)) {
+                // Dropping the preview shifts indices: re-find by id.
+                const id = doc.id;
                 self.finderDropPreview();
+                const idx = self.docIndexForId(id) orelse return;
                 self.active_doc_idx = idx;
                 self.paneShowDoc(idx);
                 return;
             }
         }
-        if (!self.finder_preview_appended) {
+        // A preview a Lua timer edited is kept as a tab, never overwritten.
+        if (self.finderPreviewIdx()) |old| if (self.documents.items[old].dirty) self.finderDropPreview();
+        const pidx = self.finderPreviewIdx() orelse blk: {
             var doc = Document.init(self.allocator) catch return;
             doc.preview = true;
+            doc.history.max_size = self.max_undo_history;
             self.documents.append(self.allocator, doc) catch {
                 doc.deinit();
                 return;
             };
-            self.finder_preview_appended = true;
-        }
-        const pidx = self.documents.items.len - 1;
+            self.finder_preview_id = doc.id;
+            break :blk self.documents.items.len - 1;
+        };
         const pdoc = &self.documents.items[pidx];
         pdoc.openWithEncoding(self.io, path, self.knownEncoding(path)) catch {
             // Unreadable/binary — drop the peek, show where we were.
@@ -944,9 +1202,14 @@ pub const Editor = struct {
             self.status_message = std.fmt.bufPrint(&self.status_buf, "{d} preview(s) skipped; open to choose encoding", .{self.finder_skipped}) catch "Preview skipped";
             return;
         };
+        // The preview document is reused across peeks: nothing of the
+        // previous file may carry over (a LICENSE after a .zig must not
+        // stay Zig; rules, diagnostics and scroll are per file).
+        pdoc.language = null;
         pdoc.detectLanguage(self);
-        // The preview doc is reused across peeks — don't carry the previous
-        // file's scroll into this one.
+        self.resolveFormatting(pdoc);
+        pdoc.clearDiagnostics();
+        pdoc.clearLintDiagnostics();
         pdoc.scroll_top = 0;
         pdoc.scroll_left = 0;
         self.active_doc_idx = pidx;
@@ -966,85 +1229,137 @@ pub const Editor = struct {
     }
 
     /// Escape: drop any preview and restore the view exactly as it was.
+    /// Also the chokepoint commands and opens call first (a no-op outside
+    /// the finder), so nothing acts on — or lands behind — a preview.
     pub fn finderCancel(self: *Editor) void {
-        self.finderDropPreview();
-        self.finderShowPrev();
-        self.mode = .normal;
-        self.finderClearFiles();
+        if (self.mode == .file_finder) {
+            self.setMode(.normal);
+        } else if (self.finder_preview_id != null or self.finder_prev_doc != null) {
+            // A direct `mode` write left the session behind (a frontend
+            // that does not go through setMode yet): end it now.
+            self.finderEndSession();
+        }
     }
 
     /// Enter: promote the preview to a real tab (or focus/open the file).
     pub fn finderCommit(self: *Editor) void {
+        if (self.mode != .file_finder) return;
         var pbuf: [1024]u8 = undefined;
-        const maybe_path = self.finderSelectedPath(&pbuf);
-        self.mode = .normal;
-        const path = maybe_path orelse {
+        const path = self.finderSelectedPath(&pbuf) orelse {
             // Nothing selected — behave like cancel.
-            self.finderDropPreview();
-            self.finderShowPrev();
-            self.finderClearFiles();
+            self.finderCancel();
             return;
         };
-        if (self.finder_preview_appended) {
-            const pidx = self.documents.items.len - 1;
+        // The jump leaves the pre-finder document, not the preview.
+        if (self.finderReturnId()) |id| if (self.docIndexForId(id)) |ri| self.recordNavPointFor(ri);
+        if (self.finderPreviewIdx()) |pidx| {
             const pdoc = &self.documents.items[pidx];
             if (pdoc.file_path != null and self.pathsEqual(pdoc.file_path.?, path)) {
-                // Promote in place — same post-open bookkeeping as openFile.
+                // Promote in place. The session is claimed first, so the
+                // leave-hook neither removes the document nor restores the
+                // old view — `pidx` stays valid across setMode.
                 pdoc.preview = false;
-                self.finder_preview_appended = false;
-                self.active_doc_idx = pidx;
-                self.paneShowDoc(pidx);
-                self.lspNotifyOpen(pdoc);
-                lua_api.fireEvent(self, .open, pdoc);
-                self.finderClearFiles();
+                self.finder_preview_id = null;
+                self.finder_prev_doc = null;
+                self.setMode(.normal);
+                self.paneShowDoc(pidx); // outside the finder: adopts the tab
+                self.afterOpen(&self.documents.items[pidx]);
                 return;
             }
-            // Preview is stale (selection changed without a refresh) —
-            // drop it and open cleanly below.
-            self.finderDropPreview();
-            self.finderShowPrev();
         }
+        // Stale or no preview (the file is already open, or the selection
+        // moved without a refresh): end the session, then open or focus.
+        self.setMode(.normal);
         _ = self.openOrFocus(path) catch {};
-        self.finderClearFiles();
     }
 
-    /// Pop and free the transient preview document, if present.
-    fn finderDropPreview(self: *Editor) void {
-        if (!self.finder_preview_appended) return;
-        self.finder_preview_appended = false;
-        if (self.documents.pop()) |popped| {
-            var doc = popped;
-            doc.deinit();
-            // Any pane that showed the preview (a split made while the
-            // finder was open, another window) now points past the end —
-            // send it back to the pre-finder document.
-            const popped_idx = self.documents.items.len;
-            const fallback = @min(self.finder_prev_active, self.documents.items.len -| 1);
-            self.retargetDocIndex(popped_idx, fallback);
+    /// Index of the live preview document (by id, and still flagged).
+    fn finderPreviewIdx(self: *const Editor) ?usize {
+        const id = self.finder_preview_id orelse return null;
+        const idx = self.docIndexForId(id) orelse return null;
+        return if (self.documents.items[idx].preview) idx else null;
+    }
+
+    /// Where quick-open returns to: the pre-finder document while it is
+    /// still open, else the active window's first tab, else any real
+    /// document (null only when nothing but a preview exists).
+    fn finderReturnId(self: *const Editor) ?u64 {
+        if (self.finder_prev_doc) |id| if (self.docIndexForId(id)) |idx| {
+            if (!self.documents.items[idx].preview) return id;
+        };
+        for (self.activeWindow().tabs.items) |di| {
+            if (di < self.documents.items.len and !self.documents.items[di].preview) return self.documents.items[di].id;
         }
+        for (self.documents.items) |*doc| if (!doc.preview) return doc.id;
+        return null;
     }
 
-    /// Point the active pane back at the pre-finder document (clamped).
+    /// Remove the transient preview document, if any: panes that showed
+    /// it (a split made meanwhile, another window) go to finderReturnId.
+    /// Safety net: a preview with edits (a Lua timer typed into it), or
+    /// the last document standing, becomes a real tab instead of being
+    /// freed.
+    fn finderDropPreview(self: *Editor) void {
+        const pidx = self.finderPreviewIdx() orelse {
+            self.finder_preview_id = null;
+            return;
+        };
+        self.finder_preview_id = null;
+        const dirty = self.documents.items[pidx].dirty;
+        const back = if (dirty) null else self.finderReturnId();
+        const back_id = back orelse {
+            self.documents.items[pidx].preview = false;
+            // adoptDoc is suppressed while the finder is open: add the tab here.
+            if (self.docWindow(pidx) == null) self.activeWindow().tabs.append(self.allocator, pidx) catch {};
+            self.status_message = if (dirty) "Quick-open preview had edits; kept it open as a tab" else "Quick-open preview kept open as a tab";
+            return;
+        };
+        var doc = self.documents.orderedRemove(pidx);
+        doc.deinit();
+        const back_idx = self.docIndexForId(back_id).?;
+        self.retargetDocIndex(pidx, back_idx);
+        if (self.active_doc_idx == pidx) {
+            self.active_doc_idx = back_idx;
+        } else if (self.active_doc_idx > pidx) {
+            self.active_doc_idx -= 1;
+        }
+        self.active_doc_idx = self.windowDocIdx(self.active_window);
+    }
+
+    /// Point the active pane back at the pre-finder document (or where
+    /// finderReturnId says, when that one closed meanwhile).
     fn finderShowPrev(self: *Editor) void {
-        const target = @min(self.finder_prev_active, self.documents.items.len -| 1);
-        self.active_doc_idx = target;
-        self.paneShowDoc(target);
+        const id = self.finderReturnId() orelse return;
+        const idx = self.docIndexForId(id) orelse return;
+        self.active_doc_idx = idx;
+        self.paneShowDoc(idx);
+    }
+
+    /// Leave-hook of .file_finder (setMode runs it while the mode is still
+    /// .file_finder, so adoptDoc stays suppressed): drop the preview, show
+    /// the pre-finder document again unless finderCommit claimed the
+    /// session, free the snapshot. May remove a document, so callers
+    /// re-find indices by id.
+    fn finderEndSession(self: *Editor) void {
+        self.finderDropPreview();
+        if (self.finder_prev_doc != null) self.finderShowPrev();
+        self.finder_prev_doc = null;
+        self.finderClearFiles();
     }
 
     // ------------------------------------------------------------------
     // Workspace search & replace panel (find_in_files)
     // ------------------------------------------------------------------
 
-    /// Ctrl+Shift+F cycle: hidden → shown + focused; shown but editor
-    /// focused → focus the panel; panel focused → hide (results persist
-    /// for next_result / prev_result).
+    /// Ctrl+Shift+F cycle: hidden → shown + focused; shown but something
+    /// else owns the keyboard → focus the panel; panel focused → hide
+    /// (results persist for next_result / prev_result).
     pub fn searchToggle(self: *Editor) void {
         if (!self.search_visible) {
-            self.search_visible = true;
-            self.search_focused = true;
             self.search.field = .query;
-        } else if (!self.search_focused) {
-            self.search_focused = true;
+            _ = self.takeKeyboardFocus(.search);
+        } else if (self.keyboardOwner() != .search) {
+            _ = self.takeKeyboardFocus(.search);
         } else {
             self.search_visible = false;
             self.search_focused = false;
@@ -1079,7 +1394,7 @@ pub const Editor = struct {
         // Opening fires Lua hooks, which may alter documents or search state.
         const path = self.allocator.dupe(u8, sp.paths.items[old.path_idx]) catch return false;
         defer self.allocator.free(path);
-        const opened = self.openOrFocus(path) catch {
+        const opened = self.navOpen(path) catch {
             const msg = std.fmt.bufPrint(&self.status_buf, "Cannot open {s}", .{path}) catch "Cannot open result";
             self.status_message = msg;
             return false;
@@ -1111,7 +1426,7 @@ pub const Editor = struct {
         c.anchor = start_off;
         c.offset = end_off;
         c.preferred_col = doc.buffer.offsetToPos(c.offset).col;
-        self.search_focused = false;
+        _ = self.takeKeyboardFocus(.pane);
         return true;
     }
 
@@ -1169,8 +1484,8 @@ pub const Editor = struct {
     }
 
     /// Get the file tree, creating it on first use. Returns null (with a
-    /// status message, and the panel hidden so the failure doesn't repeat
-    /// every frame) if the root directory can't be opened.
+    /// status message, and the panel hidden and unfocused so the failure
+    /// doesn't repeat every frame) if the root directory can't be opened.
     pub fn ensureFiletree(self: *Editor) ?*filetree_mod.FileTree {
         if (self.filetree == null) {
             const root = self.filetree_root orelse ".";
@@ -1178,6 +1493,7 @@ pub const Editor = struct {
                 const msg = std.fmt.bufPrint(&self.status_buf, "File tree: cannot open '{s}': {s}", .{ root, @errorName(err) }) catch "File tree: open failed";
                 self.status_message = msg;
                 self.filetree_visible = false;
+                self.filetree_focused = false;
                 return null;
             };
             self.filetree.?.git_enabled = self.filetree_git_colors;
@@ -1186,24 +1502,19 @@ pub const Editor = struct {
         return &self.filetree.?;
     }
 
-    /// Ctrl+B cycle: hidden → shown + focused; shown but editor focused →
-    /// focus the tree; tree focused → hide (focus returns to the editor).
-    /// Gives a full keyboard round-trip together with Escape.
+    /// Ctrl+B cycle: hidden → shown + focused; shown but something else
+    /// owns the keyboard → focus the tree (scrolled to its selection); tree
+    /// focused → hide (focus returns to the pane). Gives a full keyboard
+    /// round-trip together with Escape.
     pub fn toggleFiletree(self: *Editor) void {
-        if (!self.filetree_visible) {
-            self.filetree_visible = true;
-            if (self.ensureFiletree() != null) self.filetree_focused = true;
-        } else if (!self.filetree_focused) {
-            if (self.ensureFiletree() != null) {
-                self.filetree_focused = true;
-                self.filetree.?.scroll_to_selected = true;
-            } else {
-                self.filetree_visible = false;
-            }
-        } else {
+        if (self.filetree_visible and self.keyboardOwner() == .filetree) {
             self.filetree_visible = false;
             self.filetree_focused = false;
+            return;
         }
+        const was_visible = self.filetree_visible;
+        if (!self.takeKeyboardFocus(.filetree)) return;
+        if (was_visible) self.filetree.?.scroll_to_selected = true;
     }
 
     /// Mark the selected entry for a move (tree 'x'). 'p' pastes it into
@@ -1458,6 +1769,7 @@ pub const Editor = struct {
         // Root-relative state can't survive a root swap.
         self.filetreeClipClear();
         self.cancelFiletreeMove();
+        const had_keyboard = self.keyboardOwner() == .filetree;
         const trimmed = std.mem.trim(u8, path, " \t");
         const new_root: ?[]const u8 = if (trimmed.len == 0)
             null
@@ -1484,6 +1796,9 @@ pub const Editor = struct {
         self.filetree_root = old_root;
         self.filetree_visible = true;
         _ = self.ensureFiletree();
+        // The failed attempt unfocused the tree; the restored one gets the
+        // keyboard back if it had it (tree Backspace into an unreadable parent).
+        if (had_keyboard and self.filetree != null) _ = self.takeKeyboardFocus(.filetree);
         @memcpy(self.status_buf[0..fail_len], fail_buf[0..fail_len]);
         self.status_message = self.status_buf[0..fail_len];
         return false;
@@ -1551,14 +1866,19 @@ pub const Editor = struct {
             const name = ft.nodes.items[target_idx].name;
             text_input.set(&self.open_buf, &self.open_buf_len, name);
         }
-        self.mode = .filetree_prompt;
+        self.setMode(.filetree_prompt);
     }
 
     /// Cancel the file-tree prompt and return to normal mode.
     pub fn cancelFiletreePrompt(self: *Editor) void {
+        self.freeFiletreePromptTarget();
+        if (self.mode == .filetree_prompt) self.setMode(.normal);
+    }
+
+    /// Leave-hook of .filetree_prompt (and part of cancelFiletreePrompt).
+    fn freeFiletreePromptTarget(self: *Editor) void {
         if (self.filetree_prompt_target) |old| self.allocator.free(old);
         self.filetree_prompt_target = null;
-        self.mode = .normal;
     }
 
     /// Apply the active file-tree prompt (Enter / 'y'): perform the file
@@ -1731,7 +2051,7 @@ pub const Editor = struct {
         if (doc_idx >= self.documents.items.len) return false;
         if (self.documents.items[doc_idx].dirty) {
             self.confirm_close_doc = self.documents.items[doc_idx].id;
-            self.mode = .confirm_close;
+            self.setMode(.confirm_close);
             return false;
         }
         _ = self.closeDocAt(doc_idx);
@@ -1750,7 +2070,7 @@ pub const Editor = struct {
     /// writes the file and closes the tab; a file that changed on disk
     /// meanwhile gets the overwrite prompt instead and the tab stays.
     pub fn resolveCloseDoc(self: *Editor, choice: CloseChoice) CloseOutcome {
-        self.mode = .normal;
+        self.setMode(.normal);
         const id = self.confirm_close_doc;
         self.confirm_close_doc = null;
         const idx = (if (id) |target| self.docIndexForId(target) else null) orelse {
@@ -1807,6 +2127,7 @@ pub const Editor = struct {
             var fresh = Document.init(self.allocator) catch return false;
             fresh.history.max_size = self.max_undo_history;
             fresh.loadText("") catch {};
+            self.rememberClosed(&self.documents.items[0]);
             self.forgetRecovery(self.documents.items[0].id);
             // Send didClose before resetting
             self.lspForgetDoc(&self.documents.items[0]);
@@ -1833,6 +2154,7 @@ pub const Editor = struct {
                 }
             }
         }
+        self.rememberClosed(&self.documents.items[removed_idx]);
         self.lspForgetDoc(&self.documents.items[removed_idx]);
         self.forgetRecovery(self.documents.items[removed_idx].id);
         self.documents.items[removed_idx].deinit();
@@ -1882,6 +2204,351 @@ pub const Editor = struct {
     }
 
     /// Switch to document at index (in the currently focused pane).
+    // ------------------------------------------------------------------
+    // Navigation history — navigate_back / navigate_forward.
+
+    /// The caret position of document `idx` as a history point; null for a
+    /// quick-open preview (never a place to return to).
+    fn navPos(self: *Editor, idx: usize) ?nav_history.Pos {
+        if (idx >= self.documents.items.len) return null;
+        const doc = &self.documents.items[idx];
+        if (doc.preview) return null;
+        const p = doc.buffer.offsetToPos(doc.cursors.primary().offset);
+        return .{ .doc_id = doc.id, .path = doc.file_path, .line = p.line, .col = p.col };
+    }
+
+    /// Remember the active document's caret so `navigate_back` can return
+    /// here. Jumping commands call this before they move the caret.
+    pub fn recordNavPoint(self: *Editor) void {
+        self.recordNavPointFor(self.activeDocIdx());
+    }
+
+    pub fn recordNavPointFor(self: *Editor, idx: usize) void {
+        const pos = self.navPos(idx) orelse return;
+        self.nav.record(pos) catch {};
+    }
+
+    /// Open or focus `path` as a jump: the caret it leaves is recorded first.
+    pub fn navOpen(self: *Editor, path: []const u8) !*Document {
+        self.recordNavPoint();
+        return self.openOrFocus(path);
+    }
+
+    /// `goto_line`'s apply — a recorded jump, so navigate_back undoes it.
+    pub fn jumpToLine(self: *Editor, line_num: usize) void {
+        self.recordNavPoint();
+        self.activeDoc().gotoLine(line_num);
+    }
+
+    /// Move through the history. False (with a status message) when there
+    /// is nowhere to go; entries whose document is gone are dropped.
+    pub fn navigate(self: *Editor, dir: nav_history.Direction) bool {
+        const here = self.navPos(self.activeDocIdx()) orelse return false;
+        // Opening a file runs extension hooks that may close documents, so
+        // the position being left keeps its own copy of the path.
+        const from_path = if (here.path) |p| self.allocator.dupe(u8, p) catch return false else null;
+        defer if (from_path) |p| self.allocator.free(p);
+        const from: nav_history.Pos = .{ .doc_id = here.doc_id, .path = from_path, .line = here.line, .col = here.col };
+        while (self.nav.take(dir, from)) |taken| {
+            var entry = taken;
+            defer entry.deinit(self.allocator);
+            if (self.applyNav(entry)) {
+                self.nav.leave(dir, from) catch {};
+                return true;
+            }
+        }
+        self.status_message = if (dir == .back) "Nothing to go back to" else "Nothing to go forward to";
+        return false;
+    }
+
+    fn applyNav(self: *Editor, entry: nav_history.Entry) bool {
+        var idx = self.docIndexForId(entry.doc_id);
+        if (idx == null) {
+            const path = entry.path orelse return false; // an untitled buffer that was closed
+            const doc = self.openOrFocus(path) catch return false;
+            idx = self.docIndexForId(doc.id);
+        }
+        const i = idx orelse return false;
+        if (self.documents.items[i].preview) return false;
+        self.switchToDoc(i);
+        const doc = &self.documents.items[i];
+        const line = @min(entry.line, doc.buffer.lineCount() -| 1);
+        doc.gotoLine(line + 1);
+        doc.cursors.primary().gotoPos(&doc.buffer, line, entry.col);
+        self.setMode(.normal);
+        return true;
+    }
+
+    // ------------------------------------------------------------------
+    // Reopen closed tab.
+
+    pub const ClosedTab = struct { path: []u8, line: usize, col: usize };
+    const closed_tabs_capacity: usize = 20;
+
+    /// Remember a named document that is about to close so
+    /// `reopen_closed_tab` can bring it back at its caret. One entry per
+    /// file (the newest wins); untitled buffers and previews are not kept.
+    fn rememberClosed(self: *Editor, doc: *const Document) void {
+        if (doc.preview) return;
+        const path = doc.file_path orelse return;
+        const owned = self.allocator.dupe(u8, path) catch return;
+        var i: usize = 0;
+        while (i < self.closed_tabs.items.len) {
+            if (self.pathsEqual(self.closed_tabs.items[i].path, owned)) {
+                const old = self.closed_tabs.orderedRemove(i);
+                self.allocator.free(old.path);
+                continue;
+            }
+            i += 1;
+        }
+        const p = doc.buffer.offsetToPos(doc.cursors.primaryConst().offset);
+        self.closed_tabs.append(self.allocator, .{ .path = owned, .line = p.line, .col = p.col }) catch {
+            self.allocator.free(owned);
+            return;
+        };
+        if (self.closed_tabs.items.len > closed_tabs_capacity) {
+            const oldest = self.closed_tabs.orderedRemove(0);
+            self.allocator.free(oldest.path);
+        }
+    }
+
+    /// Reopen the most recently closed file that is not open now, at the
+    /// caret it was closed with. False (with a status message) when the
+    /// list is empty or the file cannot be opened.
+    pub fn reopenClosedTab(self: *Editor) bool {
+        while (self.closed_tabs.pop()) |entry| {
+            defer self.allocator.free(entry.path);
+            if ((self.findDocument(entry.path) catch null) != null) continue;
+            self.recordNavPoint();
+            const doc = self.openOrFocus(entry.path) catch |err| {
+                if (err != error.EncodingRequired and err != error.BinaryFile) {
+                    self.status_message = std.fmt.bufPrint(&self.status_buf, "Cannot reopen {s}: {s}", .{ std.fs.path.basename(entry.path), @errorName(err) }) catch "Cannot reopen closed tab";
+                }
+                return false;
+            };
+            const line = @min(entry.line, doc.buffer.lineCount() -| 1);
+            doc.gotoLine(line + 1);
+            doc.cursors.primary().gotoPos(&doc.buffer, line, entry.col);
+            return true;
+        }
+        self.status_message = "No closed tabs to reopen";
+        return false;
+    }
+
+    // ------------------------------------------------------------------
+    // Signature help.
+
+    pub const Signature = struct { label: []u8, param_start: usize, param_end: usize, doc: []u8 };
+
+    pub fn clearSignature(self: *Editor) void {
+        if (self.signature) |s| {
+            self.allocator.free(s.label);
+            self.allocator.free(s.doc);
+        }
+        self.signature = null;
+    }
+
+    /// Show `label`, with `param_start..param_end` highlighted, for the
+    /// active document's caret line.
+    pub fn setSignature(self: *Editor, label: []const u8, param_start: usize, param_end: usize, doc: []const u8) !void {
+        const l = try self.allocator.dupe(u8, label);
+        errdefer self.allocator.free(l);
+        const d = try self.allocator.dupe(u8, doc);
+        errdefer self.allocator.free(d);
+        self.clearSignature();
+        const active = self.activeDoc();
+        self.signature = .{ .label = l, .param_start = @min(param_start, l.len), .param_end = @min(@max(param_start, param_end), l.len), .doc = d };
+        self.signature_doc_id = active.id;
+        self.signature_line = active.buffer.offsetToPos(active.cursors.primaryConst().offset).line;
+    }
+
+    /// Whether to draw the signature popup now; one left behind on another
+    /// line is dropped here.
+    pub fn signatureVisible(self: *Editor) bool {
+        if (self.signature == null) return false;
+        const doc = self.activeDoc();
+        if (doc.id != self.signature_doc_id or self.mode != .normal) return false;
+        if (doc.buffer.offsetToPos(doc.cursors.primaryConst().offset).line != self.signature_line) {
+            self.clearSignature();
+            return false;
+        }
+        return true;
+    }
+
+    fn signatureTriggerByte(self: *Editor, b: u8) bool {
+        const client = self.lspClientForDoc(self.activeDoc()) orelse return false;
+        return client.capabilities.isSignatureTrigger(b);
+    }
+
+    // ------------------------------------------------------------------
+    // Generic pick-list overlay (go-to-symbol; Lua extensions later).
+
+    /// Show the list prepared with `picker.begin` / `picker.add`.
+    pub fn openPicker(self: *Editor) void {
+        self.picker.refilter();
+        self.setMode(.picker);
+    }
+
+    pub fn pickerCancel(self: *Editor) void {
+        self.setMode(.normal);
+    }
+
+    /// Enter: leave picker mode, then hand the chosen payload to the callback.
+    pub fn pickerConfirm(self: *Editor) void {
+        const payload = self.picker.selectedPayload();
+        const on_pick = self.picker.on_pick;
+        self.setMode(.normal);
+        if (payload) |p| if (on_pick) |cb| cb(self, p);
+    }
+
+    pub fn pickerTyped(self: *Editor, text: []const u8) void {
+        self.picker.typeText(text);
+        if (self.picker.on_query) |cb| cb(self, self.picker.filter());
+    }
+
+    pub fn pickerBackspace(self: *Editor) void {
+        self.picker.backspace();
+        if (self.picker.on_query) |cb| cb(self, self.picker.filter());
+    }
+
+    /// Open `path` at `line` / `col` (0-based; `columns` says whether `col`
+    /// counts bytes or UTF-16 units) as a recorded jump. Problems, task
+    /// output, references and symbol pickers all land here.
+    pub fn jumpToLocation(self: *Editor, path: []const u8, line: u32, col: u32, columns: @import("diagnostics.zig").Columns) void {
+        // Opening can run extensions that replace the store `path` lives in.
+        const owned = self.allocator.dupe(u8, path) catch return;
+        defer self.allocator.free(owned);
+        const doc = self.navOpen(owned) catch |err| {
+            self.status_message = std.fmt.bufPrint(&self.status_buf, "Cannot open {s}: {s}", .{ std.fs.path.basename(owned), @errorName(err) }) catch "Cannot open location";
+            return;
+        };
+        doc.gotoLine(line +| 1);
+        const byte_col = if (columns == .utf16) lsp_mod.utf16ColToByte(doc.lineContent(line), col) else col;
+        doc.cursors.primary().gotoPos(&doc.buffer, line, byte_col);
+        self.setMode(.normal);
+    }
+
+    // ------------------------------------------------------------------
+    // Projects: open folder, recent projects, re-root from the tree.
+
+    /// Nine, so the TUI picker's digit keys cover every row.
+    pub const recent_projects_max: usize = 9;
+
+    fn recentProjectsPath(buf: []u8) ?[]const u8 {
+        const lua_settings = @import("lua_settings.zig");
+        const dir = lua_settings.getConfigDir() orelse return null;
+        return std.fmt.bufPrint(buf, "{s}/recent_projects", .{dir}) catch null;
+    }
+
+    /// Load `~/.config/zide/recent_projects` once: one path per line,
+    /// newest first.
+    pub fn ensureRecentProjects(self: *Editor) void {
+        if (self.recent_loaded) return;
+        self.recent_loaded = true;
+        var pbuf: [std.fs.max_path_bytes]u8 = undefined;
+        const path = recentProjectsPath(&pbuf) orelse return;
+        const data = std.Io.Dir.cwd().readFileAlloc(self.io, path, self.allocator, .limited(64 * 1024)) catch return;
+        defer self.allocator.free(data);
+        var lines = std.mem.splitScalar(u8, data, '\n');
+        while (lines.next()) |raw| {
+            const line = std.mem.trim(u8, raw, " \t\r");
+            if (line.len == 0) continue;
+            if (self.recent_projects.items.len >= recent_projects_max) break;
+            const owned = self.allocator.dupe(u8, line) catch return;
+            self.recent_projects.append(self.allocator, owned) catch {
+                self.allocator.free(owned);
+                return;
+            };
+        }
+    }
+
+    fn saveRecentProjects(self: *Editor) void {
+        var pbuf: [std.fs.max_path_bytes]u8 = undefined;
+        const path = recentProjectsPath(&pbuf) orelse return;
+        const file = std.Io.Dir.cwd().createFile(self.io, path, .{}) catch return;
+        defer file.close(self.io);
+        for (self.recent_projects.items) |p| {
+            file.writeStreamingAll(self.io, p) catch return;
+            file.writeStreamingAll(self.io, "\n") catch return;
+        }
+    }
+
+    /// Put the current tree root at the top of the recent-projects list.
+    pub fn rememberProject(self: *Editor) void {
+        const ft = self.ensureFiletree() orelse return;
+        self.ensureRecentProjects();
+        const owned = self.allocator.dupe(u8, ft.root_path) catch return;
+        var i: usize = 0;
+        while (i < self.recent_projects.items.len) {
+            if (self.pathsEqual(self.recent_projects.items[i], owned)) {
+                self.allocator.free(self.recent_projects.orderedRemove(i));
+                continue;
+            }
+            i += 1;
+        }
+        self.recent_projects.insert(self.allocator, 0, owned) catch {
+            self.allocator.free(owned);
+            return;
+        };
+        while (self.recent_projects.items.len > recent_projects_max) self.allocator.free(self.recent_projects.pop().?);
+        self.saveRecentProjects();
+    }
+
+    /// Open `path` as the project: it becomes the file tree root and the
+    /// language-server workspace (servers restart) and joins the recent
+    /// list. False (with the tree's message) when the folder is unusable.
+    pub fn openProject(self: *Editor, path: []const u8) bool {
+        if (!self.setFiletreeRoot(path)) return false;
+        self.rememberProject();
+        self.restartLsp();
+        if (self.filetree) |*ft| {
+            self.status_message = std.fmt.bufPrint(&self.status_buf, "Project: {s}", .{ft.root_path}) catch "Project opened";
+        }
+        return true;
+    }
+
+    /// `recent_projects`: show the picker, or say when there is nothing to pick.
+    pub fn startRecentProjects(self: *Editor) void {
+        self.ensureRecentProjects();
+        if (self.recent_projects.items.len == 0) {
+            self.status_message = "No recent projects yet";
+            return;
+        }
+        self.recent_selected = 0;
+        self.setMode(.recent_projects);
+    }
+
+    pub fn cancelRecentProjects(self: *Editor) void {
+        self.setMode(.normal);
+    }
+
+    /// Open recent project `idx`; a folder that cannot be opened any more
+    /// leaves the list.
+    pub fn chooseRecentProject(self: *Editor, idx: usize) void {
+        self.setMode(.normal);
+        if (idx >= self.recent_projects.items.len) return;
+        const copy = self.allocator.dupe(u8, self.recent_projects.items[idx]) catch return;
+        defer self.allocator.free(copy);
+        if (!self.openProject(copy)) {
+            self.allocator.free(self.recent_projects.orderedRemove(idx));
+            self.saveRecentProjects();
+        }
+    }
+
+    /// Tree `o`: the selected folder (or a selected file's folder) becomes
+    /// the project root.
+    pub fn filetreeOpenSelectedAsRoot(self: *Editor) void {
+        const ft = self.ensureFiletree() orelse return;
+        const target = ft.opTargetDir();
+        if (target == 0) {
+            self.status_message = "File tree: that folder is already the root";
+            return;
+        }
+        const abs = ft.absPathAlloc(self.allocator, target) catch return;
+        defer self.allocator.free(abs);
+        _ = self.openProject(abs);
+    }
+
     pub fn switchToDoc(self: *Editor, idx: usize) void {
         if (idx < self.documents.items.len) {
             if (idx != self.activeDocIdx()) self.cancelSnippets();
@@ -1896,20 +2563,24 @@ pub const Editor = struct {
         lua_api.pumpLuaJobs(self);
     }
 
-    /// Execute a command by name.
+    /// Execute a command by name. Commands act on real documents, so an
+    /// open quick-open session ends first.
     pub fn execCommand(self: *Editor, name: []const u8, args: ?[]const u8) bool {
+        self.finderCancel();
         return self.commands.execute(self, name, args);
     }
 
     /// Execute an action by name. Handles special actions (quit, save, find, etc.)
     /// that aren't in the command registry, then falls back to execCommand.
-    /// Returns true if the action was recognized and handled.
+    /// Returns true if the action was recognized and handled. Ends an open
+    /// quick-open session first (menus, keybinds and Lua exec all land here).
     pub fn execAction(self: *Editor, action: []const u8) bool {
+        self.finderCancel();
         self.validateSnippetState();
         defer self.validateSnippetState();
         if (std.mem.eql(u8, action, "quit")) {
             if (self.hasUnsavedChanges()) {
-                self.mode = .confirm_quit;
+                self.setMode(.confirm_quit);
             } else {
                 self.running = false;
             }
@@ -1923,13 +2594,13 @@ pub const Editor = struct {
             return true;
         }
         if (std.mem.eql(u8, action, "find")) {
-            self.mode = .find;
+            self.setMode(.find);
             self.find_buf_len = 0;
             self.find_origin = self.activeDoc().cursors.primary().offset;
             return true;
         }
         if (std.mem.eql(u8, action, "find_replace")) {
-            self.mode = .find_replace;
+            self.setMode(.find_replace);
             self.find_buf_len = 0;
             self.replace_buf_len = 0;
             self.replace_field_active = false;
@@ -1937,7 +2608,7 @@ pub const Editor = struct {
             return true;
         }
         if (std.mem.eql(u8, action, "file_open")) {
-            self.mode = .file_open;
+            self.setMode(.file_open);
             self.open_buf_len = 0;
             return true;
         }
@@ -1946,18 +2617,18 @@ pub const Editor = struct {
             return true;
         }
         if (std.mem.eql(u8, action, "command_palette")) {
-            self.mode = .command_palette;
+            self.setMode(.command_palette);
             self.palette_buf_len = 0;
             self.palette_selected = 0;
             return true;
         }
         if (std.mem.eql(u8, action, "goto_line")) {
-            self.mode = .goto_line;
+            self.setMode(.goto_line);
             self.goto_buf_len = 0;
             return true;
         }
         if (std.mem.eql(u8, action, "settings")) {
-            self.mode = .settings;
+            self.setMode(.settings);
             self.settings_window_id = self.activeWindow().id;
             self.settings_selected = 0;
             self.settings_editing = null;
@@ -2040,6 +2711,27 @@ pub const Editor = struct {
         }
         if (std.mem.eql(u8, action, "lsp_goto_definition")) {
             self.triggerGotoDefinition();
+            return true;
+        }
+        if (std.mem.eql(u8, action, "reopen_closed_tab")) {
+            _ = self.reopenClosedTab();
+            return true;
+        }
+        if (std.mem.eql(u8, action, "open_folder")) {
+            self.setMode(.folder_open);
+            self.open_buf_len = 0;
+            return true;
+        }
+        if (std.mem.eql(u8, action, "recent_projects")) {
+            self.startRecentProjects();
+            return true;
+        }
+        if (std.mem.eql(u8, action, "navigate_back")) {
+            _ = self.navigate(.back);
+            return true;
+        }
+        if (std.mem.eql(u8, action, "navigate_forward")) {
+            _ = self.navigate(.forward);
             return true;
         }
         // Fall back to command registry
@@ -2234,7 +2926,7 @@ pub const Editor = struct {
         self.cancelEncoding();
         self.encoding_path = owned;
         self.encoding_action = .open;
-        self.mode = .encoding_picker;
+        self.setMode(.encoding_picker);
         self.status_message = "Choose an encoding to open this file";
     }
     pub fn startEncoding(self: *Editor, action: EncodingAction) void {
@@ -2242,7 +2934,7 @@ pub const Editor = struct {
         self.cancelEncoding();
         self.encoding_doc_id = self.activeDoc().id;
         self.encoding_action = action;
-        self.mode = .encoding_picker;
+        self.setMode(.encoding_picker);
     }
     pub fn cancelEncoding(self: *Editor) void {
         self.close_after_save_id = null;
@@ -2252,7 +2944,7 @@ pub const Editor = struct {
         self.reopen_encoding = null;
         self.reopen_after_save = false;
         self.encoding_selected = 0;
-        self.mode = .normal;
+        self.setMode(.normal);
         self.clearPendingSave();
     }
     pub fn encodingTitle(self: *const Editor) []const u8 {
@@ -2293,7 +2985,7 @@ pub const Editor = struct {
             return;
         };
         if (self.encoding_action == .save) {
-            self.mode = .normal;
+            self.setMode(.normal);
             switch (self.saveDocument(id, .{ .format = format })) {
                 .needs_path => self.startSaveAs(id, format),
                 else => {},
@@ -2304,7 +2996,7 @@ pub const Editor = struct {
                 return;
             }
             self.reopen_encoding = format.encoding;
-            if (self.documents.items[di].dirty) self.mode = .confirm_reopen else self.finishReopen();
+            if (self.documents.items[di].dirty) self.setMode(.confirm_reopen) else self.finishReopen();
         }
     }
     fn finishReopen(self: *Editor) void {
@@ -2331,7 +3023,7 @@ pub const Editor = struct {
             .save => {
                 const id = self.encoding_doc_id orelse return;
                 self.reopen_after_save = true;
-                self.mode = .normal;
+                self.setMode(.normal);
                 switch (self.saveDocument(id, .{})) {
                     .needs_path => self.startSaveAs(id, null),
                     else => {},
@@ -2344,12 +3036,12 @@ pub const Editor = struct {
         self.save_as_id = id;
         self.save_as_format = format;
         text_input.set(&self.open_buf, &self.open_buf_len, self.documents.items[idx].file_path orelse "");
-        self.mode = .save_as;
+        self.setMode(.save_as);
     }
     pub fn finishSaveAs(self: *Editor, path: []const u8) SaveOutcome {
         const id = self.save_as_id orelse return .{ .failed = error.DocumentClosed };
         const format = self.save_as_format;
-        self.mode = .normal;
+        self.setMode(.normal);
         self.save_as_id = null;
         self.save_as_format = null;
         return self.saveDocument(id, .{ .path = path, .format = format });
@@ -2378,7 +3070,7 @@ pub const Editor = struct {
         self.save_destination_conflict = false;
     }
     pub fn resolveEncodingSave(self: *Editor, convert: bool) void {
-        self.mode = .normal;
+        self.setMode(.normal);
         const id = self.pending_save_id orelse return;
         if (!convert) {
             self.cancelEncoding();
@@ -2410,27 +3102,31 @@ pub const Editor = struct {
         }
         return null;
     }
-    fn showSaveBlocker(self: *Editor, idx: usize, result: SaveOutcome) void {
-        self.switchToDoc(idx);
-        self.mode = .normal;
+    /// Show why an interactive save stopped. Leaves the current mode first
+    /// (ending quick-open can remove its preview and shift indices, so the
+    /// document is found by id afterwards), then shows it and enters the
+    /// prompt the outcome needs.
+    fn showSaveBlocker(self: *Editor, id: u64, result: SaveOutcome) void {
+        self.setMode(.normal);
+        self.switchToDoc(self.docIndexForId(id) orelse return);
         switch (result) {
             .formatting => self.status_message = "Formatting before save",
             .conflict => {
                 self.save_destination_conflict = false;
-                self.confirm_overwrite_doc = idx;
-                self.mode = .confirm_overwrite;
+                self.confirm_overwrite_doc = id;
+                self.setMode(.confirm_overwrite);
                 self.status_message = "File changed on disk; save cancelled";
             },
             .destination_exists => {
-                self.confirm_overwrite_doc = idx;
+                self.confirm_overwrite_doc = id;
                 self.save_destination_conflict = true;
-                self.mode = .confirm_overwrite;
+                self.setMode(.confirm_overwrite);
                 self.status_message = "Save As destination exists; confirm overwrite";
             },
             .needs_path => self.status_message = "Use Save As for the untitled document, then quit again",
             .failed => |err| self.status_message = std.fmt.bufPrint(&self.status_buf, "Save failed: {s}", .{@errorName(err)}) catch "Save failed",
             .unrepresentable => {
-                self.mode = .confirm_encoding;
+                self.setMode(.confirm_encoding);
                 self.status_message = "Text cannot be represented in Windows-1252";
             },
             .saved => {},
@@ -2441,18 +3137,23 @@ pub const Editor = struct {
     pub fn saveDocument(self: *Editor, id: u64, options: SaveOptions) SaveOutcome {
         const idx = self.docIndexForId(id) orelse return .{ .failed = error.DocumentClosed };
         const doc = &self.documents.items[idx];
+        // Invariant P: a quick-open preview is never written anywhere.
+        if (doc.preview) return .{ .failed = error.PreviewDocument };
         const same_path = options.path == null or (doc.file_path != null and self.pathsEqual(doc.file_path.?, options.path.?));
         if (options.path) |path| {
             const owner = self.findDocument(path) catch |err| return .{ .failed = err };
             if (owner) |other| if (other != idx) {
-                self.switchToDoc(other);
-                self.status_message = "Destination is already open; save its document instead";
+                // cancelEncoding leaves the current mode, which can shift
+                // indices: switch to the destination by id afterwards.
+                const other_id = self.documents.items[other].id;
                 self.cancelEncoding();
+                if (self.docIndexForId(other_id)) |current| self.switchToDoc(current);
+                self.status_message = "Destination is already open; save its document instead";
                 return .{ .failed = error.DestinationOpen };
             };
             if (!same_path) {
                 const stamp = text_file.Stamp.read(self.io, path) catch |err| {
-                    if (options.interactive) self.showSaveBlocker(idx, .{ .failed = err });
+                    if (options.interactive) self.showSaveBlocker(id, .{ .failed = err });
                     return .{ .failed = err };
                 };
                 if (stamp) |current| if (!options.overwrite or options.destination_stamp == null or !std.meta.eql(current, options.destination_stamp.?)) {
@@ -2460,7 +3161,7 @@ pub const Editor = struct {
                         var held = options;
                         held.destination_stamp = current;
                         self.holdSave(id, held) catch return .{ .failed = error.OutOfMemory };
-                        self.showSaveBlocker(idx, .destination_exists);
+                        self.showSaveBlocker(id, .destination_exists);
                     }
                     return .destination_exists;
                 };
@@ -2469,18 +3170,25 @@ pub const Editor = struct {
         if (!options.overwrite and same_path) if (self.saveBlocker(idx)) |blocker| {
             if (options.interactive) {
                 self.holdSave(id, options) catch return .{ .failed = error.OutOfMemory };
-                self.showSaveBlocker(idx, blocker);
+                self.showSaveBlocker(id, blocker);
             }
             return blocker;
         };
         const old_path = if (options.path != null and doc.file_path != null) self.allocator.dupe(u8, doc.file_path.?) catch return .{ .failed = error.OutOfMemory } else null;
         defer if (old_path) |p| self.allocator.free(p);
-        if (self.lsp_tools.maybeFormatSave(self, doc, options) catch |err| {
-            self.showSaveBlocker(idx, .{ .failed = err });
+        // A server that does not have this document open (too large to
+        // send, or not synced yet) cannot format it: save it as it is and
+        // say why, instead of failing with ServerNotReady.
+        const unformatted = self.formatSkipReason(doc, options);
+        var format_options = options;
+        if (unformatted != null) format_options.skip_format = true;
+        if (self.lsp_tools.maybeFormatSave(self, doc, format_options) catch |err| {
+            // Auto-save never switches tabs or closes prompts; it retries.
+            if (options.interactive) self.showSaveBlocker(id, .{ .failed = err });
             return .{ .failed = err };
         }) return .formatting;
-        self.prepareProjectFormatting(doc, options.path orelse doc.file_path orelse return .needs_path, options.format_group) catch |err| {
-            if (options.interactive) self.showSaveBlocker(idx, .{ .failed = err });
+        const editorconfig_skipped = self.prepareProjectFormatting(doc, options.path orelse doc.file_path orelse return .needs_path, options.format_group) catch |err| {
+            if (options.interactive) self.showSaveBlocker(id, .{ .failed = err });
             return .{ .failed = err };
         };
         const result = if (options.path) |p| doc.saveAsWithFormat(self.io, p, options.format) else doc.saveWithFormat(self.io, options.format);
@@ -2490,7 +3198,7 @@ pub const Editor = struct {
                 if (outcome == .unrepresentable) {
                     self.holdSave(id, options) catch return .{ .failed = error.OutOfMemory };
                 } else self.cancelEncoding();
-                self.showSaveBlocker(idx, outcome);
+                self.showSaveBlocker(id, outcome);
             }
             return outcome;
         };
@@ -2506,7 +3214,12 @@ pub const Editor = struct {
             ((doc.format.encoding == .utf16_le or doc.format.encoding == .utf16_be) and !doc.format.bom))
             if (doc.file_path) |p| self.rememberEncoding(p, doc.format.encoding) catch {};
         if (self.pending_save_id == id) self.clearPendingSave();
-        self.status_message = std.fmt.bufPrint(&self.status_buf, "Saved {s}", .{doc.display_name}) catch "Saved";
+        self.status_message = if (editorconfig_skipped) |why|
+            std.fmt.bufPrint(&self.status_buf, "Saved {s} without .editorconfig rules ({s})", .{ doc.display_name, @errorName(why) }) catch "Saved without .editorconfig rules"
+        else if (unformatted) |why|
+            std.fmt.bufPrint(&self.status_buf, "Saved {s} unformatted ({s})", .{ doc.display_name, why }) catch "Saved unformatted"
+        else
+            std.fmt.bufPrint(&self.status_buf, "Saved {s}", .{doc.display_name}) catch "Saved";
         self.lspDidSave(doc);
         const saved_version = doc.buffer.version;
         self.forgetRecovery(id);
@@ -2531,6 +3244,17 @@ pub const Editor = struct {
         }
         return .saved;
     }
+    /// Why format-on-save must pass over `doc` (null = format as usual): a
+    /// server that would format it does not have the document open — it is
+    /// too large to send, or not yet synced. A format-save of this very
+    /// document that is already in flight keeps waiting for its reply.
+    fn formatSkipReason(self: *const Editor, doc: *const Document, options: SaveOptions) ?[]const u8 {
+        if (!self.lsp_tools.format_on_save or options.skip_format or doc.lsp_opened) return null;
+        if (self.lsp_tools.save) |pending| if (pending.id == doc.id) return null;
+        const client = self.lspClientForDoc(doc) orelse return null;
+        if (!client.capabilities.format_document) return null;
+        return if (self.lsp_too_large.contains(doc.id)) "too large for the language server" else "not synced with the language server";
+    }
     fn dirtyDocumentIds(self: *Editor) ![]u64 {
         var ids: std.ArrayList(u64) = .empty;
         errdefer ids.deinit(self.allocator);
@@ -2540,7 +3264,7 @@ pub const Editor = struct {
         return ids.toOwnedSlice(self.allocator);
     }
     pub fn saveAllAndQuit(self: *Editor) void {
-        self.mode = .normal;
+        self.setMode(.normal);
         const ids = self.dirtyDocumentIds() catch {
             self.status_message = "Save failed: out of memory";
             return;
@@ -2554,7 +3278,7 @@ pub const Editor = struct {
                     self.status_message = "Save failed: out of memory";
                     return;
                 };
-                self.showSaveBlocker(idx, blocker);
+                self.showSaveBlocker(id, blocker);
                 return;
             }
         }
@@ -2582,13 +3306,15 @@ pub const Editor = struct {
     /// for (confirm_overwrite_doc), not whatever is active when answered.
     pub fn resolveOverwrite(self: *Editor, choice: OverwriteChoice) void {
         if (self.save_destination_conflict and choice == .reload) return;
-        self.mode = .normal;
+        self.setMode(.normal);
+        const target = self.confirm_overwrite_doc;
+        self.confirm_overwrite_doc = null;
         const id = self.pending_save_id orelse blk: {
-            if (self.confirm_overwrite_doc >= self.documents.items.len) {
+            const idx = (if (target) |doc_id| self.docIndexForId(doc_id) else null) orelse {
                 self.status_message = "Save cancelled (the document was closed)";
                 return;
-            }
-            break :blk self.documents.items[self.confirm_overwrite_doc].id;
+            };
+            break :blk self.documents.items[idx].id;
         };
         const idx = self.docIndexForId(id) orelse {
             self.cancelEncoding();
@@ -2634,6 +3360,12 @@ pub const Editor = struct {
             switch (self.saveDocument(id, .{ .interactive = false, .refresh_tree = false })) {
                 .saved => saved += 1,
                 .needs_path, .formatting => {},
+                // Another document's format-on-save is still in flight (or
+                // this is a preview a Lua timer edited): retried on the next
+                // auto-save tick, not a failure.
+                .failed => |err| if (err != error.FormattingInProgress and err != error.PreviewDocument) {
+                    failed += 1;
+                },
                 else => failed += 1,
             }
         }
@@ -2761,10 +3493,8 @@ pub const Editor = struct {
                     // Replace the initial empty document, like a CLI file open.
                     doc = self.activeDoc();
                     doc.openWithEncoding(self.io, file_path, self.knownEncoding(file_path)) catch continue;
-                    doc.detectLanguage(self);
-                    self.lspNotifyOpen(doc);
                     const id = doc.id;
-                    lua_api.fireEvent(self, .open, doc);
+                    self.afterOpen(doc);
                     doc = &self.documents.items[self.docIndexForId(id) orelse continue];
                 } else {
                     doc = self.openFileWithEncoding(file_path, self.knownEncoding(file_path), false) catch continue;
@@ -2786,7 +3516,8 @@ pub const Editor = struct {
 
     // ---- Split pane operations ----
 
-    /// Split the currently focused pane. The new pane shows the same document.
+    /// Split the currently focused pane. The new pane shows the same
+    /// document and takes the keyboard.
     pub fn splitActive(self: *Editor, direction: SplitDirection) void {
         const win = self.activeWindow();
         const current_doc_idx = self.activeDocIdx();
@@ -2795,6 +3526,7 @@ pub const Editor = struct {
         win.active_pane = new_pane;
         // Keep active_doc_idx in sync for compatibility
         self.active_doc_idx = current_doc_idx;
+        _ = self.takeKeyboardFocus(.pane);
     }
 
     /// Close the currently focused pane. If it's the last pane, does nothing.
@@ -2823,14 +3555,16 @@ pub const Editor = struct {
                 .editor => {},
             }
         }
-        // Move focus to a sibling before closing
-        win.active_pane = win.layout.nextPane(closed_pane) orelse 0;
-        _ = win.layout.closePane(closed_pane);
+        // Focus moves to the closed pane's sibling (its first leaf) — the
+        // spatial neighbour, not the next pane in traversal order.
+        if (win.layout.closePane(closed_pane)) |sibling| win.active_pane = sibling;
+        ensureValidActivePaneIn(win);
         // Update active_doc_idx to match new focused pane
         self.active_doc_idx = self.activeDocIdx();
     }
 
-    /// Focus the next pane in traversal order (within the focused window).
+    /// Focus the next pane in traversal order (within the focused window);
+    /// the pane takes the keyboard from a focused side panel (F6).
     pub fn focusNextPane(self: *Editor) void {
         const win = self.activeWindow();
         if (win.layout.nextPane(win.active_pane)) |next| {
@@ -2838,9 +3572,11 @@ pub const Editor = struct {
             win.active_pane = next;
             self.active_doc_idx = self.activeDocIdx();
         }
+        _ = self.takeKeyboardFocus(.pane);
     }
 
-    /// Focus the previous pane in traversal order (within the focused window).
+    /// Focus the previous pane in traversal order (within the focused
+    /// window); like focusNextPane it takes the keyboard from the panels.
     pub fn focusPrevPane(self: *Editor) void {
         const win = self.activeWindow();
         if (win.layout.prevPane(win.active_pane)) |prev| {
@@ -2848,9 +3584,11 @@ pub const Editor = struct {
             win.active_pane = prev;
             self.active_doc_idx = self.activeDocIdx();
         }
+        _ = self.takeKeyboardFocus(.pane);
     }
 
-    /// Set the active pane (of the focused window) by pane ID and update active_doc_idx.
+    /// Set the active pane (of the focused window) by pane ID and update
+    /// active_doc_idx. The pane takes the keyboard from the side panels.
     pub fn focusPane(self: *Editor, pane_id: u8) void {
         const win = self.activeWindow();
         if (pane_id < win.layout.panes.items.len) {
@@ -2860,25 +3598,25 @@ pub const Editor = struct {
                 .editor => |idx| self.active_doc_idx = idx,
                 .terminal => {},
             }
+            _ = self.takeKeyboardFocus(.pane);
         }
     }
 
-    /// Give window `idx` the keyboard focus (no-op for a bad index).
+    /// Give window `idx` the keyboard focus (no-op for a bad index). Its
+    /// focused pane owns the keyboard afterwards: the side panels live in
+    /// the primary window and always let go (a panel re-takes it through
+    /// takeKeyboardFocus, which focuses the primary first).
     pub fn focusWindow(self: *Editor, idx: usize) void {
         if (idx >= self.windows.items.len) return;
         if (idx != self.active_window) {
             // A prompt or popup opened in one window must not resolve
             // against another window's document — leave it on the way out.
             self.cancelTransientMode();
-            // The file tree and search panel live in the primary window.
-            if (idx != 0) {
-                self.filetree_focused = false;
-                self.search_focused = false;
-            }
         }
         self.active_window = idx;
         self.ensureValidActivePane();
         self.active_doc_idx = self.windowDocIdx(idx);
+        _ = self.takeKeyboardFocus(.pane);
     }
 
     /// Focus pane `pane_id` of window `win_idx` — the frontends' click path.
@@ -2888,22 +3626,63 @@ pub const Editor = struct {
     }
 
     /// Show document `doc_idx` in window `win_idx` (a window's tab bar).
+    /// The pane takes the keyboard from the side panels (focusWindow).
     pub fn showDocIn(self: *Editor, win_idx: usize, doc_idx: usize) void {
+        // focusWindow can end quick-open, whose preview removal shifts
+        // indices: keep the id and find the document again afterwards.
+        const id: ?u64 = if (doc_idx < self.documents.items.len) self.documents.items[doc_idx].id else null;
         self.focusWindow(win_idx);
-        self.switchToDoc(doc_idx);
+        if (id) |doc_id| if (self.docIndexForId(doc_id)) |idx| self.switchToDoc(idx);
     }
 
     /// Leave transient input and completion modes. Settings and pending file
     /// decisions follow window focus; the latter retain their document IDs.
+    /// Every other prompt ends through setMode, so its owner resolves as
+    /// cancelled (a rename preview answers the server applied=false, a git
+    /// stage or task save prompt releases its pending operation).
     pub fn cancelTransientMode(self: *Editor) void {
         self.cancelSnippets();
         switch (self.mode) {
             .normal, .settings, .encoding_picker, .confirm_reopen, .confirm_encoding, .confirm_overwrite, .save_as => {},
-            .file_finder => self.finderCancel(),
-            .filetree_prompt => self.cancelFiletreePrompt(),
-            else => self.mode = .normal,
+            else => self.setMode(.normal),
         }
         self.clearCompletionItems();
+    }
+
+    /// THE way to change `mode` (every write in this file goes through it;
+    /// frontends and other modules adopt it). Runs the leave-hook of the
+    /// OLD mode, then assigns:
+    ///   .file_finder       → finderEndSession (drops the preview, restores
+    ///                        the pre-finder view, frees the snapshot)
+    ///   .filetree_prompt   → frees the prompt target
+    ///   .workspace_preview → lsp_tools.resolvePreview(false)
+    ///   .git_stage_prompt  → git.resolveStage(false)
+    ///   .task_save_prompt  → tasks.resolveSave(.cancel)
+    /// Leaving one of the last three this way CANCELS it; to accept, call
+    /// the resolver, which leaves the mode itself.
+    /// Rules: hooks never run Lua or open documents; the finder hook may
+    /// REMOVE the preview document, so callers re-find indices and pointers
+    /// by id afterwards; the resolvers a hook calls leave their own mode
+    /// with a guarded direct write (`if (mode == .x) mode = .normal`) — a
+    /// setMode from inside a hook would only assign (mode_leaving).
+    pub fn setMode(self: *Editor, new: Mode) void {
+        const old = self.mode;
+        if (old == new) return;
+        // Re-entry from a hook (a resolver that did call setMode) assigns
+        // only: running the old mode's hook again would never end.
+        if (!self.mode_leaving) {
+            self.mode_leaving = true;
+            defer self.mode_leaving = false;
+            switch (old) {
+                .file_finder => self.finderEndSession(),
+                .filetree_prompt => self.freeFiletreePromptTarget(),
+                .workspace_preview => self.lsp_tools.resolvePreview(self, false),
+                .git_stage_prompt => self.git.resolveStage(self, false),
+                .task_save_prompt => self.tasks.resolveSave(self, .cancel),
+                else => {},
+            }
+        }
+        self.mode = new;
     }
 
     // ---- Windows: create / close ----
@@ -3026,13 +3805,17 @@ pub const Editor = struct {
             return;
         };
         if (src.layout.paneCount() > 1) {
-            src.active_pane = src.layout.nextPane(src_pane) orelse 0;
-            _ = src.layout.closePane(src_pane);
+            if (src.layout.closePane(src_pane)) |sibling| src.active_pane = sibling;
             ensureValidActivePaneIn(src);
         } else if (content == .terminal) {
             if (src_idx == 0) {
                 if (self.appendUntitled(0)) |fresh| src.layout.panes.items[src_pane].content = .{ .editor = fresh };
             } else {
+                // The source window closes, and closeWindow stops every
+                // terminal its panes still show: the moved terminal must not
+                // be one of them (invariant I6). Any live document index
+                // serves the frame the window has left (no tab is adopted).
+                src.layout.panes.items[src_pane].content = .{ .editor = @min(self.active_doc_idx, self.documents.items.len - 1) };
                 self.requestCloseWindow(src_idx);
             }
         }
@@ -3126,11 +3909,6 @@ pub const Editor = struct {
         return null;
     }
 
-    /// The finder's transient preview rides hidden at the end of `documents`.
-    fn isPreviewDoc(self: *const Editor, doc_idx: usize) bool {
-        return self.finder_preview_appended and doc_idx + 1 == self.documents.items.len;
-    }
-
     /// Make window `target` the owner of `doc_idx`'s tab. The previous
     /// owner's panes that showed it switch to its neighbouring tab; when it
     /// was that window's last tab, a secondary window is asked to close and
@@ -3139,7 +3917,7 @@ pub const Editor = struct {
     /// peeking at documents (its commit adopts).
     fn adoptDoc(self: *Editor, target: usize, doc_idx: usize) void {
         if (target >= self.windows.items.len or doc_idx >= self.documents.items.len) return;
-        if (self.isPreviewDoc(doc_idx) or self.mode == .file_finder) return;
+        if (self.documents.items[doc_idx].preview or self.mode == .file_finder) return;
         const owner_idx = self.docWindow(doc_idx);
         if (owner_idx == target) return;
         self.windows.items[target].tabs.append(self.allocator, doc_idx) catch return;
@@ -3202,7 +3980,10 @@ pub const Editor = struct {
 
     fn openTerminalSplit(self: *Editor, direction: @import("layout.zig").SplitDirection) void {
         const builtin = @import("builtin");
-        const command = if (builtin.os.tag == .windows) "powershell.exe" else "/bin/bash";
+        const command = if (builtin.os.tag == .windows)
+            "powershell.exe"
+        else
+            posixShell(self.io, if (std.c.getenv("SHELL")) |shell| std.mem.span(shell) else null);
         const term = terminal_mod.Terminal.init(self.allocator, self.io, 80, 24, command) catch |err| {
             std.log.err("Failed to open terminal: {}", .{err});
             self.status_message = "Failed to open terminal (see zide.log)";
@@ -3214,6 +3995,7 @@ pub const Editor = struct {
         const win = self.activeWindow();
         const new_pane = win.layout.splitPane(win.active_pane, direction, .{ .terminal = term_idx }) catch return;
         win.active_pane = new_pane;
+        _ = self.takeKeyboardFocus(.pane);
     }
 
     /// Close a terminal by index: stop PTY, close its pane, focus a neighbor.
@@ -3233,11 +4015,10 @@ pub const Editor = struct {
                         self.requestCloseWindow(w);
                         return;
                     }
-                    if (win.active_pane == pane_u8) {
-                        win.active_pane = win.layout.nextPane(pane_u8) orelse 0;
-                    }
-                    const closed = win.layout.closePane(pane_u8);
-                    if (!closed) {
+                    if (win.layout.closePane(pane_u8)) |sibling| {
+                        // A focused terminal hands focus to its sibling pane.
+                        if (win.active_pane == pane_u8) win.active_pane = sibling;
+                    } else {
                         // Last live pane of the main window — convert to an editor so the user isn't stuck on a blank pane.
                         win.layout.panes.items[i].content = .{ .editor = self.active_doc_idx };
                         win.active_pane = pane_u8;
@@ -3277,6 +4058,12 @@ pub const Editor = struct {
 
     /// Toggle terminal: focus existing terminal, or open one. If already in terminal, go back.
     pub fn toggleTerminal(self: *Editor) void {
+        // The focused pane is a terminal but a side panel has the keyboard:
+        // hand it to that terminal rather than leave it or open another.
+        if (self.activePaneIsTerminal() and self.keyboardOwner() != .terminal) {
+            _ = self.takeKeyboardFocus(.pane);
+            return;
+        }
         // If currently in a terminal pane, focus the nearest non-terminal
         // pane of the same window
         if (self.activePaneIsTerminal()) {
@@ -3313,36 +4100,65 @@ pub const Editor = struct {
     //
     // Any number of servers, each registered from Lua (zide.register_lsp)
     // and started lazily the first time a document of a language it serves
-    // opens. Documents route to "the running client whose config serves
-    // doc.language" — nothing is cached on Documents or LanguageDefs (their
-    // names die on re-registration).
+    // opens. A document opens on the running client of the NEWEST
+    // registration for doc.language (lspConfigFor) and then stays with that
+    // server (lsp_doc_owner) until it is closed there — nothing is cached on
+    // Documents or LanguageDefs (their names die on re-registration).
+
+    /// Index of the registration that would serve `lang_name`: newest first.
+    fn lspConfigIndexFor(self: *const Editor, lang_name: []const u8) ?usize {
+        var i = self.lsp_configs.items.len;
+        while (i > 0) {
+            i -= 1;
+            if (self.lsp_configs.items[i].servesLanguage(lang_name)) return i;
+        }
+        return null;
+    }
 
     /// The registration that would serve `lang_name` — newest first, so a
     /// later zide.register_lsp overrides an earlier one (and the built-in
     /// zls seed). Null when nothing serves the language.
     pub fn lspConfigFor(self: *Editor, lang_name: []const u8) ?*lsp_mod.ServerConfig {
-        var i = self.lsp_configs.items.len;
-        while (i > 0) {
-            i -= 1;
-            const cfg = &self.lsp_configs.items[i];
-            if (cfg.servesLanguage(lang_name)) return cfg;
-        }
-        return null;
+        return &self.lsp_configs.items[self.lspConfigIndexFor(lang_name) orelse return null];
     }
 
-    /// The running client serving `lang_name` (handshake may still be pending).
+    /// The running client of the registration that serves `lang_name` (see
+    /// lspConfigFor; its handshake may still be pending). An older server
+    /// that also lists the language is never picked: when the newest
+    /// registration has no client yet, this is null and lspNotifyOpen
+    /// starts one.
     pub fn lspClientForLanguage(self: *const Editor, lang_name: []const u8) ?*lsp_mod.LspClient {
+        const wanted = &self.lsp_configs.items[self.lspConfigIndexFor(lang_name) orelse return null];
         for (self.lsp_clients.items) |client| {
             const cfg = if (client.config) |*c| c else continue;
-            if (cfg.servesLanguage(lang_name)) return client;
+            if (cfg.eql(wanted)) return client;
         }
         return null;
     }
 
-    /// The running client for a document's language, if any.
+    /// The server a document talks to: the one that got its didOpen while
+    /// it is open there (null if that server is gone), else the client for
+    /// its language.
     pub fn lspClientForDoc(self: *const Editor, doc: *const Document) ?*lsp_mod.LspClient {
+        if (doc.lsp_opened) if (self.lsp_doc_owner.get(doc.id)) |generation| return self.lspClientByGeneration(generation);
         const lang = doc.language orelse return null;
         return self.lspClientForLanguage(lang.name);
+    }
+
+    fn lspClientByGeneration(self: *const Editor, generation: u64) ?*lsp_mod.LspClient {
+        for (self.lsp_clients.items) |client| if (client.generation == generation) return client;
+        return null;
+    }
+
+    /// Whether `doc` is open on `client`. A document opened without an
+    /// owner record (a failed record insert) counts as open on every
+    /// server of its language, so a stop re-opens it rather than strands it.
+    fn lspDocOpenOn(self: *const Editor, doc: *const Document, client: *const lsp_mod.LspClient) bool {
+        if (!doc.lsp_opened) return false;
+        if (self.lsp_doc_owner.get(doc.id)) |generation| return generation == client.generation;
+        const cfg = if (client.config) |*c| c else return false;
+        const lang = doc.language orelse return false;
+        return cfg.servesLanguage(lang.name);
     }
 
     // ---- Per-language profiles (setting overrides + keybind overlays) ----
@@ -3451,6 +4267,7 @@ pub const Editor = struct {
     }
 
     pub fn serviceTick(self: *Editor, now: i128) void {
+        self.normalizeKeyboardFocus();
         self.deadlines.tick(self, now);
         self.tasks.tick(self);
         self.git.tick(self, now);
@@ -3474,14 +4291,14 @@ pub const Editor = struct {
 
     pub fn showRecovery(self: *Editor) void {
         if (self.recovery) |*recovery| if (recovery.candidates.items.len > 0) {
-            self.mode = .recovery_picker;
+            self.setMode(.recovery_picker);
             return;
         };
         self.status_message = "No recovery snapshots for this workspace";
     }
 
     pub fn resolveRecovery(self: *Editor, choice: enum { recover, discard, later }) void {
-        self.mode = .normal;
+        self.setMode(.normal);
         if (choice == .later) return;
         const recovery = if (self.recovery) |*r| r else return;
         var index: usize = 0;
@@ -3537,11 +4354,29 @@ pub const Editor = struct {
         doc.format_rules = if (doc.file_path) |path| self.project_formatting.resolve(path) catch .{} else .{};
     }
 
-    fn prepareProjectFormatting(self: *Editor, doc: *Document, path: []const u8, format_group: ?u64) !void {
-        if (!self.editorconfig_enabled) return;
-        _ = try self.project_formatting.refresh();
-        const rules = try self.project_formatting.resolve(path);
-        if (rules.eol == null and rules.final_newline == null and !(rules.trim orelse false)) return;
+    /// Save-time EditorConfig normalization (trim_trailing_whitespace,
+    /// end_of_line, insert_final_newline) as minimal per-line edits: each
+    /// changed line pair loses its common prefix AND suffix, so a trim is a
+    /// pure delete before the line break and CRLF→LF deletes only the `\r`.
+    /// Carets never cross a line break (see mapNormalized), and the edit is
+    /// its own undo group, never merged into the user's typing. EditorConfig
+    /// trouble never fails a save: returns the error that made it skip the
+    /// rules (an unreadable .editorconfig), else null.
+    fn prepareProjectFormatting(self: *Editor, doc: *Document, path: []const u8, format_group: ?u64) !?anyerror {
+        if (!self.editorconfig_enabled) return null;
+        // A cached .editorconfig that can no longer be re-read (replaced by
+        // a directory, share gone) counts as unchanged.
+        _ = self.project_formatting.refresh() catch false;
+        const rules = self.project_formatting.resolve(path) catch |err| {
+            std.log.warn("EditorConfig for {s}: {s}; saved without normalizing", .{ path, @errorName(err) });
+            const skipped: ?anyerror = err;
+            return skipped;
+        };
+        // An explicit end_of_line rule decides what Enter inserts from now on.
+        defer if (rules.eol) |eol| {
+            doc.crlf = eol == .crlf;
+        };
+        if (rules.eol == null and rules.final_newline == null and !(rules.trim orelse false)) return null;
         const before = try doc.buffer.textAlloc(self.allocator);
         defer self.allocator.free(before);
         const after = try @import("editorconfig.zig").normalize(self.allocator, before, rules, doc.crlf);
@@ -3557,19 +4392,73 @@ pub const Editor = struct {
             const new_line = after[new_at..new_end];
             var prefix: usize = 0;
             while (prefix < old_line.len and prefix < new_line.len and old_line[prefix] == new_line[prefix]) : (prefix += 1) {}
-            if (prefix != old_line.len or prefix != new_line.len) try ranges.append(self.allocator, .{ .start = old_at + prefix, .end = old_end, .text = new_line[prefix..] });
+            var suffix: usize = 0;
+            while (suffix < old_line.len - prefix and suffix < new_line.len - prefix and
+                old_line[old_line.len - 1 - suffix] == new_line[new_line.len - 1 - suffix]) : (suffix += 1)
+            {}
+            if (prefix + suffix != old_line.len or prefix + suffix != new_line.len) try ranges.append(self.allocator, .{
+                .start = old_at + prefix,
+                .end = old_end - suffix,
+                .text = new_line[prefix .. new_line.len - suffix],
+            });
             old_at = old_end;
             new_at = new_end;
         }
+        if (ranges.items.len == 0) {
+            doc.detectLineEndings();
+            return null;
+        }
+        // Where every caret and anchor must end up, from the ascending
+        // ranges: the commit alone would push a caret sitting at an
+        // insertion point (end of line, EOF) past the inserted line break.
+        const Cursor = @import("cursor.zig").Cursor;
+        const targets = try self.allocator.dupe(Cursor, doc.cursors.cursors.items);
+        defer self.allocator.free(targets);
+        const clamped = try self.allocator.alloc(bool, targets.len);
+        defer self.allocator.free(clamped);
+        for (targets, clamped) |*c, *in_span| {
+            const moved = mapNormalized(ranges.items, c.offset);
+            in_span.* = moved.in_span;
+            c.offset = moved.offset;
+            if (c.anchor) |a| c.anchor = mapNormalized(ranges.items, a).offset;
+        }
         std.mem.reverse(Document.RangeEdit, ranges.items);
         const join = format_group != null and doc.history.undo_stack.items.len > 0 and doc.history.undo_stack.items[doc.history.undo_stack.items.len - 1].group_id == format_group.?;
-        if (join) {
-            doc.history.beginGroup();
-            doc.history.active_group = format_group.?;
-        }
-        defer if (join) doc.history.endGroup();
+        // Its own undo group (or the formatter's, when joining one): never
+        // coalesced into the user's typing — a lone 1-byte trim would
+        // otherwise merge into the preceding Backspace run.
+        doc.history.merge_allowed = false;
+        try doc.beginEdit();
+        defer doc.endEdit();
+        if (join) doc.history.active_group = format_group.?;
         try doc.applyRanges(ranges.items);
+        // Before endEdit, so undo/redo restore these positions too.
+        if (doc.cursors.cursors.items.len == targets.len) {
+            for (doc.cursors.cursors.items, targets, clamped) |*c, target, in_span| {
+                c.* = target;
+                // Only a caret the edit moved gets a new sticky column.
+                if (in_span) c.preferred_col = doc.buffer.offsetToPos(c.offset).col;
+            }
+            doc.cursors.mergeCursors();
+        }
         doc.detectLineEndings();
+        return null;
+    }
+
+    /// Map an offset through ascending, disjoint normalization ranges. A
+    /// position inside a changed span or at either of its edges lands at
+    /// the span start — before any inserted line-break material, so a
+    /// caret at the end of a line (or at EOF) stays on its line.
+    fn mapNormalized(ranges: []const Document.RangeEdit, offset: usize) struct { offset: usize, in_span: bool } {
+        var removed: usize = 0;
+        var inserted: usize = 0;
+        for (ranges) |r| {
+            if (offset < r.start) break;
+            if (offset <= r.end) return .{ .offset = r.start - removed + inserted, .in_span = true };
+            removed += r.end - r.start;
+            inserted += r.text.len;
+        }
+        return .{ .offset = offset - removed + inserted, .in_span = false };
     }
 
     pub fn wordWrapFor(self: *const Editor, doc: *const Document) bool {
@@ -3597,7 +4486,7 @@ pub const Editor = struct {
     /// global exact match, but a global exact match beats an overlay's
     /// shift-stripped fallback.
     pub fn lookupKeybind(self: *const Editor, combo: []const u8) ?[]const u8 {
-        if (!self.filetree_focused and !self.search_focused and !self.activePaneIsTerminal()) {
+        if (self.keyboardOwner() == .editor) {
             if (self.langProfileFor(self.activeDocConst())) |p| {
                 if (p.keybinds.get(combo)) |action| return action;
             }
@@ -3609,7 +4498,7 @@ pub const Editor = struct {
     /// the server name once one is up for it — `c (clangd)`.
     pub fn languageStatusText(self: *const Editor, doc: *const Document, buf: []u8) []const u8 {
         const lang = doc.language orelse return "plain text";
-        if (self.lspClientForLanguage(lang.name)) |client| {
+        if (self.lspClientForDoc(doc)) |client| {
             if (client.isReady()) {
                 return std.fmt.bufPrint(buf, "{s} ({s})", .{ lang.name, client.name() }) catch lang.name;
             }
@@ -3660,8 +4549,10 @@ pub const Editor = struct {
         return client;
     }
 
-    /// Stop and free the client at `idx`; documents it served forget they
-    /// were opened so the next sync re-opens them on whatever serves them.
+    /// Stop and free the client at `idx`; the documents open on it (and
+    /// only those — another server of the same language keeps its own)
+    /// forget they were opened, so the next sync re-opens them on whatever
+    /// serves them now.
     fn stopLspClient(self: *Editor, idx: usize) void {
         const client = self.lsp_clients.items[idx];
         self.lsp_tools.clientStopped(self, client);
@@ -3670,15 +4561,11 @@ pub const Editor = struct {
         if (self.completion_context) |ctx| {
             if (ctx.client == client) self.clearCompletionItems();
         }
-        if (client.config) |*cfg| {
-            for (self.documents.items) |*doc| {
-                if (!doc.lsp_opened) continue;
-                const lang = doc.language orelse continue;
-                if (cfg.servesLanguage(lang.name)) {
-                    doc.lsp_opened = false;
-                    doc.clearDiagnostics();
-                }
-            }
+        for (self.documents.items) |*doc| {
+            if (!self.lspDocOpenOn(doc, client)) continue;
+            doc.lsp_opened = false;
+            _ = self.lsp_doc_owner.remove(doc.id);
+            doc.clearDiagnostics();
         }
         client.deinit();
         self.allocator.destroy(client);
@@ -3715,8 +4602,11 @@ pub const Editor = struct {
     }
 
     /// reload_extensions, after re-running extensions/*.lua: stop servers
-    /// whose registration vanished or changed. Identical registrations keep
-    /// their server (no clangd restart on every reload).
+    /// whose registration vanished, changed, or is now outranked for every
+    /// language it lists. Identical registrations keep their server (no
+    /// clangd restart on every reload); a server outranked for only some of
+    /// its languages keeps running, and its documents of those languages
+    /// close there so the next sync opens them on the newer registration.
     pub fn reconcileLspClients(self: *Editor) void {
         var i: usize = 0;
         while (i < self.lsp_clients.items.len) {
@@ -3725,12 +4615,23 @@ pub const Editor = struct {
                 self.stopLspClient(i);
                 continue;
             };
-            const first_lang: []const u8 = if (running_cfg.languages.len > 0) running_cfg.languages[0] else "";
-            const current = self.lspConfigFor(first_lang);
-            if (current == null or !current.?.eql(running_cfg)) {
+            var serves_any = false;
+            for (running_cfg.languages) |lang| {
+                const current = self.lspConfigFor(lang) orelse continue;
+                if (current.eql(running_cfg)) serves_any = true;
+            }
+            if (!serves_any) {
                 std.log.info("LSP[{s}] registration changed or removed — stopping", .{client.name()});
                 self.stopLspClient(i);
                 continue;
+            }
+            for (self.documents.items) |*doc| {
+                if (!doc.lsp_opened) continue;
+                const owner = self.lsp_doc_owner.get(doc.id) orelse continue;
+                if (owner != client.generation) continue;
+                const lang = doc.language orelse continue;
+                const current = self.lspConfigFor(lang.name);
+                if (current == null or !current.?.eql(running_cfg)) self.lspForgetDoc(doc);
             }
             i += 1;
         }
@@ -3763,13 +4664,19 @@ pub const Editor = struct {
             }
             self.stopLspClient(i);
         }
-        // Index loop: a definition response can open a file, which may
-        // start a server and grow the list under us.
+        // Index loop: the list may change under a response (a Lua hook run
+        // while handling one can stop clients). Replies that would open or
+        // save a file — whose hooks may restart servers — only queue that
+        // work for lsp_tools.tick below.
         var j: usize = 0;
         while (j < self.lsp_clients.items.len) : (j += 1) {
             self.lsp_clients.items[j].pollMessages(self);
+            if (j >= self.lsp_clients.items.len) break;
             self.lsp_clients.items[j].expireRequests(self, std.Io.Clock.now(.awake, self.io).nanoseconds);
         }
+        // Deferred work the responses queued (the goto-definition jump, the
+        // post-format save), run outside any client's message handling.
+        self.lsp_tools.tick(self);
         self.syncLspDocuments();
     }
 
@@ -3867,11 +4774,15 @@ pub const Editor = struct {
     /// registration serves the document's language but no client runs
     /// yet, the server is started here — lazily, the moment a file opens —
     /// and the didOpen lands in a later sync once its handshake completes.
+    /// A document whose full text cannot fit one frame is marked for its
+    /// current version and skipped until an edit changes it, so a huge file
+    /// is not JSON-escaped again on every sync.
     pub fn lspNotifyOpen(self: *Editor, doc: *Document) void {
         if (!self.lsp_enabled) return;
         if (doc.lsp_opened or doc.preview) return;
         const path = doc.file_path orelse return;
         const lang = doc.language orelse return;
+        if (self.lspTooLargeNow(doc)) return;
 
         const client = self.lspClientForLanguage(lang.name) orelse blk: {
             const cfg = self.lspConfigFor(lang.name) orelse return;
@@ -3885,30 +4796,85 @@ pub const Editor = struct {
 
         const cfg = if (client.config) |*c| c else return;
         const lang_id = cfg.languageIdFor(lang.name);
+        if (self.lspFrameTooLarge(doc, uri.len + lang_id.len)) {
+            self.markLspTooLarge(doc);
+            return;
+        }
         const text = doc.buffer.slice(0, doc.buffer.byteLen());
 
         client.sendDidOpen(uri, lang_id, doc.lsp_version, text) catch return;
         doc.lsp_opened = true;
         doc.lsp_last_synced = doc.lsp_version;
+        _ = self.lsp_too_large.remove(doc.id);
+        // Without the record the document still works: it counts as open on
+        // every server of its language (lspDocOpenOn).
+        self.lsp_doc_owner.put(self.allocator, doc.id, client.generation) catch {};
         std.log.info("LSP[{s}] didOpen: {s} (languageId={s})", .{ client.name(), uri, lang_id });
     }
 
-    /// Forget a document on the LSP side: didClose for its CURRENT path,
-    /// `lsp_opened` cleared, the server's diagnostics dropped. Path and
-    /// language are taken as they are at call time, so callers that change
-    /// either (rename, save-as, re-detection) must call this FIRST.
-    /// No-op when the document was never opened with LSP.
+    /// Forget a document on the LSP side: didClose (to the server that has
+    /// it) for its CURRENT path, `lsp_opened` cleared, the server's
+    /// diagnostics dropped, and its versioned Problems entries too — their
+    /// versions belong to this document instance. Path and language are
+    /// taken as they are at call time, so callers that change either
+    /// (rename, save-as, re-detection) must call this FIRST. Also drops a
+    /// too-large mark (the next sync measures again); nothing else happens
+    /// when the document was never opened with LSP.
     pub fn lspForgetDoc(self: *Editor, doc: *Document) void {
+        _ = self.lsp_too_large.remove(doc.id);
         if (!doc.lsp_opened) return;
+        const client = self.lspClientForDoc(doc);
         doc.lsp_opened = false;
+        _ = self.lsp_doc_owner.remove(doc.id);
         doc.clearDiagnostics();
-        const client = self.lspClientForDoc(doc) orelse return;
         const path = doc.file_path orelse return;
+        self.problems.forgetVersioned(path);
+        const server = client orelse return;
 
         const uri = lsp_mod.pathToUri(self.allocator, path) catch return;
         defer self.allocator.free(uri);
 
-        client.sendDidClose(uri) catch {};
+        server.sendDidClose(uri) catch {};
+    }
+
+    /// `doc` was found too large for one frame at its current version.
+    fn lspTooLargeNow(self: *const Editor, doc: *const Document) bool {
+        const version = self.lsp_too_large.get(doc.id) orelse return false;
+        return version == doc.lsp_version;
+    }
+
+    /// Remember that `doc` does not fit one frame at its current version;
+    /// say so once per document (later versions update the mark quietly).
+    fn markLspTooLarge(self: *Editor, doc: *const Document) void {
+        const first = !self.lsp_too_large.contains(doc.id);
+        self.lsp_too_large.put(self.allocator, doc.id, doc.lsp_version) catch return;
+        if (!first) return;
+        std.log.warn("LSP: {s} ({d} bytes) does not fit one message; not sent to the language server", .{ doc.display_name, doc.buffer.byteLen() });
+        self.status_message = std.fmt.bufPrint(&self.status_buf, "LSP: {s} is too large for the language server", .{doc.display_name}) catch "LSP: document too large for the language server";
+    }
+
+    /// Whether a full-text didOpen/didChange of `doc` would exceed
+    /// `lsp_frame_limit`. `extra` is the variable unescaped part (uri,
+    /// languageId); 256 bytes cover the method, the JSON keys and the
+    /// version. Escaping never shrinks a byte and at most sextuples one
+    /// (`\u00XX`), so only documents near the limit are scanned, counting
+    /// the escapes lsp.writeJsonString writes.
+    fn lspFrameTooLarge(self: *const Editor, doc: *Document, extra: usize) bool {
+        const envelope = extra +| 256;
+        if (envelope >= self.lsp_frame_limit) return true;
+        const room = self.lsp_frame_limit - envelope;
+        const len = doc.buffer.byteLen();
+        if (len +| 2 > room) return true;
+        if (len <= (room - 2) / 6) return false;
+        var escaped: usize = 2; // the quotes
+        for (doc.buffer.slice(0, len)) |c| {
+            escaped += switch (c) {
+                '"', '\\', '\n', '\r', '\t' => 2,
+                else => if (c < 0x20) 6 else 1,
+            };
+            if (escaped > room) return true;
+        }
+        return false;
     }
 
     /// Send didSave notification.
@@ -3950,6 +4916,14 @@ pub const Editor = struct {
             const uri = lsp_mod.pathToUri(self.allocator, path) catch continue;
             defer self.allocator.free(uri);
 
+            if (self.lspFrameTooLarge(doc, uri.len)) {
+                // The server cannot get this version: close the document
+                // there rather than leave it a stale copy. It re-opens once
+                // an edit makes it fit (lspNotifyOpen measures per version).
+                self.lspForgetDoc(doc);
+                self.markLspTooLarge(doc);
+                continue;
+            }
             const text = doc.buffer.slice(0, doc.buffer.byteLen());
             client.sendDidChange(uri, doc.lsp_version, text) catch continue;
             doc.lsp_last_synced = doc.lsp_version;
@@ -3960,13 +4934,15 @@ pub const Editor = struct {
     pub fn clearCompletionItems(self: *Editor) void {
         self.completion_context = null;
         self.completion_generation +%= 1;
-        for (self.completion_items.items) |*item| {
+        for (self.completion_all.items) |*item| {
             self.allocator.free(item.label);
             if (item.detail) |d| self.allocator.free(d);
             if (item.insert_text) |t| self.allocator.free(t);
         }
+        self.completion_all.clearRetainingCapacity();
         self.completion_items.clearRetainingCapacity();
         self.completion_active = false;
+        self.completion_stale = false;
         self.completion_selected = 0;
     }
 
@@ -3975,14 +4951,21 @@ pub const Editor = struct {
         try self.addCompletionEntry(.{ .label = label, .detail = detail, .insert_text = insert_text });
     }
     pub fn addCompletionEntry(self: *Editor, item: EditorCompletionItem) !void {
-        try self.completion_items.append(self.allocator, item);
+        // Both appends are reserved first: once the item is in the owner
+        // list a failure must not hand it back to the caller to free.
+        try self.completion_all.ensureUnusedCapacity(self.allocator, 1);
+        try self.completion_items.ensureUnusedCapacity(self.allocator, 1);
+        self.completion_all.appendAssumeCapacity(item);
         if (self.completion_context == null) self.completion_context = .{
             .doc_id = self.activeDoc().id,
             .version = self.activeDoc().buffer.version,
             .cursor_offset = self.activeDoc().cursors.primaryConst().offset,
             .generation = self.completion_generation,
         };
-        self.completion_active = true;
+        if (self.completionMatches(item)) {
+            self.completion_items.appendAssumeCapacity(item);
+            self.completion_active = true;
+        }
     }
     fn completionCurrent(self: *const Editor) bool {
         const ctx = self.completion_context orelse return false;
@@ -3996,9 +4979,87 @@ pub const Editor = struct {
         return ctx.client == client and ctx.request_id == id and self.completionCurrent();
     }
 
+    /// The identifier bytes just before the caret — what the popup is
+    /// filtered by (at most 64 bytes).
+    fn completionPrefix(self: *const Editor, buf: *[64]u8) []const u8 {
+        const doc = &self.documents.items[self.activeDocIdx()];
+        const caret = doc.cursors.primaryConst().offset;
+        var start = caret;
+        while (start > 0 and caret - start < buf.len and isIdentChar(doc.buffer.byteAt(start - 1) orelse 0)) start -= 1;
+        var i: usize = 0;
+        while (start + i < caret) : (i += 1) buf[i] = doc.buffer.byteAt(start + i) orelse 0;
+        return buf[0..i];
+    }
+
+    fn completionPrefixLen(self: *const Editor) usize {
+        var pbuf: [64]u8 = undefined;
+        return self.completionPrefix(&pbuf).len;
+    }
+
+    fn completionMatches(self: *const Editor, item: EditorCompletionItem) bool {
+        var pbuf: [64]u8 = undefined;
+        const prefix = self.completionPrefix(&pbuf);
+        if (prefix.len == 0) return true;
+        return std.ascii.startsWithIgnoreCase(item.label, prefix);
+    }
+
+    /// Rebuild the visible list for the prefix now before the caret (after
+    /// typing). No match leaves the popup closed until the next reply.
+    pub fn refilterCompletion(self: *Editor) void {
+        self.completion_items.clearRetainingCapacity();
+        for (self.completion_all.items) |item| {
+            if (self.completionMatches(item)) self.completion_items.append(self.allocator, item) catch break;
+        }
+        if (self.completion_selected >= self.completion_items.items.len) self.completion_selected = 0;
+        self.completion_active = self.completion_items.items.len > 0;
+    }
+
+    fn completionTriggerByte(self: *Editor, b: u8) bool {
+        const client = self.lspClientForDoc(self.activeDoc()) orelse return false;
+        return client.capabilities.isCompletionTrigger(b);
+    }
+
+    /// Does typing `b` keep the popup open? Identifier characters narrow
+    /// it and a server trigger character refreshes it; anything else
+    /// dismisses it (the frontends ask before passing the key through).
+    pub fn completionKeepsOnByte(self: *Editor, b: u8) bool {
+        return isIdentChar(b) or self.completionTriggerByte(b);
+    }
+
+    /// After `insert_char` typed `text`: open, refresh or dismiss the
+    /// completion popup.
+    pub fn afterTypedText(self: *Editor, text: []const u8) void {
+        if (self.mode != .normal or text.len == 0) return;
+        if (self.activeDoc().cursors.count() > 1) return;
+        const b = text[0];
+        if (b == ')' and self.signature != null) self.clearSignature();
+        if (self.signature_help_auto and self.signatureTriggerByte(b)) self.lsp_tools.startQuiet(self, .signature_help);
+        if (self.completionTriggerByte(b)) {
+            if (self.completion_auto or self.completion_active) self.requestCompletion(false);
+            return;
+        }
+        if (isIdentChar(b)) {
+            if (self.completion_active) {
+                self.refilterCompletion();
+                self.requestCompletion(true);
+            } else if (self.completion_auto and self.completionPrefixLen() >= self.completion_min_chars) {
+                self.requestCompletion(false);
+            }
+            return;
+        }
+        if (self.completion_active) self.clearCompletionItems();
+    }
+
     /// Trigger LSP completion at the current cursor position.
     pub fn triggerCompletion(self: *Editor) void {
-        self.clearCompletionItems();
+        self.requestCompletion(false);
+    }
+
+    /// Ask the server for completions at the caret. `keep` leaves the
+    /// current (filtered) list visible, marked stale, until the reply
+    /// replaces it.
+    fn requestCompletion(self: *Editor, keep: bool) void {
+        if (!keep) self.clearCompletionItems();
         const doc = self.activeDoc();
         const lsp_client = self.lspClientForDoc(doc) orelse return;
         if (!lsp_client.isReady()) return;
@@ -4032,6 +5093,7 @@ pub const Editor = struct {
             .request_id = request_id,
             .generation = self.completion_generation,
         };
+        if (keep) self.completion_stale = true;
     }
 
     /// Trigger LSP go-to-definition at the current cursor position.
@@ -4071,6 +5133,12 @@ pub const Editor = struct {
     }
     pub fn acceptCompletion(self: *Editor) void {
         if (!self.completion_active) return;
+        // The list on screen belongs to a superseded request: its edits no
+        // longer fit the text, so close it rather than apply them.
+        if (self.completion_stale) {
+            self.clearCompletionItems();
+            return;
+        }
         defer self.clearCompletionItems();
         if (!self.completionCurrent() or self.completion_doc_idx != self.activeDocIdx() or self.completion_selected >= self.completion_items.items.len) return;
         const item = self.completion_items.items[self.completion_selected];
@@ -4149,7 +5217,7 @@ pub const Editor = struct {
     }
 
     pub fn editorOwnsInput(self: *Editor) bool {
-        return self.mode == .normal and !self.filetree_focused and !self.search_focused and !self.activePaneIsTerminal();
+        return self.mode == .normal and self.keyboardOwner() == .editor;
     }
 
     pub fn cancelSnippets(self: *Editor) void {
@@ -4281,6 +5349,20 @@ pub const Editor = struct {
         return (c >= 'a' and c <= 'z') or (c >= 'A' and c <= 'Z') or (c >= '0' and c <= '9') or c == '_' or c == '@';
     }
 };
+
+/// The shell a POSIX terminal pane runs: `$SHELL` when it names something
+/// that can run, else /bin/bash, else /bin/sh — no bash (or a desktop
+/// session without SHELL) must not leave a dead pane.
+fn posixShell(io: std.Io, env_shell: ?[]const u8) []const u8 {
+    if (env_shell) |shell| if (shell.len > 0 and canExecute(io, shell)) return shell;
+    if (canExecute(io, "/bin/bash")) return "/bin/bash";
+    return "/bin/sh";
+}
+
+fn canExecute(io: std.Io, path: []const u8) bool {
+    std.Io.Dir.cwd().access(io, path, .{ .execute = true }) catch return false;
+    return true;
+}
 
 // ---- Tests ----
 
@@ -4524,6 +5606,7 @@ test "fuzzy finder: filter, preview, commit and cancel" {
 
     var editor = try Editor.init(t.allocator, t.io);
     defer editor.deinit();
+    editor.lsp_enabled = false;
     editor.filetree_root = try t.allocator.dupe(u8, root);
 
     editor.finderOpen();
@@ -4536,7 +5619,7 @@ test "fuzzy finder: filter, preview, commit and cancel" {
     editor.finder_buf_len = 4;
     editor.finderRefresh();
     try t.expectEqual(@as(usize, 1), editor.finder_matches.items.len);
-    try t.expect(editor.finder_preview_appended);
+    try t.expect(editor.finder_preview_id != null);
     try t.expectEqual(@as(usize, 2), editor.documents.items.len);
     try t.expect(editor.activeDoc().preview);
     try t.expect(std.mem.endsWith(u8, editor.activeDoc().file_path.?, "readme.md"));
@@ -4554,7 +5637,7 @@ test "fuzzy finder: filter, preview, commit and cancel" {
     @memcpy(editor.finder_buf[0..5], "alpha");
     editor.finder_buf_len = 5;
     editor.finderRefresh();
-    try t.expect(editor.finder_preview_appended);
+    try t.expect(editor.finder_preview_id != null);
     editor.finderCommit();
     try t.expectEqual(Editor.Mode.normal, editor.mode);
     try t.expectEqual(@as(usize, 2), editor.documents.items.len);
@@ -4567,10 +5650,35 @@ test "fuzzy finder: filter, preview, commit and cancel" {
     @memcpy(editor.finder_buf[0..5], "alpha");
     editor.finder_buf_len = 5;
     editor.finderRefresh();
-    try t.expect(!editor.finder_preview_appended);
+    try t.expect(editor.finder_preview_id == null);
     try t.expectEqual(@as(usize, 2), editor.documents.items.len);
     editor.finderCommit();
     try t.expect(std.mem.endsWith(u8, editor.activeDoc().file_path.?, "alpha.zig"));
+}
+
+test "quick open and workspace search skip .gitignore names" {
+    const t = std.testing;
+    var tmp = t.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(t.io, "vendor");
+    try tmp.dir.writeFile(t.io, .{ .sub_path = ".gitignore", .data = "vendor/\n" });
+    try tmp.dir.writeFile(t.io, .{ .sub_path = "keep.txt", .data = "needle\n" });
+    try tmp.dir.writeFile(t.io, .{ .sub_path = "vendor/lib.txt", .data = "needle\n" });
+    const root = try tmp.dir.realPathFileAlloc(t.io, ".", t.allocator);
+    defer t.allocator.free(root);
+
+    var editor = try Editor.init(t.allocator, t.io);
+    defer editor.deinit();
+    editor.filetree_root = try t.allocator.dupe(u8, root);
+
+    editor.finderOpen();
+    try t.expectEqual(@as(usize, 1), editor.finder_files.items.len);
+    try t.expectEqualStrings("keep.txt", editor.finder_files.items[0]);
+
+    text_input.set(&editor.search.query_buf, &editor.search.query_len, "needle");
+    editor.search.start(&editor);
+    waitSearch(&editor.search);
+    try t.expectEqual(@as(usize, 1), editor.search.matches.items.len);
 }
 
 test "windows: primary only after init, splits stay in the focused window" {
@@ -4593,6 +5701,39 @@ test "windows: primary only after init, splits stay in the focused window" {
     try t.expect(editor.activeLayout().findLeafNode(editor.activePaneId()) != null);
 }
 
+test "windows: closing a split pane focuses its sibling, not the far pane" {
+    const t = std.testing;
+    var editor = try Editor.init(t.allocator, t.io);
+    defer editor.deinit();
+    const win = editor.windows.items[0];
+
+    // [A | [B / C]], C focused: close_pane lands on B (traversal order
+    // would wrap to A on the far side).
+    editor.splitActive(.horizontal); // A = 0 | B = 1
+    editor.splitActive(.vertical); // B = 1 / C = 2
+    try t.expectEqual(@as(u8, 2), win.active_pane);
+    editor.closePaneAction();
+    try t.expectEqual(@as(usize, 2), win.layout.paneCount());
+    try t.expectEqual(@as(u8, 1), win.active_pane);
+
+    // Same shape with C a terminal: closing that terminal focuses B too.
+    editor.splitActive(.vertical);
+    const c = win.active_pane;
+    try editor.terminals.append(t.allocator, null); // fake slot: no shell
+    win.layout.panes.items[c].content = .{ .terminal = 0 };
+    editor.closeTerminal(0);
+    try t.expectEqual(@as(usize, 2), win.layout.paneCount());
+    try t.expectEqual(@as(u8, 1), win.active_pane);
+
+    // And moving C into its own window leaves B focused behind it.
+    editor.multi_window_supported = true;
+    editor.splitActive(.vertical);
+    editor.movePaneToNewWindow();
+    try t.expectEqual(@as(usize, 2), editor.windows.items.len);
+    try t.expectEqual(@as(usize, 2), win.layout.paneCount());
+    try t.expectEqual(@as(u8, 1), win.active_pane);
+}
+
 test "finder cancel repoints a pane split while the preview was showing" {
     const t = std.testing;
     const root = ".zig-cache/zide-test-finder-split";
@@ -4606,14 +5747,14 @@ test "finder cancel repoints a pane split while the preview was showing" {
 
     var editor = try Editor.init(t.allocator, t.io);
     defer editor.deinit();
+    editor.lsp_enabled = false;
     editor.filetree_root = try t.allocator.dupe(u8, root);
 
     editor.finderOpen();
     @memcpy(editor.finder_buf[0..4], "beta");
     editor.finder_buf_len = 4;
     editor.finderRefresh();
-    try t.expect(editor.finder_preview_appended);
-    const preview_idx = editor.documents.items.len - 1;
+    const preview_idx = editor.docIndexForId(editor.finder_preview_id.?).?;
     // A split made while the finder is open shows the preview document too
     editor.splitActive(.horizontal);
     for (editor.activeLayout().panes.items) |pane| {
@@ -4747,7 +5888,7 @@ test "windows: closing tabs — the owner's neighbour takes over; the last tab c
     try t.expectEqual(Editor.Mode.settings, editor.mode);
     try t.expect(editor.closeWindow(1));
     try t.expectEqual(@as(u32, 0), editor.settings_window_id);
-    editor.mode = .normal;
+    editor.setMode(.normal);
 }
 
 test "windows: closeDocAt repoints panes in every window" {
@@ -4913,7 +6054,7 @@ test "windows: switching windows cancels transient prompts; stale completions ar
     var editor = try Editor.init(t.allocator, t.io);
     defer editor.deinit();
     editor.multi_window_supported = true;
-    editor.mode = .goto_line;
+    editor.setMode(.goto_line);
     _ = try editor.newWindow(.{ .editor = 0 }); // focusWindow(1) cancels the prompt
     try t.expectEqual(Editor.Mode.normal, editor.mode);
 
@@ -4951,6 +6092,269 @@ test "windows: detach_terminal guard, move, and terminal passthrough chords" {
     try t.expectEqualStrings("close_pane", editor.terminalPassthroughAction("ctrl+alt+q").?);
     try t.expect(editor.terminalPassthroughAction("ctrl+s") == null);
     try t.expect(editor.terminalPassthroughAction("ctrl+c") == null);
+}
+
+test "keyboard focus: panels are exclusive and any pane focus takes it back" {
+    const t = std.testing;
+    var tmp = t.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(t.io, .{ .sub_path = "a.txt", .data = "a\n" });
+    const root = try tmp.dir.realPathFileAlloc(t.io, ".", t.allocator);
+    defer t.allocator.free(root);
+    var editor = try Editor.init(t.allocator, t.io);
+    defer editor.deinit();
+    editor.lsp_enabled = false;
+    editor.filetree_root = try t.allocator.dupe(u8, root);
+    editor.filetree_visible = false;
+    try t.expectEqual(Editor.KeyboardOwner.editor, editor.keyboardOwner());
+
+    // One panel at a time; taking one shows it and closes the completion popup.
+    try editor.addCompletionItem(try t.allocator.dupe(u8, "foo"), null, null);
+    try t.expect(editor.takeKeyboardFocus(.filetree));
+    try t.expect(editor.filetree_visible and editor.filetree != null);
+    try t.expectEqual(Editor.KeyboardOwner.filetree, editor.keyboardOwner());
+    try t.expect(!editor.completion_active and !editor.editorOwnsInput());
+    try t.expect(editor.takeKeyboardFocus(.search));
+    try t.expect(editor.search_visible and !editor.filetree_focused);
+    try t.expectEqual(Editor.KeyboardOwner.search, editor.keyboardOwner());
+    try t.expect(editor.takeKeyboardFocus(.filetree));
+    try t.expect(!editor.search_focused and editor.search_visible);
+
+    // Every way a pane takes focus takes the keyboard back — clicking the
+    // pane that is already active included.
+    const PaneFocus = enum { focus_pane, next_pane, prev_pane, split, focus_window, show_doc, take_pane };
+    for (std.enums.values(PaneFocus), 0..) |how, i| {
+        try t.expect(editor.takeKeyboardFocus(if (i % 2 == 0) .filetree else .search));
+        switch (how) {
+            .focus_pane => editor.focusPane(editor.activePaneId()),
+            .next_pane => editor.focusNextPane(),
+            .prev_pane => editor.focusPrevPane(),
+            .split => editor.splitActive(.horizontal),
+            .focus_window => editor.focusWindow(0),
+            .show_doc => editor.showDocIn(0, 0),
+            .take_pane => try t.expect(editor.takeKeyboardFocus(.pane)),
+        }
+        try t.expectEqual(Editor.KeyboardOwner.editor, editor.keyboardOwner());
+        try t.expect(editor.editorOwnsInput());
+    }
+
+    // Structural moves (tab cycling, switching documents) leave it alone.
+    _ = try editor.newDocument();
+    try t.expect(editor.takeKeyboardFocus(.filetree));
+    editor.nextDoc();
+    editor.switchToDoc(0);
+    try t.expectEqual(Editor.KeyboardOwner.filetree, editor.keyboardOwner());
+
+    // Ctrl+B / Ctrl+Shift+F: focused → hidden (the pane gets the keys),
+    // hidden → shown + focused, shown behind another owner → focused.
+    editor.toggleFiletree();
+    try t.expect(!editor.filetree_visible and !editor.filetree_focused);
+    try t.expectEqual(Editor.KeyboardOwner.editor, editor.keyboardOwner());
+    editor.toggleFiletree();
+    try t.expectEqual(Editor.KeyboardOwner.filetree, editor.keyboardOwner());
+    editor.searchToggle();
+    try t.expectEqual(Editor.KeyboardOwner.search, editor.keyboardOwner());
+    try t.expect(editor.filetree_visible);
+    editor.filetree.?.scroll_to_selected = false;
+    editor.toggleFiletree();
+    try t.expectEqual(Editor.KeyboardOwner.filetree, editor.keyboardOwner());
+    try t.expect(editor.filetree.?.scroll_to_selected);
+    editor.searchToggle();
+    try t.expectEqual(Editor.KeyboardOwner.search, editor.keyboardOwner());
+    editor.searchToggle();
+    try t.expect(!editor.search_visible);
+    try t.expectEqual(Editor.KeyboardOwner.editor, editor.keyboardOwner());
+}
+
+test "keyboard focus: a focused panel outranks a terminal pane" {
+    const t = std.testing;
+    var tmp = t.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(t.io, .{ .sub_path = "a.txt", .data = "a\n" });
+    const root = try tmp.dir.realPathFileAlloc(t.io, ".", t.allocator);
+    defer t.allocator.free(root);
+    var editor = try Editor.init(t.allocator, t.io);
+    defer editor.deinit();
+    editor.lsp_enabled = false;
+    editor.filetree_root = try t.allocator.dupe(u8, root);
+    // Fake terminal slot — Terminal.init would start a shell.
+    try editor.terminals.append(t.allocator, null);
+    editor.activeLayout().panes.items[0].content = .{ .terminal = 0 };
+    try t.expectEqual(Editor.KeyboardOwner.terminal, editor.keyboardOwner());
+
+    // The tree over a terminal owns the keys; the bound copy chord copies
+    // the selected file instead of reaching the shell.
+    try t.expect(editor.takeKeyboardFocus(.filetree));
+    try t.expectEqual(Editor.KeyboardOwner.filetree, editor.keyboardOwner());
+    try t.expect(editor.panelAction("copy"));
+    try t.expectEqual(@as(usize, 1), editor.filetree_clip_paths.items.len);
+    try t.expectEqualStrings("a.txt", editor.filetree_clip_paths.items[0]);
+    try t.expect(!editor.filetree_clip_cut);
+    try t.expect(editor.panelAction("cut"));
+    try t.expect(editor.filetree_clip_cut);
+    try t.expect(editor.panelAction("select_all")); // swallowed
+    try t.expect(!editor.panelAction("save")); // not a panel chord
+    try t.expect(editor.lookupKeybind("ctrl+c") != null);
+
+    // Clicking the terminal hands it the keyboard; Ctrl+C is the shell's again.
+    editor.focusPaneIn(0, editor.activePaneId());
+    try t.expectEqual(Editor.KeyboardOwner.terminal, editor.keyboardOwner());
+    try t.expect(!editor.panelAction("copy"));
+
+    // Ctrl+` while a panel holds the keyboard over the terminal focuses
+    // that terminal instead of opening another one.
+    try t.expect(editor.takeKeyboardFocus(.search));
+    const panes = editor.activeLayout().paneCount();
+    try t.expect(editor.execAction("toggle_terminal"));
+    try t.expectEqual(Editor.KeyboardOwner.terminal, editor.keyboardOwner());
+    try t.expectEqual(panes, editor.activeLayout().paneCount());
+
+    // F6 and splits release a panel too.
+    try t.expect(editor.takeKeyboardFocus(.filetree));
+    try t.expect(editor.execAction("focus_next_pane"));
+    try t.expectEqual(Editor.KeyboardOwner.terminal, editor.keyboardOwner());
+    try t.expect(editor.takeKeyboardFocus(.search));
+    editor.splitActive(.horizontal);
+    try t.expectEqual(Editor.KeyboardOwner.editor, editor.keyboardOwner());
+    try t.expectEqual(panes + 1, editor.activeLayout().paneCount());
+}
+
+test "keyboard focus: windows, hidden panels and failed trees never own it" {
+    const t = std.testing;
+    var tmp = t.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(t.io, ".", t.allocator);
+    defer t.allocator.free(root);
+    var editor = try Editor.init(t.allocator, t.io);
+    defer editor.deinit();
+    editor.lsp_enabled = false;
+    editor.multi_window_supported = true;
+    editor.filetree_root = try t.allocator.dupe(u8, root);
+
+    // A new window takes the keyboard from a panel of the primary.
+    try t.expect(editor.takeKeyboardFocus(.search));
+    const w = try editor.newWindow(.{ .editor = 0 });
+    try t.expectEqual(w, editor.active_window);
+    try t.expect(!editor.search_focused and !editor.filetree_focused);
+    try t.expectEqual(Editor.KeyboardOwner.editor, editor.keyboardOwner());
+    // A flag written while a secondary is focused owns nothing (a pure
+    // read) and the next tick clears it.
+    editor.search_focused = true;
+    try t.expectEqual(Editor.KeyboardOwner.editor, editor.keyboardOwner());
+    editor.normalizeKeyboardFocus();
+    try t.expect(!editor.search_focused);
+    // Asking for a panel from the secondary focuses the primary first.
+    try t.expect(editor.takeKeyboardFocus(.filetree));
+    try t.expectEqual(@as(usize, 0), editor.active_window);
+    try t.expectEqual(Editor.KeyboardOwner.filetree, editor.keyboardOwner());
+
+    // A panel hidden under its focus (Lua, Settings) keeps none.
+    editor.filetree_visible = false;
+    editor.normalizeKeyboardFocus();
+    try t.expectEqual(Editor.KeyboardOwner.editor, editor.keyboardOwner());
+    editor.search_visible = false;
+    editor.search_focused = true;
+    editor.normalizeKeyboardFocus();
+    try t.expect(!editor.search_focused);
+    // Both set by direct writes: the tree keeps the keyboard, and
+    // serviceTick normalizes first thing.
+    editor.filetree_visible = true;
+    editor.search_visible = true;
+    editor.filetree_focused = true;
+    editor.search_focused = true;
+    try t.expectEqual(Editor.KeyboardOwner.filetree, editor.keyboardOwner());
+    editor.serviceTick(0);
+    try t.expect(editor.filetree_focused and !editor.search_focused);
+
+    // A failed re-root (tree Backspace into an unreadable parent) keeps the
+    // keyboard on the restored tree.
+    try t.expect(!editor.setFiletreeRoot("zide-no-such-dir/missing"));
+    try t.expect(editor.filetree != null);
+    try t.expectEqual(Editor.KeyboardOwner.filetree, editor.keyboardOwner());
+
+    // A tree whose root cannot be opened never takes the keyboard, and a
+    // search panel that had it keeps it.
+    try t.expect(editor.takeKeyboardFocus(.pane));
+    editor.filetree.?.deinit();
+    editor.filetree = null;
+    t.allocator.free(editor.filetree_root.?);
+    editor.filetree_root = try t.allocator.dupe(u8, "zide-no-such-dir/missing");
+    try t.expect(!editor.takeKeyboardFocus(.filetree));
+    try t.expect(!editor.filetree_visible and !editor.filetree_focused);
+    try t.expectEqual(Editor.KeyboardOwner.editor, editor.keyboardOwner());
+    editor.toggleFiletree();
+    try t.expect(!editor.filetree_visible and !editor.filetree_focused);
+    try t.expect(editor.takeKeyboardFocus(.search));
+    try t.expect(!editor.takeKeyboardFocus(.filetree));
+    try t.expectEqual(Editor.KeyboardOwner.search, editor.keyboardOwner());
+}
+
+const PanelTestClipboard = struct {
+    // Nothing reaches the system clipboard; getClipboard reads editor.clipboard.
+    fn set(_: []const u8) void {}
+    fn get() []const u8 {
+        return "";
+    }
+};
+
+test "panelAction: search field owns clipboard and word-delete chords" {
+    const t = std.testing;
+    var editor = try Editor.init(t.allocator, t.io);
+    defer editor.deinit();
+    editor.lsp_enabled = false;
+    editor.clipboard_set_fn = PanelTestClipboard.set;
+    editor.clipboard_get_fn = PanelTestClipboard.get;
+    const doc = editor.activeDoc();
+    try doc.loadText("document text");
+    const version = doc.buffer.version;
+
+    // While the editor owns the keyboard the chords are the document's.
+    try t.expect(!editor.panelAction("paste"));
+    try t.expect(editor.takeKeyboardFocus(.search));
+    editor.search.field = .query;
+    text_input.set(&editor.search.query_buf, &editor.search.query_len, "foo bar");
+    editor.search.confirm_armed = true;
+
+    try t.expect(editor.panelAction("delete_word_backward"));
+    try t.expectEqualStrings("foo ", editor.search.query());
+    try t.expect(!editor.search.confirm_armed);
+    try t.expect(editor.panelAction("delete_word_forward")); // caret at the end: nothing
+    try t.expect(editor.panelAction("select_all"));
+    try t.expectEqualStrings("foo ", editor.search.query());
+
+    // Paste takes the clipboard's first line.
+    editor.setClipboard("needle\nx");
+    try t.expect(editor.panelAction("paste"));
+    try t.expectEqualStrings("foo needle", editor.search.query());
+    try t.expect(editor.panelAction("copy"));
+    try t.expectEqualStrings("foo needle", editor.clipboard);
+
+    // Word delete stops at a space, never inside a multi-byte character;
+    // cut empties the field and disarms a pending Replace.
+    editor.search.field = .replace;
+    text_input.set(&editor.search.replace_buf, &editor.search.replace_len, "héllo wörld  ");
+    try t.expect(editor.panelAction("delete_word_backward"));
+    try t.expectEqualStrings("héllo ", editor.search.replacement());
+    editor.search.confirm_armed = true;
+    try t.expect(editor.panelAction("cut"));
+    try t.expectEqualStrings("héllo ", editor.clipboard);
+    try t.expectEqualStrings("", editor.search.replacement());
+    try t.expect(!editor.search.confirm_armed);
+
+    // The results list has no text: the chords are swallowed.
+    editor.search.field = .results;
+    try t.expect(editor.panelAction("paste"));
+    try t.expectEqualStrings("foo needle", editor.search.query());
+
+    // Other actions, and modal modes, are not the panel's.
+    try t.expect(!editor.panelAction("undo"));
+    editor.setMode(.find);
+    try t.expect(!editor.panelAction("paste"));
+    editor.setMode(.normal);
+
+    // The document behind the panel never changed.
+    try t.expectEqual(version, doc.buffer.version);
+    try t.expectEqualStrings("document text", doc.buffer.slice(0, doc.buffer.byteLen()));
 }
 
 /// Test helper: bounded wait for the search worker to finish.
@@ -5089,7 +6493,7 @@ test "close tab: a dirty document prompts; discard closes, cancel keeps it" {
     try t.expectEqual(Editor.Mode.normal, editor.mode);
     // A prompt whose document vanished resolves to nothing
     editor.confirm_close_doc = std.math.maxInt(u64);
-    editor.mode = .confirm_close;
+    editor.setMode(.confirm_close);
     try t.expectEqual(Editor.CloseOutcome.kept, editor.resolveCloseDoc(.discard));
     try t.expectEqual(@as(usize, 2), editor.documents.items.len);
     try t.expectEqual(Editor.Mode.normal, editor.mode);
@@ -5221,7 +6625,7 @@ test "save and quit preflights all files and conflict resolution never resumes q
         editor.saveAllAndQuit();
         try t.expect(editor.running);
         try t.expectEqual(Editor.Mode.confirm_overwrite, editor.mode);
-        try t.expectEqual(@as(usize, 1), editor.confirm_overwrite_doc);
+        try t.expectEqual(@as(?u64, editor.documents.items[1].id), editor.confirm_overwrite_doc);
         const first = try tmp.dir.readFileAlloc(t.io, "a.txt", t.allocator, .limited(100));
         defer t.allocator.free(first);
         try t.expectEqualStrings("a", first);
@@ -5335,11 +6739,14 @@ test "completion supports UTF-16 insert-replace edits and rejects invalid positi
     try t.expectEqualStrings("\xf0\x9f\x98\x80foobaz", doc.buffer.slice(0, doc.buffer.byteLen()));
     _ = try doc.undoAction();
     const invalid = [_][]const u8{
-        \\{"result":[{"label":"bad","textEdit":{"newText":"bad","range":{"start":{"line":0,"character":1},"end":{"line":0,"character":8}}}}]}
+        // Starts inside the surrogate pair.
+        \\{"result":[{"label":"foobad","textEdit":{"newText":"bad","range":{"start":{"line":0,"character":1},"end":{"line":0,"character":8}}}}]}
         ,
-        \\{"result":[{"label":"bad","textEdit":{"newText":"bad","range":{"start":{"line":0,"character":2},"end":{"line":0,"character":90}}}}]}
+        // Spans two lines (a completion edit is single-line).
+        \\{"result":[{"label":"foobad","textEdit":{"newText":"bad","range":{"start":{"line":0,"character":2},"end":{"line":1,"character":0}}}}]}
         ,
-        \\{"result":[{"label":"bad","textEdit":{"newText":"bad","range":{"start":{"line":0,"character":8},"end":{"line":0,"character":2}}}}]}
+        // Inverted.
+        \\{"result":[{"label":"foobad","textEdit":{"newText":"bad","range":{"start":{"line":0,"character":8},"end":{"line":0,"character":2}}}}]}
         ,
     };
     for (invalid) |json| {
@@ -5348,6 +6755,12 @@ test "completion supports UTF-16 insert-replace edits and rejects invalid positi
         try t.expectEqualStrings(original, doc.buffer.slice(0, doc.buffer.byteLen()));
         try t.expect(!doc.history.canUndo());
     }
+    // A character past the line end means the line end (LSP spec).
+    try testLoadCompletion(&editor,
+        \\{"result":[{"label":"foobad","textEdit":{"newText":"bad","range":{"start":{"line":0,"character":2},"end":{"line":0,"character":90}}}}]}
+    );
+    editor.acceptCompletion();
+    try t.expectEqualStrings("\xf0\x9f\x98\x80bad", doc.buffer.slice(0, doc.buffer.byteLen()));
 }
 
 test "completion fallback works and stale responses cannot target reused tabs" {
@@ -5604,7 +7017,7 @@ test "autosave and workspace replacements report failures and preserve source fo
         try t.expectEqualDeep(text_file.TextFormat{ .encoding = .windows1252 }, doc.format);
     }
     try doc.insertAtCursor("😀");
-    editor.mode = .find;
+    editor.setMode(.find);
     try t.expectEqual(@as(usize, 0), editor.autoSaveAll());
     try t.expectEqual(Editor.Mode.find, editor.mode);
     try t.expect(std.mem.indexOf(u8, editor.status_message, "failed") != null);
@@ -5657,4 +7070,848 @@ test "session restores explicit BOM-less encodings and reads old session records
     defer t.allocator.free(old_text);
     try t.expectEqual(@as(usize, 1), old.restoreSessionText(old_text));
     try t.expectEqual(@as(usize, 2), old.activeDoc().cursors.primary().offset);
+}
+
+/// Test helper: type `text` into the quick-open filter (live preview).
+fn finderType(ed: *Editor, text: []const u8) void {
+    text_input.set(&ed.finder_buf, &ed.finder_buf_len, text);
+    ed.finderRefresh();
+}
+
+/// Test helper: invariant P holds — no preview document, no session left,
+/// every pane shows a live document.
+fn expectNoPeek(ed: *const Editor) !void {
+    const t = std.testing;
+    try t.expect(ed.finder_preview_id == null);
+    try t.expect(ed.finder_prev_doc == null);
+    for (ed.documents.items) |*doc| try t.expect(!doc.preview);
+    for (ed.windows.items) |win| for (win.layout.panes.items) |pane| switch (pane.content) {
+        .editor => |idx| try t.expect(idx < ed.documents.items.len),
+        .terminal => {},
+    };
+}
+
+test "quick open: a command ends the session; later documents are never taken for the preview" {
+    const t = std.testing;
+    var tmp = t.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(t.io, .{ .sub_path = "beta.txt", .data = "beta\n" });
+    const root = try tmp.dir.realPathFileAlloc(t.io, ".", t.allocator);
+    defer t.allocator.free(root);
+    var editor = try Editor.init(t.allocator, t.io);
+    defer editor.deinit();
+    editor.lsp_enabled = false;
+    editor.filetree_root = try t.allocator.dupe(u8, root);
+
+    editor.finderOpen();
+    finderType(&editor, "beta");
+    try t.expect(editor.activeDoc().preview);
+    // A command (menu, keybind, Lua exec) ends quick-open first.
+    try t.expect(editor.execAction("find"));
+    try t.expectEqual(Editor.Mode.find, editor.mode);
+    try expectNoPeek(&editor);
+    editor.setMode(.normal);
+    // The next appended document is a real tab, not a stale preview...
+    try t.expect(editor.execAction("new_document"));
+    const draft_id = editor.activeDoc().id;
+    try editor.activeDoc().insertAtCursor("unsaved draft");
+    try t.expect(editor.docWindow(editor.docIndexForId(draft_id).?) != null);
+    // ...so the next peek cannot load a file into it, and Escape keeps it.
+    editor.finderOpen();
+    finderType(&editor, "beta");
+    try t.expect(editor.activeDoc().preview);
+    try t.expect(editor.activeDoc().id != draft_id);
+    editor.finderCancel();
+    try expectNoPeek(&editor);
+    const kept = editor.activeDoc();
+    try t.expectEqual(draft_id, kept.id);
+    try t.expect(kept.dirty);
+    try t.expectEqualStrings("unsaved draft", kept.buffer.slice(0, kept.buffer.byteLen()));
+}
+
+test "quick open: every other way out of the finder ends the session and keeps the draft" {
+    const t = std.testing;
+    var tmp = t.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(t.io, .{ .sub_path = "alpha.txt", .data = "alpha\n" });
+    try tmp.dir.writeFile(t.io, .{ .sub_path = "beta.txt", .data = "beta\n" });
+    const root = try tmp.dir.realPathFileAlloc(t.io, ".", t.allocator);
+    defer t.allocator.free(root);
+    const beta = try std.fs.path.join(t.allocator, &.{ root, "beta.txt" });
+    defer t.allocator.free(beta);
+    const Exit = enum { request_close, cancel_encoding, start_encoding, save_untitled, new_document, open_file };
+    for (std.enums.values(Exit)) |way_out| {
+        var editor = try Editor.init(t.allocator, t.io);
+        defer editor.deinit();
+        editor.lsp_enabled = false;
+        editor.filetree_root = try t.allocator.dupe(u8, root);
+        const draft_id = editor.activeDoc().id;
+        try editor.activeDoc().insertAtCursor("draft");
+        editor.finderOpen();
+        finderType(&editor, "alpha");
+        try t.expect(editor.activeDoc().preview);
+        switch (way_out) {
+            .request_close => try t.expect(!editor.requestCloseDoc(editor.docIndexForId(draft_id).?)),
+            .cancel_encoding => editor.cancelEncoding(),
+            .start_encoding => editor.startEncoding(.choose),
+            .save_untitled => try t.expectEqual(Editor.SaveOutcome.needs_path, editor.saveDocument(draft_id, .{})),
+            .new_document => _ = try editor.newDocument(),
+            .open_file => _ = try editor.openFile(beta),
+        }
+        try t.expect(editor.mode != .file_finder);
+        try expectNoPeek(&editor);
+        const idx = editor.docIndexForId(draft_id).?;
+        const draft = &editor.documents.items[idx];
+        try t.expectEqualStrings("draft", draft.buffer.slice(0, draft.buffer.byteLen()));
+        try t.expect(draft.dirty);
+        try t.expect(editor.docWindow(idx) != null);
+    }
+}
+
+test "quick open: cancel returns to the pre-finder document by id" {
+    const t = std.testing;
+    var tmp = t.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(t.io, .{ .sub_path = "peek.txt", .data = "peek\n" });
+    const root = try tmp.dir.realPathFileAlloc(t.io, ".", t.allocator);
+    defer t.allocator.free(root);
+    {
+        var editor = try Editor.init(t.allocator, t.io);
+        defer editor.deinit();
+        editor.lsp_enabled = false;
+        editor.filetree_root = try t.allocator.dupe(u8, root);
+        _ = try editor.newDocument(); // B
+        _ = try editor.newDocument(); // C
+        _ = try editor.newDocument(); // D
+        editor.switchToDoc(1);
+        const b_id = editor.activeDoc().id;
+        editor.finderOpen();
+        finderType(&editor, "peek");
+        try t.expect(editor.activeDoc().preview);
+        // A tab closes while the finder is open: every index shifts.
+        try t.expect(editor.closeDocAt(0));
+        editor.finderCancel();
+        try expectNoPeek(&editor);
+        try t.expectEqual(b_id, editor.activeDoc().id);
+        try t.expectEqual(@as(usize, 3), editor.documents.items.len);
+    }
+    {
+        // The only document closes during the finder: one untitled remains.
+        var editor = try Editor.init(t.allocator, t.io);
+        defer editor.deinit();
+        editor.lsp_enabled = false;
+        editor.filetree_root = try t.allocator.dupe(u8, root);
+        editor.finderOpen();
+        finderType(&editor, "peek");
+        try t.expect(editor.activeDoc().preview);
+        _ = editor.closeDocAt(0);
+        editor.finderCancel();
+        try expectNoPeek(&editor);
+        try t.expectEqual(@as(usize, 1), editor.documents.items.len);
+        try t.expect(editor.activeDoc().file_path == null);
+        try t.expectEqualSlices(usize, &.{0}, editor.windows.items[0].tabs.items);
+    }
+}
+
+test "quick open: promotion runs the post-open bookkeeping; previews stay bare" {
+    const t = std.testing;
+    var tmp = t.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(t.io, .{ .sub_path = ".editorconfig", .data = "root = true\n[*]\nindent_style = space\nindent_size = 3\n" });
+    try tmp.dir.writeFile(t.io, .{ .sub_path = "a.zig", .data = "const a = 1;\n" });
+    try tmp.dir.writeFile(t.io, .{ .sub_path = "LICENSE", .data = "MIT\n" });
+    const root = try tmp.dir.realPathFileAlloc(t.io, ".", t.allocator);
+    defer t.allocator.free(root);
+    const license = try std.fs.path.join(t.allocator, &.{ root, "LICENSE" });
+    defer t.allocator.free(license);
+    var editor = try Editor.init(t.allocator, t.io);
+    defer editor.deinit();
+    editor.lsp_enabled = false;
+    editor.filetree_root = try t.allocator.dupe(u8, root);
+    // A stored lint finding for LICENSE (an extension ran on it earlier).
+    const finding: lsp_mod.Diagnostic = .{ .start_line = 0, .start_col = 0, .end_line = 0, .end_col = 1, .severity = .warning, .message = "license lint" };
+    try editor.problems.replace(license, "lint", .lua, null, .bytes, &.{finding});
+
+    editor.finderOpen();
+    finderType(&editor, "a.zig");
+    try t.expectEqualStrings("zig", editor.activeDoc().language.?.name);
+    // The reused preview sheds the previous file: LICENSE is plain text.
+    finderType(&editor, "LICENSE");
+    const peek = editor.activeDoc();
+    try t.expect(peek.preview);
+    try t.expect(std.mem.endsWith(u8, peek.file_path.?, "LICENSE"));
+    try t.expect(peek.language == null);
+    try t.expectEqual(@as(usize, 3), editor.indentWidthFor(peek));
+    try t.expectEqual(@as(usize, 0), peek.lint_diagnostics.items.len); // no diagnostics on a peek
+    editor.finderCommit();
+    try t.expectEqual(Editor.Mode.normal, editor.mode);
+    try expectNoPeek(&editor);
+    const doc = editor.activeDoc();
+    try t.expect(std.mem.endsWith(u8, doc.file_path.?, "LICENSE"));
+    try t.expect(editor.docWindow(editor.active_doc_idx) != null);
+    try t.expectEqual(@as(usize, 3), editor.indentWidthFor(doc));
+    try t.expectEqual(@as(usize, 1), doc.lint_diagnostics.items.len); // projected on commit
+}
+
+test "windows: a window switch cancels rename previews, stage and task-save prompts at their owners" {
+    const t = std.testing;
+    var editor = try Editor.init(t.allocator, t.io);
+    defer editor.deinit();
+    editor.lsp_enabled = false;
+    editor.multi_window_supported = true;
+    _ = try editor.newWindow(.{ .editor = 0 });
+    editor.focusWindow(0);
+
+    // Git: a stage waiting on its save prompt is released, not orphaned
+    // (a later stage would fail with GitOperationInProgress forever).
+    editor.git.mutation = .{ .path = try t.allocator.dupe(u8, "a.txt"), .old_path = null, .unstage = false };
+    editor.setMode(.git_stage_prompt);
+    editor.focusWindow(1);
+    try t.expectEqual(Editor.Mode.normal, editor.mode);
+    try t.expect(editor.git.mutation == null);
+
+    // Tasks: the run waiting on its save prompt is cancelled (never spawned).
+    editor.focusWindow(0);
+    try editor.activeDoc().insertAtCursor("dirty");
+    const tasks = @import("tasks.zig");
+    try editor.tasks.register(&editor, try tasks.Config.create(t.allocator, .{ .name = "never", .argv = &.{"zide-test-never-spawned"} }));
+    const run_id = try editor.tasks.request(&editor, "never");
+    try t.expectEqual(Editor.Mode.task_save_prompt, editor.mode);
+    try t.expect(editor.tasks.get(run_id).?.job == null);
+    editor.focusWindow(1);
+    try t.expectEqual(Editor.Mode.normal, editor.mode);
+    try t.expect(editor.tasks.pending == null);
+    try t.expectEqual(tasks.Status.cancelled, editor.tasks.get(run_id).?.status);
+
+    // LSP: a workspace-edit preview is declined (not left blocking renames).
+    editor.lsp_tools.preview = .{ .allocator = t.allocator };
+    editor.setMode(.workspace_preview);
+    editor.focusWindow(0);
+    try t.expectEqual(Editor.Mode.normal, editor.mode);
+    try t.expect(editor.lsp_tools.preview == null);
+}
+
+test "auto-save while another document formats never switches tabs or closes quick-open" {
+    const t = std.testing;
+    var tmp = t.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(t.io, .{ .sub_path = "a.zig", .data = "const a = 1;\n" });
+    try tmp.dir.writeFile(t.io, .{ .sub_path = "b.zig", .data = "const b = 2;\n" });
+    try tmp.dir.writeFile(t.io, .{ .sub_path = "notes.txt", .data = "notes\n" });
+    const root = try tmp.dir.realPathFileAlloc(t.io, ".", t.allocator);
+    defer t.allocator.free(root);
+    const a_path = try std.fs.path.join(t.allocator, &.{ root, "a.zig" });
+    defer t.allocator.free(a_path);
+    const b_path = try std.fs.path.join(t.allocator, &.{ root, "b.zig" });
+    defer t.allocator.free(b_path);
+    var editor = try Editor.init(t.allocator, t.io);
+    defer editor.deinit();
+    editor.lsp_enabled = false;
+    editor.filetree_root = try t.allocator.dupe(u8, root);
+    const a = try editor.openFile(a_path);
+    const a_id = a.id;
+    try a.insertAtCursor("// a\n");
+    const a_version = a.buffer.version;
+    const b = try editor.openFile(b_path);
+    const b_id = b.id;
+    try b.insertAtCursor("// b\n");
+    // A format-on-save for `a` is in flight (fake server, no process).
+    const client = try t.allocator.create(lsp_mod.LspClient);
+    client.* = lsp_mod.LspClient.init(t.allocator, t.io);
+    editor.lsp_clients.append(t.allocator, client) catch |err| {
+        client.deinit();
+        t.allocator.destroy(client);
+        return err;
+    };
+    client.config = try lsp_mod.ServerConfig.fromArgv(t.allocator, &.{"zig"}, &.{"test-server"});
+    client.capabilities.format_document = true;
+    // Documents route to the newest registration's server, and only a
+    // document the server has open can format: register it, sync `b`.
+    var registration = try client.config.?.clone(t.allocator);
+    editor.lsp_configs.append(t.allocator, registration) catch |err| {
+        registration.deinit(t.allocator);
+        return err;
+    };
+    editor.documents.items[editor.docIndexForId(b_id).?].lsp_opened = true;
+    editor.lsp_tools.format_on_save = true;
+    editor.lsp_tools.formatting = .{ .method = .format_document, .doc_id = a_id, .version = a_version, .serial = 1, .generation = client.generation };
+    editor.lsp_tools.save = .{ .id = a_id, .options = .{}, .owned_path = null };
+
+    editor.finderOpen();
+    finderType(&editor, "notes");
+    const peek_id = editor.activeDoc().id;
+    try t.expect(editor.activeDoc().preview);
+    // `b` cannot format while `a` does: retried next tick, not a failure,
+    // and nothing interactive happens behind the user's back.
+    try t.expectEqual(@as(usize, 0), editor.autoSaveAll());
+    try t.expectEqual(Editor.Mode.file_finder, editor.mode);
+    try t.expectEqual(peek_id, editor.activeDoc().id);
+    try t.expect(editor.documents.items[editor.docIndexForId(b_id).?].dirty);
+    try t.expect(std.mem.indexOf(u8, editor.status_message, "failed") == null);
+    editor.finderCancel();
+    try expectNoPeek(&editor);
+}
+
+/// A registered, handshaken language server with no process behind it:
+/// every frame it is sent queues in its detached peer (testSentFrames).
+/// Its registration is appended too, so it is the newest for `languages`.
+/// Clear `initialized` before teardown — a fake peer never answers the
+/// shutdown handshake.
+fn testLspServer(editor: *Editor, languages: []const []const u8, argv: []const []const u8) !*lsp_mod.LspClient {
+    const protocol = @import("protocol.zig");
+    const client = try editor.allocator.create(lsp_mod.LspClient);
+    client.* = lsp_mod.LspClient.init(editor.allocator, editor.io);
+    editor.lsp_clients.append(editor.allocator, client) catch |err| {
+        client.deinit();
+        editor.allocator.destroy(client);
+        return err;
+    };
+    client.peer = try protocol.Peer.detached(editor.allocator, editor.io);
+    client.config = try lsp_mod.ServerConfig.fromArgv(editor.allocator, languages, argv);
+    var registration = try client.config.?.clone(editor.allocator);
+    editor.lsp_configs.append(editor.allocator, registration) catch |err| {
+        registration.deinit(editor.allocator);
+        return err;
+    };
+    client.initialized = true;
+    client.capabilities.format_document = true;
+    return client;
+}
+
+/// The frames sent to a testLspServer so far, oldest first.
+fn testSentFrames(client: *lsp_mod.LspClient) []const []u8 {
+    return client.peer.?.outgoing.messages.items;
+}
+
+test "LSP: a document too big for one frame is marked per version, not re-sent every sync" {
+    const t = std.testing;
+    var tmp = t.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(t.io, .{ .sub_path = "big.zig", .data = "const a = 1;\n" });
+    const path = try tmp.dir.realPathFileAlloc(t.io, "big.zig", t.allocator);
+    defer t.allocator.free(path);
+    var editor = try Editor.init(t.allocator, t.io);
+    defer editor.deinit();
+    defer for (editor.lsp_clients.items) |client| {
+        client.initialized = false;
+    };
+    editor.lsp_enabled = false;
+    editor.editorconfig_enabled = false;
+    const doc = try editor.openFile(path);
+    const id = doc.id;
+    const server = try testLspServer(&editor, &.{"zig"}, &.{"test-server"});
+    editor.lsp_enabled = true;
+    editor.lsp_frame_limit = 1024;
+
+    // Too big: marked for this version, nothing sent, the user told once.
+    try doc.insertAtCursor("// " ++ "x" ** 1000 ++ "\n");
+    editor.syncLspDocuments();
+    try t.expect(!doc.lsp_opened);
+    try t.expectEqual(@as(?i32, doc.lsp_version), editor.lsp_too_large.get(id));
+    try t.expectEqual(@as(usize, 0), testSentFrames(server).len);
+    try t.expect(std.mem.indexOf(u8, editor.status_message, "too large") != null);
+    // The same version is never measured again — even once it would fit,
+    // it waits for an edit instead of being escaped on every sync.
+    editor.lsp_frame_limit = @import("protocol.zig").max_frame;
+    editor.syncLspDocuments();
+    try t.expect(!doc.lsp_opened);
+    try t.expectEqual(@as(usize, 0), testSentFrames(server).len);
+    // Format-on-save cannot format what the server does not have: the file
+    // is saved as it is, and the status bar says why.
+    editor.lsp_tools.format_on_save = true;
+    try t.expectEqual(Editor.SaveOutcome.saved, editor.saveDocument(id, .{}));
+    try t.expect(std.mem.indexOf(u8, editor.status_message, "unformatted (too large") != null);
+    try t.expect(!doc.dirty and editor.lsp_tools.save == null);
+
+    // An edit changes the version: measured again, it fits and opens.
+    try doc.insertAtCursor(" ");
+    editor.syncLspDocuments();
+    try t.expect(doc.lsp_opened);
+    try t.expect(editor.lsp_too_large.get(id) == null);
+    try t.expectEqual(@as(usize, 1), testSentFrames(server).len);
+    try t.expect(std.mem.indexOf(u8, testSentFrames(server)[0], "textDocument/didOpen") != null);
+    try t.expectEqual(server, editor.lspClientForDoc(doc).?);
+
+    // Growing past the limit while open closes it on the server (no stale
+    // copy there) and drops the server's versioned Problems for it.
+    const problem: lsp_mod.Diagnostic = .{ .start_line = 0, .start_col = 0, .end_line = 0, .end_col = 1, .severity = .err, .message = "problem" };
+    try editor.problems.replace(path, "test-server", .lsp, doc.lsp_version, .utf16, &.{problem});
+    editor.lsp_frame_limit = 1024;
+    try doc.insertAtCursor("y");
+    editor.syncLspDocuments();
+    try t.expect(!doc.lsp_opened);
+    try t.expectEqual(@as(?i32, doc.lsp_version), editor.lsp_too_large.get(id));
+    try t.expectEqual(@as(usize, 2), testSentFrames(server).len);
+    try t.expect(std.mem.indexOf(u8, testSentFrames(server)[1], "textDocument/didClose") != null);
+    try t.expectEqual(@as(usize, 0), editor.problems.entries.items.len);
+    editor.syncLspDocuments();
+    try t.expectEqual(@as(usize, 2), testSentFrames(server).len);
+
+    // Closing the document drops its mark.
+    try t.expect(editor.closeDocAt(editor.docIndexForId(id).?));
+    try t.expect(editor.lsp_too_large.get(id) == null);
+}
+
+test "LSP: the newest registration serves a language; a server keeps and forgets only its own documents" {
+    const t = std.testing;
+    var tmp = t.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(t.io, .{ .sub_path = "a.zig", .data = "const a = 1;\n" });
+    try tmp.dir.writeFile(t.io, .{ .sub_path = "b.zig", .data = "const b = 2;\n" });
+    try tmp.dir.writeFile(t.io, .{ .sub_path = "notes.md", .data = "# notes\n" });
+    const root = try tmp.dir.realPathFileAlloc(t.io, ".", t.allocator);
+    defer t.allocator.free(root);
+    var editor = try Editor.init(t.allocator, t.io);
+    defer editor.deinit();
+    defer for (editor.lsp_clients.items) |client| {
+        client.initialized = false;
+    };
+    editor.lsp_enabled = false;
+    editor.editorconfig_enabled = false;
+    var ids: [3]u64 = undefined;
+    for ([_][]const u8{ "a.zig", "b.zig", "notes.md" }, &ids) |name, *id| {
+        const p = try std.fs.path.join(t.allocator, &.{ root, name });
+        defer t.allocator.free(p);
+        id.* = (try editor.openFile(p)).id;
+    }
+    const a = &editor.documents.items[editor.docIndexForId(ids[0]).?];
+    const b = &editor.documents.items[editor.docIndexForId(ids[1]).?];
+    const md = &editor.documents.items[editor.docIndexForId(ids[2]).?];
+    editor.lsp_enabled = true;
+
+    // `old` serves zig and markdown; b and the notes open there.
+    const old = try testLspServer(&editor, &.{ "zig", "markdown" }, &.{"old-server"});
+    editor.lspNotifyOpen(b);
+    editor.lspNotifyOpen(md);
+    try t.expectEqual(@as(usize, 2), testSentFrames(old).len);
+    // A newer zig-only registration takes over zig opens although `old` is
+    // running and listed first.
+    const new = try testLspServer(&editor, &.{"zig"}, &.{"new-server"});
+    try t.expectEqual(new, editor.lspClientForLanguage("zig").?);
+    try t.expectEqual(old, editor.lspClientForLanguage("markdown").?);
+    editor.syncLspDocuments();
+    try t.expect(a.lsp_opened);
+    try t.expectEqual(new, editor.lspClientForDoc(a).?);
+    try t.expectEqual(@as(usize, 1), testSentFrames(new).len);
+    // An open document keeps talking to the server that has it.
+    try t.expectEqual(old, editor.lspClientForDoc(b).?);
+    try b.insertAtCursor("// edit\n");
+    editor.syncLspDocuments();
+    try t.expectEqual(@as(usize, 3), testSentFrames(old).len);
+    try t.expect(std.mem.indexOf(u8, testSentFrames(old)[2], "textDocument/didChange") != null);
+    try t.expectEqual(@as(usize, 1), testSentFrames(new).len);
+
+    // Reload reconcile: `old` still serves markdown and keeps running; its
+    // zig document closes there and opens on the newer registration.
+    editor.reconcileLspClients();
+    try t.expectEqual(@as(usize, 2), editor.lsp_clients.items.len);
+    try t.expect(!b.lsp_opened and md.lsp_opened);
+    try t.expectEqual(@as(usize, 4), testSentFrames(old).len);
+    try t.expect(std.mem.indexOf(u8, testSentFrames(old)[3], "textDocument/didClose") != null);
+    editor.syncLspDocuments();
+    try t.expect(b.lsp_opened);
+    try t.expectEqual(new, editor.lspClientForDoc(b).?);
+    try t.expectEqual(@as(usize, 2), testSentFrames(new).len);
+
+    // Stopping `old` forgets only the notes: a and b stay open on `new`,
+    // so no duplicate didOpen follows.
+    editor.lsp_enabled = false; // nothing may start "old-server" for real
+    old.initialized = false;
+    editor.stopLspClient(std.mem.indexOfScalar(*lsp_mod.LspClient, editor.lsp_clients.items, old).?);
+    try t.expect(!md.lsp_opened and a.lsp_opened and b.lsp_opened);
+    try t.expectEqual(new, editor.lspClientForDoc(a).?);
+    try t.expectEqual(new, editor.lspClientForDoc(b).?);
+    try t.expectEqual(@as(usize, 2), testSentFrames(new).len);
+}
+
+test "quick open: the visible range scrolls with the selection and Enter opens what is selected" {
+    const t = std.testing;
+    var tmp = t.tmpDir(.{});
+    defer tmp.cleanup();
+    for (0..12) |i| {
+        var name_buf: [16]u8 = undefined;
+        const name = try std.fmt.bufPrint(&name_buf, "f{d:0>2}.txt", .{i});
+        try tmp.dir.writeFile(t.io, .{ .sub_path = name, .data = name });
+    }
+    const root = try tmp.dir.realPathFileAlloc(t.io, ".", t.allocator);
+    defer t.allocator.free(root);
+    var editor = try Editor.init(t.allocator, t.io);
+    defer editor.deinit();
+    editor.lsp_enabled = false;
+    editor.filetree_root = try t.allocator.dupe(u8, root);
+
+    editor.finderOpen();
+    try t.expectEqual(@as(usize, 12), editor.finder_matches.items.len);
+    try t.expectEqual(Editor.FinderRange{ .start = 0, .end = 8 }, editor.finderVisibleRange(8));
+    try t.expectEqual(Editor.FinderRange{ .start = 0, .end = 0 }, editor.finderVisibleRange(0));
+    for (0..9) |_| editor.finderMove(true);
+    try t.expectEqual(@as(usize, 9), editor.finder_selected);
+    try t.expectEqual(Editor.FinderRange{ .start = 2, .end = 10 }, editor.finderVisibleRange(8));
+    const selected = try t.allocator.dupe(u8, editor.finder_files.items[editor.finder_matches.items[9]]);
+    defer t.allocator.free(selected);
+    try t.expect(std.mem.endsWith(u8, editor.activeDoc().file_path.?, selected)); // the peek matches
+    editor.finderCommit();
+    try expectNoPeek(&editor);
+    try t.expect(std.mem.endsWith(u8, editor.activeDoc().file_path.?, selected));
+}
+
+test "windows: detaching a lone terminal from a secondary keeps exactly one view of it" {
+    const t = std.testing;
+    var editor = try Editor.init(t.allocator, t.io);
+    defer editor.deinit();
+    editor.multi_window_supported = true;
+    try editor.terminals.append(t.allocator, null); // fake slot: no shell
+    editor.windows.items[0].layout.panes.items[0].content = .{ .terminal = 0 };
+    try t.expect(editor.execAction("detach_terminal")); // primary → window 1
+    try t.expect(editor.execAction("detach_terminal")); // window 1 → window 2
+    try t.expectEqual(@as(usize, 3), editor.windows.items.len);
+    try t.expect(!editor.windows.items[1].open);
+    // Before the reap too: the closing window no longer shows the terminal,
+    // so closeWindow cannot stop the one that moved (invariant I6).
+    var views: usize = 0;
+    for (editor.windows.items) |win| for (win.layout.panes.items) |pane| {
+        if (pane.content == .terminal and pane.content.terminal == 0) views += 1;
+    };
+    try t.expectEqual(@as(usize, 1), views);
+    const left_behind = editor.windows.items[1].layout.panes.items[0].content;
+    try t.expect(left_behind == .editor and left_behind.editor < editor.documents.items.len);
+    editor.retireClosedWindows();
+    try t.expectEqual(@as(usize, 2), editor.windows.items.len);
+    try t.expectEqual(@as(?usize, 0), editor.activePaneTerminalIdx());
+}
+
+test "terminal shell: $SHELL when it can run, else /bin/bash, else /bin/sh" {
+    const t = std.testing;
+    const fallback = posixShell(t.io, null);
+    try t.expect(std.mem.eql(u8, fallback, "/bin/bash") or std.mem.eql(u8, fallback, "/bin/sh"));
+    try t.expectEqualStrings(fallback, posixShell(t.io, ""));
+    try t.expectEqualStrings(fallback, posixShell(t.io, "/no/such/zide-shell"));
+    // (Windows' access() ignores the execute bit; the positive case is POSIX's.)
+    if (@import("builtin").os.tag != .windows) try t.expectEqualStrings("/bin/sh", posixShell(t.io, "/bin/sh"));
+}
+
+test "EditorConfig save normalization keeps carets on their line and in their own undo step" {
+    const t = std.testing;
+    var tmp = t.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(t.io, .{ .sub_path = ".editorconfig", .data =
+        \\root = true
+        \\[trim.txt]
+        \\trim_trailing_whitespace = true
+        \\[crlf.txt]
+        \\end_of_line = lf
+        \\[final.txt]
+        \\insert_final_newline = true
+        \\[typing.txt]
+        \\trim_trailing_whitespace = true
+        \\insert_final_newline = true
+        \\[merge.txt]
+        \\trim_trailing_whitespace = true
+        \\
+    });
+    const Case = struct { name: []const u8, disk: []const u8, caret: usize, saved: []const u8, line: usize, col: usize };
+    const cases = [_]Case{
+        // Enter on an indented line, then save: the caret stays on the emptied line.
+        .{ .name = "trim.txt", .disk = "fn main() {\n    \n}\n", .caret = 16, .saved = "fn main() {\n\n}\n", .line = 1, .col = 0 },
+        // CRLF→LF deletes only the \r: an end-of-line caret stays put.
+        .{ .name = "crlf.txt", .disk = "abc\r\ndef\r\n", .caret = 3, .saved = "abc\ndef\n", .line = 0, .col = 3 },
+        // The final newline goes in after a caret at EOF.
+        .{ .name = "final.txt", .disk = "abc", .caret = 3, .saved = "abc\n", .line = 0, .col = 3 },
+    };
+    const root = try tmp.dir.realPathFileAlloc(t.io, ".", t.allocator);
+    defer t.allocator.free(root);
+    var editor = try Editor.init(t.allocator, t.io);
+    defer editor.deinit();
+    editor.lsp_enabled = false;
+    for (cases) |case| {
+        try tmp.dir.writeFile(t.io, .{ .sub_path = case.name, .data = case.disk });
+        const path = try std.fs.path.join(t.allocator, &.{ root, case.name });
+        defer t.allocator.free(path);
+        const doc = try editor.openFile(path);
+        const id = doc.id;
+        doc.cursors.primary().offset = case.caret;
+        try t.expectEqual(Editor.SaveOutcome.saved, editor.saveDocument(id, .{}));
+        const saved = &editor.documents.items[editor.docIndexForId(id).?];
+        try t.expectEqualStrings(case.saved, saved.buffer.slice(0, saved.buffer.byteLen()));
+        const pos = saved.buffer.offsetToPos(saved.cursors.primaryConst().offset);
+        try t.expectEqual(case.line, pos.line);
+        try t.expectEqual(case.col, pos.col);
+        const disk = try tmp.dir.readFileAlloc(t.io, case.name, t.allocator, .limited(100));
+        defer t.allocator.free(disk);
+        try t.expectEqualStrings(case.saved, disk);
+        // An explicit end_of_line rule also decides what Enter inserts next.
+        if (std.mem.eql(u8, case.name, "crlf.txt")) try t.expect(!saved.crlf);
+    }
+    {
+        // Typing continues on the same line after a (auto-)save mid-word.
+        try tmp.dir.writeFile(t.io, .{ .sub_path = "typing.txt", .data = "x" });
+        const path = try std.fs.path.join(t.allocator, &.{ root, "typing.txt" });
+        defer t.allocator.free(path);
+        const doc = try editor.openFile(path);
+        const id = doc.id;
+        doc.cursors.primary().offset = 1;
+        try doc.insertAtCursor("foo ");
+        try t.expectEqual(Editor.SaveOutcome.saved, editor.saveDocument(id, .{}));
+        const saved = &editor.documents.items[editor.docIndexForId(id).?];
+        try saved.insertAtCursor("bar");
+        try t.expectEqualStrings("xfoobar\n", saved.buffer.slice(0, saved.buffer.byteLen()));
+    }
+    {
+        // A lone 1-byte trim is its own undo step, not part of the Backspace run.
+        try tmp.dir.writeFile(t.io, .{ .sub_path = "merge.txt", .data = "abc" });
+        const path = try std.fs.path.join(t.allocator, &.{ root, "merge.txt" });
+        defer t.allocator.free(path);
+        const doc = try editor.openFile(path);
+        const id = doc.id;
+        doc.cursors.primary().offset = 3;
+        try doc.insertAtCursor("  ");
+        try doc.deleteCharacterAll(true);
+        try t.expectEqual(Editor.SaveOutcome.saved, editor.saveDocument(id, .{}));
+        const saved = &editor.documents.items[editor.docIndexForId(id).?];
+        try t.expectEqualStrings("abc", saved.buffer.slice(0, saved.buffer.byteLen()));
+        try t.expect(try saved.undoAction());
+        try t.expectEqualStrings("abc ", saved.buffer.slice(0, saved.buffer.byteLen()));
+        try t.expect(saved.dirty);
+    }
+}
+
+test "EditorConfig trouble never fails a save" {
+    const t = std.testing;
+    var tmp = t.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(t.io, "cached");
+    try tmp.dir.createDirPath(t.io, "broken/.editorconfig"); // unreadable from the start
+    try tmp.dir.writeFile(t.io, .{ .sub_path = "cached/.editorconfig", .data = "root = true\n[*]\ntrim_trailing_whitespace = true\n" });
+    try tmp.dir.writeFile(t.io, .{ .sub_path = "cached/a.txt", .data = "a\n" });
+    try tmp.dir.writeFile(t.io, .{ .sub_path = "broken/b.txt", .data = "b\n" });
+    const root = try tmp.dir.realPathFileAlloc(t.io, ".", t.allocator);
+    defer t.allocator.free(root);
+    const a_path = try std.fs.path.join(t.allocator, &.{ root, "cached", "a.txt" });
+    defer t.allocator.free(a_path);
+    const b_path = try std.fs.path.join(t.allocator, &.{ root, "broken", "b.txt" });
+    defer t.allocator.free(b_path);
+    var editor = try Editor.init(t.allocator, t.io);
+    defer editor.deinit();
+    editor.lsp_enabled = false;
+    // Opening caches cached/.editorconfig; then it becomes a directory, so
+    // re-checking the cache fails — that counts as unchanged.
+    const a = try editor.openFile(a_path);
+    const a_id = a.id;
+    try a.insertAtCursor("edit ");
+    try tmp.dir.deleteFile(t.io, "cached/.editorconfig");
+    try tmp.dir.createDirPath(t.io, "cached/.editorconfig");
+    try t.expectEqual(Editor.SaveOutcome.saved, editor.saveDocument(a_id, .{}));
+    try t.expect(!editor.documents.items[editor.docIndexForId(a_id).?].dirty);
+    // Resolving fails outright: the save goes ahead without the rules.
+    const b = try editor.openFile(b_path);
+    const b_id = b.id;
+    try b.insertAtCursor("edit  ");
+    try t.expectEqual(Editor.SaveOutcome.saved, editor.saveDocument(b_id, .{}));
+    try t.expectEqual(Editor.Mode.normal, editor.mode);
+    try t.expect(std.mem.startsWith(u8, editor.status_message, "Saved"));
+    const disk = try tmp.dir.readFileAlloc(t.io, "broken/b.txt", t.allocator, .limited(100));
+    defer t.allocator.free(disk);
+    try t.expectEqualStrings("edit  b\n", disk);
+}
+
+test "an open document whose path has no identity never blocks opening or saving others" {
+    const t = std.testing;
+    const builtin = @import("builtin");
+    const identity = @import("file_identity.zig");
+    var tmp = t.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(t.io, .{ .sub_path = "other.txt", .data = "other\n" });
+    const root = try tmp.dir.realPathFileAlloc(t.io, ".", t.allocator);
+    defer t.allocator.free(root);
+    const other = try std.fs.path.join(t.allocator, &.{ root, "other.txt" });
+    defer t.allocator.free(other);
+    const copy = try std.fs.path.join(t.allocator, &.{ root, "copy.txt" });
+    defer t.allocator.free(copy);
+    // Windows: a reserved device name (BadPathName); POSIX: an over-long
+    // name component (NameTooLong). Stands in for an unreachable share,
+    // AccessDenied or a sharing violation.
+    const odd = try std.fs.path.join(t.allocator, &.{ root, if (builtin.os.tag == .windows) "nul" else "x" ** 300 });
+    defer t.allocator.free(odd);
+    if (builtin.os.tag == .windows) {
+        const key = identity.key(t.allocator, t.io, odd);
+        if (key) |k| t.allocator.free(k) else |_| {}
+        try t.expect(std.meta.isError(key)); // the precondition, verified
+    }
+    var editor = try Editor.init(t.allocator, t.io);
+    defer editor.deinit();
+    editor.lsp_enabled = false;
+    try editor.activeDoc().setFilePath(odd); // no disk I/O
+    const doc = try editor.openFile(other);
+    try t.expect(std.mem.endsWith(u8, doc.file_path.?, "other.txt"));
+    try t.expectEqual(@as(usize, 2), editor.documents.items.len);
+    _ = try editor.openOrFocus(other); // finds the open tab again
+    try t.expectEqual(@as(usize, 2), editor.documents.items.len);
+    // Save As compares the destination with every open document.
+    try t.expectEqual(Editor.SaveOutcome.saved, editor.saveDocument(editor.activeDoc().id, .{ .path = copy }));
+    try t.expect(std.mem.endsWith(u8, editor.activeDoc().file_path.?, "copy.txt"));
+}
+
+fn caretLine(editor: *Editor) usize {
+    const doc = editor.activeDoc();
+    return doc.buffer.offsetToPos(doc.cursors.primary().offset).line;
+}
+
+test "navigation: back returns to the caret a jump left, forward re-jumps" {
+    const t = std.testing;
+    var editor = try Editor.init(t.allocator, t.io);
+    defer editor.deinit();
+    const a_id = editor.activeDoc().id;
+    try editor.activeDoc().insertAtCursor("one\ntwo\nthree\nfour\n");
+    editor.activeDoc().gotoLine(2);
+    // A jump records where it left from, then lands elsewhere.
+    editor.recordNavPoint();
+    const b = try editor.newDocument();
+    const b_id = b.id;
+    try b.insertAtCursor("x\ny\nz\n");
+    b.gotoLine(3);
+    try t.expect(editor.execAction("navigate_back"));
+    try t.expectEqual(a_id, editor.activeDoc().id);
+    try t.expectEqual(@as(usize, 1), caretLine(&editor));
+    try t.expect(editor.execAction("navigate_forward"));
+    try t.expectEqual(b_id, editor.activeDoc().id);
+    try t.expectEqual(@as(usize, 2), caretLine(&editor));
+    // Nothing further forward: stays put and says so.
+    try t.expect(editor.execAction("navigate_forward"));
+    try t.expectEqual(b_id, editor.activeDoc().id);
+    try t.expectEqualStrings("Nothing to go forward to", editor.status_message);
+}
+
+test "navigation: go to line is a recorded jump; a closed untitled buffer is skipped" {
+    const t = std.testing;
+    var editor = try Editor.init(t.allocator, t.io);
+    defer editor.deinit();
+    const a_id = editor.activeDoc().id;
+    try editor.activeDoc().insertAtCursor("1\n2\n3\n4\n5\n");
+    editor.activeDoc().gotoLine(1);
+    editor.jumpToLine(5);
+    try t.expectEqual(@as(usize, 4), caretLine(&editor));
+    try t.expect(editor.execAction("navigate_back"));
+    try t.expectEqual(@as(usize, 0), caretLine(&editor));
+    // A point in an untitled document that is closed afterwards cannot be
+    // reached and is dropped on the way back.
+    editor.recordNavPoint();
+    _ = try editor.newDocument();
+    editor.recordNavPoint();
+    _ = try editor.newDocument();
+    try t.expect(editor.requestCloseDoc(1));
+    try t.expect(editor.execAction("navigate_back"));
+    try t.expectEqual(a_id, editor.activeDoc().id);
+}
+
+test "reopen closed tab: the last closed file returns at its caret; open files and untitled buffers are skipped" {
+    const t = std.testing;
+    var tmp = t.tmpDir(.{});
+    defer tmp.cleanup();
+    inline for (.{ "a.txt", "b.txt" }) |name| {
+        const f = try tmp.dir.createFile(t.io, name, .{});
+        defer f.close(t.io);
+        try f.writeStreamingAll(t.io, "one\ntwo\nthree\n");
+    }
+    const root = try tmp.dir.realPathFileAlloc(t.io, ".", t.allocator);
+    defer t.allocator.free(root);
+    const a_path = try std.fs.path.join(t.allocator, &.{ root, "a.txt" });
+    defer t.allocator.free(a_path);
+    const b_path = try std.fs.path.join(t.allocator, &.{ root, "b.txt" });
+    defer t.allocator.free(b_path);
+
+    var editor = try Editor.init(t.allocator, t.io);
+    defer editor.deinit();
+    editor.lsp_enabled = false;
+    const a = try editor.openFile(a_path); // index 1
+    a.gotoLine(2);
+    _ = try editor.openFile(b_path); // index 2, active
+    try t.expect(editor.requestCloseDoc(1)); // a is clean: closed at once
+    try t.expectEqual(@as(usize, 2), editor.documents.items.len);
+    // An untitled buffer closed meanwhile is not remembered.
+    _ = try editor.newDocument();
+    try t.expect(editor.requestCloseDoc(editor.activeDocIdx()));
+    try t.expect(editor.execAction("reopen_closed_tab"));
+    try t.expect(editor.pathsEqual(editor.activeDoc().file_path.?, a_path));
+    try t.expectEqual(@as(usize, 1), caretLine(&editor));
+    // b closed, then opened again by hand: its entry is skipped and the
+    // list is empty.
+    const b_idx = (try editor.findDocument(b_path)).?;
+    try t.expect(editor.requestCloseDoc(b_idx));
+    _ = try editor.openFile(b_path);
+    try t.expect(editor.execAction("reopen_closed_tab"));
+    try t.expectEqualStrings("No closed tabs to reopen", editor.status_message);
+}
+
+test "projects: open folder re-roots the tree, keeps recents newest-first and persists them" {
+    const t = std.testing;
+    var tmp = t.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(t.io, "alpha/src");
+    try tmp.dir.createDirPath(t.io, "beta");
+    const root = try tmp.dir.realPathFileAlloc(t.io, ".", t.allocator);
+    defer t.allocator.free(root);
+    const alpha = try std.fs.path.join(t.allocator, &.{ root, "alpha" });
+    defer t.allocator.free(alpha);
+    const beta = try std.fs.path.join(t.allocator, &.{ root, "beta" });
+    defer t.allocator.free(beta);
+    const lua_settings = @import("lua_settings.zig");
+    lua_settings.test_config_dir = root; // recent_projects lands in the temp dir
+    defer lua_settings.test_config_dir = null;
+    {
+        var editor = try Editor.init(t.allocator, t.io);
+        defer editor.deinit();
+        editor.lsp_enabled = false;
+        try t.expect(editor.openProject(alpha));
+        try t.expect(std.mem.endsWith(u8, editor.filetree.?.root_path, "alpha"));
+        try t.expect(editor.openProject(beta));
+        try t.expect(editor.openProject(alpha)); // again: moves to the top, no duplicate
+        try t.expectEqual(@as(usize, 2), editor.recent_projects.items.len);
+        try t.expect(editor.pathsEqual(editor.recent_projects.items[0], alpha));
+        try t.expect(editor.pathsEqual(editor.recent_projects.items[1], beta));
+        // The tree's `o` re-roots into the selected folder.
+        const ft = editor.ensureFiletree().?;
+        const src_node = ft.findByPath("src").?;
+        ft.selected = ft.rowOf(src_node).?;
+        editor.filetreeOpenSelectedAsRoot();
+        try t.expect(std.mem.endsWith(u8, editor.filetree.?.root_path, "src"));
+        try t.expectEqual(@as(usize, 3), editor.recent_projects.items.len);
+        // A missing folder is refused and the current project stays.
+        try t.expect(!editor.openProject("Z:/no/such/folder/zide-test"));
+        try t.expect(std.mem.endsWith(u8, editor.filetree.?.root_path, "src"));
+    }
+    // A fresh editor reads the persisted list back.
+    var again = try Editor.init(t.allocator, t.io);
+    defer again.deinit();
+    again.ensureRecentProjects();
+    try t.expectEqual(@as(usize, 3), again.recent_projects.items.len);
+    try t.expect(std.mem.endsWith(u8, again.recent_projects.items[0], "src"));
+}
+
+test "completion: the typed prefix filters the list and typing keeps the popup open" {
+    const t = std.testing;
+    var editor = try Editor.init(t.allocator, t.io);
+    defer editor.deinit();
+    const doc = editor.activeDoc();
+    try doc.insertAtCursor("fo");
+    // Items as a server reply adds them (the editor owns the strings).
+    try editor.addCompletionEntry(.{ .label = try t.allocator.dupe(u8, "foo") });
+    try editor.addCompletionEntry(.{ .label = try t.allocator.dupe(u8, "Fob") });
+    try editor.addCompletionEntry(.{ .label = try t.allocator.dupe(u8, "bar") });
+    try t.expect(editor.completion_active);
+    try t.expectEqual(@as(usize, 3), editor.completion_all.items.len);
+    try t.expectEqual(@as(usize, 2), editor.completion_items.items.len);
+    try t.expect(editor.completionKeepsOnByte('x'));
+    try t.expect(editor.completionKeepsOnByte('_'));
+    try t.expect(!editor.completionKeepsOnByte(' '));
+    // Another identifier character narrows the list and keeps the popup
+    // (no server here, so the refresh request is simply skipped).
+    try t.expect(editor.execCommand("insert_char", "o"));
+    try t.expect(editor.completion_active);
+    try t.expectEqual(@as(usize, 1), editor.completion_items.items.len);
+    try t.expectEqualStrings("foo", editor.completion_items.items[0].label);
+    try t.expect(!editor.completion_stale);
+    // A space dismisses it.
+    try t.expect(editor.execCommand("insert_char", " "));
+    try t.expect(!editor.completion_active);
+    try t.expectEqual(@as(usize, 0), editor.completion_all.items.len);
 }

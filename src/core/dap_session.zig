@@ -3,6 +3,7 @@ const std = @import("std");
 const Editor = @import("editor.zig").Editor;
 const protocol = @import("protocol.zig");
 const output = @import("tool_output.zig");
+const text_input = @import("text_input.zig");
 const Allocator = std.mem.Allocator;
 const Value = std.json.Value;
 pub const Mode = enum { launch, attach };
@@ -18,6 +19,13 @@ pub const Request = struct {
     node: u64 = 0,
     configuration: bool = false,
 };
+/// Reply size caps. A reply over a cap is truncated with a note, never an
+/// error: `receive` errors end the whole session (and a launched debuggee).
+pub const max_threads = 4096;
+pub const max_frames = 4096;
+pub const max_scopes = 256;
+/// Variables deeper than this are shown but cannot be expanded.
+pub const max_variable_depth: u8 = 32;
 pub const Thread = struct { id: i64, name: []u8 };
 pub const Frame = struct { id: i64, name: []u8, path: ?[]u8, line: u32, column: u32 };
 pub const Node = struct {
@@ -102,9 +110,15 @@ pub const Session = struct {
         return self.phase != .terminated and self.phase != .failed;
     }
     pub fn note(self: *Session, text: []const u8) void {
-        const length = @min(text.len, self.reason.len);
+        var length = @min(text.len, self.reason.len);
+        // Never cut a UTF-8 sequence: frontends measure and draw this text.
+        while (length < text.len and length > 0 and text[length] & 0xc0 == 0x80) length -= 1;
         @memcpy(self.reason[0..length], text[0..length]);
         self.reason_len = length;
+    }
+    fn noteTruncated(self: *Session, what: []const u8, kept: usize, total: usize) void {
+        var buf: [128]u8 = undefined;
+        self.note(std.fmt.bufPrint(&buf, "Showing the first {d} of {d} {s}", .{ kept, total, what }) catch "Reply truncated at its size limit");
     }
     fn log(self: *Session, bytes: []const u8) !void {
         var clean: std.ArrayList(u8) = .empty;
@@ -230,7 +244,8 @@ pub const Session = struct {
             if (info.epoch != self.epoch and transient(info.command)) return;
             if (!std.mem.eql(u8, string(value, "command") orelse return error.InvalidDebugMessage, @tagName(info.command))) return error.MismatchedDebugResponse;
             if (!boolean(value, "success")) {
-                self.requestFailed(editor, info, string(value, "message") orelse "Adapter rejected request");
+                var text: [512]u8 = undefined;
+                self.requestFailed(editor, info, adapterError(&text, value));
                 return;
             }
             try self.response(editor, info, field(value, "body"));
@@ -302,8 +317,9 @@ pub const Session = struct {
             .threads => {
                 for (self.threads.items) |thread| self.allocator.free(thread.name);
                 self.threads.clearRetainingCapacity();
-                const items = array(body, "threads");
-                if (items.len > 4096) return error.TooManyDebugThreads;
+                const all = array(body, "threads");
+                const items = all[0..@min(all.len, max_threads)];
+                if (items.len < all.len) self.noteTruncated("threads", items.len, all.len);
                 for (items) |thread| {
                     const id = integer(thread, "id") orelse return error.InvalidDebugThread;
                     const name = try self.allocator.dupe(u8, string(thread, "name") orelse "thread");
@@ -326,8 +342,9 @@ pub const Session = struct {
             .stackTrace => {
                 if (self.phase != .stopped or self.selected_thread != info.handle) return;
                 self.clearFrames();
-                const items = array(body, "stackFrames");
-                if (items.len > 4096) return error.TooManyDebugFrames;
+                const all = array(body, "stackFrames");
+                const items = all[0..@min(all.len, max_frames)];
+                if (items.len < all.len) self.noteTruncated("stack frames", items.len, all.len);
                 for (items) |frame| {
                     const name = try self.allocator.dupe(u8, string(frame, "name") orelse "frame");
                     errdefer self.allocator.free(name);
@@ -336,14 +353,17 @@ pub const Session = struct {
                     errdefer if (path) |p| self.allocator.free(p);
                     try self.frames.append(self.allocator, .{ .id = integer(frame, "id") orelse return error.InvalidStackFrame, .name = name, .path = path, .line = std.math.cast(u32, integer(frame, "line") orelse 0) orelse 0, .column = std.math.cast(u32, integer(frame, "column") orelse 0) orelse 0 });
                 }
-                if (self.frames.items.len > 0) try self.selectFrame(editor, 0, editor.mode == .normal);
+                // Showing the top frame is best effort: a request failure here
+                // is noted, and an unavailable source only ever notes (G1).
+                if (self.frames.items.len > 0) _ = self.selectFrame(editor, 0, editor.mode == .normal) catch |err| self.note(@errorName(err));
             },
             .scopes => {
                 if (self.phase != .stopped or self.selected_frame != info.handle) return;
                 self.clearNodes();
-                const scopes = array(body, "scopes");
-                if (scopes.len > 256) return error.TooManyScopes;
+                const all = array(body, "scopes");
+                const scopes = all[0..@min(all.len, max_scopes)];
                 for (scopes) |scope| try self.appendNode(null, 0, scope, true);
+                if (scopes.len < all.len) self.noteTruncated("scopes", scopes.len, all.len);
             },
             .variables => {
                 if (self.phase != .stopped) return;
@@ -355,7 +375,8 @@ pub const Session = struct {
                     break;
                 };
                 const node = parent orelse return;
-                if (node.depth >= 32) return error.VariableDepthLimit;
+                // expand() refuses these, so only a stale reply lands here.
+                if (node.depth >= max_variable_depth) return self.note(depth_note);
                 for (array(body, "variables")) |variable| try self.appendNode(node.id, node.depth + 1, variable, false);
             },
             .disconnect => {
@@ -383,10 +404,17 @@ pub const Session = struct {
         self.node_bytes += name.len + text.len;
         self.tree_revision +%= 1;
     }
+    /// Toggle a variable node; expanding loads its children. A node at
+    /// `max_variable_depth` is not expanded: the session notes it and this
+    /// returns error.VariableDepthLimit (the session itself is unaffected).
     pub fn expand(self: *Session, index: usize) !void {
         if (self.phase != .stopped or index >= self.nodes.items.len) return;
         const node = &self.nodes.items[index];
         if (node.reference <= 0) return;
+        if (!node.expanded and node.depth >= max_variable_depth) {
+            self.note(depth_note);
+            return error.VariableDepthLimit;
+        }
         node.expanded = !node.expanded;
         self.tree_revision +%= 1;
         if (node.expanded and !node.loaded and !node.loading) {
@@ -398,7 +426,7 @@ pub const Session = struct {
         var parent = self.nodes.items[index].parent;
         var depth: usize = 0;
         while (parent) |id| {
-            if (depth >= 32) return false;
+            if (depth >= max_variable_depth) return false;
             const node = for (self.nodes.items) |item| {
                 if (item.id == id) break item;
             } else return false;
@@ -410,6 +438,8 @@ pub const Session = struct {
     }
     fn event(self: *Session, editor: *Editor, name: []const u8, body: Value) !void {
         if (std.mem.eql(u8, name, "output")) {
+            // DAP: telemetry output goes to telemetry, never to the user.
+            if (string(body, "category")) |category| if (std.mem.eql(u8, category, "telemetry")) return;
             try self.log(string(body, "output") orelse "");
             return;
         }
@@ -492,26 +522,45 @@ pub const Session = struct {
         self.clearFrames();
         _ = if (self.supports_stack_paging) try self.request(.stackTrace, .{ .threadId = thread, .startFrame = 0, .levels = 256 }, .{ .handle = thread }) else try self.request(.stackTrace, .{ .threadId = thread }, .{ .handle = thread });
     }
-    pub fn selectFrame(self: *Session, editor: *Editor, index: usize, open: bool) !void {
-        if (self.phase != .stopped or index >= self.frames.items.len) return;
+    /// Select frame `index` and request its scopes; with `open`, also show its
+    /// source. Returns false when that source could not be shown. A missing,
+    /// unreadable or undecodable source (libc, a moved toolchain, a deleted
+    /// cache file, a Latin-1 C file) is a note, never an error: only request
+    /// failures propagate. The open never prompts (no encoding picker pops
+    /// up behind a debugger stop).
+    pub fn selectFrame(self: *Session, editor: *Editor, index: usize, open: bool) !bool {
+        if (self.phase != .stopped or index >= self.frames.items.len) return true;
         const frame = self.frames.items[index];
         self.selected_frame = frame.id;
         self.clearNodes();
         _ = try self.request(.scopes, .{ .frameId = frame.id }, .{ .handle = frame.id });
         self.execution_doc = null;
-        if (frame.path) |path| {
-            if (try editor.findDocument(path)) |doc_index| self.execution_doc = editor.documents.items[doc_index].id;
-            self.execution_line = frame.line;
-            if (open and frame.line > 0) {
-                const owned = try self.allocator.dupe(u8, path);
-                defer self.allocator.free(owned);
-                // No borrowed frame fields are used after extension callbacks can run.
-                const doc = try editor.openOrFocus(owned);
-                doc.gotoLine(frame.line);
-                doc.cursors.primary().gotoPos(&doc.buffer, frame.line - 1, frame.column -| 1);
-                self.execution_doc = doc.id;
-            }
-        }
+        self.execution_line = frame.line;
+        // No borrowed frame fields are used after extension callbacks can run.
+        const path = try self.allocator.dupe(u8, frame.path orelse return true);
+        defer self.allocator.free(path);
+        const found = editor.findDocument(path) catch |err| {
+            self.sourceUnavailable(editor, path, err);
+            return false;
+        };
+        if (found) |doc_index| self.execution_doc = editor.documents.items[doc_index].id;
+        if (!open or frame.line == 0) return true;
+        // openOrFocus without its interactive encoding fallback; a stop is
+        // a jump the user can navigate back from.
+        editor.recordNavPoint();
+        const doc = editor.openFileWithEncoding(path, editor.knownEncoding(path), false) catch |err| {
+            self.sourceUnavailable(editor, path, err);
+            return false;
+        };
+        doc.gotoLine(frame.line);
+        doc.cursors.primary().gotoPos(&doc.buffer, frame.line - 1, frame.column -| 1);
+        self.execution_doc = doc.id;
+        return true;
+    }
+    fn sourceUnavailable(self: *Session, editor: *Editor, path: []const u8, err: anyerror) void {
+        var buf: [1024]u8 = undefined;
+        self.note(std.fmt.bufPrint(&buf, "Source unavailable: {s} ({s})", .{ path, @errorName(err) }) catch "Source unavailable (path too long)");
+        editor.status_message = std.fmt.bufPrint(&editor.status_buf, "Debug: source unavailable: {s} ({s})", .{ std.fs.path.basename(path), @errorName(err) }) catch "Debug: source unavailable";
     }
     pub fn control(self: *Session, command: Command) !void {
         if (command == .pause) {
@@ -542,6 +591,40 @@ pub const Session = struct {
     }
 };
 
+const depth_note = "Variables nest deeper than 32 levels; the rest is not shown";
+/// The user-facing text of a failed response: DAP puts it in `body.error`
+/// (a Message: `format` with `{name}` placeholders filled from `variables`);
+/// `message` is only the short raw form. Unknown placeholders stay literal.
+fn adapterError(buf: []u8, response_value: Value) []const u8 {
+    const raw = string(response_value, "message") orelse "Adapter rejected request";
+    const detail = field(field(response_value, "body"), "error");
+    const format = string(detail, "format") orelse return raw;
+    if (format.len == 0) return raw;
+    const variables = field(detail, "variables");
+    var len: usize = 0;
+    var i: usize = 0;
+    while (i < format.len) {
+        // Whole slices only (a literal run, a value or one '{'), so the
+        // cut at the buffer's end is always on a UTF-8 boundary.
+        const brace = std.mem.indexOfScalarPos(u8, format, i, '{') orelse format.len;
+        var piece = format[i..brace];
+        var next = brace;
+        if (piece.len == 0) {
+            piece = format[i .. i + 1];
+            next = i + 1;
+            if (std.mem.indexOfScalarPos(u8, format, i + 1, '}')) |end| if (string(variables, format[i + 1 .. end])) |value| {
+                piece = value;
+                next = end + 1;
+            };
+        }
+        const fits = text_input.floor(piece, buf.len - len);
+        @memcpy(buf[len..][0..fits], piece[0..fits]);
+        len += fits;
+        if (fits < piece.len) break;
+        i = next;
+    }
+    return buf[0..len];
+}
 fn transient(command: Command) bool {
     return command == .threads or command == .stackTrace or command == .scopes or command == .variables;
 }
@@ -629,6 +712,148 @@ test "DAP ordering, breakpoint verification, resume invalidation and unsupported
     try t.expect(boolean(field(stop.value, "arguments"), "terminateDebuggee"));
     try testReply(session, &editor, .disconnect, "{}");
     try t.expectEqual(Phase.terminated, session.phase);
+}
+
+/// A fake session already stopped on thread 9 (no adapter process).
+fn stoppedTestSession(editor: *Editor, root: []const u8) !*Session {
+    const session = try Session.create(editor, "fake", root, "{}", .launch, 1, false);
+    editor.dap.session = session;
+    session.phase = .stopped;
+    session.selected_thread = 9;
+    return session;
+}
+fn reasonHas(session: *const Session, needle: []const u8) bool {
+    return std.mem.indexOf(u8, session.reason[0..session.reason_len], needle) != null;
+}
+
+test "DAP: an unopenable or undecodable top-frame source is a note, never a session failure" {
+    const t = std.testing;
+    var tmp = t.tmpDir(.{});
+    defer tmp.cleanup();
+    const base = try tmp.dir.realPathFileAlloc(t.io, ".", t.allocator);
+    defer t.allocator.free(base);
+    const legacy = try std.fs.path.join(t.allocator, &.{ base, "legacy.c" });
+    defer t.allocator.free(legacy);
+    try @import("text_file.zig").atomicWrite(t.allocator, t.io, legacy, "caf\xe9\n");
+    var editor = try Editor.init(t.allocator, t.io);
+    defer editor.deinit();
+    editor.lsp_enabled = false;
+    const session = try stoppedTestSession(&editor, base);
+    editor.mode = .normal; // the stop may open the source
+    try session.selectThread(9);
+    try testReply(session, &editor, .stackTrace, "{\"stackFrames\":[{\"id\":10,\"name\":\"main\",\"line\":3,\"column\":1,\"source\":{\"path\":\"missing/gone.c\"}}]}");
+    try t.expectEqual(Phase.stopped, session.phase);
+    try t.expect(session.peer == null and session.active());
+    try t.expect(reasonHas(session, "Source unavailable"));
+    try t.expect(reasonHas(session, "gone.c"));
+    try t.expect(session.execution_doc == null);
+    try t.expectEqual(@as(u32, 3), session.execution_line);
+    try t.expectEqual(@as(usize, 1), editor.documents.items.len);
+    // The frame's scopes were still requested.
+    try testReply(session, &editor, .scopes, "{\"scopes\":[{\"name\":\"Locals\",\"variablesReference\":100}]}");
+    try t.expectEqual(@as(usize, 1), session.nodes.items.len);
+
+    // A file that needs an encoding choice: no picker behind the stop.
+    try session.selectThread(9);
+    try testReply(session, &editor, .stackTrace, "{\"stackFrames\":[{\"id\":11,\"name\":\"legacy\",\"line\":1,\"column\":1,\"source\":{\"path\":\"legacy.c\"}}]}");
+    try t.expectEqual(Phase.stopped, session.phase);
+    try t.expectEqual(Editor.Mode.normal, editor.mode);
+    try t.expect(reasonHas(session, "EncodingRequired"));
+    try t.expectEqual(@as(usize, 1), editor.documents.items.len);
+
+    // The Stack view keeps the panel open on an unavailable source.
+    editor.dap.show(&editor, .stack);
+    editor.dap.activate(&editor, 0);
+    try t.expectEqual(Editor.Mode.tool_panel, editor.mode);
+    try t.expectEqual(Phase.stopped, session.phase);
+}
+
+test "DAP: oversized replies are truncated with a note and deep variables stop expanding, never fatal" {
+    const t = std.testing;
+    var editor = try Editor.init(t.allocator, t.io);
+    defer editor.deinit();
+    editor.lsp_enabled = false;
+    editor.mode = .confirm_quit; // nothing opens in this test
+    const session = try stoppedTestSession(&editor, ".");
+    var json: std.ArrayList(u8) = .empty;
+    defer json.deinit(t.allocator);
+
+    try json.appendSlice(t.allocator, "{\"threads\":[");
+    for (0..5000) |i| try json.print(t.allocator, "{s}{{\"id\":{d},\"name\":\"t\"}}", .{ if (i > 0) "," else "", i + 1 });
+    try json.appendSlice(t.allocator, "]}");
+    _ = try session.request(.threads, .{}, .{});
+    try testReply(session, &editor, .threads, json.items);
+    try t.expectEqual(Phase.stopped, session.phase);
+    try t.expectEqual(@as(usize, max_threads), session.threads.items.len);
+    try t.expect(reasonHas(session, "4096 of 5000 threads"));
+
+    json.clearRetainingCapacity();
+    try json.appendSlice(t.allocator, "{\"stackFrames\":[");
+    for (0..5000) |i| try json.print(t.allocator, "{s}{{\"id\":{d},\"name\":\"f\",\"line\":0}}", .{ if (i > 0) "," else "", i + 1 });
+    try json.appendSlice(t.allocator, "]}");
+    try testReply(session, &editor, .stackTrace, json.items); // requested by the threads reply
+    try t.expectEqual(Phase.stopped, session.phase);
+    try t.expectEqual(@as(usize, max_frames), session.frames.items.len);
+    try t.expect(reasonHas(session, "4096 of 5000 stack frames"));
+
+    json.clearRetainingCapacity();
+    try json.appendSlice(t.allocator, "{\"scopes\":[");
+    for (0..300) |i| try json.print(t.allocator, "{s}{{\"name\":\"s\",\"variablesReference\":{d}}}", .{ if (i > 0) "," else "", i + 1 });
+    try json.appendSlice(t.allocator, "]}");
+    try testReply(session, &editor, .scopes, json.items); // requested for the top frame
+    try t.expectEqual(Phase.stopped, session.phase);
+    try t.expectEqual(@as(usize, max_scopes), session.nodes.items.len);
+    try t.expect(reasonHas(session, "256 of 300 scopes"));
+
+    // A linked list 33 levels deep: the 33rd expansion is refused.
+    try t.expect(try session.selectFrame(&editor, 0, false));
+    try testReply(session, &editor, .scopes, "{\"scopes\":[{\"name\":\"Locals\",\"variablesReference\":1}]}");
+    for (0..max_variable_depth) |level| {
+        try session.expand(session.nodes.items.len - 1);
+        const reply = try std.fmt.allocPrint(t.allocator, "{{\"variables\":[{{\"name\":\"next\",\"value\":\"*\",\"variablesReference\":{d}}}]}}", .{level + 2});
+        defer t.allocator.free(reply);
+        try testReply(session, &editor, .variables, reply);
+    }
+    const deepest = session.nodes.items.len - 1;
+    try t.expectEqual(max_variable_depth, session.nodes.items[deepest].depth);
+    try t.expectError(error.VariableDepthLimit, session.expand(deepest));
+    try t.expect(!session.nodes.items[deepest].expanded);
+    try t.expectEqual(@as(usize, 0), session.pending.count());
+    try t.expectEqual(Phase.stopped, session.phase);
+    try t.expect(reasonHas(session, "32 levels"));
+    // The Variables view lists every level and reports the refusal.
+    editor.dap.view = .variables;
+    try t.expectEqual(@as(usize, max_variable_depth) + 1, editor.dap.count(&editor));
+    editor.dap.activate(&editor, max_variable_depth);
+    try t.expect(std.mem.indexOf(u8, editor.status_message, "32 levels") != null);
+    try t.expectEqual(Phase.stopped, session.phase);
+}
+
+test "DAP: adapter errors show body.error.format and telemetry output stays hidden" {
+    const t = std.testing;
+    var editor = try Editor.init(t.allocator, t.io);
+    defer editor.deinit();
+    const session = try stoppedTestSession(&editor, ".");
+    const seq = try session.request(.threads, .{}, .{});
+    const failure = try std.fmt.allocPrint(t.allocator, "{{\"type\":\"response\",\"request_seq\":{d},\"command\":\"threads\",\"success\":false,\"message\":\"raw\",\"body\":{{\"error\":{{\"id\":7,\"format\":\"Cannot read {{what}} at {{_addr}} ({{missing}})\",\"variables\":{{\"what\":\"memory\",\"_addr\":\"0x10\"}}}}}}}}", .{seq});
+    defer t.allocator.free(failure);
+    try session.receive(&editor, failure);
+    try t.expectEqualStrings("Cannot read memory at 0x10 ({missing})", session.reason[0..session.reason_len]);
+    try t.expectEqual(Phase.stopped, session.phase);
+    const plain = try session.request(.threads, .{}, .{});
+    const bare = try std.fmt.allocPrint(t.allocator, "{{\"type\":\"response\",\"request_seq\":{d},\"command\":\"threads\",\"success\":false,\"message\":\"only raw\"}}", .{plain});
+    defer t.allocator.free(bare);
+    try session.receive(&editor, bare);
+    try t.expectEqualStrings("only raw", session.reason[0..session.reason_len]);
+    var buf: [8]u8 = undefined;
+    const long = try std.json.parseFromSlice(Value, t.allocator, "{\"message\":\"m\",\"body\":{\"error\":{\"format\":\"abcdefg\\u00e9\"}}}", .{});
+    defer long.deinit();
+    try t.expectEqualStrings("abcdefg", adapterError(&buf, long.value)); // never ends inside é
+
+    try session.receive(&editor, "{\"type\":\"event\",\"event\":\"output\",\"body\":{\"category\":\"telemetry\",\"output\":\"usage ping\\n\"}}");
+    try t.expectEqual(@as(usize, 0), session.output.text.items.len);
+    try session.receive(&editor, "{\"type\":\"event\",\"event\":\"output\",\"body\":{\"category\":\"stdout\",\"output\":\"hello\\n\"}}");
+    try t.expectEqualStrings("hello\n", session.output.text.items);
 }
 
 test "DAP attach detaches by default, late initialize cannot launch, and timeouts are explicit" {

@@ -1,11 +1,16 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const text_input = @import("../core/text_input.zig");
 const vaxis = @import("vaxis");
+const keybind = @import("../core/keybind.zig");
+const cursor_mod = @import("../core/cursor.zig");
+const lua_api = @import("../core/lua_api.zig");
 const Editor = @import("../core/editor.zig").Editor;
 const Document = @import("../core/document.zig").Document;
 const Layout = @import("../core/layout.zig").Layout;
 const TuiColor = @import("../core/theme.zig").TuiColor;
 const syntax = @import("../core/syntax.zig");
+const brackets = @import("../core/brackets.zig");
 const lsp = @import("../core/lsp.zig");
 const terminal_mod = @import("../core/terminal.zig");
 const filetree_mod = @import("../core/filetree.zig");
@@ -72,8 +77,10 @@ const ByteLut = struct {
 
 /// Per-frame storage for multi-byte grapheme strings referenced by vaxis
 /// cells (see header comment — cell text must outlive vx.render). Reset at
-/// the top of each frame in `run`.
-var grapheme_arena: [128 * 1024]u8 = undefined;
+/// the top of each frame in `run`. Sized for a large screen of non-ASCII
+/// terminal cells (btop, lazygit) plus the editor panes: 128 KB ran out and
+/// cells rendered as "?".
+var grapheme_arena: [256 * 1024]u8 = undefined;
 var grapheme_arena_len: usize = 0;
 
 fn frameArenaReset() void {
@@ -121,8 +128,9 @@ fn getWinsizeWindows() ?vaxis.Winsize {
     const stdout: std.Io.File = .stdout();
     var info: CONSOLE_SCREEN_BUFFER_INFO = undefined;
     if (GetConsoleScreenBufferInfo(stdout.handle, &info) != 0) {
-        const cols: u16 = @intCast(info.srWindow.Right - info.srWindow.Left + 1);
-        const rows: u16 = @intCast(info.srWindow.Bottom - info.srWindow.Top + 1);
+        const r = info.srWindow;
+        const cols: u16 = @intCast(std.math.clamp(@as(i32, r.Right) - r.Left + 1, 1, std.math.maxInt(u16)));
+        const rows: u16 = @intCast(std.math.clamp(@as(i32, r.Bottom) - r.Top + 1, 1, std.math.maxInt(u16)));
         return .{ .rows = rows, .cols = cols, .x_pixel = 0, .y_pixel = 0 };
     }
     return null;
@@ -136,6 +144,14 @@ const Event = union(enum) {
     winsize: vaxis.Winsize,
     focus_in,
     focus_out,
+    /// Bracketed paste (POSIX terminals — vaxis's Windows reader forwards
+    /// no paste markers): the key presses between these two are the pasted
+    /// text, collected and applied as one edit (`pasteKey`).
+    paste_start,
+    paste_end,
+    /// OSC 52 clipboard reply (only ever sent after a request); freed with
+    /// the loop's paste allocator.
+    paste: []const u8,
     lsp_data,
     terminal_data,
     lua_job_data,
@@ -147,12 +163,15 @@ const Event = union(enum) {
 /// race; both threads are joined moments later in the deinit path).
 var global_loop: ?*vaxis.Loop(Event) = null;
 
+// The wakes never block: `tryPostEvent` drops the wake when the queue is
+// full — the queued events already guarantee the main loop runs again. (A
+// blocking post parked worker threads on a full queue; with a wake called
+// under a job/peer mutex, the UI then froze waiting on that mutex.)
+
 /// Wake function called from LSP reader thread to unblock nextEvent.
 fn lspWakeFn() void {
     if (global_loop) |loop_ptr| {
-        // Queue full or canceled: drop the wake — pending events already
-        // guarantee the main loop runs again.
-        loop_ptr.postEvent(.lsp_data) catch {};
+        _ = loop_ptr.tryPostEvent(.lsp_data) catch false;
     }
 }
 
@@ -160,7 +179,7 @@ fn lspWakeFn() void {
 /// landed in a grid — unblocks nextEvent so the pane repaints.
 fn terminalWakeFn() void {
     if (global_loop) |loop_ptr| {
-        loop_ptr.postEvent(.terminal_data) catch {};
+        _ = loop_ptr.tryPostEvent(.terminal_data) catch false;
     }
 }
 
@@ -168,8 +187,168 @@ fn terminalWakeFn() void {
 /// queued — unblocks nextEvent so pumpLuaJobs runs promptly.
 fn luaJobWakeFn() void {
     if (global_loop) |loop_ptr| {
-        loop_ptr.postEvent(.lua_job_data) catch {};
+        _ = loop_ptr.tryPostEvent(.lua_job_data) catch false;
     }
+}
+
+/// One loop event. Window resizes need the tty; everything else is input.
+fn processEvent(editor: *Editor, vx: *vaxis.Vaxis, allocator: std.mem.Allocator, writer: *std.Io.Writer, event: Event) !void {
+    switch (event) {
+        .winsize => |ws| {
+            try vx.resize(allocator, writer, ws);
+            vx.refresh = true;
+        },
+        else => handleInputEvent(editor, event, vx.opts.system_clipboard_allocator),
+    }
+}
+
+/// Keyboard, mouse and paste events. `paste_alloc` frees `.paste` payloads.
+fn handleInputEvent(editor: *Editor, event: Event, paste_alloc: ?std.mem.Allocator) void {
+    switch (event) {
+        .key_press => |key| if (paste_active) pasteKey(editor, key) else dispatchKey(editor, key),
+        .mouse => |mouse| {
+            // A paste never contains clicks: one arriving mid-paste means the
+            // end marker was lost — apply what came and stop collecting keys.
+            if (paste_active) finishPaste(editor);
+            handleMouse(editor, mouse);
+        },
+        .paste_start => {
+            paste_active = true;
+            paste_buf.clearRetainingCapacity();
+        },
+        .paste_end => if (paste_active) finishPaste(editor),
+        .paste => |text| {
+            applyPaste(editor, text);
+            if (paste_alloc) |a| a.free(text);
+        },
+        else => {},
+    }
+}
+
+fn finishPaste(editor: *Editor) void {
+    paste_active = false;
+    applyPaste(editor, paste_buf.items);
+    paste_buf.clearRetainingCapacity();
+    // Don't keep a huge paste's buffer around
+    if (paste_buf.capacity > 1 << 20) paste_buf.clearAndFree(editor.allocator);
+}
+
+// ===========================================================================
+// Paste
+// ===========================================================================
+
+/// Bracketed-paste collector. Between paste_start and paste_end the pasted
+/// text arrives as ordinary key presses; typed one by one they ran Enter's
+/// auto-indent and the auto-closing brackets (staircase indentation,
+/// doubled brackets), so they are gathered here and applied once.
+var paste_active: bool = false;
+var paste_buf: std.ArrayList(u8) = .empty;
+/// A runaway paste stops collecting here (the rest is dropped).
+const paste_limit: usize = 64 * 1024 * 1024;
+
+/// Collect one pasted key. Raw line breaks are kept (CR from Enter, LF
+/// from a legacy Ctrl+J) and normalized when the paste is applied.
+fn pasteKey(editor: *Editor, key: Key) void {
+    var cp_buf: [4]u8 = undefined;
+    const bytes: []const u8 = switch (key.codepoint) {
+        Key.enter => "\r",
+        Key.tab => "\t",
+        else => blk: {
+            if (key.mods.ctrl and key.codepoint == 'j' and key.text == null) break :blk "\n";
+            if (key.mods.ctrl or key.mods.alt) break :blk ""; // other control bytes
+            if (key.text) |text| break :blk text;
+            if (key.codepoint < 0x20 or (key.codepoint >= 0xE000 and key.codepoint <= 0xF8FF)) break :blk "";
+            const n = std.unicode.utf8Encode(key.codepoint, &cp_buf) catch break :blk "";
+            break :blk cp_buf[0..n];
+        },
+    };
+    if (paste_buf.items.len + bytes.len > paste_limit) return;
+    paste_buf.appendSlice(editor.allocator, bytes) catch {};
+}
+
+/// First line of `text` (up to the first CR or LF).
+fn firstLine(text: []const u8) []const u8 {
+    return text[0 .. std.mem.indexOfAny(u8, text, "\r\n") orelse text.len];
+}
+
+/// Where a paste goes: the focused terminal's program (bracketed when it
+/// asked for that), the document as one edit, the search field or a
+/// single-line prompt as typed text (its first line). Pickers and
+/// confirmation prompts never take a paste — a pasted letter must not
+/// answer them.
+fn applyPaste(editor: *Editor, text: []const u8) void {
+    if (text.len == 0) return;
+    editor.validateSnippetState();
+    defer editor.validateSnippetState();
+    switch (editor.mode) {
+        .normal => switch (editor.keyboardOwner()) {
+            .terminal => if (activeTerminal(editor)) |term| term.paste(text),
+            .editor => pasteIntoDocument(editor, text),
+            .search => typeLine(editor, firstLine(text)),
+            .filetree => {},
+        },
+        .find, .find_replace, .file_open, .folder_open, .save_as, .command_palette, .picker, .goto_line, .file_finder, .symbol_rename => typeLine(editor, firstLine(text)),
+        .filetree_prompt => if (editor.filetree_prompt_kind != .delete_confirm) typeLine(editor, firstLine(text)),
+        else => {},
+    }
+}
+
+/// Insert pasted text at every cursor as ONE edit: no auto-indent, no
+/// auto-closed brackets. Line breaks become the document's; other control
+/// characters are dropped.
+fn pasteIntoDocument(editor: *Editor, text: []const u8) void {
+    editor.clearCompletionItems();
+    const doc = editor.activeDoc();
+    const eol = doc.lineEnding();
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(editor.allocator);
+    out.ensureTotalCapacity(editor.allocator, text.len) catch {
+        editor.status_message = "Paste failed: out of memory";
+        return;
+    };
+    var i: usize = 0;
+    while (i < text.len) : (i += 1) {
+        const b = text[i];
+        const ok = switch (b) {
+            '\r', '\n' => blk: {
+                if (b == '\r' and i + 1 < text.len and text[i + 1] == '\n') i += 1;
+                break :blk out.appendSlice(editor.allocator, eol);
+            },
+            '\t' => out.append(editor.allocator, '\t'),
+            0x00...0x08, 0x0B, 0x0C, 0x0E...0x1F, 0x7F => {},
+            else => out.append(editor.allocator, b),
+        };
+        ok catch {
+            editor.status_message = "Paste failed: out of memory";
+            return;
+        };
+    }
+    doc.insertAtAllCursors(out.items) catch {
+        editor.status_message = "Paste failed: out of memory";
+        return;
+    };
+    scroll_pinned = false;
+    editor.status_message = "";
+}
+
+/// Type `line` into the focused input as key presses (control characters
+/// skipped): the search field and the single-line prompts.
+fn typeLine(editor: *Editor, line: []const u8) void {
+    var i: usize = 0;
+    while (i < line.len) {
+        const ch = charAt(line, i);
+        const bytes = line[i..][0..ch.len];
+        i += ch.len;
+        if (ch.cp < 0x20 or ch.cp == 0x7F or (ch.cp == 0xFFFD and bytes.len == 1)) continue;
+        dispatchKey(editor, .{ .codepoint = ch.cp, .text = bytes });
+    }
+}
+
+/// The terminal shown in the focused pane, if any.
+fn activeTerminal(editor: *Editor) ?*terminal_mod.Terminal {
+    const idx = editor.activePaneTerminalIdx() orelse return null;
+    if (idx >= editor.terminals.items.len) return null;
+    return editor.terminals.items[idx];
 }
 
 /// When true, the user explicitly scrolled (wheel) so ensureCursorVisible is skipped.
@@ -219,6 +398,16 @@ pub fn run(allocator: std.mem.Allocator, editor: *Editor) !void {
 
     // Enter alternate screen
     try vx.enterAltScreen(tty.writer());
+    // Mouse reporting and bracketed paste (vx.deinit turns both off again).
+    // POSIX only: a Windows console already delivers mouse events (vaxis
+    // sets MOUSE_INPUT) and vaxis's Windows reader forwards no paste
+    // markers. Without these, Linux/macOS terminals had no mouse at all and
+    // pastes arrived as typed keys.
+    if (builtin.os.tag != .windows) {
+        try vx.setMouseMode(tty.writer(), true);
+        try vx.setBracketedPaste(tty.writer(), true);
+    }
+    defer paste_buf.clearAndFree(editor.allocator);
 
     // On Windows, we can get the initial size directly instead of waiting
     // for a winsize event (which may not arrive on all terminals)
@@ -249,15 +438,7 @@ pub fn run(allocator: std.mem.Allocator, editor: *Editor) !void {
     while (editor.running) {
         // Drain all pending events
         while (loop.tryEvent() catch null) |event| {
-            switch (event) {
-                .key_press => |key| dispatchKey(editor, key),
-                .mouse => |mouse| handleMouse(editor, mouse),
-                .winsize => |ws| {
-                    try vx.resize(allocator, tty.writer(), ws);
-                    vx.refresh = true;
-                },
-                else => {},
-            }
+            try processEvent(editor, &vx, allocator, tty.writer(), event);
         }
 
         // Language servers: sweep dead ones, drain messages, sync documents
@@ -301,16 +482,11 @@ pub fn run(allocator: std.mem.Allocator, editor: *Editor) !void {
 
         if (height < 3 or width < 10) {
             try vx.render(tty.writer());
-            const event = try loop.nextEvent();
-            switch (event) {
-                .key_press => |key| dispatchKey(editor, key),
-                .mouse => |mouse| handleMouse(editor, mouse),
-                .winsize => |ws| {
-                    try vx.resize(allocator, tty.writer(), ws);
-                    vx.refresh = true;
-                },
-                else => {},
-            }
+            // Same deadline wait as a normal frame: auto-save, file polls and
+            // queued LSP work keep running while the window is tiny.
+            const tiny_micros = editor.deadlines.waitMicros(std.Io.Clock.now(.awake, editor.io).nanoseconds);
+            const event = try loop.nextEventTimeout(.{ .duration = .{ .raw = .fromMicroseconds(tiny_micros), .clock = .awake } }) orelse continue;
+            try processEvent(editor, &vx, allocator, tty.writer(), event);
             continue;
         }
 
@@ -337,12 +513,17 @@ pub fn run(allocator: std.mem.Allocator, editor: *Editor) !void {
             .file_open => {
                 drawOverlay(win, editor, "Open: ", editor.open_buf[0..editor.open_buf_len], width, height);
             },
+            .folder_open => {
+                drawOverlay(win, editor, "Open folder: ", editor.open_buf[0..editor.open_buf_len], width, height);
+            },
+            .recent_projects => drawRecentProjects(win, editor, width, height),
             .save_as => {
                 drawOverlay(win, editor, "Save As: ", editor.open_buf[0..editor.open_buf_len], width, height);
             },
             .command_palette => {
                 drawCommandPalette(win, editor, width, height);
             },
+            .picker => drawPicker(win, editor, width, height),
             .goto_line => {
                 drawOverlay(win, editor, "Go to line: ", editor.goto_buf[0..editor.goto_buf_len], width, height);
             },
@@ -381,18 +562,24 @@ pub fn run(allocator: std.mem.Allocator, editor: *Editor) !void {
                         const target = editor.filetree_prompt_target orelse "";
                         const del_count = if (editor.filetree) |*t| t.selectionCount() else 1;
                         const title = if (del_count > 1)
-                            std.fmt.bufPrint(&buf, "Delete {d} selected items? [Y]es [N]o: ", .{del_count}) catch "Delete? [Y]es [N]o: "
+                            std.fmt.bufPrint(&buf, "Delete {d} selected items? [Y]es / any other key cancels: ", .{del_count}) catch "Delete? [Y]es / any other key cancels: "
                         else
-                            std.fmt.bufPrint(&buf, "Delete {s}? [Y]es [N]o: ", .{target}) catch "Delete? [Y]es [N]o: ";
+                            std.fmt.bufPrint(&buf, "Delete {s}? [Y]es / any other key cancels: ", .{target}) catch "Delete? [Y]es / any other key cancels: ";
                         drawOverlay(win, editor, title, "", width, height);
                     },
                 }
             },
-            // No terminal cursor while the file tree owns the keyboard —
-            // the tree shows its own selection bar instead.
-            .normal => if (!editor.filetree_focused) positionCursor(win, editor, width, height),
+            // The caret follows the keyboard: the editor's or the terminal's
+            // cursor, none while a side panel owns the keys (the tree and the
+            // search panel draw their own selection / field marker).
+            .normal => switch (editor.keyboardOwner()) {
+                .editor, .terminal => positionCursor(win, editor, width, height),
+                .filetree, .search => win.hideCursor(),
+            },
         }
 
+        // Signature help above the caret, then the completion popup on top
+        if (editor.signatureVisible()) drawSignatureHelp(win, editor, width, height);
         // Draw completion popup on top of everything (when active)
         if (editor.completion_active) {
             drawCompletionPopup(win, editor, width, height);
@@ -403,15 +590,7 @@ pub fn run(allocator: std.mem.Allocator, editor: *Editor) !void {
         // Sleep until input/background work or the next shared deadline.
         const micros = editor.deadlines.waitMicros(std.Io.Clock.now(.awake, editor.io).nanoseconds);
         const event = try loop.nextEventTimeout(.{ .duration = .{ .raw = .fromMicroseconds(micros), .clock = .awake } }) orelse continue;
-        switch (event) {
-            .key_press => |key| dispatchKey(editor, key),
-            .mouse => |mouse| handleMouse(editor, mouse),
-            .winsize => |ws| {
-                try vx.resize(allocator, tty.writer(), ws);
-                vx.refresh = true;
-            },
-            else => {},
-        }
+        try processEvent(editor, &vx, allocator, tty.writer(), event);
     }
 }
 
@@ -421,10 +600,16 @@ fn dispatchKey(editor: *Editor, key: Key) void {
     defer editor.validateSnippetState();
     // The close-after-Save-As hand-off only spans one Save As prompt.
     if (editor.mode != .save_as) close_tab_after_save_as = false;
-    // Terminal pane: route keys to PTY (except ctrl+backtick for toggle)
-    if (editor.mode == .normal and editor.activePaneIsTerminal()) {
-        handleTerminalKey(editor, key);
-        return;
+    // Normal mode: exactly one owner gets the keys. A focused side panel
+    // outranks the focused pane — a terminal pane used to swallow keys
+    // meant for the tree or the search field shown focused beside it.
+    if (editor.mode == .normal) {
+        switch (editor.keyboardOwner()) {
+            .terminal => return handleTerminalKey(editor, key),
+            .filetree => return handleFiletreeKey(editor, key),
+            .search => return handleSearchKey(editor, key),
+            .editor => {},
+        }
     }
     if (editor.editorOwnsInput() and !key.mods.ctrl and !key.mods.alt and !key.mods.super) {
         const snippet_key: ?Editor.SnippetKey = switch (key.codepoint) {
@@ -442,18 +627,19 @@ fn dispatchKey(editor: *Editor, key: Key) void {
         handleCompletionKey(editor, key);
         return;
     }
+    // The inline prompts below answer only unmodified letters: Ctrl+S or
+    // Ctrl+D pressed out of habit must not stage, save or discard.
+    const plain = !hasCommandMod(key);
     switch (editor.mode) {
-        .normal => if (editor.filetree_focused)
-            handleFiletreeKey(editor, key)
-        else if (editor.search_focused)
-            handleSearchKey(editor, key)
-        else
-            handleKey(editor, key),
+        .normal => handleKey(editor, key),
         .find => handleFindKey(editor, key),
         .find_replace => handleFindReplaceKey(editor, key),
         .file_open => handleFileOpenKey(editor, key),
+        .folder_open => handleFolderOpenKey(editor, key),
+        .recent_projects => handleRecentProjectsKey(editor, key),
         .save_as => handleSaveAsKey(editor, key),
         .command_palette => handlePaletteKey(editor, key),
+        .picker => handlePickerKey(editor, key),
         .file_finder => handleFinderKey(editor, key),
         .goto_line => handleGotoLineKey(editor, key),
         .confirm_quit => handleConfirmQuitKey(editor, key),
@@ -462,18 +648,18 @@ fn dispatchKey(editor: *Editor, key: Key) void {
         .encoding_picker, .confirm_reopen, .confirm_encoding => handleEncodingKey(editor, key),
         .lsp_panel, .symbol_rename, .workspace_preview => handleLspKey(editor, key),
         .tool_panel => handleToolKey(editor, key),
-        .git_stage_prompt => switch (key.codepoint) {
+        .git_stage_prompt => if (plain) switch (key.codepoint) {
             's', 'S' => editor.git.resolveStage(editor, true),
             'c', 'C', Key.escape => editor.git.resolveStage(editor, false),
             else => {},
         },
-        .task_save_prompt => switch (key.codepoint) {
+        .task_save_prompt => if (plain) switch (key.codepoint) {
             's', 'S' => editor.tasks.resolveSave(editor, .save),
             'r', 'R' => editor.tasks.resolveSave(editor, .run),
             'c', 'C', Key.escape => editor.tasks.resolveSave(editor, .cancel),
             else => {},
         },
-        .recovery_picker => switch (key.codepoint) {
+        .recovery_picker => if (plain) switch (key.codepoint) {
             'r', 'R' => editor.resolveRecovery(.recover),
             'd', 'D' => editor.resolveRecovery(.discard),
             'l', 'L', Key.escape => editor.resolveRecovery(.later),
@@ -481,14 +667,23 @@ fn dispatchKey(editor: *Editor, key: Key) void {
         },
         .settings => {
             // Settings panel is GUI-only; Escape returns to normal
-            if (key.codepoint == 0x1b) editor.mode = .normal; // Escape
+            if (key.codepoint == Key.escape) editor.setMode(.normal);
         },
         .filetree_prompt => handleFiletreePromptKey(editor, key),
     }
 }
 
+/// A chord modifier (Ctrl, Alt, Super) is held: such a key is never a
+/// letter answering a prompt.
+fn hasCommandMod(key: Key) bool {
+    return key.mods.ctrl or key.mods.alt or key.mods.super;
+}
+
 /// Handle key events when focused on a terminal pane.
 fn handleTerminalKey(editor: *Editor, key: Key) void {
+    // Modifier keys alone send nothing (their private-use codes used to be
+    // dropped by accident; now explicitly).
+    if (key.isModifier()) return;
     // ctrl+backtick (`) toggles back to editor
     if (key.codepoint == '`' and key.mods.ctrl and !key.mods.alt) {
         editor.toggleTerminal();
@@ -505,53 +700,66 @@ fn handleTerminalKey(editor: *Editor, key: Key) void {
         }
     }
 
-    // Get the active terminal
-    const term_idx = editor.activePaneTerminalIdx() orelse return;
-    if (term_idx >= editor.terminals.items.len) return;
-    const term = editor.terminals.items[term_idx] orelse return;
-
-    // Map vaxis key to terminal key encoding
-    var out: [16]u8 = undefined;
-    const cp: u21 = mapVaxisKey(key);
-    if (cp == 0) return;
-
-    const n = terminal_mod.Terminal.encodeKey(
-        cp,
-        key.mods.ctrl,
-        key.mods.alt,
-        key.mods.shift,
-        &out,
-    );
-    if (n > 0) {
-        term.writeInput(out[0..n]);
-    }
+    const term = activeTerminal(editor) orelse return;
+    var out: [64]u8 = undefined;
+    const bytes = terminalKeyBytes(key, term.appCursorKeys(), &out);
+    if (bytes.len > 0) term.writeInput(bytes);
 }
 
-/// Map a vaxis Key to a codepoint for terminal key encoding.
-fn mapVaxisKey(key: Key) u21 {
-    // If there's a codepoint, use it directly
-    if (key.codepoint > 0 and key.codepoint < 0xF700) {
-        return key.codepoint;
-    }
-
-    // Special keys
-    return switch (key.codepoint) {
-        Key.enter => 0x0D,
+/// ZIDE's terminal key code (terminal.zig `key_*`) for a vaxis special key,
+/// or null. vaxis reports the specials as kitty private-use code points
+/// (Up = 57352) — sent as text they reached the shell as UTF-8 junk.
+fn mapVaxisKey(codepoint: u21) ?u21 {
+    return switch (codepoint) {
+        Key.enter, Key.kp_enter => 0x0D,
         Key.tab => 0x09,
-        Key.backspace => 0x08,
+        Key.backspace => 0x7F,
         Key.escape => 0x1B,
-        Key.up => 0xF700,
-        Key.down => 0xF701,
-        Key.left => 0xF702,
-        Key.right => 0xF703,
-        Key.home => 0xF704,
-        Key.end => 0xF705,
-        Key.page_up => 0xF706,
-        Key.page_down => 0xF707,
-        Key.insert => 0xF708,
-        Key.delete => 0xF709,
-        else => 0,
+        Key.up, Key.kp_up => terminal_mod.key_up,
+        Key.down, Key.kp_down => terminal_mod.key_down,
+        Key.left, Key.kp_left => terminal_mod.key_left,
+        Key.right, Key.kp_right => terminal_mod.key_right,
+        Key.home, Key.kp_home => terminal_mod.key_home,
+        Key.end, Key.kp_end => terminal_mod.key_end,
+        Key.page_up, Key.kp_page_up => terminal_mod.key_page_up,
+        Key.page_down, Key.kp_page_down => terminal_mod.key_page_down,
+        Key.insert, Key.kp_insert => terminal_mod.key_insert,
+        Key.delete, Key.kp_delete => terminal_mod.key_delete,
+        Key.f1...Key.f12 => terminal_mod.key_f1 + (codepoint - Key.f1),
+        else => null,
     };
+}
+
+/// The bytes a key press sends to a terminal pane's program: VT sequences
+/// for the special keys (xterm modifier parameters; SS3 arrows when the
+/// program switched on application cursor keys), C0 bytes for Ctrl chords
+/// (Ctrl+[ is ESC), and otherwise the key's text — every byte of it, so
+/// emoji, CJK and multi-code-point graphemes arrive whole. Empty when the
+/// key sends nothing (modifier-only and media keys).
+fn terminalKeyBytes(key: Key, app_cursor: bool, out: *[64]u8) []const u8 {
+    const ctrl = key.mods.ctrl;
+    const alt = key.mods.alt;
+    var enc: [16]u8 = undefined;
+    if (mapVaxisKey(key.codepoint)) |code| {
+        const n = terminal_mod.Terminal.encodeKeyMode(code, ctrl, alt, key.mods.shift, app_cursor, &enc);
+        @memcpy(out[0..n], enc[0..n]);
+        return out[0..n];
+    }
+    // Typed text (Alt = ESC prefix). A Ctrl chord's text is the plain
+    // character on some consoles, so those take encodeKey's C0 table.
+    if (!ctrl) if (key.text) |text| if (text.len > 0 and text.len < out.len) {
+        const n: usize = if (alt) 1 else 0;
+        out[0] = 0x1B;
+        @memcpy(out[n..][0..text.len], text);
+        return out[0 .. n + text.len];
+    };
+    // Private-use codes without text (modifier and media keys) and
+    // multi-code-point keys whose text was lost send nothing.
+    if (key.codepoint >= 0xE000 and key.codepoint <= 0xF8FF) return out[0..0];
+    if (key.codepoint > 0x10FFFF) return out[0..0];
+    const n = terminal_mod.Terminal.encodeKey(key.codepoint, ctrl, alt, key.mods.shift, &enc);
+    @memcpy(out[0..n], enc[0..n]);
+    return out[0..n];
 }
 
 /// Rectangle in screen space. Used to route mouse clicks to panes.
@@ -573,16 +781,16 @@ fn pushPaneRect(pane_id: u8, x: u16, y: u16, w: u16, h: u16) void {
     pane_rect_count += 1;
 }
 
-/// Find which pane contains screen coordinates (col, row). Returns pane_id and
-/// the local (pane-relative) coordinates.
-fn resolvePaneAt(editor: *Editor, col: i16, row: i16) ?struct { pane_id: u8, local_x: u16, local_y: u16 } {
+/// Find which pane contains screen coordinates (col, row). Returns pane_id,
+/// the local (pane-relative) coordinates and the pane's rect.
+fn resolvePaneAt(editor: *Editor, col: i16, row: i16) ?struct { pane_id: u8, local_x: u16, local_y: u16, rect: PaneRect } {
     _ = editor;
     if (col < 0 or row < 0) return null;
     const cx: u16 = @intCast(col);
     const ry: u16 = @intCast(row);
     for (pane_rects[0..pane_rect_count]) |pr| {
         if (cx >= pr.x and cx < pr.x + pr.w and ry >= pr.y and ry < pr.y + pr.h) {
-            return .{ .pane_id = pr.pane_id, .local_x = cx - pr.x, .local_y = ry - pr.y };
+            return .{ .pane_id = pr.pane_id, .local_x = cx - pr.x, .local_y = ry - pr.y, .rect = pr };
         }
     }
     return null;
@@ -599,6 +807,7 @@ const SearchBand = struct { y: u16, h: u16 };
 var search_band: ?SearchBand = null;
 var encoding_band: ?FiletreeBand = null;
 var encoding_picker_band: ?FiletreeBand = null;
+var recent_projects_band: ?FiletreeBand = null;
 
 /// Double-click state for tree rows: single click on a row NAME only
 /// selects; a second click on the same row within the threshold toggles
@@ -619,6 +828,7 @@ fn drawEditor(win: Window, editor: *Editor, width: u16, height: u16) void {
     search_band = null;
     encoding_band = null;
     encoding_picker_band = null;
+    recent_projects_band = null;
     if (!editor.activePaneIsTerminal()) {
         const w: u16 = @intCast(@min(editor.activeDoc().format.label().len + 2, width));
         encoding_band = .{ .x = width -| w, .y = height -| 1, .w = w, .h = 1 };
@@ -643,7 +853,8 @@ fn drawEditor(win: Window, editor: *Editor, width: u16, height: u16) void {
     var tree_w: u16 = 0;
     if (editor.filetree_visible) {
         if (width < 40) {
-            editor.filetree_focused = false;
+            // Not drawn: a hidden tree must not keep the keyboard
+            if (editor.filetree_focused) _ = editor.takeKeyboardFocus(.pane);
         } else if (editor.ensureFiletree() != null) {
             tree_w = @min(editor.tui_filetree_width, width / 2);
             if (tree_w < 16) tree_w = 16;
@@ -849,8 +1060,8 @@ fn mouseOverSearch(mouse: vaxis.Mouse) bool {
 /// a double click (toggle dir / open file) so a stray click never opens
 /// or collapses anything.
 fn handleFiletreeClick(editor: *Editor, band: FiletreeBand, col_abs: u16, row_abs: u16) void {
+    if (!editor.takeKeyboardFocus(.filetree)) return;
     const ft = editor.ensureFiletree() orelse return;
-    editor.filetree_focused = true;
     if (row_abs <= band.y) {
         // Header: the ^ button re-roots at the parent folder
         const hdr_text_x: u16 = if (editor.filetree_side == .left) 0 else 1;
@@ -901,7 +1112,7 @@ fn handleFiletreeClick(editor: *Editor, band: FiletreeBand, col_abs: u16, row_ab
 fn openFiletreeFileTui(editor: *Editor, ft: *FileTree, idx: u32) void {
     const abs = ft.absPathAlloc(editor.allocator, idx) catch return;
     defer editor.allocator.free(abs);
-    _ = editor.openOrFocus(abs) catch |err| {
+    _ = editor.navOpen(abs) catch |err| {
         editor.status_message = if (err == error.BinaryFile)
             "Cannot open: binary file"
         else
@@ -1027,11 +1238,12 @@ fn drawPane(win: Window, editor: *Editor, pane_id: u8, width: u16, height: u16) 
                 editor.text_width = tw;
 
                 if (!scroll_pinned) {
+                    const tab = tabStop(editor, doc);
                     if (editor.wordWrapFor(doc)) {
                         doc.scroll_left = 0;
-                        ensureCursorVisibleWrapped(doc, height, width, editor.gutter_min_digits);
+                        ensureCursorVisibleWrapped(doc, height, width, editor.gutter_min_digits, tab);
                     } else {
-                        doc.ensureCursorVisible(height, width -| 5);
+                        ensureCursorVisibleNoWrap(doc, height, tw, tab);
                     }
                 }
             }
@@ -1039,7 +1251,7 @@ fn drawPane(win: Window, editor: *Editor, pane_id: u8, width: u16, height: u16) 
             const wrap = editor.wordWrapFor(doc);
             drawContent(win, doc, editor, width, height, wrap);
             if (is_active and doc.cursors.count() > 1) {
-                drawSecondaryCursors(win, doc, editor, width, height, wrap);
+                drawSecondaryCursors(win, doc, editor, width, height);
             }
         },
         .terminal => |term_idx| {
@@ -1145,37 +1357,129 @@ fn drawTabBar(win: Window, editor: *Editor, width: u16) void {
 }
 
 // ===========================================================================
-// Word-wrap helpers (display-width aware, UTF-8 safe)
+// Cell math (display-width aware, UTF-8 safe)
+//
+// One rule maps text to screen cells for everything — drawing, the caret,
+// clicks, selections and wrapping: `cellWidth`. A tab reaches the next tab
+// stop; zero-width code points (combining marks, ZWJ, variation selectors,
+// control characters) take no cell; wide characters take two — the
+// per-code-point widths vaxis lays text out with (its `.wcwidth` method,
+// the one ZIDE's screen uses; drawn text never contains a tab, see
+// `writeText`). Tab stops count from the start of the visual row: the line
+// start without wrapping, each wrapped row's start with it.
 // ===========================================================================
 
-/// Count the display width of a text slice.
-/// Each non-continuation byte counts as 1 column (ASCII and UTF-8 lead bytes).
-/// Continuation bytes (10xxxxxx) are skipped.
-fn displayWidth(text: []const u8) usize {
-    var w: usize = 0;
-    for (text) |byte| {
-        if ((byte & 0xC0) != 0x80) w += 1;
-    }
-    return w;
+/// One code point at a byte offset: its value and byte length. A stray
+/// continuation byte reads as zero-width code point 0 (so a position inside
+/// a character snaps forward to the next one); other invalid bytes are
+/// U+FFFD, one byte each.
+const Char = struct { cp: u21, len: usize };
+
+fn charAt(text: []const u8, i: usize) Char {
+    const b = text[i];
+    if (b < 0x80) return .{ .cp = b, .len = 1 };
+    if (b & 0xC0 == 0x80) return .{ .cp = 0, .len = 1 };
+    const n = std.unicode.utf8ByteSequenceLength(b) catch return .{ .cp = 0xFFFD, .len = 1 };
+    if (i + n > text.len) return .{ .cp = 0xFFFD, .len = 1 };
+    const cp = std.unicode.utf8Decode(text[i..][0..n]) catch return .{ .cp = 0xFFFD, .len = 1 };
+    return .{ .cp = cp, .len = n };
 }
 
-/// Advance through `line` starting at `start_pos`, consuming up to `text_width`
-/// display columns. Returns the byte end position for this visual row.
-/// Uses word-boundary wrapping: prefers breaking after spaces.
-fn wrapAdvanceRow(line: []const u8, text_width: usize, start_pos: usize) usize {
+/// Cells code point `cp` takes when it starts at cell column `col` (tab
+/// stops every `tab` columns, tab >= 1).
+fn cellWidth(cp: u21, col: usize, tab: usize) usize {
+    if (cp == '\t') return tab - col % tab;
+    if (cp < 0x80) return @intFromBool(cp >= 0x20 and cp != 0x7f);
+    var buf: [4]u8 = undefined;
+    const n = std.unicode.utf8Encode(cp, &buf) catch return 1;
+    return vaxis.gwidth.gwidth(buf[0..n], .wcwidth);
+}
+
+/// Tab stop width for `doc` (never 0).
+fn tabStop(editor: *const Editor, doc: *const Document) usize {
+    return @max(1, editor.tabWidthFor(doc));
+}
+
+/// Cell column after `text` drawn from column `col`.
+fn advanceCols(text: []const u8, col: usize, tab: usize) usize {
+    var c = col;
+    var i: usize = 0;
+    while (i < text.len) {
+        const ch = charAt(text, i);
+        c += cellWidth(ch.cp, c, tab);
+        i += ch.len;
+    }
+    return c;
+}
+
+/// Cell column of byte `byte` of `line` (tab stops from the line start). A
+/// byte inside a character counts that whole character: it snaps forward.
+fn colOfByte(line: []const u8, byte: usize, tab: usize) usize {
+    const end = @min(byte, line.len);
+    var c: usize = 0;
+    var i: usize = 0;
+    while (i < end) {
+        const ch = charAt(line, i);
+        c += cellWidth(ch.cp, c, tab);
+        i += ch.len;
+    }
+    return c;
+}
+
+/// Byte offset in `text` (which starts at cell column `col0`) for cell
+/// column `target`: the first character starting at or after it — or, with
+/// `nearest`, the nearer edge of a tab or wide character that covers it.
+/// Zero-width code points at the target are stepped over, so a position
+/// never lands between a character and its combining marks.
+fn byteAtCol(text: []const u8, col0: usize, target: usize, tab: usize, nearest: bool) usize {
+    var c = col0;
+    var i: usize = 0;
+    while (i < text.len) {
+        const ch = charAt(text, i);
+        const w = cellWidth(ch.cp, c, tab);
+        if (w > 0) {
+            if (c >= target) return i;
+            if (nearest and target < c + w and target - c < (w + 1) / 2) return i;
+        }
+        c += w;
+        i += ch.len;
+    }
+    return text.len;
+}
+
+/// End of the characters of `text` (starting at column `col0`) that fit
+/// before column `limit`; zero-width marks at the edge included, a wide
+/// character straddling it left out.
+fn fitEnd(text: []const u8, col0: usize, limit: usize, tab: usize) usize {
+    var c = col0;
+    var i: usize = 0;
+    while (i < text.len) {
+        const ch = charAt(text, i);
+        const w = cellWidth(ch.cp, c, tab);
+        if (c + w > limit) break;
+        c += w;
+        i += ch.len;
+    }
+    return i;
+}
+
+/// End byte of the visual row starting at `start_pos` of a wrapped line:
+/// the characters that fit in `text_width` cells, broken after the last
+/// space when a word would be cut. Always advances — a character wider
+/// than the whole row gets a row of its own.
+fn wrapAdvanceRow(line: []const u8, text_width: usize, start_pos: usize, tab: usize) usize {
     if (text_width == 0) return line.len;
     var pos = start_pos;
     var col: usize = 0;
     var last_space: ?usize = null;
 
     while (pos < line.len) {
-        const byte = line[pos];
-        if ((byte & 0xC0) != 0x80) { // character start
-            if (col >= text_width) break; // this char would exceed width
-            if (byte == ' ') last_space = pos + 1; // break after space
-            col += 1;
-        }
-        pos += 1;
+        const ch = charAt(line, pos);
+        const w = cellWidth(ch.cp, col, tab);
+        if (col > 0 and col + w > text_width) break; // this char would exceed width
+        if (ch.cp == ' ') last_space = pos + 1; // break after space
+        col += w;
+        pos += ch.len;
     }
 
     // If we hit the width limit and there's more text, try word break
@@ -1188,42 +1492,98 @@ fn wrapAdvanceRow(line: []const u8, text_width: usize, start_pos: usize) usize {
 }
 
 /// Count how many visual rows a line occupies with word wrapping.
-fn wrapLineRows(line: []const u8, text_width: u16) u16 {
+fn wrapLineRows(line: []const u8, text_width: u16, tab: usize) u16 {
     if (text_width == 0 or line.len == 0) return 1;
-    const tw: usize = text_width;
     var rows: u16 = 0;
     var pos: usize = 0;
     while (pos < line.len) {
-        pos = wrapAdvanceRow(line, tw, pos);
-        rows += 1;
+        pos = wrapAdvanceRow(line, text_width, pos, tab);
+        rows +|= 1;
     }
     return if (rows == 0) 1 else rows;
 }
 
 /// Given a byte column within a line, find which visual wrap row it falls on
-/// and what display column within that row.
-fn wrapColToVisual(line: []const u8, text_width: u16, byte_col: usize) struct { row: u16, col: u16 } {
-    if (text_width == 0) return .{ .row = 0, .col = @intCast(@min(byte_col, 65535)) };
-    const tw: usize = text_width;
+/// and what cell column within that row.
+fn wrapColToVisual(line: []const u8, text_width: u16, byte_col: usize, tab: usize) struct { row: u16, col: u16 } {
+    if (text_width == 0) return .{ .row = 0, .col = @intCast(@min(colOfByte(line, byte_col, tab), 65535)) };
     var visual_row: u16 = 0;
     var pos: usize = 0;
 
     while (pos < line.len) {
         const row_start = pos;
-        pos = wrapAdvanceRow(line, tw, pos);
+        pos = wrapAdvanceRow(line, text_width, pos, tab);
         const row_end = pos;
 
         if (byte_col < row_end or pos >= line.len) {
             const clamped = @min(byte_col, row_end);
             const effective_start = @min(row_start, clamped);
-            const dcol = displayWidth(line[effective_start..clamped]);
+            const dcol = advanceCols(line[effective_start..clamped], 0, tab);
             return .{ .row = visual_row, .col = @intCast(@min(dcol, 65535)) };
         }
-        visual_row += 1;
+        visual_row +|= 1;
     }
     // Cursor at end of empty line
     return .{ .row = visual_row, .col = 0 };
 }
+
+/// Byte column for cell column `preferred_col` on visual row `target_row`
+/// of a wrapped line (the nearer edge of a tab or wide character there). On
+/// a row that continues, the result stays on that row.
+fn wrapVisualToCol(line: []const u8, text_width: u16, target_row: u16, preferred_col: usize, tab: usize) usize {
+    if (text_width == 0) return 0;
+    var row: u16 = 0;
+    var pos: usize = 0;
+
+    while (pos < line.len) {
+        const row_start = pos;
+        pos = wrapAdvanceRow(line, text_width, pos, tab);
+
+        if (row == target_row) {
+            const b = row_start + byteAtCol(line[row_start..pos], 0, preferred_col, tab, true);
+            // For non-final rows, clamp to the last character start within
+            // the row so wrapColToVisual maps it to this row, not the next.
+            if (b >= pos and pos < line.len and pos > row_start) {
+                var last = pos - 1;
+                while (last > row_start and (line[last] & 0xC0) == 0x80) last -= 1;
+                return last;
+            }
+            return b;
+        }
+        row +|= 1;
+    }
+    return line.len;
+}
+
+/// Sticky visual column for Up/Down with word wrap (Design 7): the cell
+/// column a run of vertical moves aims for, so moving down through a short
+/// line comes back out at the column it started from. A cursor keeps its
+/// target while it sits where the last vertical move put it; any other
+/// motion or edit that moves it starts a new run. Entries are keyed by that
+/// placed offset, so each cursor of a multi-cursor set keeps its own.
+const VerticalMotion = struct {
+    const capacity = 64;
+    doc_id: u64 = 0,
+    count: usize = 0,
+    placed: [capacity]usize = undefined,
+    target: [capacity]usize = undefined,
+
+    fn lookup(self: *const VerticalMotion, doc_id: u64, offset: usize) ?usize {
+        if (self.doc_id != doc_id) return null;
+        for (self.placed[0..self.count], self.target[0..self.count]) |placed, target| {
+            if (placed == offset) return target;
+        }
+        return null;
+    }
+
+    fn record(self: *VerticalMotion, offset: usize, target: usize) void {
+        if (self.count == capacity) return;
+        self.placed[self.count] = offset;
+        self.target[self.count] = target;
+        self.count += 1;
+    }
+};
+var vertical_motion: VerticalMotion = .{};
 
 /// Move cursor up or down by one visual (wrapped) row.
 /// When word wrap is on, this moves through screen rows rather than logical lines.
@@ -1232,17 +1592,19 @@ fn moveVisualVertical(editor: *Editor, direction: enum { up, down }, extend_sele
     const buf = &doc.buffer;
     const total_lines = doc.lineCount();
     const text_width: u16 = editor.text_width;
+    const tab = tabStop(editor, doc);
 
     if (text_width == 0) return;
 
+    var next: VerticalMotion = .{ .doc_id = doc.id };
     for (doc.cursors.cursors.items) |*c| {
         const pos = buf.offsetToPos(c.offset);
         const cur_line = doc.lineContent(pos.line);
-        const wrap_pos = wrapColToVisual(cur_line, text_width, pos.col);
-        // Target column is the DISPLAY column within the current visual row —
-        // preferred_col is a byte column within the whole logical line, which
-        // made vertical movement in wrapped lines snap to row ends.
-        const target_dcol: usize = wrap_pos.col;
+        const wrap_pos = wrapColToVisual(cur_line, text_width, pos.col, tab);
+        // The target is a CELL column on the visual row (preferred_col is a
+        // byte column of the whole logical line, which snapped to row ends);
+        // a run of vertical moves keeps the column it started with.
+        const target_col: usize = vertical_motion.lookup(doc.id, c.offset) orelse wrap_pos.col;
 
         if (!extend_selection) {
             c.clearSelection();
@@ -1253,29 +1615,31 @@ fn moveVisualVertical(editor: *Editor, direction: enum { up, down }, extend_sele
         switch (direction) {
             .up => {
                 if (wrap_pos.row > 0) {
-                    const target_col = wrapVisualToCol(cur_line, text_width, wrap_pos.row - 1, target_dcol);
-                    c.offset = @import("../core/cursor.zig").lineOffset(buf, pos.line, target_col);
+                    const byte_col = wrapVisualToCol(cur_line, text_width, wrap_pos.row - 1, target_col, tab);
+                    c.offset = cursor_mod.lineOffset(buf, pos.line, byte_col);
                 } else if (pos.line > 0) {
                     const prev_line = doc.lineContent(pos.line - 1);
-                    const prev_rows = wrapLineRows(prev_line, text_width);
-                    const target_col = wrapVisualToCol(prev_line, text_width, prev_rows - 1, target_dcol);
-                    c.offset = @import("../core/cursor.zig").lineOffset(buf, pos.line - 1, target_col);
+                    const prev_rows = wrapLineRows(prev_line, text_width, tab);
+                    const byte_col = wrapVisualToCol(prev_line, text_width, prev_rows - 1, target_col, tab);
+                    c.offset = cursor_mod.lineOffset(buf, pos.line - 1, byte_col);
                 }
             },
             .down => {
-                const cur_rows = wrapLineRows(cur_line, text_width);
+                const cur_rows = wrapLineRows(cur_line, text_width, tab);
                 if (wrap_pos.row + 1 < cur_rows) {
-                    const target_col = wrapVisualToCol(cur_line, text_width, wrap_pos.row + 1, target_dcol);
-                    c.offset = @import("../core/cursor.zig").lineOffset(buf, pos.line, target_col);
+                    const byte_col = wrapVisualToCol(cur_line, text_width, wrap_pos.row + 1, target_col, tab);
+                    c.offset = cursor_mod.lineOffset(buf, pos.line, byte_col);
                 } else if (pos.line + 1 < total_lines) {
                     const next_line = doc.lineContent(pos.line + 1);
-                    const target_col = wrapVisualToCol(next_line, text_width, 0, target_dcol);
-                    c.offset = @import("../core/cursor.zig").lineOffset(buf, pos.line + 1, target_col);
+                    const byte_col = wrapVisualToCol(next_line, text_width, 0, target_col, tab);
+                    c.offset = cursor_mod.lineOffset(buf, pos.line + 1, byte_col);
                 }
             },
         }
+        next.record(c.offset, target_col);
     }
     doc.cursors.mergeCursors();
+    vertical_motion = next;
 }
 
 /// Dispatch a keybind action with TUI-specific overrides (visual-row multi-cursor).
@@ -1293,12 +1657,24 @@ fn execTuiAction(editor: *Editor, action: []const u8) void {
     _ = editor.execAction(action);
 }
 
+/// Add a cursor at `offset` with its own preferred column: a bare
+/// addCursor leaves it 0, so the next Up/Down (or the next add-cursor,
+/// which starts from the outermost cursor) snapped to column 0.
+fn addCursorAt(doc: *Document, offset: usize) void {
+    doc.cursors.addCursor(offset) catch return;
+    const col = doc.buffer.offsetToPos(offset).col;
+    for (doc.cursors.cursors.items) |*c| {
+        if (c.offset == offset) c.preferred_col = col;
+    }
+}
+
 /// Add a new cursor one visual (wrapped) row above or below the outermost cursor.
 fn tuiAddCursorVisual(editor: *Editor, direction: enum { up, down }) void {
     const doc = editor.activeDoc();
     const buf = &doc.buffer;
     const total_lines = doc.lineCount();
     const text_width: u16 = editor.text_width;
+    const tab = tabStop(editor, doc);
 
     if (text_width == 0) return;
 
@@ -1308,7 +1684,7 @@ fn tuiAddCursorVisual(editor: *Editor, direction: enum { up, down }) void {
     var edge_wrap_row: u16 = 0;
     for (doc.cursors.cursors.items, 0..) |c, i| {
         const pos = buf.offsetToPos(c.offset);
-        const wrap_pos = wrapColToVisual(doc.lineContent(pos.line), text_width, pos.col);
+        const wrap_pos = wrapColToVisual(doc.lineContent(pos.line), text_width, pos.col, tab);
         switch (direction) {
             .up => if (pos.line < edge_line or (pos.line == edge_line and wrap_pos.row < edge_wrap_row)) {
                 edge_line = pos.line;
@@ -1325,78 +1701,40 @@ fn tuiAddCursorVisual(editor: *Editor, direction: enum { up, down }) void {
 
     const ref_cursor = doc.cursors.cursors.items[edge_idx];
     const cur_line = doc.lineContent(edge_line);
-    // Use the edge cursor's display column within its visual row (see
+    // Use the edge cursor's cell column within its visual row (see
     // moveVisualVertical — preferred_col is the wrong unit here).
     const ref_pos = buf.offsetToPos(ref_cursor.offset);
-    const ref_dcol: usize = wrapColToVisual(cur_line, text_width, ref_pos.col).col;
+    const ref_dcol: usize = wrapColToVisual(cur_line, text_width, ref_pos.col, tab).col;
 
     switch (direction) {
         .up => {
             if (edge_wrap_row > 0) {
-                const target_col = wrapVisualToCol(cur_line, text_width, edge_wrap_row - 1, ref_dcol);
-                doc.cursors.addCursor(buf.posToOffset(edge_line, target_col)) catch {};
+                const target_col = wrapVisualToCol(cur_line, text_width, edge_wrap_row - 1, ref_dcol, tab);
+                addCursorAt(doc, buf.posToOffset(edge_line, target_col));
             } else if (edge_line > 0) {
                 const prev_line = doc.lineContent(edge_line - 1);
-                const prev_rows = wrapLineRows(prev_line, text_width);
-                const target_col = wrapVisualToCol(prev_line, text_width, prev_rows - 1, ref_dcol);
-                doc.cursors.addCursor(buf.posToOffset(edge_line - 1, target_col)) catch {};
+                const prev_rows = wrapLineRows(prev_line, text_width, tab);
+                const target_col = wrapVisualToCol(prev_line, text_width, prev_rows - 1, ref_dcol, tab);
+                addCursorAt(doc, buf.posToOffset(edge_line - 1, target_col));
             }
         },
         .down => {
-            const cur_rows = wrapLineRows(cur_line, text_width);
+            const cur_rows = wrapLineRows(cur_line, text_width, tab);
             if (edge_wrap_row + 1 < cur_rows) {
-                const target_col = wrapVisualToCol(cur_line, text_width, edge_wrap_row + 1, ref_dcol);
-                doc.cursors.addCursor(buf.posToOffset(edge_line, target_col)) catch {};
+                const target_col = wrapVisualToCol(cur_line, text_width, edge_wrap_row + 1, ref_dcol, tab);
+                addCursorAt(doc, buf.posToOffset(edge_line, target_col));
             } else if (edge_line + 1 < total_lines) {
                 const next_line = doc.lineContent(edge_line + 1);
-                const target_col = wrapVisualToCol(next_line, text_width, 0, ref_dcol);
-                doc.cursors.addCursor(buf.posToOffset(edge_line + 1, target_col)) catch {};
+                const target_col = wrapVisualToCol(next_line, text_width, 0, ref_dcol, tab);
+                addCursorAt(doc, buf.posToOffset(edge_line + 1, target_col));
             }
         },
     }
-}
-
-/// Convert a visual row and preferred display column to a byte column within a line.
-/// Finds the byte offset at the given visual wrap row that corresponds to the
-/// desired display column.
-fn wrapVisualToCol(line: []const u8, text_width: u16, target_row: u16, preferred_dcol: usize) usize {
-    if (text_width == 0) return 0;
-    const tw: usize = text_width;
-    var row: u16 = 0;
-    var pos: usize = 0;
-
-    while (pos < line.len) {
-        const row_start = pos;
-        pos = wrapAdvanceRow(line, tw, pos);
-
-        if (row == target_row) {
-            // Walk through this row's bytes to find the byte at preferred_dcol
-            var dcol: usize = 0;
-            var byte_pos = row_start;
-            while (byte_pos < pos) {
-                if (dcol >= preferred_dcol) return byte_pos;
-                if ((line[byte_pos] & 0xC0) != 0x80) dcol += 1;
-                byte_pos += 1;
-            }
-            // For non-final rows, clamp to the last character start within
-            // the row so wrapColToVisual maps it to this row, not the next.
-            if (pos < line.len and byte_pos > row_start) {
-                byte_pos -= 1;
-                while (byte_pos > row_start and (line[byte_pos] & 0xC0) == 0x80) {
-                    byte_pos -= 1;
-                }
-                return byte_pos;
-            }
-            return @min(byte_pos, line.len);
-        }
-        row += 1;
-    }
-    return line.len;
 }
 
 /// Ensure the cursor is visible when word wrapping is active.
 /// Accounts for variable visual row heights per logical line.
-fn ensureCursorVisibleWrapped(doc: *Document, editor_height: u16, width: u16, min_digits: usize) void {
+fn ensureCursorVisibleWrapped(doc: *Document, editor_height: u16, width: u16, min_digits: usize, tab: usize) void {
     if (editor_height == 0) return;
     const total_lines = doc.lineCount();
     const gutter_width = lineNumberWidth(total_lines, min_digits);
@@ -1414,11 +1752,12 @@ fn ensureCursorVisibleWrapped(doc: *Document, editor_height: u16, width: u16, mi
     var visual_rows: u16 = 0;
     var line_idx: usize = doc.scroll_top;
     while (line_idx < cursor_pos.line and line_idx < total_lines) : (line_idx += 1) {
-        visual_rows +|= wrapLineRows(doc.lineContent(line_idx), text_width);
+        visual_rows +|= wrapLineRows(doc.lineContent(line_idx), text_width, tab);
+        if (visual_rows >= editor_height) break;
     }
     // Add cursor's row within its wrapped line
     const cur_line = doc.lineContent(cursor_pos.line);
-    const wrap_pos = wrapColToVisual(cur_line, text_width, cursor_pos.col);
+    const wrap_pos = wrapColToVisual(cur_line, text_width, cursor_pos.col, tab);
     const cursor_visual_row = visual_rows +| wrap_pos.row;
 
     // If cursor is visible, done
@@ -1432,10 +1771,81 @@ fn ensureCursorVisibleWrapped(doc: *Document, editor_height: u16, width: u16, mi
     var new_top: usize = cursor_pos.line;
     while (new_top > 0 and rows_needed < target_row) {
         new_top -= 1;
-        rows_needed +|= wrapLineRows(doc.lineContent(new_top), text_width);
+        rows_needed +|= wrapLineRows(doc.lineContent(new_top), text_width, tab);
     }
     // If we overshot, new_top is the right starting line
     doc.scroll_top = new_top;
+}
+
+/// No-wrap scrolling: the core's vertical rule, and a horizontal one in
+/// CELLS against the pane's real text width, so the caret's column (tabs
+/// and wide characters counted) stays inside the text area. It used to
+/// assume a 4-column gutter and compare bytes with cells. `scroll_left`
+/// stays a byte offset on a character boundary.
+fn ensureCursorVisibleNoWrap(doc: *Document, height: u16, text_width: u16, tab: usize) void {
+    // Vertical, and back to a caret left of the view (visible_cols 0 skips
+    // the core's byte-based right edge)
+    doc.ensureCursorVisible(height, 0);
+    if (text_width == 0) return;
+    const pos = doc.cursorPos();
+    const line = doc.lineContent(pos.line);
+    const caret = colOfByte(line, pos.col, tab);
+    const left = colOfByte(line, doc.scroll_left, tab);
+    if (caret >= left + text_width) {
+        // The first character whose column puts the caret on the last cell
+        doc.scroll_left = byteAtCol(line, 0, caret + 1 - text_width, tab, false);
+    }
+}
+
+/// The bytes one screen row of a line shows — [start, end) — and the
+/// tab-grid column of its first cell. A wrapped row restarts the grid at its
+/// first byte; an unwrapped line is scrolled sideways by `h_scroll` (a byte
+/// offset, snapped forward to a character).
+const RowSegment = struct { start: usize, end: usize, col0: usize };
+
+fn rowSegment(line: []const u8, do_wrap: bool, row_start: usize, row_end: usize, h_scroll: usize, text_width: u16, tab: usize) RowSegment {
+    if (do_wrap) return .{ .start = row_start, .end = row_end, .col0 = 0 };
+    const left = colOfByte(line, h_scroll, tab);
+    const start = byteAtCol(line, 0, left, tab, false);
+    return .{ .start = start, .end = start + fitEnd(line[start..], left, left + text_width, tab), .col0 = left };
+}
+
+/// Spaces for tab expansion.
+const tab_spaces = " " ** 64;
+
+/// `text` with every tab replaced by the spaces up to its tab stop (`text`
+/// starts at cell column `col`), copied into the frame arena. A full arena
+/// cuts the copy short; the cells after it stay blank.
+fn frameArenaExpandTabs(text: []const u8, col: usize, tab: usize) []const u8 {
+    const start = grapheme_arena_len;
+    var c = col;
+    var i: usize = 0;
+    while (i < text.len) {
+        const ch = charAt(text, i);
+        const w = cellWidth(ch.cp, c, tab);
+        const bytes: []const u8 = if (ch.cp == '\t') tab_spaces[0..@min(w, tab_spaces.len)] else text[i..][0..ch.len];
+        if (grapheme_arena_len + bytes.len > grapheme_arena.len) break;
+        @memcpy(grapheme_arena[grapheme_arena_len..][0..bytes.len], bytes);
+        grapheme_arena_len += bytes.len;
+        c += w;
+        i += ch.len;
+    }
+    return grapheme_arena[start..grapheme_arena_len];
+}
+
+/// Draw document text on row 0 of `win` from window column `col`, tabs
+/// expanded to their tab stops; `grid` is the tab-grid column of window
+/// column 0. vaxis measures a tab as zero cells and skips it, so tab
+/// indentation used to vanish while the caret math counted it. Returns the
+/// column after the text by `cellWidth`'s count — where the caret and
+/// clicks put it.
+fn writeText(win: Window, col: u16, text: []const u8, style: Style, tab: usize, grid: usize) u16 {
+    if (text.len == 0) return col;
+    const start = grid + col;
+    const end = advanceCols(text, start, tab);
+    const shown = if (std.mem.indexOfScalar(u8, text, '\t') == null) frameArenaDupe(text) else frameArenaExpandTabs(text, start, tab);
+    _ = win.printSegment(.{ .text = shown, .style = style }, .{ .col_offset = col, .wrap = .none });
+    return @intCast(@min(@as(usize, col) + (end - start), std.math.maxInt(u16)));
 }
 
 /// Draw the editor content area with line numbers and optional word wrap.
@@ -1444,6 +1854,12 @@ fn drawContent(win: Window, doc: *Document, editor: *Editor, width: u16, height:
     const gutter_width = lineNumberWidth(total_lines, editor.gutter_min_digits);
     const text_start_x = gutter_width + 1; // +1 for separator
     const text_width: u16 = if (width > text_start_x) width - text_start_x else 1;
+    const tab = tabStop(editor, doc);
+    // Wrapped views never scroll sideways
+    const h_scroll: usize = if (wrap) 0 else doc.scroll_left;
+    // The bracket under the caret and its partner, highlighted in the pane
+    // that shows the active document.
+    const bracket_pair: ?brackets.Pair = if (doc == editor.activeDoc()) brackets.matchAtCaret(&doc.buffer, doc.cursors.primaryConst().offset) else null;
 
     const cursor_pos = doc.cursorPos();
 
@@ -1483,14 +1899,17 @@ fn drawContent(win: Window, doc: *Document, editor: *Editor, width: u16, height:
         // Iterate visual rows for this logical line
         var wrap_row: u16 = 0;
         var byte_pos: usize = 0;
-        const do_wrap = wrap and displayWidth(line) > text_width;
+        const do_wrap = wrap and advanceCols(line, 0, tab) > text_width;
 
         while (y < height) {
             const row_start = byte_pos;
             const row_end = if (do_wrap)
-                wrapAdvanceRow(line, text_width, byte_pos)
+                wrapAdvanceRow(line, text_width, byte_pos, tab)
             else
                 line.len;
+            // The bytes this row shows and the tab-grid column of its
+            // first cell: every piece below is measured from it.
+            const seg = rowSegment(line, do_wrap, row_start, row_end, h_scroll, text_width, tab);
 
             // Line number: only on first row of a logical line
             if (wrap_row == 0) {
@@ -1541,9 +1960,8 @@ fn drawContent(win: Window, doc: *Document, editor: *Editor, width: u16, height:
 
             // Text content for this row
             if (text_start_x < width) {
-                const visible_start: usize = if (do_wrap) row_start else doc.scroll_left;
-                const segment_start = @min(visible_start, line.len);
-                const segment_end = if (do_wrap) row_end else @min(line.len, visible_start + text_width);
+                const segment_start = seg.start;
+                const segment_end = seg.end;
                 const segment = line[segment_start..segment_end];
 
                 if (segment.len > 0) {
@@ -1590,7 +2008,7 @@ fn drawContent(win: Window, doc: *Document, editor: *Editor, width: u16, height:
                                     sel_style
                                 else
                                     text_style;
-                                col = writeStr(text_win, col, 0, gap, gap_style);
+                                col = writeText(text_win, col, gap, gap_style, tab, seg.col0);
                             }
 
                             // Span → syntax color (selection overrides)
@@ -1598,18 +2016,18 @@ fn drawContent(win: Window, doc: *Document, editor: *Editor, width: u16, height:
                                 const span_text = segment[vis_start..vis_end];
                                 // If fully inside selection, use sel_style; otherwise syntax color
                                 if (has_sel and vis_start >= sel_begin and vis_end <= sel_end_local) {
-                                    col = writeStr(text_win, col, 0, span_text, sel_style);
+                                    col = writeText(text_win, col, span_text, sel_style, tab, seg.col0);
                                 } else if (has_sel and vis_start < sel_end_local and vis_end > sel_begin) {
                                     // Partial overlap — split into pre-sel, sel, post-sel
                                     const pre_end = @max(vis_start, sel_begin);
                                     const post_start = @min(vis_end, sel_end_local);
                                     const syn_style = synTokenStyle(syn_theme, span_buf[si].token, text_style.fg, bg);
-                                    if (pre_end > vis_start) col = writeStr(text_win, col, 0, span_text[0 .. pre_end - vis_start], syn_style);
-                                    if (post_start > pre_end) col = writeStr(text_win, col, 0, span_text[pre_end - vis_start .. post_start - vis_start], sel_style);
-                                    if (vis_end > post_start) col = writeStr(text_win, col, 0, span_text[post_start - vis_start ..], syn_style);
+                                    if (pre_end > vis_start) col = writeText(text_win, col, span_text[0 .. pre_end - vis_start], syn_style, tab, seg.col0);
+                                    if (post_start > pre_end) col = writeText(text_win, col, span_text[pre_end - vis_start .. post_start - vis_start], sel_style, tab, seg.col0);
+                                    if (vis_end > post_start) col = writeText(text_win, col, span_text[post_start - vis_start ..], syn_style, tab, seg.col0);
                                 } else {
                                     const syn_style = synTokenStyle(syn_theme, span_buf[si].token, text_style.fg, bg);
-                                    col = writeStr(text_win, col, 0, span_text, syn_style);
+                                    col = writeText(text_win, col, span_text, syn_style, tab, seg.col0);
                                 }
                             }
                             if (vis_end > seg_pos) seg_pos = vis_end;
@@ -1619,25 +2037,15 @@ fn drawContent(win: Window, doc: *Document, editor: *Editor, width: u16, height:
                         if (seg_pos < segment.len) {
                             const trail = segment[seg_pos..];
                             const trail_style = if (has_sel and seg_pos < sel_end_local) sel_style else text_style;
-                            _ = writeStr(text_win, col, 0, trail, trail_style);
+                            _ = writeText(text_win, col, trail, trail_style, tab, seg.col0);
                         }
                     } else if (has_sel) {
                         // No syntax highlighting, but has selection
-                        var col: u16 = 0;
-                        if (sel_begin > 0) {
-                            col = @intCast(@min(displayWidth(segment[0..sel_begin]), text_width));
-                            _ = writeStr(text_win, 0, 0, segment[0..sel_begin], text_style);
-                        }
-                        if (sel_end_local > sel_begin) {
-                            const sel_w: u16 = @intCast(@min(displayWidth(segment[sel_begin..sel_end_local]), text_width -| col));
-                            _ = writeStr(text_win, col, 0, segment[sel_begin..sel_end_local], sel_style);
-                            col +|= sel_w;
-                        }
-                        if (sel_end_local < segment.len) {
-                            _ = writeStr(text_win, col, 0, segment[sel_end_local..], text_style);
-                        }
+                        var col = writeText(text_win, 0, segment[0..sel_begin], text_style, tab, seg.col0);
+                        col = writeText(text_win, col, segment[sel_begin..sel_end_local], sel_style, tab, seg.col0);
+                        _ = writeText(text_win, col, segment[sel_end_local..], text_style, tab, seg.col0);
                     } else {
-                        _ = writeStr(text_win, 0, 0, segment, text_style);
+                        _ = writeText(text_win, 0, segment, text_style, tab, seg.col0);
                     }
                 }
             }
@@ -1647,19 +2055,16 @@ fn drawContent(win: Window, doc: *Document, editor: *Editor, width: u16, height:
             // covered cells post-hoc, same as the diagnostic underlines below.
             if (doc.cursors.count() > 1 and text_start_x < width) {
                 const line_start_offset = doc.buffer.posToOffset(line_idx, 0);
-                const visible_start: usize = if (do_wrap) row_start else doc.scroll_left;
-                const seg_start = @min(visible_start, line.len);
-                const seg_end = if (do_wrap) row_end else @min(line.len, visible_start + text_width);
-                const seg = line[seg_start..seg_end];
-                const abs_seg_start = line_start_offset + seg_start;
-                const abs_seg_end = line_start_offset + seg_end;
+                const seg_text = line[seg.start..seg.end];
+                const abs_seg_start = line_start_offset + seg.start;
+                const abs_seg_end = line_start_offset + seg.end;
                 for (doc.cursors.cursors.items[1..]) |sc| {
                     const r = sc.selectionRange() orelse continue;
                     if (!(r.start < abs_seg_end and r.end > abs_seg_start)) continue;
                     const lo = if (r.start > abs_seg_start) r.start - abs_seg_start else 0;
-                    const hi = if (r.end < abs_seg_end) r.end - abs_seg_start else seg.len;
-                    const cx_start = displayWidth(seg[0..@min(lo, seg.len)]);
-                    const cx_end = displayWidth(seg[0..@min(hi, seg.len)]);
+                    const hi = if (r.end < abs_seg_end) r.end - abs_seg_start else seg_text.len;
+                    const cx_start = advanceCols(seg_text[0..@min(lo, seg_text.len)], seg.col0, tab) - seg.col0;
+                    const cx_end = advanceCols(seg_text[0..@min(hi, seg_text.len)], seg.col0, tab) - seg.col0;
                     var cx: u16 = @intCast(@min(cx_start, text_width));
                     const cx_lim: u16 = @intCast(@min(cx_end, text_width));
                     while (cx < cx_lim) : (cx += 1) {
@@ -1673,22 +2078,52 @@ fn drawContent(win: Window, doc: *Document, editor: *Editor, width: u16, height:
                 }
             }
 
-            // Apply diagnostic underlines to rendered text cells
-            var ul_diag_it = doc.diagIter();
-            while (ul_diag_it.next()) |diag| {
-                if (diag.start_line == line_idx and wrap_row == 0) {
-                    const visible_start_offset: usize = if (do_wrap) row_start else doc.scroll_left;
-                    const ul_start = if (diag.start_col >= visible_start_offset) diag.start_col - @as(u32, @intCast(visible_start_offset)) else 0;
-                    const ul_end_col = if (diag.end_line == line_idx) diag.end_col else @as(u32, @intCast(line.len));
-                    const ul_end = if (ul_end_col >= visible_start_offset) ul_end_col - @as(u32, @intCast(visible_start_offset)) else 0;
+            // Matching-bracket highlight: the bracket under the caret and its
+            // partner, restyled post-hoc like the secondary selections.
+            if (bracket_pair) |pair| {
+                if (text_start_x < width) {
+                    const line_start_offset = doc.buffer.posToOffset(line_idx, 0);
+                    const seg_text = line[seg.start..seg.end];
+                    const abs_seg_start = line_start_offset + seg.start;
+                    const abs_seg_end = line_start_offset + seg.end;
+                    for ([_]usize{ pair.open, pair.close }) |off| {
+                        if (off < abs_seg_start or off >= abs_seg_end) continue;
+                        const cx = advanceCols(seg_text[0 .. off - abs_seg_start], seg.col0, tab) - seg.col0;
+                        if (cx >= text_width) continue;
+                        const x: u16 = text_start_x + @as(u16, @intCast(cx));
+                        if (win.readCell(x, y)) |cell| {
+                            var new_cell = cell;
+                            new_cell.style.reverse = true;
+                            new_cell.style.bold = true;
+                            win.writeCell(x, y, new_cell);
+                        }
+                    }
+                }
+            }
+
+            // Diagnostic underlines on their start line: byte columns
+            // converted to this row's cells (they used to be used as cell
+            // positions directly, drifting on tabs and non-ASCII text)
+            if (text_start_x < width) {
+                var ul_diag_it = doc.diagIter();
+                while (ul_diag_it.next()) |diag| {
+                    if (diag.start_line != line_idx) continue;
+                    const lo: usize = @min(diag.start_col, line.len);
+                    const hi: usize = if (diag.end_line == line_idx) @min(diag.end_col, line.len) else line.len;
+                    const a = @max(lo, seg.start);
+                    const b = @min(hi, seg.end);
+                    if (a >= b) continue;
                     const diag_fg: Color = switch (diag.severity) {
                         .err => .{ .rgb = .{ 0xE0, 0x40, 0x40 } },
                         .warning => .{ .rgb = .{ 0xE0, 0xC0, 0x40 } },
                         .information => .{ .rgb = .{ 0x40, 0xA0, 0xE0 } },
                         .hint => .{ .rgb = .{ 0x80, 0x80, 0xA0 } },
                     };
+                    const ul_start = advanceCols(line[seg.start..a], seg.col0, tab) - seg.col0;
+                    const ul_end = advanceCols(line[seg.start..b], seg.col0, tab) - seg.col0;
                     var cx: u16 = @intCast(@min(ul_start, text_width));
-                    while (cx < @min(ul_end, text_width)) : (cx += 1) {
+                    const cx_lim: u16 = @intCast(@min(ul_end, text_width));
+                    while (cx < cx_lim) : (cx += 1) {
                         if (win.readCell(text_start_x + cx, y)) |cell| {
                             var new_cell = cell;
                             new_cell.style.ul = diag_fg;
@@ -1717,53 +2152,24 @@ fn drawContent(win: Window, doc: *Document, editor: *Editor, width: u16, height:
 }
 
 /// Draw secondary cursors as reverse-video cells.
-fn drawSecondaryCursors(win: Window, doc: *Document, editor: *Editor, width: u16, height: u16, wrap: bool) void {
-    const total_lines = doc.lineCount();
-    const gutter_width = lineNumberWidth(total_lines, editor.gutter_min_digits);
-    const text_start_x = gutter_width + 1;
-    const text_width: u16 = if (width > text_start_x) width - text_start_x else 1;
+fn drawSecondaryCursors(win: Window, doc: *Document, editor: *Editor, width: u16, height: u16) void {
     const cursor_style: Style = .{ .bg = toVaxis(editor.tui_theme.cursor_bg), .fg = toVaxis(editor.tui_theme.cursor_fg) };
 
     // Skip primary cursor (index 0), render the rest
     for (doc.cursors.cursors.items[1..]) |c| {
+        const cell = caretCell(editor, doc, c.offset, width, height) orelse continue;
+        // Fetched after caretCell's own lineContent calls: a line spanning
+        // the buffer gap is served from the shared scratch slice.
         const pos = doc.buffer.offsetToPos(c.offset);
-        if (pos.line < doc.scroll_top) continue;
-
-        // Calculate screen position
-        var screen_y: u16 = undefined;
-        var screen_x: u16 = undefined;
-
-        if (wrap) {
-            // Sum visual rows of lines before this one
-            var visual_row: u16 = 0;
-            var li: usize = doc.scroll_top;
-            while (li < pos.line and li < total_lines) : (li += 1) {
-                visual_row += wrapLineRows(doc.lineContent(li), text_width);
-                if (visual_row >= height) break;
-            }
-            if (visual_row >= height) continue;
-            const cur_line = doc.lineContent(pos.line);
-            const wp = wrapColToVisual(cur_line, text_width, pos.col);
-            screen_y = visual_row + wp.row;
-            screen_x = text_start_x +| wp.col;
+        const line = doc.lineContent(pos.line);
+        // Draw a reverse-video block at the cursor position
+        if (pos.col < line.len and line[pos.col] >= 32) {
+            // Show the actual character in reverse video
+            const cp_len = std.unicode.utf8ByteSequenceLength(line[pos.col]) catch 1;
+            _ = writeStr(win, cell.x, cell.y, line[pos.col..@min(line.len, pos.col + cp_len)], cursor_style);
         } else {
-            const visible_line = pos.line -| doc.scroll_top;
-            if (visible_line >= height) continue;
-            screen_y = @intCast(visible_line);
-            const visible_col = pos.col -| doc.scroll_left;
-            screen_x = text_start_x +| @as(u16, @intCast(@min(visible_col, width -| text_start_x)));
-        }
-
-        if (screen_y < height and screen_x < width) {
-            // Draw a reverse-video block at the cursor position
-            const line = doc.lineContent(pos.line);
-            if (pos.col < line.len and line[pos.col] >= 32) {
-                // Show the actual character in reverse video
-                _ = writeStr(win, screen_x, screen_y, line[pos.col .. pos.col + 1], cursor_style);
-            } else {
-                // At end of line or control char — draw a space in reverse
-                _ = writeStr(win, screen_x, screen_y, " ", cursor_style);
-            }
+            // At end of line, on a tab or a control char — a space in reverse
+            _ = writeStr(win, cell.x, cell.y, " ", cursor_style);
         }
     }
 }
@@ -1864,30 +2270,70 @@ fn lineNumberWidth(total_lines: usize, min_digits: usize) u16 {
     return @max(digits, @max(min, 1));
 }
 
+/// Rect of the focused pane from the last draw.
+fn activePaneRect(editor: *Editor) ?PaneRect {
+    return paneRectFor(editor.activePaneId());
+}
+
+/// Rect of pane `pane_id` from the last draw.
+fn paneRectFor(pane_id: u8) ?PaneRect {
+    for (pane_rects[0..pane_rect_count]) |pr| {
+        if (pr.pane_id == pane_id) return pr;
+    }
+    return null;
+}
+
+/// Pane-local cell of the caret at `offset` of `doc` shown in a pane
+/// `pane_w` x `pane_h` cells (gutter included); null when it is off
+/// screen — above or below the view (a wheel-pinned view used to draw it
+/// on row 0) or beside it.
+fn caretCell(editor: *Editor, doc: *Document, offset: usize, pane_w: u16, pane_h: u16) ?struct { x: u16, y: u16 } {
+    const pos = doc.buffer.offsetToPos(offset);
+    if (pos.line < doc.scroll_top) return null;
+    const tab = tabStop(editor, doc);
+    const total_lines = doc.lineCount();
+    const text_start_x = lineNumberWidth(total_lines, editor.gutter_min_digits) + 1;
+    if (pane_w <= text_start_x) return null;
+    const text_width: u16 = pane_w - text_start_x;
+
+    var row: usize = 0;
+    var col: usize = 0;
+    if (editor.wordWrapFor(doc)) {
+        // Rows of the lines above, stopping at the pane's height (a caret
+        // 65 536 rows below the view overflowed this sum)
+        var line_idx: usize = doc.scroll_top;
+        while (line_idx < pos.line and line_idx < total_lines) : (line_idx += 1) {
+            row += wrapLineRows(doc.lineContent(line_idx), text_width, tab);
+            if (row >= pane_h) return null;
+        }
+        const vis = wrapColToVisual(doc.lineContent(pos.line), text_width, pos.col, tab);
+        row += vis.row;
+        col = vis.col;
+    } else {
+        row = pos.line - doc.scroll_top;
+        if (row >= pane_h) return null;
+        const line = doc.lineContent(pos.line);
+        const caret = colOfByte(line, pos.col, tab);
+        const left = colOfByte(line, doc.scroll_left, tab);
+        if (caret < left) return null;
+        col = caret - left;
+    }
+    if (row >= pane_h or col >= text_width) return null;
+    return .{ .x = text_start_x + @as(u16, @intCast(col)), .y = @intCast(row) };
+}
+
 /// Position the real terminal cursor at the editor cursor location.
 fn positionCursor(win: Window, editor: *Editor, width: u16, height: u16) void {
     _ = width;
     _ = height;
-    var active_rect: ?PaneRect = null;
-    for (pane_rects[0..pane_rect_count]) |pr| {
-        if (pr.pane_id == editor.activePaneId()) {
-            active_rect = pr;
-            break;
-        }
-    }
-    const rect = active_rect orelse {
+    const rect = activePaneRect(editor) orelse {
         win.hideCursor();
         return;
     };
 
     // Terminal pane: mirror the embedded terminal's own cursor.
     if (editor.activePaneIsTerminal()) {
-        const term: ?*terminal_mod.Terminal = blk: {
-            const idx = editor.activePaneTerminalIdx() orelse break :blk null;
-            if (idx >= editor.terminals.items.len) break :blk null;
-            break :blk editor.terminals.items[idx];
-        };
-        const t = term orelse {
+        const t = activeTerminal(editor) orelse {
             win.hideCursor();
             return;
         };
@@ -1906,83 +2352,52 @@ fn positionCursor(win: Window, editor: *Editor, width: u16, height: u16) void {
     }
 
     const doc = editor.activeDoc();
-    const pos = doc.cursorPos();
-
-    const total_lines = doc.lineCount();
-    const gutter_width = lineNumberWidth(total_lines, editor.gutter_min_digits);
-    const text_start_x = gutter_width + 1;
-    const text_width: u16 = if (rect.w > text_start_x) rect.w - text_start_x else 1;
-
-    if (editor.wordWrapFor(doc)) {
-        // With wrapping: compute visual row by summing wrapped heights of preceding lines
-        var visual_row: u16 = 0;
-        var line_idx: usize = doc.scroll_top;
-        while (line_idx < pos.line and line_idx < total_lines) : (line_idx += 1) {
-            visual_row += wrapLineRows(doc.lineContent(line_idx), text_width);
-        }
-        const cur_line = doc.lineContent(pos.line);
-        const wrap_pos = wrapColToVisual(cur_line, text_width, pos.col);
-        visual_row += wrap_pos.row;
-
-        const screen_y = rect.y +| visual_row;
-        const screen_x = rect.x +| text_start_x +| wrap_pos.col;
-
-        if (visual_row < rect.h and (text_start_x + wrap_pos.col) < rect.w) {
-            win.showCursor(screen_x, screen_y);
-            win.setCursorShape(.beam_blink);
-        } else {
-            win.hideCursor();
-        }
+    if (caretCell(editor, doc, doc.cursors.primaryConst().offset, rect.w, rect.h)) |cell| {
+        win.showCursor(rect.x +| cell.x, rect.y +| cell.y);
+        win.setCursorShape(.beam_blink);
     } else {
-        const visible_line = pos.line -| doc.scroll_top;
-        const visible_col = pos.col -| doc.scroll_left;
-
-        const screen_y: u16 = rect.y +| @as(u16, @intCast(@min(visible_line, rect.h -| 1)));
-        const screen_x: u16 = rect.x +| text_start_x +| @as(u16, @intCast(@min(visible_col, rect.w -| text_start_x)));
-
-        if (visible_line < rect.h and (text_start_x + visible_col) < rect.w) {
-            win.showCursor(screen_x, screen_y);
-            win.setCursorShape(.beam_blink);
-        } else {
-            win.hideCursor();
-        }
+        win.hideCursor();
     }
 }
 
-/// Convert a screen position (x, y) in the editor area to a buffer offset.
-/// Returns null if the position is outside the editor content area.
-fn screenToOffset(editor: *Editor, screen_x: i16, screen_y: i16) ?usize {
-    const hit = resolvePaneAt(editor, screen_x, screen_y) orelse return null;
-    const pane = tuiLayout(editor).panes.items[hit.pane_id];
-    const doc_idx = switch (pane.content) {
+/// Buffer offset under pane-local cell (local_x, local_y) of editor pane
+/// `pane_id`, drawn `pane_w` cells wide. Null for a terminal pane, and for
+/// the gutter unless `clamp_gutter` (a drag) treats it as text column 0.
+fn paneOffsetAt(editor: *Editor, pane_id: u8, pane_w: u16, local_x: u16, local_y: u16, clamp_gutter: bool) ?usize {
+    const layout = tuiLayout(editor);
+    if (pane_id >= layout.panes.items.len) return null;
+    const doc_idx = switch (layout.panes.items[pane_id].content) {
         .editor => |idx| idx,
         .terminal => return null,
     };
     if (doc_idx >= editor.documents.items.len) return null;
     const doc = &editor.documents.items[doc_idx];
+    const tab = tabStop(editor, doc);
 
     const total_lines = doc.lineCount();
     const gutter_width = lineNumberWidth(total_lines, editor.gutter_min_digits);
     const text_start_x: u16 = gutter_width + 1;
 
     // Must be in the text area of the pane
-    if (hit.local_x < text_start_x) return null;
-    const text_col: usize = hit.local_x - text_start_x;
-    const content_row: usize = hit.local_y;
+    if (local_x < text_start_x and !clamp_gutter) return null;
+    const text_col: usize = local_x -| text_start_x;
+    const content_row: usize = local_y;
 
     if (editor.wordWrapFor(doc)) {
-        const text_width = editor.text_width;
+        // This pane's own text width: editor.text_width belongs to the
+        // focused pane, and a click in another split was measured with it.
+        const text_width: u16 = if (pane_w > text_start_x) pane_w - text_start_x else 1;
         // Walk through visible lines, counting visual rows
         var visual_row: usize = 0;
         var line_idx: usize = doc.scroll_top;
         while (line_idx < total_lines) : (line_idx += 1) {
             const line = doc.lineContent(line_idx);
-            const rows = wrapLineRows(line, text_width);
+            const rows = wrapLineRows(line, text_width, tab);
             if (content_row < visual_row + rows) {
                 // Click is on this logical line, in visual row (content_row - visual_row)
                 const wrap_row: u16 = @intCast(content_row - visual_row);
-                const byte_col = wrapVisualToCol(line, text_width, wrap_row, text_col);
-                return @import("../core/cursor.zig").lineOffset(&doc.buffer, line_idx, byte_col);
+                const byte_col = wrapVisualToCol(line, text_width, wrap_row, text_col, tab);
+                return cursor_mod.lineOffset(&doc.buffer, line_idx, byte_col);
             }
             visual_row += rows;
         }
@@ -1991,11 +2406,16 @@ fn screenToOffset(editor: *Editor, screen_x: i16, screen_y: i16) ?usize {
     } else {
         const target_line = doc.scroll_top + content_row;
         if (target_line >= total_lines) return doc.buffer.byteLen();
-        const col = doc.scroll_left + text_col;
-        const line_len = doc.lineContent(target_line).len;
-        return @import("../core/cursor.zig").lineOffset(&doc.buffer, target_line, @min(col, line_len));
+        const line = doc.lineContent(target_line);
+        const left = colOfByte(line, doc.scroll_left, tab);
+        const col = byteAtCol(line, 0, left + text_col, tab, true);
+        return cursor_mod.lineOffset(&doc.buffer, target_line, col);
     }
 }
+
+/// The editor pane a left press landed in: drags stay in it. Null when the
+/// press went elsewhere (tab bar, panels, a terminal, a gutter).
+var press_pane: ?u8 = null;
 
 /// Handle mouse events.
 fn handleMouse(editor: *Editor, mouse: vaxis.Mouse) void {
@@ -2004,6 +2424,12 @@ fn handleMouse(editor: *Editor, mouse: vaxis.Mouse) void {
         if (editor.mode == .encoding_picker) {
             if (encoding_picker_band) |b| {
                 if (mouse.row >= b.y and mouse.row < b.y + b.h) editor.chooseEncoding(@as(usize, @intCast(mouse.row)) - b.y);
+            }
+            return;
+        }
+        if (editor.mode == .recent_projects) {
+            if (recent_projects_band) |b| {
+                if (mouse.row >= b.y and mouse.row < b.y + b.h) editor.chooseRecentProject(@as(usize, @intCast(mouse.row)) - b.y);
             }
             return;
         }
@@ -2017,140 +2443,171 @@ fn handleMouse(editor: *Editor, mouse: vaxis.Mouse) void {
     if (editor.mode != .normal) return;
 
     switch (mouse.button) {
-        .left => {
-            if (mouse.type == .press) {
-                // Click: position cursor — un-pin scroll, drop old status
-                scroll_pinned = false;
-                editor.status_message = "";
-
-                // Tab bar click: switch document in active pane
-                const tab_bar_height: i16 = if (editor.docCount() > 1) 1 else 0;
-                if (tab_bar_height > 0 and mouse.row == 0) {
-                    if (tabAtX(editor, @intCast(mouse.col))) |doc_idx| {
-                        editor.switchToDoc(doc_idx);
-                    }
-                    return;
-                }
-
-                // Search panel band: clicks focus the panel / pick a row
-                if (search_band) |band| {
-                    if (mouse.row >= band.y and mouse.row < band.y + band.h) {
-                        handleSearchClick(editor, band, @intCast(mouse.row));
-                        return;
-                    }
-                }
-
-                // File tree band: clicks focus/select/toggle/open in the tree
-                if (filetree_band) |band| {
-                    if (mouseOverFiletree(mouse)) {
-                        handleFiletreeClick(editor, band, @intCast(mouse.col), @intCast(mouse.row));
-                        return;
-                    }
-                }
-
-                // Route click to the pane it landed in (takes focus back
-                // from the file tree)
-                if (resolvePaneAt(editor, mouse.col, mouse.row)) |hit| {
-                    editor.focusPane(hit.pane_id); // also syncs active_doc_idx
-                    editor.filetree_focused = false;
-                }
-
+        .left => switch (mouse.type) {
+            .press => mousePress(editor, mouse),
+            .drag => mouseDrag(editor, mouse),
+            .release => {
+                press_pane = null;
                 block_drag = false;
                 block_engaged = false;
-                if (screenToOffset(editor, mouse.col, mouse.row)) |offset| {
-                    const doc = editor.activeDoc();
-                    if (mouse.mods.alt) {
-                        // Alt+click adds a cursor; if a drag follows and leaves
-                        // the press cell, it promotes to a block (column)
-                        // selection. Plain Alt (not Shift+Alt) must arm it too:
-                        // Windows Terminal swallows Shift+drag for its own
-                        // selection and never forwards it.
-                        const p = doc.buffer.offsetToPos(offset);
-                        block_drag = true;
-                        block_anchor_line = p.line;
-                        block_anchor_col = p.col;
-                        if (mouse.mods.shift) {
-                            doc.cursors.clearSecondary();
-                            const c = doc.cursors.primary();
-                            c.clearSelection();
-                            c.offset = offset;
-                            c.preferred_col = p.col;
-                        } else {
-                            doc.cursors.addCursor(offset) catch {};
-                        }
-                    } else {
-                        // Regular click: clear secondary cursors if enabled
-                        if (editor.click_clears_cursors and doc.cursors.count() > 1) {
-                            doc.cursors.clearSecondary();
-                        }
-                        const c = doc.cursors.primary();
-                        c.clearSelection();
-                        c.offset = offset;
-                        c.preferred_col = doc.buffer.offsetToPos(offset).col;
-                    }
-                }
-            } else if (mouse.type == .drag) {
-                if (screenToOffset(editor, mouse.col, mouse.row)) |offset| {
-                    const doc = editor.activeDoc();
-                    if (block_drag) {
-                        // Block (column) selection: cursor per line, same col
-                        // span. Only engage once the drag leaves the press
-                        // cell, so a steady Alt+click never disturbs other
-                        // alt-clicked cursors.
-                        const p = doc.buffer.offsetToPos(offset);
-                        if (block_engaged or p.line != block_anchor_line or p.col != block_anchor_col) {
-                            block_engaged = true;
-                            doc.cursors.setBlockSelection(
-                                &doc.buffer,
-                                block_anchor_line,
-                                block_anchor_col,
-                                p.line,
-                                p.col,
-                            ) catch {};
-                        }
-                    } else {
-                        // Drag: extend selection
-                        const c = doc.cursors.primary();
-                        if (!c.hasSelection()) c.startSelection();
-                        c.offset = offset;
-                        c.preferred_col = doc.buffer.offsetToPos(offset).col;
-                    }
-                }
-            } else if (mouse.type == .release) {
-                block_drag = false;
-                block_engaged = false;
-            }
+            },
+            .motion => {},
         },
-        .wheel_up => {
-            if (mouseOverSearch(mouse)) {
-                editor.search.moveSelection(false, 3);
-            } else if (mouseOverFiletree(mouse)) {
-                editor.tui_filetree_scroll -|= 3;
-            } else {
-                const doc = editor.activeDoc();
-                doc.scroll_top -|= 5;
-                scroll_pinned = true;
-            }
-        },
-        .wheel_down => {
-            if (mouseOverSearch(mouse)) {
-                editor.search.moveSelection(true, 3);
-            } else if (mouseOverFiletree(mouse)) {
-                editor.tui_filetree_scroll +|= 3; // clamped at draw time
-            } else {
-                const doc = editor.activeDoc();
-                const max_top = doc.lineCount() -| 1;
-                doc.scroll_top = @min(doc.scroll_top + 5, max_top);
-                scroll_pinned = true;
-            }
-        },
+        .wheel_up => mouseWheel(editor, mouse, false),
+        .wheel_down => mouseWheel(editor, mouse, true),
         else => {},
     }
 }
 
-/// Convert a vaxis Key to a keybind lookup string.
-/// Format: [ctrl+][alt+][shift+]<keyname>
-/// Shift is only included for non-letter keys (arrows, home, etc.)
+fn mousePress(editor: *Editor, mouse: vaxis.Mouse) void {
+    // Click: position cursor — un-pin scroll, drop old status
+    scroll_pinned = false;
+    editor.status_message = "";
+    press_pane = null;
+    block_drag = false;
+    block_engaged = false;
+
+    // Tab bar click: show the document in the focused pane, which also takes
+    // the keyboard back from a focused side panel (Editor.showDocIn)
+    const tab_bar_height: i16 = if (editor.docCount() > 1) 1 else 0;
+    if (tab_bar_height > 0 and mouse.row == 0) {
+        if (mouse.col >= 0) {
+            if (tabAtX(editor, @intCast(mouse.col))) |doc_idx| editor.showDocIn(0, doc_idx);
+        }
+        return;
+    }
+
+    // Search panel band: clicks focus the panel / pick a row
+    if (search_band) |band| {
+        if (mouse.row >= band.y and mouse.row < band.y + band.h) {
+            handleSearchClick(editor, band, @intCast(mouse.row));
+            return;
+        }
+    }
+
+    // File tree band: clicks focus/select/toggle/open in the tree
+    if (filetree_band) |band| {
+        if (mouseOverFiletree(mouse)) {
+            handleFiletreeClick(editor, band, @intCast(mouse.col), @intCast(mouse.row));
+            return;
+        }
+    }
+
+    // A pane click focuses that pane, which takes the keyboard back from the
+    // tree and the search panel alike (Editor.focusPane)
+    const hit = resolvePaneAt(editor, mouse.col, mouse.row) orelse return;
+    editor.focusPane(hit.pane_id); // also syncs active_doc_idx
+    const offset = paneOffsetAt(editor, hit.pane_id, hit.rect.w, hit.local_x, hit.local_y, false) orelse return;
+    press_pane = hit.pane_id;
+    const doc = editor.activeDoc();
+    if (mouse.mods.alt) {
+        // Alt+click adds a cursor; if a drag follows and leaves
+        // the press cell, it promotes to a block (column)
+        // selection. Plain Alt (not Shift+Alt) must arm it too:
+        // Windows Terminal swallows Shift+drag for its own
+        // selection and never forwards it.
+        const p = doc.buffer.offsetToPos(offset);
+        block_drag = true;
+        block_anchor_line = p.line;
+        block_anchor_col = p.col;
+        if (mouse.mods.shift) {
+            doc.cursors.clearSecondary();
+            const c = doc.cursors.primary();
+            c.clearSelection();
+            c.offset = offset;
+            c.preferred_col = p.col;
+        } else {
+            addCursorAt(doc, offset);
+        }
+    } else {
+        // Regular click: clear secondary cursors if enabled
+        if (editor.click_clears_cursors and doc.cursors.count() > 1) {
+            doc.cursors.clearSecondary();
+        }
+        const c = doc.cursors.primary();
+        c.clearSelection();
+        c.offset = offset;
+        c.preferred_col = doc.buffer.offsetToPos(offset).col;
+    }
+}
+
+/// Cell `v` of the screen relative to `origin`, clamped into [0, size).
+fn clampLocal(v: i16, origin: u16, size: u16) u16 {
+    const rel: i32 = @as(i32, v) - origin;
+    return @intCast(std.math.clamp(rel, 0, @as(i32, size) - 1));
+}
+
+fn mouseDrag(editor: *Editor, mouse: vaxis.Mouse) void {
+    // A drag stays in the pane its press landed in, clamped to that pane's
+    // text: resolved against the pane under the mouse, it wrote another
+    // document's offset into this one (an offset past its end).
+    const pane_id = press_pane orelse return;
+    if (pane_id != editor.activePaneId()) return;
+    const rect = paneRectFor(pane_id) orelse return;
+    const local_x = clampLocal(mouse.col, rect.x, rect.w);
+    const local_y = clampLocal(mouse.row, rect.y, rect.h);
+    const offset = paneOffsetAt(editor, pane_id, rect.w, local_x, local_y, true) orelse return;
+    const doc = editor.activeDoc();
+    if (block_drag) {
+        // Block (column) selection: cursor per line, same col
+        // span. Only engage once the drag leaves the press
+        // cell, so a steady Alt+click never disturbs other
+        // alt-clicked cursors.
+        const p = doc.buffer.offsetToPos(offset);
+        if (block_engaged or p.line != block_anchor_line or p.col != block_anchor_col) {
+            block_engaged = true;
+            doc.cursors.setBlockSelection(
+                &doc.buffer,
+                block_anchor_line,
+                block_anchor_col,
+                p.line,
+                p.col,
+            ) catch {};
+        }
+    } else {
+        // Drag: extend selection
+        const c = doc.cursors.primary();
+        if (!c.hasSelection()) c.startSelection();
+        c.offset = offset;
+        c.preferred_col = doc.buffer.offsetToPos(offset).col;
+    }
+}
+
+fn mouseWheel(editor: *Editor, mouse: vaxis.Mouse, down: bool) void {
+    if (mouseOverSearch(mouse)) {
+        editor.search.moveSelection(down, 3);
+        return;
+    }
+    if (mouseOverFiletree(mouse)) {
+        // Clamped at draw time
+        if (down) editor.tui_filetree_scroll +|= 3 else editor.tui_filetree_scroll -|= 3;
+        return;
+    }
+    // The document under the mouse scrolls — not the focused one — and
+    // nothing does over a terminal pane (no scrollback) or outside the panes.
+    const hit = resolvePaneAt(editor, mouse.col, mouse.row) orelse return;
+    const doc_idx = switch (tuiLayout(editor).panes.items[hit.pane_id].content) {
+        .editor => |idx| idx,
+        .terminal => return,
+    };
+    if (doc_idx >= editor.documents.items.len) return;
+    const doc = &editor.documents.items[doc_idx];
+    if (down) {
+        doc.scroll_top = @min(doc.scroll_top + 5, doc.lineCount() -| 1);
+    } else {
+        doc.scroll_top -|= 5;
+    }
+    // The focused pane follows its caret every frame: pin it while the
+    // wheel moves its document (shown in this pane or another one).
+    if (!editor.activePaneIsTerminal() and doc_idx == editor.active_doc_idx) scroll_pinned = true;
+}
+
+/// Convert a vaxis Key to a keybind lookup string in the canonical
+/// vocabulary (keybind.zig): [ctrl+][alt+][shift+]<keyname>. Shift is
+/// included whenever the terminal reports it — Ctrl+Shift+K is
+/// "ctrl+shift+k", exactly what the GUI sends (a legacy terminal reports a
+/// shifted letter as its capital without the modifier, which lowercases to
+/// the plain key).
 fn keyToStr(key: Key, buf: *[64]u8) []const u8 {
     var pos: usize = 0;
 
@@ -2180,9 +2637,14 @@ fn keyToStr(key: Key, buf: *[64]u8) []const u8 {
         Key.page_down => "page_down",
         Key.backspace => "backspace",
         Key.delete => "delete",
+        Key.insert => "insert",
         Key.tab => "tab",
         Key.enter => "enter",
         Key.escape => "escape",
+        // Ctrl+Space: legacy terminals send NUL, which vaxis reports as
+        // Ctrl+'@' (it used to become "ctrl+@" / "ctrl+ " and never match)
+        Key.space => "space",
+        '@' => if (key.mods.ctrl) "space" else null,
         Key.f1 => "f1",
         Key.f2 => "f2",
         Key.f3 => "f3",
@@ -2239,25 +2701,34 @@ fn tryKeybindCommand(editor: *Editor, key: Key) bool {
     const key_str = keyToStr(key, &kbuf);
     if (key_str.len > 0) {
         if (editor.lookupKeybind(key_str)) |action| {
-            execTuiAction(editor, action);
+            runKeybindAction(editor, action);
             return true;
         }
-        // Fallback: if shift was held, try without shift
-        // (e.g. Ctrl+Shift+K falls back to Ctrl+K binding)
-        if (key.mods.shift) {
+        // An unbound Shift chord falls back to its unshifted binding — for
+        // punctuation and special keys only, never letters (Ctrl+Shift+K
+        // fell back to Ctrl+K's delete_line, Ctrl+Shift+Z to undo)
+        if (key.mods.shift and keybind.allowsShiftFallback(key_str)) {
             var kbuf2: [64]u8 = undefined;
             var fallback_key = key;
             fallback_key.mods.shift = false;
             const fallback_str = keyToStr(fallback_key, &kbuf2);
             if (fallback_str.len > 0) {
                 if (editor.lookupKeybind(fallback_str)) |action| {
-                    execTuiAction(editor, action);
+                    runKeybindAction(editor, action);
                     return true;
                 }
             }
         }
     }
     return true;
+}
+
+/// Run a bound action — unless a focused side panel takes it over: the
+/// tree's copy/cut/paste act on files, the search panel's clipboard and
+/// word-delete chords edit its field, and neither ever edits the document
+/// behind the panel.
+fn runKeybindAction(editor: *Editor, action: []const u8) void {
+    if (!editor.panelAction(action)) execTuiAction(editor, action);
 }
 
 /// Keys while the file tree owns the keyboard (filetree_focused, normal
@@ -2267,8 +2738,10 @@ fn handleFiletreeKey(editor: *Editor, key: Key) void {
     // Keep the "press p" hint visible while a move is pending
     if (editor.filetree_move_src == null) editor.status_message = "";
     if (tryKeybindCommand(editor, key)) return;
+    // Super+letter is a desktop/OS chord, never a tree command
+    if (key.mods.super) return;
     const ft = editor.ensureFiletree() orelse {
-        editor.filetree_focused = false;
+        _ = editor.takeKeyboardFocus(.pane);
         return;
     };
     switch (key.codepoint) {
@@ -2281,7 +2754,7 @@ fn handleFiletreeKey(editor: *Editor, key: Key) void {
             } else if (ft.multi.count() > 0) {
                 ft.clearMulti();
             } else {
-                editor.filetree_focused = false;
+                _ = editor.takeKeyboardFocus(.pane);
             }
         },
         Key.up, 'k' => {
@@ -2322,7 +2795,7 @@ fn handleFiletreeKey(editor: *Editor, key: Key) void {
                 }
             } else {
                 openFiletreeFileTui(editor, ft, idx);
-                editor.filetree_focused = false;
+                _ = editor.takeKeyboardFocus(.pane);
             }
         },
         Key.left => {
@@ -2342,6 +2815,7 @@ fn handleFiletreeKey(editor: *Editor, key: Key) void {
         'x' => editor.startFiletreeMove(),
         'p' => editor.applyFiletreeMove(),
         Key.backspace, 'u' => editor.filetreeRootUp(),
+        'o' => editor.filetreeOpenSelectedAsRoot(),
         'r', 'R' => {
             if (key.codepoint == 'R' or key.mods.shift) {
                 _ = editor.execCommand("filetree_refresh", null);
@@ -2359,13 +2833,20 @@ fn handleKey(editor: *Editor, key_in: Key) void {
     // Ignore modifier-only keys
     if (key.isModifier()) return;
 
-    // Terminals without the kitty keyboard protocol send Ctrl+/ as the bare
-    // C0 byte 0x1F with no mods (vaxis's legacy map stops at 0x1A) —
-    // normalize so the "ctrl+/" keybind works everywhere.
-    if (key.codepoint == 0x1f) {
-        key.codepoint = '/';
-        key.mods.ctrl = true;
-        key.text = null;
+    // Terminals without the kitty keyboard protocol send Ctrl+/, Ctrl+\ and
+    // Ctrl+] as bare C0 bytes with no mods (vaxis's legacy map stops at
+    // 0x1A) — normalize so those keybinds work everywhere.
+    switch (key.codepoint) {
+        0x1c, 0x1d, 0x1f => {
+            key.codepoint = switch (key.codepoint) {
+                0x1c => '\\',
+                0x1d => ']',
+                else => '/',
+            };
+            key.mods.ctrl = true;
+            key.text = null;
+        },
+        else => {},
     }
 
     // Any key press un-pins scroll (cursor tracking resumes) and drops
@@ -2446,9 +2927,11 @@ fn handleKey(editor: *Editor, key_in: Key) void {
         else => {},
     }
 
-    // Regular character input — use text if available, otherwise encode codepoint
+    // Regular character input — use text if available, otherwise encode
+    // codepoint. A lone control byte (a legacy chord with no binding) is
+    // never typed into the document.
     if (key.text) |text| {
-        if (text.len > 0) {
+        if (text.len > 0 and !(text.len == 1 and (text[0] < 0x20 or text[0] == 0x7f))) {
             _ = editor.execCommand("insert_char", text);
         }
     } else if (key.codepoint >= 32 and key.codepoint < 127) {
@@ -2561,12 +3044,13 @@ fn handleSearchKey(editor: *Editor, key: Key) void {
     if (key.isModifier()) return;
 
     if (sp.confirm_armed) {
-        switch (key.codepoint) {
+        // Only unmodified letters answer (Ctrl+A is select-all, not "All")
+        if (!hasCommandMod(key)) switch (key.codepoint) {
             'a', 'A' => editor.searchExecuteReplace(.all),
             'o', 'O' => editor.searchExecuteReplace(.open_only),
             'c', 'C', Key.escape => sp.confirm_armed = false,
             else => {},
-        }
+        };
         return;
     }
     if (key.codepoint == Key.escape) {
@@ -2636,8 +3120,7 @@ fn handleSearchKey(editor: *Editor, key: Key) void {
 /// Click inside the search band: focus the panel, pick a field or result.
 fn handleSearchClick(editor: *Editor, band: SearchBand, row: u16) void {
     const sp = &editor.search;
-    editor.search_focused = true;
-    editor.filetree_focused = false;
+    _ = editor.takeKeyboardFocus(.search);
     const rel = row - band.y;
     switch (rel) {
         0 => sp.field = .query,
@@ -2684,20 +3167,18 @@ fn drawFileFinder(win: Window, editor: *Editor, width: u16, height: u16) void {
     win.showCursor(cursor_col, input_y);
     win.setCursorShape(.beam_blink);
 
-    // Matches (paths are heap-allocated in finder_files — safe to reference)
+    // Matches (paths are heap-allocated in finder_files — safe to reference).
+    // The core scrolls the window so the selection is always drawn; the
+    // draw never writes finder_selected (clamping it here made Down on the
+    // last row preview one match while Enter opened another).
     const max_items: u16 = @min(height -| input_y -| 2, 8);
     const count = editor.finder_matches.items.len;
-    const visible_count: usize = @min(count, max_items);
-    if (visible_count > 0) {
-        if (editor.finder_selected >= visible_count) editor.finder_selected = visible_count - 1;
-    } else {
-        editor.finder_selected = 0;
-    }
+    const range = editor.finderVisibleRange(max_items);
 
     var item_y: u16 = 1;
-    for (editor.finder_matches.items[0..visible_count], 0..) |fi, shown| {
+    for (editor.finder_matches.items[range.start..range.end], range.start..) |fi, row| {
         const path = editor.finder_files.items[fi];
-        const is_selected = shown == editor.finder_selected;
+        const is_selected = row == editor.finder_selected;
         const style = if (is_selected) selected_style else item_style;
         const row_win = win.child(.{
             .x_off = @intCast(finder_x),
@@ -2752,25 +3233,20 @@ fn drawCommandPalette(win: Window, editor: *Editor, width: u16, height: u16) voi
     // Get all command names and filter
     const names = editor.commands.allNames() catch return;
 
-    // Count matches to clamp selection
-    var match_count: usize = 0;
-    for (names) |name| {
-        if (filter.len > 0 and !fuzzyMatch(name, filter)) continue;
-        match_count += 1;
-    }
-    const visible_count = @min(match_count, max_items);
-    if (visible_count > 0) {
-        if (editor.palette_selected >= visible_count) editor.palette_selected = visible_count - 1;
-    } else {
-        editor.palette_selected = 0;
-    }
+    // The visible window scrolls with the selection (the finder's rule, see
+    // Editor.finderVisibleRange); drawing never writes palette_selected.
+    const match_count = paletteMatchCount(editor);
+    const selected = @min(editor.palette_selected, match_count -| 1);
+    const first = (selected + 1) -| @as(usize, max_items);
 
     var shown: usize = 0;
     for (names) |name| {
         if (item_y > max_items) break;
         if (filter.len > 0 and !fuzzyMatch(name, filter)) continue;
+        defer shown += 1;
+        if (shown < first) continue;
 
-        const is_selected = shown == editor.palette_selected;
+        const is_selected = shown == selected;
         const style = if (is_selected) selected_style else item_style;
 
         const row_win = win.child(.{
@@ -2784,7 +3260,84 @@ fn drawCommandPalette(win: Window, editor: *Editor, width: u16, height: u16) voi
         const name_win = row_win.child(.{ .x_off = 1, .width = palette_width -| 1 });
         _ = name_win.printSegment(.{ .text = name, .style = style }, .{ .wrap = .none });
         item_y += 1;
-        shown += 1;
+    }
+}
+
+/// The generic pick-list (Editor.picker): title, filter line, rows with a
+/// dim detail; the window scrolls with the selection like the palette.
+fn drawPicker(win: Window, editor: *Editor, width: u16, height: u16) void {
+    const p = &editor.picker;
+    const top: u16 = height / 3;
+    const box_w: u16 = @min(width -| 4, 70);
+    const box_x: u16 = (width -| box_w) / 2;
+    const border_style: Style = .{ .bg = toVaxis(editor.tui_theme.overlay_bg), .fg = toVaxis(editor.tui_theme.overlay_border) };
+    const input_style: Style = .{ .bg = toVaxis(editor.tui_theme.overlay_bg), .fg = toVaxis(editor.tui_theme.overlay_fg), .bold = true };
+    const item_style: Style = .{ .bg = toVaxis(editor.tui_theme.overlay_bg), .fg = toVaxis(editor.tui_theme.overlay_fg) };
+    const dim_style: Style = .{ .bg = toVaxis(editor.tui_theme.overlay_bg), .fg = toVaxis(editor.tui_theme.overlay_dim) };
+    const selected_style: Style = .{ .bg = toVaxis(editor.tui_theme.overlay_selection_bg), .fg = toVaxis(editor.tui_theme.overlay_selection_fg), .bold = true, .reverse = true };
+
+    const title_win = win.child(.{ .x_off = @intCast(box_x), .y_off = @intCast(top), .width = box_w, .height = 1 });
+    title_win.fill(.{ .style = border_style });
+    _ = title_win.printSegment(.{ .text = p.title(), .style = border_style }, .{ .wrap = .none });
+
+    const input_win = win.child(.{ .x_off = @intCast(box_x), .y_off = @intCast(top + 1), .width = box_w, .height = 1 });
+    input_win.fill(.{ .style = border_style });
+    _ = input_win.printSegment(.{ .text = "> ", .style = border_style }, .{ .wrap = .none });
+    const filter = p.filter();
+    if (filter.len > 0) {
+        const f_win = input_win.child(.{ .x_off = 2, .width = box_w -| 2 });
+        _ = f_win.printSegment(.{ .text = filter, .style = input_style }, .{ .wrap = .none });
+    }
+    const cursor_col = box_x + 2 + @as(u16, @intCast(@min(win.gwidth(filter), box_w -| 2)));
+    win.showCursor(cursor_col, top + 1);
+    win.setCursorShape(.beam_blink);
+
+    const max_items: usize = @min(@as(usize, height -| top -| 3), 12);
+    if (p.count() == 0) {
+        const row_win = win.child(.{ .x_off = @intCast(box_x), .y_off = @intCast(top + 2), .width = box_w, .height = 1 });
+        row_win.fill(.{ .style = dim_style });
+        _ = row_win.printSegment(.{ .text = if (p.items.items.len == 0) p.empty_hint else "(no matches)", .style = dim_style }, .{ .wrap = .none });
+        return;
+    }
+    const first = p.firstVisible(max_items);
+    var row: usize = 0;
+    while (row < max_items and first + row < p.count()) : (row += 1) {
+        const item = p.itemAt(first + row);
+        const is_selected = first + row == p.selected;
+        const style = if (is_selected) selected_style else item_style;
+        const row_win = win.child(.{ .x_off = @intCast(box_x), .y_off = @intCast(top + 2 + row), .width = box_w, .height = 1 });
+        row_win.fill(.{ .style = style });
+        _ = row_win.printSegment(.{ .text = " ", .style = style }, .{ .wrap = .none });
+        const label_win = row_win.child(.{ .x_off = 1, .width = box_w -| 1 });
+        _ = label_win.printSegment(.{ .text = item.label, .style = style }, .{ .wrap = .none });
+        if (item.detail.len > 0) {
+            const lw = win.gwidth(item.label);
+            if (lw + 3 < box_w) {
+                const d_off: u16 = @intCast(lw + 3);
+                const d_win = row_win.child(.{ .x_off = d_off, .width = box_w -| d_off });
+                _ = d_win.printSegment(.{ .text = item.detail, .style = if (is_selected) style else dim_style }, .{ .wrap = .none });
+            }
+        }
+    }
+}
+
+/// Keys in picker mode: the list, the filter, Enter and Escape.
+fn handlePickerKey(editor: *Editor, key: Key) void {
+    if (key.isModifier()) return;
+    switch (key.codepoint) {
+        Key.escape => editor.pickerCancel(),
+        Key.enter => editor.pickerConfirm(),
+        Key.tab, Key.down => editor.picker.move(1),
+        Key.up => editor.picker.move(-1),
+        Key.page_down => editor.picker.move(10),
+        Key.page_up => editor.picker.move(-10),
+        Key.backspace => editor.pickerBackspace(),
+        else => {
+            var tmp: [64]u8 = undefined;
+            var n: usize = 0;
+            appendToInputBuf(&tmp, &n, key);
+            if (n > 0) editor.pickerTyped(tmp[0..n]);
+        },
     }
 }
 
@@ -2802,43 +3355,69 @@ fn fuzzyMatch(haystack: []const u8, needle: []const u8) bool {
     return true;
 }
 
+/// Signature help: the call's signature on the row above the caret with
+/// the active parameter in bold reverse, and a documentation row under it
+/// when there is one.
+fn drawSignatureHelp(win: Window, editor: *Editor, width: u16, height: u16) void {
+    const sig = editor.signature orelse return;
+    const rect = activePaneRect(editor) orelse return;
+    const doc = editor.activeDoc();
+    const caret = caretCell(editor, doc, doc.cursors.primaryConst().offset, rect.w, rect.h) orelse return;
+    const caret_row: u16 = rect.y +| caret.y;
+    const rows: u16 = if (sig.doc.len > 0) 2 else 1;
+    const want: usize = @max(sig.label.len, sig.doc.len) + 2;
+    const box_w: u16 = @intCast(@min(@as(usize, width -| 2), want));
+    if (box_w == 0) return;
+    const box_x: u16 = @min(rect.x +| caret.x, width -| box_w);
+    const box_y: u16 = if (caret_row >= rows) caret_row - rows else caret_row + 1;
+    if (box_y + rows > height) return;
+    const style: Style = .{ .bg = toVaxis(editor.tui_theme.overlay_bg), .fg = toVaxis(editor.tui_theme.overlay_fg) };
+    const param_style: Style = .{ .bg = toVaxis(editor.tui_theme.overlay_bg), .fg = toVaxis(editor.tui_theme.overlay_fg), .bold = true, .reverse = true };
+    const dim_style: Style = .{ .bg = toVaxis(editor.tui_theme.overlay_bg), .fg = toVaxis(editor.tui_theme.overlay_dim) };
+    const row = win.child(.{ .x_off = @intCast(box_x), .y_off = @intCast(box_y), .width = box_w, .height = 1 });
+    row.fill(.{ .style = style });
+    const segments = [_]struct { text: []const u8, style: Style }{
+        .{ .text = sig.label[0..sig.param_start], .style = style },
+        .{ .text = sig.label[sig.param_start..sig.param_end], .style = param_style },
+        .{ .text = sig.label[sig.param_end..], .style = style },
+    };
+    var x: u16 = 1;
+    for (segments) |seg| {
+        if (seg.text.len == 0 or x >= box_w) continue;
+        const seg_win = row.child(.{ .x_off = @intCast(x), .width = box_w - x });
+        _ = seg_win.printSegment(.{ .text = seg.text, .style = seg.style }, .{ .wrap = .none });
+        x +|= @intCast(@min(win.gwidth(seg.text), @as(usize, box_w)));
+    }
+    if (sig.doc.len > 0) {
+        const doc_row = win.child(.{ .x_off = @intCast(box_x), .y_off = @intCast(box_y + 1), .width = box_w, .height = 1 });
+        doc_row.fill(.{ .style = dim_style });
+        const doc_win = doc_row.child(.{ .x_off = 1, .width = box_w -| 1 });
+        _ = doc_win.printSegment(.{ .text = sig.doc, .style = dim_style }, .{ .wrap = .none });
+    }
+}
+
 /// Draw the completion popup near the cursor position.
 fn drawCompletionPopup(win: Window, editor: *Editor, width: u16, height: u16) void {
     if (!editor.completion_active) return;
     const items = editor.completion_items.items;
     if (items.len == 0) return;
 
-    const max_visible: u16 = @min(@as(u16, @intCast(items.len)), @min(height / 3, 10));
+    // (@min before the cast: a server can return more than 65 535 items)
+    const max_visible: u16 = @intCast(@min(items.len, @min(height / 3, 10)));
     if (max_visible == 0) return;
 
-    // Calculate popup position relative to cursor
+    // Anchored at the caret of the focused pane, by positionCursor's math.
+    // The old estimate ignored the pane's origin (tree, splits, no tab
+    // bar), scrolling, wrapping and wide text.
+    const rect = activePaneRect(editor) orelse return;
     const doc = editor.activeDoc();
-    const cursor = doc.cursors.primaryConst();
-    const cursor_pos = doc.buffer.offsetToPos(cursor.offset);
-
-    // Gutter width
-    const line_count = doc.lineCount();
-    var digits: u16 = 1;
-    {
-        var n = line_count;
-        while (n >= 10) : (digits += 1) n /= 10;
-    }
-    const gutter_w: u16 = digits + 2;
-
-    // Cursor screen position (approximate — does not account for scroll offset perfectly)
-    const cursor_screen_col: u16 = gutter_w + @as(u16, @intCast(@min(cursor_pos.col, width -| gutter_w -| 1)));
-    const cursor_screen_row: u16 = blk: {
-        const cl = cursor_pos.line;
-        const sv = doc.scroll_top;
-        if (cl < sv) break :blk 1; // tab bar row
-        const row = @as(u16, @intCast(@min(cl - sv, height -| 3)));
-        break :blk row + 1; // +1 for tab bar
-    };
+    const caret = caretCell(editor, doc, doc.cursors.primaryConst().offset, rect.w, rect.h) orelse return;
+    const cursor_screen_col: u16 = rect.x +| caret.x;
+    const cursor_screen_row: u16 = rect.y +| caret.y;
 
     // Position popup below cursor, or above if near bottom
     const popup_width: u16 = @min(width -| 2, 40);
-    var popup_x: u16 = @min(cursor_screen_col, width -| popup_width);
-    _ = &popup_x;
+    const popup_x: u16 = @min(cursor_screen_col, width -| popup_width);
     var popup_y: u16 = cursor_screen_row + 1;
     if (popup_y + max_visible >= height -| 1) {
         // Not enough space below — show above cursor
@@ -2892,10 +3471,41 @@ fn drawCompletionPopup(win: Window, editor: *Editor, width: u16, height: u16) vo
 // Overlay key handlers
 // ===========================================================================
 
-/// Append a character to a fixed buffer, returns new length.
+/// Append a character to a fixed buffer, returns new length. Keys that
+/// arrive without text (arrows, Home/End, F-keys) are not typed text and
+/// never land in a prompt.
 fn appendToInputBuf(buf: []u8, buf_len: *usize, key: Key) void {
     if (key.mods.ctrl or key.mods.alt or key.mods.super) return;
-    if (key.text) |text| text_input.append(buf, buf_len, text) else text_input.appendCodepoint(buf, buf_len, key.codepoint);
+    if (key.text) |text| {
+        text_input.append(buf, buf_len, text);
+    } else if (isTextCodepoint(key.codepoint)) {
+        text_input.appendCodepoint(buf, buf_len, key.codepoint);
+    }
+}
+
+/// A bare codepoint that stands for a typed character: not a C0/DEL
+/// control, and not a kitty-protocol functional key — vaxis reports those
+/// in the private-use block U+E000–U+F8FF (Key.left … Key.right_meta),
+/// which a Nerd Font happily draws as random icons.
+fn isTextCodepoint(cp: u21) bool {
+    if (cp < 0x20 or cp == 0x7F) return false;
+    if (cp >= 0xE000 and cp <= 0xF8FF) return false;
+    return true;
+}
+
+test "prompt input ignores functional keys that arrive without text" {
+    var buf: [16]u8 = undefined;
+    var len: usize = 0;
+    appendToInputBuf(&buf, &len, .{ .codepoint = Key.left });
+    appendToInputBuf(&buf, &len, .{ .codepoint = Key.right });
+    appendToInputBuf(&buf, &len, .{ .codepoint = Key.f7 });
+    appendToInputBuf(&buf, &len, .{ .codepoint = Key.home });
+    appendToInputBuf(&buf, &len, .{ .codepoint = Key.escape });
+    try std.testing.expectEqual(@as(usize, 0), len);
+    appendToInputBuf(&buf, &len, .{ .codepoint = 'a' });
+    appendToInputBuf(&buf, &len, .{ .codepoint = Key.space });
+    appendToInputBuf(&buf, &len, .{ .codepoint = 0xE9, .text = "é" });
+    try std.testing.expectEqualStrings("a é", buf[0..len]);
 }
 
 /// Handle keys in Find mode.
@@ -2904,7 +3514,7 @@ fn handleFindKey(editor: *Editor, key: Key) void {
 
     if (key.codepoint == Key.escape) {
         // Close find, keep cursor at current match
-        editor.mode = .normal;
+        editor.setMode(.normal);
         editor.status_message = "";
         return;
     }
@@ -2987,7 +3597,7 @@ fn handleFindReplaceKey(editor: *Editor, key: Key) void {
     if (key.isModifier()) return;
 
     if (key.codepoint == Key.escape) {
-        editor.mode = .normal;
+        editor.setMode(.normal);
         return;
     }
     if (key.codepoint == Key.tab) {
@@ -3033,7 +3643,7 @@ fn handleFindReplaceKey(editor: *Editor, key: Key) void {
 
 /// Handle keys in Confirm Overwrite mode (disk changed under a save).
 fn handleConfirmOverwriteKey(editor: *Editor, key: Key) void {
-    if (key.isModifier()) return;
+    if (key.isModifier() or hasCommandMod(key)) return;
     switch (key.codepoint) {
         'o', 'O' => editor.resolveOverwrite(.overwrite),
         'r', 'R' => editor.resolveOverwrite(.reload),
@@ -3048,7 +3658,7 @@ var close_tab_after_save_as = false;
 
 /// Close-tab prompt ([S]ave [D]iscard [C]ancel for one document).
 fn handleConfirmCloseKey(editor: *Editor, key: Key) void {
-    if (key.isModifier()) return;
+    if (key.isModifier() or hasCommandMod(key)) return;
     switch (key.codepoint) {
         's', 'S' => {
             if (editor.resolveCloseDoc(.save) == .needs_path) {
@@ -3069,7 +3679,7 @@ fn handleConfirmCloseKey(editor: *Editor, key: Key) void {
 
 /// Handle keys in Confirm Quit mode.
 fn handleConfirmQuitKey(editor: *Editor, key: Key) void {
-    if (key.isModifier()) return;
+    if (key.isModifier() or hasCommandMod(key)) return;
 
     switch (key.codepoint) {
         's', 'S' => editor.saveAllAndQuit(),
@@ -3079,7 +3689,7 @@ fn handleConfirmQuitKey(editor: *Editor, key: Key) void {
         },
         'c', 'C', Key.escape => {
             // Cancel — go back to normal mode
-            editor.mode = .normal;
+            editor.setMode(.normal);
         },
         else => {},
     }
@@ -3090,14 +3700,15 @@ fn handleFileOpenKey(editor: *Editor, key: Key) void {
     if (key.isModifier()) return;
 
     if (key.codepoint == Key.escape) {
-        editor.mode = .normal;
+        editor.setMode(.normal);
         return;
     }
     if (key.codepoint == Key.enter) {
-        editor.mode = .normal;
+        editor.setMode(.normal);
         if (editor.open_buf_len > 0) {
             const path = editor.open_buf[0..editor.open_buf_len];
-            _ = editor.openFile(path) catch {};
+            editor.recordNavPoint();
+            _ = editor.openFile(path) catch |err| reportOpenError(editor, path, err);
         }
         return;
     }
@@ -3106,6 +3717,78 @@ fn handleFileOpenKey(editor: *Editor, key: Key) void {
         return;
     }
     appendToInputBuf(&editor.open_buf, &editor.open_buf_len, key);
+}
+
+/// `open_folder` prompt: Enter makes the typed folder the project.
+fn handleFolderOpenKey(editor: *Editor, key: Key) void {
+    if (key.isModifier()) return;
+    if (key.codepoint == Key.escape) {
+        editor.setMode(.normal);
+        return;
+    }
+    if (key.codepoint == Key.enter) {
+        editor.setMode(.normal);
+        if (editor.open_buf_len > 0) {
+            var pbuf: [512]u8 = undefined;
+            const n = editor.open_buf_len;
+            @memcpy(pbuf[0..n], editor.open_buf[0..n]);
+            _ = editor.openProject(pbuf[0..n]);
+        }
+        return;
+    }
+    if (key.codepoint == Key.backspace) {
+        if (editor.open_buf_len > 0) text_input.backspace(&editor.open_buf, &editor.open_buf_len);
+        return;
+    }
+    appendToInputBuf(&editor.open_buf, &editor.open_buf_len, key);
+}
+
+/// Recent-projects picker: Up/Down, Enter, a row's digit, Escape.
+fn handleRecentProjectsKey(editor: *Editor, key: Key) void {
+    if (key.isModifier() or hasCommandMod(key)) return;
+    const count = editor.recent_projects.items.len;
+    switch (key.codepoint) {
+        Key.escape => editor.cancelRecentProjects(),
+        Key.up => editor.recent_selected -|= 1,
+        Key.down, Key.tab => if (count > 0) {
+            editor.recent_selected = (editor.recent_selected + 1) % count;
+        },
+        Key.enter => editor.chooseRecentProject(editor.recent_selected),
+        '1'...'9' => editor.chooseRecentProject(key.codepoint - '1'),
+        else => {},
+    }
+}
+
+fn drawRecentProjects(win: Window, editor: *Editor, width: u16, height: u16) void {
+    const count: u16 = @intCast(@min(editor.recent_projects.items.len, Editor.recent_projects_max));
+    const top = height -| (count + 2);
+    const style: Style = .{ .bg = toVaxis(editor.tui_theme.overlay_bg), .fg = toVaxis(editor.tui_theme.overlay_fg) };
+    const panel = win.child(.{ .y_off = @intCast(top), .width = width, .height = count + 2 });
+    panel.fill(.{ .style = style });
+    _ = writeStr(panel, 1, 0, "Recent projects", style);
+    recent_projects_band = .{ .x = 0, .y = top + 1, .w = width, .h = count };
+    for (0..count) |idx| {
+        var buf: [std.fs.max_path_bytes + 8]u8 = undefined;
+        const label = std.fmt.bufPrint(&buf, " {d}. {s}", .{ idx + 1, editor.recent_projects.items[idx] }) catch "";
+        var row_style = style;
+        row_style.reverse = idx == editor.recent_selected;
+        _ = writeStr(panel, 0, @intCast(idx + 1), label, row_style);
+    }
+    _ = writeStr(panel, 1, count + 1, "Enter opens / Esc cancels", style);
+}
+
+/// Status line for a failed Open prompt (the prompt used to swallow errors).
+fn reportOpenError(editor: *Editor, path: []const u8, err: anyerror) void {
+    switch (err) {
+        // The encoding picker took over; it names the file itself
+        error.EncodingRequired => {},
+        error.BinaryFile => editor.status_message = "Not opened: binary or unsupported text encoding",
+        else => {
+            var prefix_buf: [96]u8 = undefined;
+            const prefix = std.fmt.bufPrint(&prefix_buf, "Open failed ({s}): ", .{@errorName(err)}) catch "Open failed: ";
+            lua_api.setStatusText(editor, prefix, path);
+        },
+    }
 }
 
 /// Handle keys in Save As mode.
@@ -3144,9 +3827,13 @@ fn handleFiletreePromptKey(editor: *Editor, key: Key) void {
         return;
     }
     if (editor.filetree_prompt_kind == .delete_confirm) {
-        if (key.codepoint == 'y' or key.codepoint == 'Y' or key.codepoint == Key.enter) {
+        // Deleting is permanent: only an unmodified y confirms. Enter no
+        // longer does (it was one stray keypress away from a delete), and
+        // any other key cancels; chords (Ctrl+Y, ...) are ignored.
+        if (hasCommandMod(key)) return;
+        if (key.codepoint == 'y' or key.codepoint == 'Y') {
             editor.applyFiletreePrompt();
-        } else if (key.codepoint == 'n' or key.codepoint == 'N') {
+        } else {
             editor.cancelFiletreePrompt();
         }
         return;
@@ -3203,39 +3890,55 @@ fn handleFinderKey(editor: *Editor, key: Key) void {
     if (editor.finder_buf_len != before) editor.finderRefresh();
 }
 
+/// Number of palette commands matching the current filter.
+fn paletteMatchCount(editor: *Editor) usize {
+    const filter = editor.palette_buf[0..editor.palette_buf_len];
+    const names = editor.commands.allNames() catch return 0;
+    var count: usize = 0;
+    for (names) |name| {
+        if (filter.len > 0 and !fuzzyMatch(name, filter)) continue;
+        count += 1;
+    }
+    return count;
+}
+
 fn handlePaletteKey(editor: *Editor, key: Key) void {
     if (key.isModifier()) return;
 
     if (key.codepoint == Key.escape) {
-        editor.mode = .normal;
+        editor.setMode(.normal);
         editor.palette_selected = 0;
         return;
     }
     if (key.codepoint == Key.enter) {
-        // Execute the selected matching command
+        // Execute the selected matching command (the drawn selection: the
+        // index is clamped the same way drawCommandPalette clamps it)
         const filter = editor.palette_buf[0..editor.palette_buf_len];
         const names = editor.commands.allNames() catch {
-            editor.mode = .normal;
+            editor.setMode(.normal);
             editor.palette_selected = 0;
             return;
         };
+        const selected = @min(editor.palette_selected, paletteMatchCount(editor) -| 1);
         var idx: usize = 0;
         for (names) |name| {
             if (filter.len > 0 and !fuzzyMatch(name, filter)) continue;
-            if (idx == editor.palette_selected) {
-                editor.mode = .normal;
+            if (idx == selected) {
+                editor.setMode(.normal);
                 editor.palette_selected = 0;
                 _ = editor.execCommand(name, null);
                 return;
             }
             idx += 1;
         }
-        editor.mode = .normal;
+        editor.setMode(.normal);
         editor.palette_selected = 0;
         return;
     }
     if (key.codepoint == Key.tab or key.codepoint == Key.down) {
-        editor.palette_selected += 1;
+        // Every match is reachable: the list scrolls (it used to stop at
+        // the 10 visible rows)
+        if (editor.palette_selected + 1 < paletteMatchCount(editor)) editor.palette_selected += 1;
         return;
     }
     if (key.codepoint == Key.up) {
@@ -3258,7 +3961,7 @@ fn handleGotoLineKey(editor: *Editor, key: Key) void {
     if (key.isModifier()) return;
 
     if (key.codepoint == Key.escape) {
-        editor.mode = .normal;
+        editor.setMode(.normal);
         return;
     }
     if (key.codepoint == Key.enter) {
@@ -3266,10 +3969,10 @@ fn handleGotoLineKey(editor: *Editor, key: Key) void {
             const num_str = editor.goto_buf[0..editor.goto_buf_len];
             const line_num = std.fmt.parseInt(usize, num_str, 10) catch 0;
             if (line_num > 0) {
-                editor.activeDoc().gotoLine(line_num);
+                editor.jumpToLine(line_num);
             }
         }
-        editor.mode = .normal;
+        editor.setMode(.normal);
         return;
     }
     if (key.codepoint == Key.backspace) {
@@ -3310,15 +4013,18 @@ fn handleCompletionKey(editor: *Editor, key: Key) void {
             }
         },
         else => {
-            // Any other key dismisses completion and passes through to normal handler
-            editor.clearCompletionItems();
+            // Typed identifier and trigger characters keep the popup (the
+            // insert refilters or re-requests it); anything else dismisses
+            // it. Either way the key goes on to the normal handler.
+            const keeps = if (key.text) |text| !hasCommandMod(key) and text.len > 0 and (text.len > 1 or editor.completionKeepsOnByte(text[0])) else false;
+            if (!keeps) editor.clearCompletionItems();
             handleKey(editor, key);
         },
     }
 }
 
 fn handleEncodingKey(editor: *Editor, key: Key) void {
-    if (key.isModifier()) return;
+    if (key.isModifier() or hasCommandMod(key)) return;
     switch (editor.mode) {
         .encoding_picker => switch (key.codepoint) {
             Key.escape => editor.cancelEncoding(),
@@ -3346,7 +4052,7 @@ fn handleEncodingKey(editor: *Editor, key: Key) void {
 fn handleLspKey(editor: *Editor, key: Key) void {
     if (key.isModifier()) return;
     if (key.codepoint == Key.escape) {
-        if (editor.mode == .workspace_preview) editor.lsp_tools.resolvePreview(editor, false) else editor.mode = .normal;
+        if (editor.mode == .workspace_preview) editor.lsp_tools.resolvePreview(editor, false) else editor.setMode(.normal);
     } else if (editor.mode == .symbol_rename) {
         switch (key.codepoint) {
             Key.enter => editor.lsp_tools.submitRename(editor),
@@ -3394,9 +4100,9 @@ fn drawLspPanel(win: Window, editor: *Editor, width: u16, height: u16) void {
 }
 
 fn handleToolKey(editor: *Editor, key: Key) void {
-    if (key.isModifier()) return;
+    if (key.isModifier() or hasCommandMod(key)) return;
     switch (key.codepoint) {
-        Key.escape => editor.mode = .normal,
+        Key.escape => editor.setMode(.normal),
         Key.enter => editor.tool_panel.activate(editor),
         Key.up => editor.tool_panel.move(editor, false),
         Key.down => editor.tool_panel.move(editor, true),
@@ -3530,4 +4236,830 @@ test "TUI encoding smoke: status click picker Unicode fields and caret width" {
     editor.search.field = .query;
     handleSearchKey(&editor, .{ .codepoint = 0x754c });
     try t.expectEqualStrings("界", editor.search.query());
+}
+
+test "TUI cell math: tabs, wide and zero-width characters, mid-character starts" {
+    const t = std.testing;
+    // Cells to bytes, clamped; a start inside a character snaps forward
+    try t.expectEqual(@as(usize, 3), byteAtCol("héllo", 0, 2, 4, false));
+    try t.expectEqual(@as(usize, 6), byteAtCol("héllo", 0, 99, 4, false));
+    try t.expectEqual(@as(usize, 2), colOfByte("héllo", 2, 4));
+    try t.expectEqual(@as(usize, 3), byteAtCol("héllo", 0, colOfByte("héllo", 2, 4), 4, false));
+    try t.expectEqual(@as(usize, 6), byteAtCol("héllo", 0, colOfByte("héllo", 9, 4), 4, false));
+    // A tab reaches the next tab stop
+    try t.expectEqual(@as(usize, 4), colOfByte("\tx", 1, 4));
+    try t.expectEqual(@as(usize, 8), colOfByte("ab\tcd\t", 6, 4));
+    try t.expectEqual(@as(usize, 3), colOfByte("ab\tcd\t", 3, 3));
+    try t.expectEqual(@as(usize, 5), advanceCols("\tx", 0, 4));
+    // Wide characters take two cells; combining marks and ZWJ none
+    try t.expectEqual(@as(usize, 2), advanceCols("界", 0, 4));
+    try t.expectEqual(@as(usize, 1), advanceCols("e\u{301}", 0, 4));
+    try t.expectEqual(@as(usize, 2), advanceCols("a\u{200d}b", 0, 4));
+    // A click lands on the nearer edge of a tab or wide character
+    try t.expectEqual(@as(usize, 0), byteAtCol("\tx", 0, 1, 4, true));
+    try t.expectEqual(@as(usize, 1), byteAtCol("\tx", 0, 2, 4, true));
+    try t.expectEqual(@as(usize, 1), byteAtCol("\tx", 0, 4, 4, true));
+    try t.expectEqual(@as(usize, 3), byteAtCol("界x", 0, 1, 4, true));
+    // ... and never between a character and its combining mark
+    try t.expectEqual(@as(usize, 3), byteAtCol("e\u{301}x", 0, 1, 4, false));
+    // A wide character straddling the right edge is left out
+    try t.expectEqual(@as(usize, 1), fitEnd("a界", 0, 2, 4));
+    // Wrapping counts cells: "a" + a 3-cell tab fill a 4-cell row
+    try t.expectEqual(@as(u16, 2), wrapLineRows("a\tb", 4, 4));
+    try t.expectEqual(@as(u16, 0), wrapColToVisual("a\tb", 4, 1, 4).row);
+    try t.expectEqual(@as(u16, 1), wrapColToVisual("a\tb", 4, 1, 4).col);
+    try t.expectEqual(@as(u16, 1), wrapColToVisual("a\tb", 4, 2, 4).row);
+    try t.expectEqual(@as(u16, 0), wrapColToVisual("a\tb", 4, 2, 4).col);
+    // A wide character that does not fit moves to the next row
+    try t.expectEqual(@as(u16, 2), wrapLineRows("abc界", 4, 4));
+    try t.expectEqual(@as(usize, 3), wrapVisualToCol("abc界", 4, 1, 0, 4));
+}
+
+test "TUI no-wrap: cursors, clicks, and row text count display cells, not bytes" {
+    const t = std.testing;
+    var editor = try Editor.init(t.allocator, t.io);
+    defer editor.deinit();
+    editor.filetree_visible = false;
+    editor.word_wrap = false;
+    var screen = try vaxis.Screen.init(t.allocator, .{ .cols = 100, .rows = 30, .x_pixel = 0, .y_pixel = 0 });
+    defer screen.deinit(t.allocator);
+    const win: Window = .{ .x_off = 0, .y_off = 0, .parent_x_off = 0, .parent_y_off = 0, .width = 100, .height = 30, .screen = &screen };
+    const doc = editor.activeDoc();
+    try doc.loadText("héllo wörld\n" ++ "é" ** 60);
+    doc.cursors.primary().offset = 4; // second "l": 4 bytes but 3 cells in
+    try doc.cursors.addCursor(8); // "ö": 7 cells in
+    frameArenaReset();
+    drawEditor(win, &editor, 100, 30);
+    positionCursor(win, &editor, 100, 30);
+    const rect = pane_rects[0];
+    const x0 = rect.x + lineNumberWidth(doc.lineCount(), editor.gutter_min_digits) + 1;
+    try t.expectEqual(x0 + 3, screen.cursor.col);
+    const sec = screen.readCell(x0 + 7, rect.y).?;
+    try t.expectEqualStrings("ö", sec.char.grapheme);
+    try t.expectEqual(toVaxis(editor.tui_theme.cursor_bg), sec.style.bg);
+    try t.expectEqualStrings("é", screen.readCell(x0 + 59, rect.y + 1).?.char.grapheme);
+    handleMouse(&editor, .{ .row = @intCast(rect.y), .col = @intCast(x0 + 8), .button = .left, .type = .press, .mods = .{} });
+    try t.expectEqual(@as(usize, 10), doc.cursors.primary().offset);
+
+    // scroll_left inside "é": row text, cursor, and clicks all snap to the next char
+    doc.scroll_left = 2;
+    doc.cursors.primary().offset = 4;
+    frameArenaReset();
+    drawEditor(win, &editor, 100, 30);
+    positionCursor(win, &editor, 100, 30);
+    try t.expectEqualStrings("l", screen.readCell(x0, rect.y).?.char.grapheme);
+    try t.expectEqual(x0 + 1, screen.cursor.col);
+    handleMouse(&editor, .{ .row = @intCast(rect.y), .col = @intCast(x0), .button = .left, .type = .press, .mods = .{} });
+    try t.expectEqual(@as(usize, 3), doc.cursors.primary().offset);
+}
+
+// ---------------------------------------------------------------------------
+// Test helpers
+// ---------------------------------------------------------------------------
+
+fn testScreen(allocator: std.mem.Allocator) !vaxis.Screen {
+    return vaxis.Screen.init(allocator, .{ .cols = 100, .rows = 30, .x_pixel = 0, .y_pixel = 0 });
+}
+
+fn testWin(screen: *vaxis.Screen) Window {
+    return .{ .x_off = 0, .y_off = 0, .parent_x_off = 0, .parent_y_off = 0, .width = 100, .height = 30, .screen = screen };
+}
+
+/// A fresh frame, as `run` draws it.
+fn testFrame(win: Window, editor: *Editor) void {
+    frameArenaReset();
+    drawEditor(win, editor, 100, 30);
+}
+
+fn testClick(editor: *Editor, col: u16, row: u16) void {
+    handleMouse(editor, .{ .row = @intCast(row), .col = @intCast(col), .button = .left, .type = .press, .mods = .{} });
+    handleMouse(editor, .{ .row = @intCast(row), .col = @intCast(col), .button = .left, .type = .release, .mods = .{} });
+}
+
+fn testKey(editor: *Editor, codepoint: u21, mods: Key.Modifiers) void {
+    dispatchKey(editor, .{ .codepoint = codepoint, .mods = mods });
+}
+
+fn testType(editor: *Editor, text: []const u8) void {
+    var i: usize = 0;
+    while (i < text.len) {
+        const ch = charAt(text, i);
+        dispatchKey(editor, .{ .codepoint = ch.cp, .text = text[i..][0..ch.len] });
+        i += ch.len;
+    }
+}
+
+/// Text of `len` screen cells starting at (x, y).
+fn testCells(screen: *vaxis.Screen, x: u16, y: u16, len: u16, buf: []u8) []const u8 {
+    var n: usize = 0;
+    for (0..len) |i| {
+        const g = screen.readCell(x + @as(u16, @intCast(i)), y).?.char.grapheme;
+        @memcpy(buf[n..][0..g.len], g);
+        n += g.len;
+    }
+    return buf[0..n];
+}
+
+const TestClipboard = struct {
+    // Nothing reaches the system clipboard; getClipboard reads editor.clipboard.
+    fn set(_: []const u8) void {}
+    fn get() []const u8 {
+        return "";
+    }
+};
+
+// ---------------------------------------------------------------------------
+// E1 terminal keys, E3 wakes, E2 paste
+// ---------------------------------------------------------------------------
+
+test "TUI terminal keys: specials, whole text and Ctrl chords reach the shell encoded" {
+    const t = std.testing;
+    var out: [64]u8 = undefined;
+    try t.expectEqualStrings("\x1b[A", terminalKeyBytes(.{ .codepoint = Key.up }, false, &out));
+    try t.expectEqualStrings("\x1b[1;2A", terminalKeyBytes(.{ .codepoint = Key.up, .mods = .{ .shift = true } }, false, &out));
+    try t.expectEqualStrings("\x1bOA", terminalKeyBytes(.{ .codepoint = Key.up }, true, &out));
+    try t.expectEqualStrings("\x1b[1;5C", terminalKeyBytes(.{ .codepoint = Key.right, .mods = .{ .ctrl = true } }, true, &out));
+    try t.expectEqualStrings("\x1b[H", terminalKeyBytes(.{ .codepoint = Key.home }, false, &out));
+    try t.expectEqualStrings("\x1b[6~", terminalKeyBytes(.{ .codepoint = Key.page_down }, false, &out));
+    try t.expectEqualStrings("\x1b[3~", terminalKeyBytes(.{ .codepoint = Key.delete }, false, &out));
+    try t.expectEqualStrings("\x1bOP", terminalKeyBytes(.{ .codepoint = Key.f1 }, false, &out));
+    try t.expectEqualStrings("\x1b[18~", terminalKeyBytes(.{ .codepoint = Key.f7 }, false, &out));
+    try t.expectEqualStrings("\r", terminalKeyBytes(.{ .codepoint = Key.enter }, false, &out));
+    try t.expectEqualStrings("\x7f", terminalKeyBytes(.{ .codepoint = Key.backspace }, false, &out));
+    try t.expectEqualStrings("\x1b", terminalKeyBytes(.{ .codepoint = Key.escape }, false, &out));
+    // Text keys send every byte: emoji, CJK, multi-code-point graphemes
+    try t.expectEqualStrings("😀", terminalKeyBytes(.{ .codepoint = 0x1F600, .text = "😀" }, false, &out));
+    try t.expectEqualStrings("界", terminalKeyBytes(.{ .codepoint = 0x754C, .text = "界" }, false, &out));
+    try t.expectEqualStrings("👩‍🚀", terminalKeyBytes(.{ .codepoint = Key.multicodepoint, .text = "👩‍🚀" }, false, &out));
+    try t.expectEqualStrings("\x1bx", terminalKeyBytes(.{ .codepoint = 'x', .text = "x", .mods = .{ .alt = true } }, false, &out));
+    // Ctrl chords are C0 bytes — Windows consoles report the character
+    try t.expectEqualStrings("\x1b", terminalKeyBytes(.{ .codepoint = '[', .mods = .{ .ctrl = true } }, false, &out));
+    try t.expectEqualStrings("\x1c", terminalKeyBytes(.{ .codepoint = '\\', .mods = .{ .ctrl = true } }, false, &out));
+    try t.expectEqualStrings("\x1f", terminalKeyBytes(.{ .codepoint = '/', .mods = .{ .ctrl = true } }, false, &out));
+    try t.expectEqualStrings("\x03", terminalKeyBytes(.{ .codepoint = 'c', .mods = .{ .ctrl = true } }, false, &out));
+    // ... and a legacy terminal's raw C0 text passes through as-is
+    try t.expectEqualStrings("\x1d", terminalKeyBytes(.{ .codepoint = 0x1d, .text = "\x1d" }, false, &out));
+    // Modifier and media keys send nothing
+    try t.expectEqualStrings("", terminalKeyBytes(.{ .codepoint = Key.left_shift, .mods = .{ .shift = true } }, false, &out));
+    try t.expectEqualStrings("", terminalKeyBytes(.{ .codepoint = Key.media_play }, false, &out));
+}
+
+var test_wakes_returned = std.atomic.Value(bool).init(false);
+fn testWakeThread() void {
+    lspWakeFn();
+    terminalWakeFn();
+    luaJobWakeFn();
+    test_wakes_returned.store(true, .release);
+}
+
+test "TUI wakes never block on a full event queue" {
+    const t = std.testing;
+    var loop: vaxis.Loop(Event) = .{ .io = t.io, .tty = undefined, .vaxis = undefined, .queue = .init(t.io) };
+    global_loop = &loop;
+    defer global_loop = null;
+    while (try loop.tryPostEvent(.lsp_data)) {}
+    test_wakes_returned.store(false, .release);
+    const th = try std.Thread.spawn(.{}, testWakeThread, .{});
+    var waited: usize = 0;
+    while (!test_wakes_returned.load(.acquire) and waited < 100) : (waited += 1) {
+        try std.Io.sleep(t.io, .fromMilliseconds(10), .awake);
+    }
+    const returned = test_wakes_returned.load(.acquire);
+    // Free the queue so a parked (unfixed) wake could finish
+    while (try loop.tryEvent()) |_| {}
+    th.join();
+    try t.expect(returned);
+}
+
+test "TUI paste: a bracketed paste is one verbatim edit; prompts take its first line" {
+    const t = std.testing;
+    var editor = try Editor.init(t.allocator, t.io);
+    defer editor.deinit();
+    defer paste_buf.clearAndFree(t.allocator);
+    editor.lsp_enabled = false;
+    editor.filetree_visible = false;
+    const doc = editor.activeDoc();
+
+    // Typed, Enter auto-indents and "(" / "{" auto-close; pasted, neither
+    handleInputEvent(&editor, .paste_start, null);
+    for ("if (x) {") |c| handleInputEvent(&editor, .{ .key_press = .{ .codepoint = c, .text = &[_]u8{c} } }, null);
+    handleInputEvent(&editor, .{ .key_press = .{ .codepoint = Key.enter } }, null);
+    handleInputEvent(&editor, .{ .key_press = .{ .codepoint = 'j', .mods = .{ .ctrl = true } } }, null); // CR LF = one break
+    for ("  y;") |c| handleInputEvent(&editor, .{ .key_press = .{ .codepoint = c, .text = &[_]u8{c} } }, null);
+    handleInputEvent(&editor, .{ .key_press = .{ .codepoint = 'j', .mods = .{ .ctrl = true } } }, null);
+    handleInputEvent(&editor, .{ .key_press = .{ .codepoint = '}', .text = "}" } }, null);
+    try t.expectEqualStrings("", doc.buffer.slice(0, doc.buffer.byteLen()));
+    handleInputEvent(&editor, .paste_end, null);
+    try t.expectEqualStrings("if (x) {\n  y;\n}", doc.buffer.slice(0, doc.buffer.byteLen()));
+    try t.expect(!paste_active);
+    // One undo step removes all of it
+    try t.expect(try doc.undoAction());
+    try t.expectEqualStrings("", doc.buffer.slice(0, doc.buffer.byteLen()));
+
+    // A single-line prompt takes the first line, as if typed
+    _ = editor.execAction("find");
+    handleInputEvent(&editor, .paste_start, null);
+    for ("needle") |c| handleInputEvent(&editor, .{ .key_press = .{ .codepoint = c, .text = &[_]u8{c} } }, null);
+    handleInputEvent(&editor, .{ .key_press = .{ .codepoint = Key.enter } }, null);
+    handleInputEvent(&editor, .{ .key_press = .{ .codepoint = 'x', .text = "x" } }, null);
+    handleInputEvent(&editor, .paste_end, null);
+    try t.expectEqual(Editor.Mode.find, editor.mode);
+    try t.expectEqualStrings("needle", editor.find_buf[0..editor.find_buf_len]);
+    editor.setMode(.normal);
+
+    // A pasted letter never answers a confirmation
+    editor.setMode(.confirm_quit);
+    handleInputEvent(&editor, .paste_start, null);
+    handleInputEvent(&editor, .{ .key_press = .{ .codepoint = 'd', .text = "d" } }, null);
+    handleInputEvent(&editor, .paste_end, null);
+    try t.expectEqual(Editor.Mode.confirm_quit, editor.mode);
+    try t.expect(editor.running);
+}
+
+// ---------------------------------------------------------------------------
+// E4 tabs and cell widths
+// ---------------------------------------------------------------------------
+
+test "TUI tabs: indentation is drawn, and caret, clicks and cursors agree with it" {
+    const t = std.testing;
+    var editor = try Editor.init(t.allocator, t.io);
+    defer editor.deinit();
+    editor.lsp_enabled = false;
+    editor.filetree_visible = false;
+    var screen = try testScreen(t.allocator);
+    defer screen.deinit(t.allocator);
+    const win = testWin(&screen);
+    const doc = editor.activeDoc();
+    try doc.loadText("\tx = 1;\n\t\t界z\n");
+    for ([_]bool{ false, true }) |wrap| {
+        editor.word_wrap = wrap;
+        doc.cursors.primary().offset = 1; // on 'x', right after the tab
+        testFrame(win, &editor);
+        positionCursor(win, &editor, 100, 30);
+        const rect = pane_rects[0];
+        const x0 = rect.x + lineNumberWidth(doc.lineCount(), editor.gutter_min_digits) + 1;
+        // The tab is 4 cells wide (was 0 drawn, 1 counted): 'x' sits at the
+        // tab stop and so does the caret
+        try t.expectEqualStrings(" ", screen.readCell(x0, rect.y).?.char.grapheme);
+        try t.expectEqualStrings("x", screen.readCell(x0 + 4, rect.y).?.char.grapheme);
+        try t.expectEqual(x0 + 4, screen.cursor.col);
+        try t.expectEqualStrings("界", screen.readCell(x0 + 8, rect.y + 1).?.char.grapheme);
+        try t.expectEqualStrings("z", screen.readCell(x0 + 10, rect.y + 1).?.char.grapheme);
+        // Clicks: the right half of the tab is after it, the left before it
+        testClick(&editor, x0 + 3, rect.y);
+        try t.expectEqual(@as(usize, 1), doc.cursors.primary().offset);
+        testClick(&editor, x0 + 1, rect.y);
+        try t.expectEqual(@as(usize, 0), doc.cursors.primary().offset);
+        testClick(&editor, x0 + 10, rect.y + 1);
+        try t.expectEqualStrings("z", doc.buffer.slice(doc.cursors.primary().offset, doc.cursors.primary().offset + 1));
+        // A secondary cursor after the tabs is drawn on the wide character
+        doc.cursors.primary().offset = 0;
+        try doc.cursors.addCursor(doc.buffer.posToOffset(1, 2));
+        testFrame(win, &editor);
+        const sec = screen.readCell(x0 + 8, rect.y + 1).?;
+        try t.expectEqualStrings("界", sec.char.grapheme);
+        try t.expectEqual(toVaxis(editor.tui_theme.cursor_bg), sec.style.bg);
+        doc.cursors.clearSecondary();
+    }
+}
+
+test "TUI diagnostic underlines land on the cells of their byte columns" {
+    const t = std.testing;
+    var editor = try Editor.init(t.allocator, t.io);
+    defer editor.deinit();
+    editor.lsp_enabled = false;
+    editor.filetree_visible = false;
+    var screen = try testScreen(t.allocator);
+    defer screen.deinit(t.allocator);
+    const win = testWin(&screen);
+    const doc = editor.activeDoc();
+    try doc.loadText("\tfoo bar");
+    // "bar" = bytes 5..8, drawn at cells 8..10 (the tab spans 0..3)
+    try doc.diagnostics.append(doc.allocator, .{
+        .start_line = 0,
+        .start_col = 5,
+        .end_line = 0,
+        .end_col = 8,
+        .severity = .err,
+        .message = try doc.allocator.dupe(u8, "bad"),
+    });
+    testFrame(win, &editor);
+    const rect = pane_rects[0];
+    const x0 = rect.x + lineNumberWidth(doc.lineCount(), editor.gutter_min_digits) + 1;
+    try t.expectEqualStrings("b", screen.readCell(x0 + 8, rect.y).?.char.grapheme);
+    for (8..11) |cx| try t.expectEqual(vaxis.Style.Underline.single, screen.readCell(x0 + @as(u16, @intCast(cx)), rect.y).?.style.ul_style);
+    for (4..8) |cx| try t.expectEqual(vaxis.Style.Underline.off, screen.readCell(x0 + @as(u16, @intCast(cx)), rect.y).?.style.ul_style);
+}
+
+test "TUI no-wrap: the view scrolls sideways by cells, against the real text width" {
+    const t = std.testing;
+    var editor = try Editor.init(t.allocator, t.io);
+    defer editor.deinit();
+    editor.lsp_enabled = false;
+    editor.filetree_visible = false;
+    editor.word_wrap = false;
+    var screen = try testScreen(t.allocator);
+    defer screen.deinit(t.allocator);
+    const win = testWin(&screen);
+    const doc = editor.activeDoc();
+    // 30 tabs = 120 cells but only 30 bytes: a byte count never scrolled
+    try doc.loadText("\t" ** 30 ++ "end");
+    doc.cursors.primary().offset = 30;
+    testFrame(win, &editor);
+    positionCursor(win, &editor, 100, 30);
+    try t.expect(screen.cursor_vis);
+    const rect = pane_rects[0];
+    const x0 = rect.x + lineNumberWidth(doc.lineCount(), editor.gutter_min_digits) + 1;
+    try t.expectEqualStrings("e", screen.readCell(screen.cursor.col, rect.y).?.char.grapheme);
+    try t.expect(screen.cursor.col < rect.x + rect.w);
+    try t.expect(doc.scroll_left > 0);
+    // Back to the start scrolls back
+    doc.cursors.primary().offset = 0;
+    testFrame(win, &editor);
+    positionCursor(win, &editor, 100, 30);
+    try t.expectEqual(@as(usize, 0), doc.scroll_left);
+    try t.expectEqual(x0, screen.cursor.col);
+}
+
+// ---------------------------------------------------------------------------
+// E5 drags, wrapped clicks and the wheel; E6 caret; E9 completion popup
+// ---------------------------------------------------------------------------
+
+test "TUI mouse: drags stay in their pane; wrapped clicks measure the pane hit" {
+    const t = std.testing;
+    var editor = try Editor.init(t.allocator, t.io);
+    defer editor.deinit();
+    editor.lsp_enabled = false;
+    editor.filetree_visible = false;
+    editor.word_wrap = false;
+    var screen = try testScreen(t.allocator);
+    defer screen.deinit(t.allocator);
+    const win = testWin(&screen);
+    const doc0 = editor.activeDoc();
+    try doc0.loadText("a\nb\nc\n");
+    const d1 = try editor.newDocument();
+    try d1.loadText("0123456789\n" ** 50);
+    const w = editor.activeWindow();
+    _ = try w.layout.splitPane(0, .horizontal, .{ .editor = 1 });
+    w.layout.panes.items[0].content = .{ .editor = 0 };
+    editor.focusPane(0);
+    testFrame(win, &editor);
+    const left = paneRectFor(0).?;
+    const right = paneRectFor(1).?;
+
+    // Press in the left pane, drag deep into the right one: the selection
+    // stays in the left document (it used to take the right pane's offset)
+    handleMouse(&editor, .{ .row = @intCast(left.y), .col = @intCast(left.x + 5), .button = .left, .type = .press, .mods = .{} });
+    handleMouse(&editor, .{ .row = @intCast(right.y + 20), .col = @intCast(right.x + 8), .button = .left, .type = .drag, .mods = .{} });
+    const d0 = &editor.documents.items[0];
+    try t.expectEqual(@as(usize, 6), d0.cursors.primary().offset);
+    try t.expectEqual(@as(usize, 0), editor.documents.items[1].cursors.primary().offset);
+    handleMouse(&editor, .{ .row = @intCast(right.y + 20), .col = @intCast(right.x + 8), .button = .left, .type = .release, .mods = .{} });
+    // Typing replaces the selection in the left document
+    testType(&editor, "z");
+    try t.expectEqualStrings("az", d0.buffer.slice(0, d0.buffer.byteLen()));
+    try t.expectEqualStrings("", editor.status_message);
+    // A drag outside the window clamps instead of failing
+    handleMouse(&editor, .{ .row = @intCast(left.y), .col = @intCast(left.x + 5), .button = .left, .type = .press, .mods = .{} });
+    handleMouse(&editor, .{ .row = -3, .col = -7, .button = .left, .type = .drag, .mods = .{} });
+    try t.expectEqual(@as(usize, 0), d0.cursors.primary().offset);
+
+    // Wrapped click in a narrower split: measured with THAT pane's width
+    // (editor.text_width is the focused left pane's)
+    editor.word_wrap = true;
+    try editor.documents.items[1].loadText("0123456789" ** 8);
+    _ = try w.layout.splitPane(1, .horizontal, .{ .editor = 1 });
+    editor.focusPane(0);
+    testFrame(win, &editor);
+    const narrow = paneRectFor(2).?;
+    try t.expect(narrow.w < left.w);
+    const gutter = lineNumberWidth(1, editor.gutter_min_digits) + 1;
+    testClick(&editor, narrow.x + gutter, narrow.y + 1);
+    try t.expectEqual(@as(u8, 2), editor.activePaneId());
+    try t.expectEqual(@as(usize, narrow.w - gutter), editor.activeDoc().cursors.primary().offset);
+}
+
+test "TUI mouse: the wheel scrolls the document under it, never a terminal" {
+    const t = std.testing;
+    var editor = try Editor.init(t.allocator, t.io);
+    defer editor.deinit();
+    editor.lsp_enabled = false;
+    editor.filetree_visible = false;
+    editor.word_wrap = false;
+    var screen = try testScreen(t.allocator);
+    defer screen.deinit(t.allocator);
+    const win = testWin(&screen);
+    try editor.activeDoc().loadText("x\n" ** 100);
+    const d1 = try editor.newDocument();
+    try d1.loadText("y\n" ** 100);
+    try editor.terminals.append(t.allocator, null); // fake slot: no shell
+    const w = editor.activeWindow();
+    _ = try w.layout.splitPane(0, .horizontal, .{ .editor = 1 });
+    _ = try w.layout.splitPane(1, .vertical, .{ .terminal = 0 });
+    w.layout.panes.items[0].content = .{ .editor = 0 };
+    editor.focusPane(0);
+    testFrame(win, &editor);
+    const right = paneRectFor(1).?;
+    const term = paneRectFor(2).?;
+    scroll_pinned = false;
+    handleMouse(&editor, .{ .row = @intCast(right.y + 1), .col = @intCast(right.x + 3), .button = .wheel_down, .type = .press, .mods = .{} });
+    try t.expectEqual(@as(usize, 5), editor.documents.items[1].scroll_top);
+    try t.expectEqual(@as(usize, 0), editor.documents.items[0].scroll_top);
+    try t.expect(!scroll_pinned); // the focused pane still follows its caret
+    handleMouse(&editor, .{ .row = @intCast(term.y + 1), .col = @intCast(term.x + 3), .button = .wheel_down, .type = .press, .mods = .{} });
+    try t.expectEqual(@as(usize, 5), editor.documents.items[1].scroll_top);
+    try t.expectEqual(@as(usize, 0), editor.documents.items[0].scroll_top);
+}
+
+test "TUI caret: hidden above a wheel-scrolled view; a far caret never overflows" {
+    const t = std.testing;
+    var editor = try Editor.init(t.allocator, t.io);
+    defer editor.deinit();
+    editor.lsp_enabled = false;
+    editor.filetree_visible = false;
+    var screen = try testScreen(t.allocator);
+    defer screen.deinit(t.allocator);
+    const win = testWin(&screen);
+    const doc = editor.activeDoc();
+    defer scroll_pinned = false;
+    try doc.loadText("x\n" ** 100);
+    for ([_]bool{ false, true }) |wrap| {
+        editor.word_wrap = wrap;
+        doc.cursors.primary().offset = 0;
+        doc.scroll_top = 50;
+        scroll_pinned = true; // what a wheel scroll sets
+        testFrame(win, &editor);
+        positionCursor(win, &editor, 100, 30);
+        try t.expect(!screen.cursor_vis);
+    }
+    // Wrapped, pinned at the top, caret 70 000 lines down: the row sum used
+    // to overflow a u16
+    try doc.loadText("x\n" ** 70000);
+    editor.word_wrap = true;
+    doc.cursors.primary().offset = doc.buffer.posToOffset(69990, 0);
+    doc.scroll_top = 0;
+    scroll_pinned = true;
+    testFrame(win, &editor);
+    positionCursor(win, &editor, 100, 30);
+    try t.expect(!screen.cursor_vis);
+}
+
+test "TUI completion popup opens at the caret of the focused pane" {
+    const t = std.testing;
+    var editor = try Editor.init(t.allocator, t.io);
+    defer editor.deinit();
+    editor.lsp_enabled = false;
+    editor.filetree_visible = false;
+    editor.word_wrap = false;
+    var screen = try testScreen(t.allocator);
+    defer screen.deinit(t.allocator);
+    const win = testWin(&screen);
+    const d1 = try editor.newDocument();
+    try d1.loadText("ab");
+    d1.cursors.primary().offset = 2;
+    const w = editor.activeWindow();
+    const right_id = try w.layout.splitPane(w.active_pane, .horizontal, .{ .editor = 1 });
+    editor.focusPane(right_id);
+    try editor.addCompletionItem(try t.allocator.dupe(u8, "abcompl"), null, null);
+    testFrame(win, &editor);
+    drawCompletionPopup(win, &editor, 100, 30);
+    const rect = paneRectFor(right_id).?;
+    const caret_x = rect.x + lineNumberWidth(d1.lineCount(), editor.gutter_min_digits) + 1 + 2;
+    var buf: [16]u8 = undefined;
+    // Popup row: one cell of padding, then the label, just below the caret
+    // (the old estimate put it at column 5, in the left pane)
+    try t.expectEqualStrings("abcompl", testCells(&screen, caret_x + 1, rect.y + 1, 7, &buf));
+}
+
+// ---------------------------------------------------------------------------
+// E7 keyboard focus, prompts and the delete confirmation
+// ---------------------------------------------------------------------------
+
+test "TUI focus: the tree over a terminal pane owns the keys until the pane is clicked" {
+    const t = std.testing;
+    var tmp = t.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(t.io, .{ .sub_path = "a.txt", .data = "a\n" });
+    try tmp.dir.writeFile(t.io, .{ .sub_path = "b.txt", .data = "b\n" });
+    const root = try tmp.dir.realPathFileAlloc(t.io, ".", t.allocator);
+    defer t.allocator.free(root);
+    var editor = try Editor.init(t.allocator, t.io);
+    defer editor.deinit();
+    editor.lsp_enabled = false;
+    editor.filetree_root = try t.allocator.dupe(u8, root);
+    editor.filetree_visible = true;
+    try editor.terminals.append(t.allocator, null); // fake slot: no shell
+    editor.activeLayout().panes.items[0].content = .{ .terminal = 0 };
+    var screen = try testScreen(t.allocator);
+    defer screen.deinit(t.allocator);
+    const win = testWin(&screen);
+    testFrame(win, &editor);
+    const band = filetree_band.?;
+
+    // Click the first tree row: the tree owns the keyboard, not the shell
+    testClick(&editor, band.x + 4, band.y + 1);
+    try t.expectEqual(Editor.KeyboardOwner.filetree, editor.keyboardOwner());
+    testKey(&editor, 'j', .{});
+    try t.expectEqual(@as(usize, 1), editor.filetree.?.selected);
+    // The bound copy chord copies the selected file
+    testKey(&editor, 'c', .{ .ctrl = true });
+    try t.expectEqual(@as(usize, 1), editor.filetree_clip_paths.items.len);
+    try t.expectEqualStrings("b.txt", editor.filetree_clip_paths.items[0]);
+    testFrame(win, &editor);
+
+    // Clicking the terminal hands it the keyboard: 'd' is typed, it no
+    // longer opens the tree's delete prompt
+    const term = pane_rects[0];
+    testClick(&editor, term.x + 2, term.y + 1);
+    try t.expectEqual(Editor.KeyboardOwner.terminal, editor.keyboardOwner());
+    testKey(&editor, 'd', .{});
+    try t.expectEqual(Editor.Mode.normal, editor.mode);
+}
+
+test "TUI focus: the search field takes clipboard and word-delete chords" {
+    const t = std.testing;
+    var editor = try Editor.init(t.allocator, t.io);
+    defer editor.deinit();
+    editor.lsp_enabled = false;
+    editor.filetree_visible = false;
+    editor.clipboard_set_fn = TestClipboard.set;
+    editor.clipboard_get_fn = TestClipboard.get;
+    editor.search_visible = true;
+    const doc = editor.activeDoc();
+    try doc.loadText("document text");
+    var screen = try testScreen(t.allocator);
+    defer screen.deinit(t.allocator);
+    const win = testWin(&screen);
+    testFrame(win, &editor);
+
+    // Click the query row, type, paste, delete a word: all in the field
+    testClick(&editor, 10, search_band.?.y);
+    try t.expectEqual(Editor.KeyboardOwner.search, editor.keyboardOwner());
+    testType(&editor, "foo ");
+    editor.setClipboard("bar\nbaz");
+    testKey(&editor, 'v', .{ .ctrl = true });
+    try t.expectEqualStrings("foo bar", editor.search.query());
+    testKey(&editor, Key.backspace, .{ .ctrl = true });
+    try t.expectEqualStrings("foo ", editor.search.query());
+    // Replace confirmation: Ctrl+A is not "All"
+    editor.search.confirm_armed = true;
+    testKey(&editor, 'a', .{ .ctrl = true });
+    try t.expect(editor.search.confirm_armed);
+    testKey(&editor, 'c', .{});
+    try t.expect(!editor.search.confirm_armed);
+    try t.expectEqualStrings("document text", doc.buffer.slice(0, doc.buffer.byteLen()));
+
+    // Clicking the code gives the keyboard back to the editor
+    testFrame(win, &editor);
+    const rect = pane_rects[0];
+    testClick(&editor, rect.x + rect.w - 2, rect.y);
+    try t.expectEqual(Editor.KeyboardOwner.editor, editor.keyboardOwner());
+    testType(&editor, "!");
+    try t.expectEqualStrings("document text!", doc.buffer.slice(0, doc.buffer.byteLen()));
+}
+
+test "TUI prompts ignore Ctrl/Alt chords; letters still answer them" {
+    const t = std.testing;
+    var editor = try Editor.init(t.allocator, t.io);
+    defer editor.deinit();
+    editor.lsp_enabled = false;
+    editor.filetree_visible = false;
+    const doc = editor.activeDoc();
+    try doc.loadText("x");
+    doc.dirty = true;
+
+    editor.setMode(.confirm_quit);
+    testKey(&editor, 'd', .{ .ctrl = true });
+    testKey(&editor, 's', .{ .alt = true });
+    try t.expectEqual(Editor.Mode.confirm_quit, editor.mode);
+    try t.expect(editor.running);
+    testKey(&editor, 'c', .{});
+    try t.expectEqual(Editor.Mode.normal, editor.mode);
+
+    try t.expect(!editor.requestCloseDoc(0));
+    try t.expectEqual(Editor.Mode.confirm_close, editor.mode);
+    testKey(&editor, 's', .{ .ctrl = true });
+    testKey(&editor, 'd', .{ .ctrl = true });
+    try t.expectEqual(Editor.Mode.confirm_close, editor.mode);
+    try t.expectEqual(@as(usize, 1), editor.documents.items.len);
+    testKey(&editor, Key.escape, .{});
+    try t.expectEqual(Editor.Mode.normal, editor.mode);
+
+    editor.setMode(.tool_panel);
+    testKey(&editor, 'd', .{ .ctrl = true });
+    try t.expectEqual(Editor.Mode.tool_panel, editor.mode);
+    testKey(&editor, Key.escape, .{});
+    try t.expectEqual(Editor.Mode.normal, editor.mode);
+}
+
+test "TUI delete prompt: only y deletes; Enter cancels; Ctrl+Y is ignored" {
+    const t = std.testing;
+    var tmp = t.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(t.io, .{ .sub_path = "a.txt", .data = "a\n" });
+    const root = try tmp.dir.realPathFileAlloc(t.io, ".", t.allocator);
+    defer t.allocator.free(root);
+    var editor = try Editor.init(t.allocator, t.io);
+    defer editor.deinit();
+    editor.lsp_enabled = false;
+    editor.filetree_root = try t.allocator.dupe(u8, root);
+    try t.expect(editor.takeKeyboardFocus(.filetree));
+
+    testKey(&editor, 'd', .{});
+    try t.expectEqual(Editor.Mode.filetree_prompt, editor.mode);
+    testKey(&editor, Key.enter, .{});
+    try t.expectEqual(Editor.Mode.normal, editor.mode);
+    _ = try tmp.dir.statFile(t.io, "a.txt", .{});
+
+    testKey(&editor, 'd', .{});
+    testKey(&editor, 'y', .{ .ctrl = true });
+    try t.expectEqual(Editor.Mode.filetree_prompt, editor.mode);
+    testKey(&editor, 'n', .{});
+    try t.expectEqual(Editor.Mode.normal, editor.mode);
+    _ = try tmp.dir.statFile(t.io, "a.txt", .{});
+
+    testKey(&editor, 'd', .{});
+    testKey(&editor, 'y', .{});
+    try t.expectEqual(Editor.Mode.normal, editor.mode);
+    try t.expectError(error.FileNotFound, tmp.dir.statFile(t.io, "a.txt", .{}));
+}
+
+// ---------------------------------------------------------------------------
+// Key names (C5), sticky column (B2), added cursors (C7)
+// ---------------------------------------------------------------------------
+
+test "TUI key names: Ctrl+Space, Insert, digits and Shift chords use the keybind vocabulary" {
+    const t = std.testing;
+    var buf: [64]u8 = undefined;
+    try t.expectEqualStrings("ctrl+space", keyToStr(.{ .codepoint = ' ', .text = " ", .mods = .{ .ctrl = true } }, &buf));
+    try t.expectEqualStrings("ctrl+space", keyToStr(.{ .codepoint = '@', .mods = .{ .ctrl = true } }, &buf));
+    try t.expectEqualStrings("shift+insert", keyToStr(.{ .codepoint = Key.insert, .mods = .{ .shift = true } }, &buf));
+    try t.expectEqualStrings("ctrl+shift+k", keyToStr(.{ .codepoint = 'K', .mods = .{ .ctrl = true, .shift = true } }, &buf));
+    try t.expectEqualStrings("ctrl+1", keyToStr(.{ .codepoint = '1', .mods = .{ .ctrl = true } }, &buf));
+    try t.expectEqualStrings("alt+backslash", keyToStr(.{ .codepoint = '\\', .mods = .{ .alt = true } }, &buf));
+
+    var editor = try Editor.init(t.allocator, t.io);
+    defer editor.deinit();
+    editor.lsp_enabled = false;
+    editor.filetree_visible = false;
+    try t.expectEqualStrings("lsp_completion", editor.lookupKeybind(keyToStr(.{ .codepoint = '@', .mods = .{ .ctrl = true } }, &buf)).?);
+    const doc = editor.activeDoc();
+    try doc.loadText("one\ntwo");
+    // Ctrl+Shift+K is its own chord: no fallback to Ctrl+K's delete_line
+    testKey(&editor, 'k', .{ .ctrl = true, .shift = true });
+    try t.expectEqualStrings("one\ntwo", doc.buffer.slice(0, doc.buffer.byteLen()));
+    // Ctrl+Shift+Z redoes (the fallback used to undo)
+    testType(&editor, "!");
+    testKey(&editor, 'z', .{ .ctrl = true });
+    try t.expectEqualStrings("one\ntwo", doc.buffer.slice(0, doc.buffer.byteLen()));
+    testKey(&editor, 'z', .{ .ctrl = true, .shift = true });
+    try t.expectEqualStrings("!one\ntwo", doc.buffer.slice(0, doc.buffer.byteLen()));
+    // A legacy terminal's bare Ctrl+\ byte is a chord, never typed text
+    dispatchKey(&editor, .{ .codepoint = 0x1c, .text = "\x1c" });
+    try t.expectEqual(@as(?usize, null), std.mem.indexOfScalar(u8, doc.buffer.slice(0, doc.buffer.byteLen()), 0x1c));
+}
+
+test "TUI sticky column: Up/Down keep their cell column through short wrapped lines" {
+    const t = std.testing;
+    var editor = try Editor.init(t.allocator, t.io);
+    defer editor.deinit();
+    editor.lsp_enabled = false;
+    editor.filetree_visible = false;
+    editor.word_wrap = true;
+    editor.text_width = 40;
+    vertical_motion = .{};
+    const doc = editor.activeDoc();
+    try doc.loadText("abcdef\nx\n\tabc\nabcdefgh");
+    doc.cursors.primary().offset = 5; // column 5 of "abcdef"
+    testKey(&editor, Key.down, .{});
+    try t.expectEqual(doc.buffer.posToOffset(1, 1), doc.cursors.primary().offset); // end of "x"
+    testKey(&editor, Key.down, .{});
+    // "\tabc": cell 5 is 'b' (the tab spans cells 0-3)
+    try t.expectEqual(doc.buffer.posToOffset(2, 2), doc.cursors.primary().offset);
+    testKey(&editor, Key.down, .{});
+    try t.expectEqual(doc.buffer.posToOffset(3, 5), doc.cursors.primary().offset);
+    testKey(&editor, Key.up, .{});
+    testKey(&editor, Key.up, .{});
+    testKey(&editor, Key.up, .{});
+    try t.expectEqual(@as(usize, 5), doc.cursors.primary().offset);
+    // A horizontal move starts a new run from the new column
+    testKey(&editor, Key.left, .{});
+    testKey(&editor, Key.down, .{});
+    testKey(&editor, Key.down, .{});
+    try t.expectEqual(doc.buffer.posToOffset(2, 1), doc.cursors.primary().offset); // cell 4: after the tab
+}
+
+test "TUI added cursors carry their own preferred column" {
+    const t = std.testing;
+    var editor = try Editor.init(t.allocator, t.io);
+    defer editor.deinit();
+    editor.lsp_enabled = false;
+    editor.filetree_visible = false;
+    editor.word_wrap = false;
+    var screen = try testScreen(t.allocator);
+    defer screen.deinit(t.allocator);
+    const win = testWin(&screen);
+    const doc = editor.activeDoc();
+    try doc.loadText("abcdef\nabcdef\nabcdef");
+    testFrame(win, &editor);
+    const rect = pane_rects[0];
+    const x0 = rect.x + lineNumberWidth(doc.lineCount(), editor.gutter_min_digits) + 1;
+    handleMouse(&editor, .{ .row = @intCast(rect.y + 1), .col = @intCast(x0 + 4), .button = .left, .type = .press, .mods = .{ .alt = true } });
+    handleMouse(&editor, .{ .row = @intCast(rect.y + 1), .col = @intCast(x0 + 4), .button = .left, .type = .release, .mods = .{ .alt = true } });
+    try t.expectEqual(@as(usize, 2), doc.cursors.count());
+    try t.expectEqual(@as(usize, 4), doc.cursors.cursors.items[1].preferred_col);
+    // Wrap-mode add-cursor below keeps the column too
+    editor.word_wrap = true;
+    doc.cursors.clearSecondary();
+    doc.cursors.primary().offset = 3;
+    tuiAddCursorVisual(&editor, .down);
+    try t.expectEqual(@as(usize, 2), doc.cursors.count());
+    try t.expectEqual(@as(usize, 3), doc.cursors.cursors.items[1].preferred_col);
+    try t.expectEqual(doc.buffer.posToOffset(1, 3), doc.cursors.cursors.items[1].offset);
+}
+
+// ---------------------------------------------------------------------------
+// Quick open, palette, Open prompt (Design 2, E13)
+// ---------------------------------------------------------------------------
+
+test "TUI quick open draws the scrolled window and never writes the selection" {
+    const t = std.testing;
+    var tmp = t.tmpDir(.{});
+    defer tmp.cleanup();
+    for (0..12) |i| {
+        var name_buf: [16]u8 = undefined;
+        const name = try std.fmt.bufPrint(&name_buf, "f{d:0>2}.txt", .{i});
+        try tmp.dir.writeFile(t.io, .{ .sub_path = name, .data = name });
+    }
+    const root = try tmp.dir.realPathFileAlloc(t.io, ".", t.allocator);
+    defer t.allocator.free(root);
+    var editor = try Editor.init(t.allocator, t.io);
+    defer editor.deinit();
+    editor.lsp_enabled = false;
+    editor.filetree_root = try t.allocator.dupe(u8, root);
+    editor.filetree_visible = false;
+    var screen = try testScreen(t.allocator);
+    defer screen.deinit(t.allocator);
+    const win = testWin(&screen);
+
+    editor.finderOpen();
+    for (0..9) |_| testKey(&editor, Key.down, .{});
+    try t.expectEqual(@as(usize, 9), editor.finder_selected);
+    testFrame(win, &editor);
+    drawFileFinder(win, &editor, 100, 30);
+    try t.expectEqual(@as(usize, 9), editor.finder_selected);
+    // 8 rows from match 2; the selection is the last one drawn
+    const finder_x: u16 = (100 - 70) / 2;
+    var buf: [32]u8 = undefined;
+    try t.expectEqualStrings("f02.txt", testCells(&screen, finder_x + 1, 30 - 11 + 1, 7, &buf));
+    try t.expectEqualStrings("f09.txt", testCells(&screen, finder_x + 1, 30 - 11 + 8, 7, &buf));
+    try t.expect(screen.readCell(finder_x + 1, 30 - 11 + 8).?.style.reverse);
+    testKey(&editor, Key.enter, .{});
+    try t.expectEqual(Editor.Mode.normal, editor.mode);
+    try t.expect(std.mem.endsWith(u8, editor.activeDoc().display_name, "f09.txt"));
+}
+
+test "TUI palette scrolls past its visible rows" {
+    const t = std.testing;
+    var editor = try Editor.init(t.allocator, t.io);
+    defer editor.deinit();
+    editor.lsp_enabled = false;
+    editor.filetree_visible = false;
+    var screen = try testScreen(t.allocator);
+    defer screen.deinit(t.allocator);
+    const win = testWin(&screen);
+    _ = editor.execAction("command_palette");
+    try t.expectEqual(Editor.Mode.command_palette, editor.mode);
+    const count = paletteMatchCount(&editor);
+    try t.expect(count > 12);
+    for (0..12) |_| testKey(&editor, Key.down, .{});
+    try t.expectEqual(@as(usize, 12), editor.palette_selected);
+    testFrame(win, &editor);
+    drawCommandPalette(win, &editor, 100, 30);
+    try t.expectEqual(@as(usize, 12), editor.palette_selected);
+    // The last drawn row is the selection
+    const names = try editor.commands.allNames();
+    const palette_x: u16 = (100 - 60) / 2;
+    var buf: [64]u8 = undefined;
+    const want = names[12][0..@min(names[12].len, 20)];
+    try t.expectEqualStrings(want, testCells(&screen, palette_x + 1, 10 + 10, @intCast(want.len), &buf));
+    // Down stops at the last match
+    for (0..count + 5) |_| testKey(&editor, Key.down, .{});
+    try t.expectEqual(count - 1, editor.palette_selected);
+    testKey(&editor, Key.escape, .{});
+}
+
+test "TUI Open prompt reports why a file did not open" {
+    const t = std.testing;
+    var editor = try Editor.init(t.allocator, t.io);
+    defer editor.deinit();
+    editor.lsp_enabled = false;
+    editor.filetree_visible = false;
+    _ = editor.execAction("file_open");
+    try t.expectEqual(Editor.Mode.file_open, editor.mode);
+    testType(&editor, "zide-no-such-dir/missing.txt");
+    testKey(&editor, Key.enter, .{});
+    try t.expectEqual(Editor.Mode.normal, editor.mode);
+    try t.expect(std.mem.startsWith(u8, editor.status_message, "Open failed ("));
+    try t.expect(std.mem.endsWith(u8, editor.status_message, "zide-no-such-dir/missing.txt"));
 }

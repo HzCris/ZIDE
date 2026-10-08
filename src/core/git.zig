@@ -94,6 +94,10 @@ const Worker = struct {
 };
 const Cache = struct {
     doc_id: u64,
+    /// Unique per cache: a Save As recreates the document's cache (maybe
+    /// with `relative = null`, outside the repository), and a base-blob job
+    /// started for the old one must not land in the new one.
+    generation: u64,
     path: []u8,
     relative: ?[]u8,
     base: ?[]u8 = null,
@@ -154,7 +158,8 @@ pub const State = struct {
     mutation: ?Mutation = null,
     mutation_job: ?u64 = null,
     caches: std.ArrayList(Cache) = .empty,
-    base_job: ?struct { id: u64, doc_id: u64, epoch: u64 } = null,
+    cache_generation: u64 = 0,
+    base_job: ?struct { id: u64, doc_id: u64, epoch: u64, generation: u64 } = null,
 
     pub fn deinit(self: *State, editor: *Editor) void {
         for ([_]?u64{ self.meta_job, self.preview_job, self.mutation_job, if (self.base_job) |job| job.id else null }) |id| if (id) |job| editor.jobs.remove(job);
@@ -186,11 +191,9 @@ pub const State = struct {
     }
     fn command(self: *State, editor: *Editor, cwd: []const u8, args: []const []const u8) !u64 {
         _ = self;
-        var argv: std.ArrayList([]const u8) = .empty;
-        defer argv.deinit(editor.allocator);
-        try argv.appendSlice(editor.allocator, &.{ "git", "--no-pager", "--literal-pathspecs", "--no-optional-locks", "-c", "color.ui=false", "-c", "core.quotepath=false", "-C", cwd });
-        try argv.appendSlice(editor.allocator, args);
-        return editor.jobs.start(.{ .argv = argv.items, .strict_output = true });
+        const argv = try commandArgv(editor.allocator, cwd, args);
+        defer editor.allocator.free(argv);
+        return editor.jobs.start(.{ .argv = argv, .strict_output = true });
     }
     pub fn tick(self: *State, editor: *Editor, now: i128) void {
         if (!self.enabled) return;
@@ -405,13 +408,17 @@ pub const State = struct {
             }
         };
         self.mutation = pending;
-        if (pending.save_count > 0) editor.mode = .git_stage_prompt else self.startMutation(editor) catch |err| {
+        if (pending.save_count > 0) {
+            editor.setMode(.git_stage_prompt);
+        } else self.startMutation(editor) catch |err| {
             self.cancelMutation(editor);
             self.report(editor, @errorName(err));
         };
     }
+    /// Also the leave-hook of `.git_stage_prompt` (Editor.setMode), so it
+    /// leaves the mode with a guarded direct write, never setMode.
     pub fn resolveStage(self: *State, editor: *Editor, save: bool) void {
-        editor.mode = .normal;
+        if (editor.mode == .git_stage_prompt) editor.mode = .normal;
         if (save) self.saveAndStage(editor) else self.cancelMutation(editor);
     }
     fn saveAndStage(self: *State, editor: *Editor) void {
@@ -514,6 +521,10 @@ pub const State = struct {
         for (self.caches.items) |*cache| if (cache.doc_id == doc_id) return cache;
         return null;
     }
+    fn cacheForGeneration(self: *State, doc_id: u64, generation: u64) ?*Cache {
+        const cache = self.cacheFor(doc_id) orelse return null;
+        return if (cache.generation == generation) cache else null;
+    }
     pub fn marker(self: *State, doc: *const Document, line: usize) diff.Mark {
         const cache = self.cacheFor(doc.id) orelse return .none;
         if (cache.version != doc.buffer.version or cache.epoch != self.index_epoch) return .none;
@@ -537,7 +548,8 @@ pub const State = struct {
             errdefer editor.allocator.free(owned);
             const rel = relative(editor.allocator, editor.io, self.root.?, path, false) catch null;
             errdefer if (rel) |r| editor.allocator.free(r);
-            try self.caches.append(editor.allocator, .{ .doc_id = doc.id, .path = owned, .relative = rel });
+            self.cache_generation +%= 1;
+            try self.caches.append(editor.allocator, .{ .doc_id = doc.id, .generation = self.cache_generation, .path = owned, .relative = rel });
         }
         if (self.base_job) |pending| {
             const job = editor.jobs.get(pending.id).?;
@@ -546,7 +558,9 @@ pub const State = struct {
                 defer result.deinit(editor.allocator);
                 editor.jobs.remove(pending.id);
                 self.base_job = null;
-                if (self.cacheFor(pending.doc_id)) |cache| if (pending.epoch == self.index_epoch) {
+                // Only the cache that started the job takes its result; a
+                // cache recreated meanwhile starts its own.
+                if (self.cacheForGeneration(pending.doc_id, pending.generation)) |cache| if (pending.epoch == self.index_epoch) {
                     cache.epoch = pending.epoch;
                     cache.failure = result.failure;
                     if (cache.base) |base| editor.allocator.free(base);
@@ -562,7 +576,7 @@ pub const State = struct {
                             cache.base = decoded.text;
                         } else {
                             var untracked = false;
-                            for (self.changes.items) |change| if (change.x == '?' and std.mem.eql(u8, change.path, cache.relative.?)) {
+                            if (cache.relative) |rel| for (self.changes.items) |change| if (change.x == '?' and std.mem.eql(u8, change.path, rel)) {
                                 untracked = true;
                                 break;
                             };
@@ -594,7 +608,7 @@ pub const State = struct {
             if (cache.epoch != self.index_epoch and self.base_job == null) {
                 const object = try std.fmt.allocPrint(editor.allocator, ":{s}", .{rel});
                 defer editor.allocator.free(object);
-                self.base_job = .{ .id = try self.command(editor, self.root.?, &.{ "show", object }), .doc_id = cache.doc_id, .epoch = self.index_epoch };
+                self.base_job = .{ .id = try self.command(editor, self.root.?, &.{ "show", object }), .doc_id = cache.doc_id, .epoch = self.index_epoch, .generation = cache.generation };
             }
             if (cache.epoch != self.index_epoch or cache.base == null or cache.worker != null or worker_running) continue;
             const doc = &editor.documents.items[editor.docIndexForId(cache.doc_id).?];
@@ -617,6 +631,20 @@ pub const State = struct {
         }
     }
 };
+
+/// argv for every Git invocation (caller frees the slice, not the strings).
+/// `core.fsmonitor=false` because Git integration starts on its own when a
+/// folder opens, and a repository's `.git/config` can name an fsmonitor
+/// hook that `git status` would execute (an extracted archive, a USB
+/// copy). Clean/smudge filters need a workspace-trust prompt instead.
+fn commandArgv(a: Allocator, cwd: []const u8, args: []const []const u8) ![]const []const u8 {
+    const base = [_][]const u8{ "git", "--no-pager", "--literal-pathspecs", "--no-optional-locks", "-c", "color.ui=false", "-c", "core.quotepath=false", "-c", "core.fsmonitor=false", "-C" };
+    const argv = try a.alloc([]const u8, base.len + 1 + args.len);
+    @memcpy(argv[0..base.len], &base);
+    argv[base.len] = cwd;
+    @memcpy(argv[base.len + 1 ..], args);
+    return argv;
+}
 
 fn relative(a: Allocator, io: std.Io, root: []const u8, path: []const u8, directory: bool) ![]u8 {
     const full = try identity.key(a, io, path);
@@ -672,6 +700,85 @@ test "Git porcelain keeps both rename paths and literal unusual filenames" {
     try t.expect(changes.items[1].staged() and changes.items[1].working());
     try t.expect(changes.items[3].conflict());
     try t.expectError(error.TruncatedGitStatus, parseStatus(t.allocator, " M bad"));
+}
+
+test "Git commands disable a repository's fsmonitor hook" {
+    const t = std.testing;
+    const argv = try commandArgv(t.allocator, "/repo", &.{ "status", "--porcelain=v1" });
+    defer t.allocator.free(argv);
+    var fsmonitor_off = false;
+    for (argv[0 .. argv.len - 1], argv[1..]) |flag, value| {
+        if (std.mem.eql(u8, flag, "-c") and std.mem.eql(u8, value, "core.fsmonitor=false")) fsmonitor_off = true;
+    }
+    try t.expect(fsmonitor_off);
+    try t.expectEqualStrings("git", argv[0]);
+    for ([_][]const u8{ "--no-pager", "--literal-pathspecs", "--no-optional-locks" }) |flag| {
+        var found = false;
+        for (argv) |arg| found = found or std.mem.eql(u8, arg, flag);
+        try t.expect(found);
+    }
+    // Global options first, then `-C <cwd>`, then the subcommand.
+    try t.expectEqualStrings("-C", argv[argv.len - 4]);
+    try t.expectEqualStrings("/repo", argv[argv.len - 3]);
+    try t.expectEqualStrings("status", argv[argv.len - 2]);
+    try t.expectEqualStrings("--porcelain=v1", argv[argv.len - 1]);
+}
+
+test "Git base-blob results only reach the cache that asked for them" {
+    const t = std.testing;
+    const windows = @import("builtin").os.tag == .windows;
+    var tmp = t.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(t.io, "repo");
+    const repo = try tmp.dir.realPathFileAlloc(t.io, "repo", t.allocator);
+    defer t.allocator.free(repo);
+    const outside = try tmp.dir.realPathFileAlloc(t.io, ".", t.allocator);
+    defer t.allocator.free(outside);
+    const saved_as = try std.fs.path.join(t.allocator, &.{ outside, "saved as.txt" });
+    defer t.allocator.free(saved_as);
+
+    var editor = try Editor.init(t.allocator, t.io);
+    defer editor.deinit();
+    editor.lsp_enabled = false;
+    editor.git.root = try identity.key(t.allocator, t.io, repo);
+    // The document now lives outside the repository (a Save As while a
+    // `git show :<old>` job ran): its cache has no relative path.
+    const doc = editor.activeDoc();
+    try doc.setFilePath(saved_as);
+    try editor.git.gutters(&editor);
+    const generation = editor.git.cacheFor(doc.id).?.generation;
+    try t.expect(editor.git.cacheFor(doc.id).?.relative == null);
+    // An untracked entry makes the failed-job branch look up the relative path.
+    try editor.git.changes.append(t.allocator, .{ .path = try t.allocator.dupe(u8, "saved as.txt"), .x = '?', .y = '?' });
+
+    const Failed = struct {
+        fn job(ed: *Editor) !u64 {
+            const id = try ed.jobs.start(.{ .argv = if (windows) &.{ "cmd", "/c", "exit 1" } else &.{ "sh", "-c", "exit 1" } });
+            for (0..1000) |_| {
+                if (ed.jobs.get(id).?.isDone()) return id;
+                try std.Io.sleep(ed.io, .fromMilliseconds(5), .awake);
+            }
+            return error.JobTimeout;
+        }
+    };
+
+    // A job tagged for an earlier cache of the same document is dropped.
+    const stale = try Failed.job(&editor);
+    editor.git.base_job = .{ .id = stale, .doc_id = doc.id, .epoch = editor.git.index_epoch, .generation = generation -% 1 };
+    try editor.git.gutters(&editor);
+    try t.expect(editor.git.base_job == null and editor.jobs.get(stale) == null);
+    const untouched = editor.git.cacheFor(doc.id).?;
+    try t.expect(untouched.base == null and untouched.failure == null and untouched.epoch != editor.git.index_epoch);
+
+    // Even a matching tag on a cache without a relative path must not panic
+    // (it used `cache.relative.?`): no base, just a failure.
+    const matching = try Failed.job(&editor);
+    editor.git.base_job = .{ .id = matching, .doc_id = doc.id, .epoch = editor.git.index_epoch, .generation = generation };
+    try editor.git.gutters(&editor);
+    try t.expect(editor.git.base_job == null and editor.jobs.get(matching) == null);
+    const answered = editor.git.cacheFor(doc.id).?;
+    try t.expect(answered.base == null);
+    try t.expectEqual(@as(?anyerror, error.IndexContentUnavailable), answered.failure);
 }
 
 fn fixtureGit(base: []const u8, args: []const []const u8) ![]u8 {

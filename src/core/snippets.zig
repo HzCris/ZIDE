@@ -186,7 +186,8 @@ pub const Definition = struct {
     from_extension: bool,
 
     pub fn init(a: Allocator, language: []const u8, prefix: []const u8, description: []const u8, body: []const u8, from_extension: bool) !Definition {
-        if (language.len == 0 or std.mem.indexOfAny(u8, language, " \t\r\n\x00") != null) return error.InvalidLanguage;
+        // The language is part of the command name the palette draws.
+        if (language.len == 0 or std.mem.indexOfAny(u8, language, " \t\r\n\x00") != null or !std.unicode.utf8ValidateSlice(language)) return error.InvalidLanguage;
         if (prefix.len == 0 or std.ascii.isDigit(prefix[0]) or !std.unicode.utf8ValidateSlice(prefix)) return error.InvalidPrefix;
         for (prefix) |c| if (!isIdentifier(c) or c == '@') return error.InvalidPrefix;
         var template = try Template.parse(a, body);
@@ -285,6 +286,15 @@ test "snippets reject malformed and unsupported syntax" {
             return error.ExpectedInvalidSnippet;
         } else |_| {}
     }
+}
+
+test "snippet definitions reject malformed UTF-8 in the language (it names a palette command)" {
+    const a = std.testing.allocator;
+    try std.testing.expectError(error.InvalidLanguage, Definition.init(a, "zi\xffg", "fn", "", "x", false));
+    try std.testing.expectError(error.InvalidLanguage, Definition.init(a, "\xC3", "fn", "", "x", false));
+    var ok = try Definition.init(a, "Ünïcode", "fn", "", "x", false);
+    defer ok.deinit(a);
+    try std.testing.expectEqualStrings("snippet.Ünïcode.fn", ok.command);
 }
 
 test "snippets expansion maps indentation, CRLF, and literal spaces" {

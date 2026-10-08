@@ -5,7 +5,10 @@ const theme_mod = @import("theme.zig");
 const lua_settings = @import("lua_settings.zig");
 const lua_api = @import("lua_api.zig");
 const syntax = @import("syntax.zig");
+const brackets = @import("brackets.zig");
 const filetree_mod = @import("filetree.zig");
+const cursor_mod = @import("cursor.zig");
+const Document = @import("document.zig").Document;
 
 /// Forward declaration — Editor will be defined in editor.zig.
 /// Commands receive a pointer to the editor state.
@@ -40,6 +43,8 @@ pub const CommandRegistry = struct {
     allocator: Allocator,
     /// Cached sorted command names (invalidated on register).
     cached_names: ?[][]const u8 = null,
+    /// Binds warnIfUnknownAction has warned about (tests read it).
+    unknown_action_warnings: u32 = 0,
 
     pub fn init(allocator: Allocator) CommandRegistry {
         return .{
@@ -72,6 +77,24 @@ pub const CommandRegistry = struct {
     /// Look up a command by name.
     pub fn get(self: *const CommandRegistry, name: []const u8) ?*const Command {
         return self.lua_commands.getPtr(name) orelse self.commands.getPtr(name);
+    }
+
+    /// Whether a keybinding to `name` can run something: any registered
+    /// command — built-in, snippet or Lua. `Editor.execAction`'s own
+    /// actions (save, quit, find, …) are registered too (see
+    /// `exec_action_commands`), so they count.
+    pub fn isKnownAction(self: *const CommandRegistry, name: []const u8) bool {
+        return self.get(name) != null;
+    }
+
+    /// Log a warning when `key` is being bound to an action no command
+    /// answers to. The binding still stands — a Lua command registered later
+    /// (an extension loads after init.lua) makes it work — but a typo no
+    /// longer fails silently. For `zide.bind` and other user-facing binders.
+    pub fn warnIfUnknownAction(self: *CommandRegistry, key: []const u8, action: []const u8) void {
+        if (self.isKnownAction(action)) return;
+        self.unknown_action_warnings +|= 1;
+        std.log.warn("keybind '{s}': no command named '{s}' is registered (yet) — the key does nothing until one is", .{ key, action });
     }
 
     /// Execute a command by name. Returns false if command not found.
@@ -231,8 +254,51 @@ test "command override allocation failures preserve the existing command and pal
     }.probe, .{});
 }
 
+/// Actions `Editor.execAction` implements itself, registered as commands so
+/// the palette (and `isKnownAction`) sees them. (The pane and window
+/// actions it also handles have their own `cmd*` entries below.)
+const exec_action_commands = [_]struct { name: []const u8, description: []const u8 }{
+    .{ .name = "new_document", .description = "Open a new untitled document" },
+    .{ .name = "file_open", .description = "Open a file by path" },
+    .{ .name = "save", .description = "Save the current document" },
+    .{ .name = "save_as", .description = "Save the current document under a new name" },
+    .{ .name = "close_tab", .description = "Close the current tab (asks about unsaved changes)" },
+    .{ .name = "next_doc", .description = "Switch to the next tab" },
+    .{ .name = "prev_doc", .description = "Switch to the previous tab" },
+    .{ .name = "quit", .description = "Quit ZIDE (asks about unsaved changes)" },
+    .{ .name = "find", .description = "Find in the current document" },
+    .{ .name = "find_replace", .description = "Find and replace in the current document" },
+    .{ .name = "goto_line", .description = "Go to a line number" },
+    .{ .name = "command_palette", .description = "Open the command palette" },
+    .{ .name = "settings", .description = "Open the settings dialog (GUI)" },
+    .{ .name = "toggle_terminal", .description = "Open a terminal below, or go back from a terminal to the editor" },
+    .{ .name = "open_terminal_right", .description = "Open a terminal in a split to the right" },
+    .{ .name = "close_terminal", .description = "Close the focused terminal pane" },
+    .{ .name = "lsp_completion", .description = "Show language-server completions at the cursor" },
+    .{ .name = "lsp_goto_definition", .description = "Go to the definition of the symbol at the cursor" },
+    .{ .name = "navigate_back", .description = "Go back to where the caret was before the last jump" },
+    .{ .name = "navigate_forward", .description = "Go forward again after navigate_back" },
+    .{ .name = "reopen_closed_tab", .description = "Reopen the most recently closed file" },
+    .{ .name = "open_folder", .description = "Open a folder as the project (file tree root and language-server workspace)" },
+    .{ .name = "recent_projects", .description = "Pick a recently opened project folder" },
+};
+
+/// A command that runs `Editor.execAction(name)`. execAction handles its own
+/// action names before it falls back to the registry, so this never
+/// recurses — keep it that way when changing execAction.
+fn execActionCommand(comptime name: []const u8) CommandFn {
+    return struct {
+        fn run(editor: *Editor, _: ?[]const u8) void {
+            _ = editor.execAction(name);
+        }
+    }.run;
+}
+
 /// Register all built-in editor commands.
 pub fn registerBuiltins(registry: *CommandRegistry) !void {
+    inline for (exec_action_commands) |c| {
+        try registry.register(c.name, c.description, execActionCommand(c.name));
+    }
     try registry.register("snippet_expand", "Expand the exact snippet trigger before the cursor", cmdSnippetExpand);
     try registry.register("snippet_next", "Visit the next snippet placeholder", cmdSnippetNext);
     try registry.register("snippet_previous", "Visit the previous snippet placeholder", cmdSnippetPrevious);
@@ -261,6 +327,13 @@ pub fn registerBuiltins(registry: *CommandRegistry) !void {
     try registry.register("previous_problem", "Open the previous problem", cmdPreviousProblem);
     try registry.register("hover", "Show language-server information at the cursor", cmdHover);
     try registry.register("rename_symbol", "Rename a symbol with a workspace edit preview", cmdRenameSymbol);
+    try registry.register("lsp_references", "Find every reference to the symbol at the cursor (References view)", cmdLspReferences);
+    try registry.register("references", "Show the last References view", cmdReferences);
+    try registry.register("lsp_document_symbols", "Go to a symbol in this file (picker)", cmdLspDocumentSymbols);
+    try registry.register("lsp_workspace_symbols", "Search symbols across the workspace (picker)", cmdLspWorkspaceSymbols);
+    try registry.register("lsp_signature_help", "Show the signature of the call at the cursor", cmdLspSignatureHelp);
+    try registry.register("lsp_stderr", "Show what the language servers wrote to stderr (read-only tab)", cmdLspStderr);
+    try registry.register("open_log", "Open zide.log (reloads as it grows)", cmdOpenLog);
     try registry.register("format_document", "Format the current document with its language server", cmdFormatDocument);
     try registry.register("format_selection", "Format the selected range when supported", cmdFormatSelection);
     try registry.register("cursor_right", "Move cursor right", cmdCursorRight);
@@ -304,6 +377,7 @@ pub fn registerBuiltins(registry: *CommandRegistry) !void {
     try registry.register("dedent", "Dedent (remove leading whitespace)", cmdDedent);
     try registry.register("toggle_comment", "Toggle comment on selected lines", cmdToggleComment);
     try registry.register("next_todo", "Jump to next TODO/FIXME/XXX/HACK/BUG/NOTE marker", cmdNextTodo);
+    try registry.register("goto_matching_bracket", "Jump to the bracket matching the one at the cursor", cmdGotoMatchingBracket);
     try registry.register("open_documentation", "Open ZIDE documentation (Documentation.md)", cmdOpenDocumentation);
     try registry.register("file_encoding", "Choose file encoding", cmdFileEncoding);
     try registry.register("reopen_with_encoding", "Reopen with Encoding", cmdReopenEncoding);
@@ -319,6 +393,7 @@ pub fn registerBuiltins(registry: *CommandRegistry) !void {
     try registry.register("filetree_reveal", "Reveal the current file in the file tree", cmdFiletreeReveal);
     try registry.register("filetree_refresh", "Refresh the file tree from disk", cmdFiletreeRefresh);
     try registry.register("filetree_root_up", "Re-root the file tree at the parent directory", cmdFiletreeRootUp);
+    try registry.register("filetree_set_root", "Open the selected folder as the project root", cmdFiletreeSetRoot);
     try registry.register("filetree_collapse_all", "Collapse all file tree folders", cmdFiletreeCollapseAll);
     try registry.register("filetree_copy_path", "Copy the selected file tree entry's absolute path", cmdFiletreeCopyPath);
     try registry.register("filetree_copy_relative_path", "Copy the selected file tree entry's root-relative path", cmdFiletreeCopyRelPath);
@@ -434,6 +509,8 @@ fn cmdSnippetCancel(editor: *Editor, _: ?[]const u8) void {
 fn cmdInsertChar(editor: *Editor, args: ?[]const u8) void {
     const text = args orelse return;
     if (text.len == 0) return;
+    // Whatever the insertion did, the completion popup reacts to the text.
+    defer editor.afterTypedText(text);
     const doc = editor.activeDoc();
     const auto_close = editor.autoCloseBracketsFor(doc);
 
@@ -599,26 +676,209 @@ fn cmdCursorEndSelect(editor: *Editor, _: ?[]const u8) void {
 
 // --- Clipboard commands ---
 
+const Span = struct { start: usize, end: usize };
+
+fn cursorSpan(c: cursor_mod.Cursor) Span {
+    const r = c.selectionRange() orelse return .{ .start = c.offset, .end = c.offset };
+    return .{ .start = r.start, .end = r.end };
+}
+
+fn spanLess(_: void, a: Span, b: Span) bool {
+    return a.start < b.start or (a.start == b.start and a.end < b.end);
+}
+
+/// Every cursor's selection in document order (a bare caret is an empty
+/// span), overlapping selections merged.
+fn selectionSpans(allocator: Allocator, doc: *const Document) !std.ArrayList(Span) {
+    var spans = try std.ArrayList(Span).initCapacity(allocator, doc.cursors.count());
+    for (doc.cursors.cursors.items) |c| spans.appendAssumeCapacity(cursorSpan(c));
+    std.mem.sort(Span, spans.items, {}, spanLess);
+    var n: usize = 0;
+    for (spans.items) |s| {
+        if (n > 0 and s.start < spans.items[n - 1].end) {
+            spans.items[n - 1].end = @max(spans.items[n - 1].end, s.end);
+        } else {
+            spans.items[n] = s;
+            n += 1;
+        }
+    }
+    spans.items.len = n;
+    return spans;
+}
+
+/// Clipboard text of the selections: every cursor's selection in document
+/// order joined by the document's line ending. A bare caret among several
+/// cursors adds an empty line, so a block selection copies one line per
+/// cursor and pastes back one per cursor. Null when nothing is selected.
+fn copiedTextAlloc(allocator: Allocator, doc: *Document) !?[]u8 {
+    var spans = try selectionSpans(allocator, doc);
+    defer spans.deinit(allocator);
+    for (spans.items) |s| {
+        if (s.end > s.start) break;
+    } else return null;
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(allocator);
+    for (spans.items, 0..) |s, i| {
+        if (i > 0) try out.appendSlice(allocator, doc.lineEnding());
+        // slice() may hand out the buffer's one shared scratch: copy it
+        // before the next call.
+        try out.appendSlice(allocator, doc.buffer.slice(s.start, s.end));
+    }
+    return try out.toOwnedSlice(allocator);
+}
+
+/// Delete every cursor's selection as one undo step; each cursor ends where
+/// its selection started.
+fn deleteSelections(allocator: Allocator, doc: *Document) !void {
+    var spans = try selectionSpans(allocator, doc);
+    defer spans.deinit(allocator);
+    var ranges = try std.ArrayList(Document.RangeEdit).initCapacity(allocator, spans.items.len);
+    defer ranges.deinit(allocator);
+    var i = spans.items.len;
+    while (i > 0) {
+        i -= 1;
+        const s = spans.items[i];
+        if (s.end > s.start) ranges.appendAssumeCapacity(.{ .start = s.start, .end = s.end, .text = "" });
+    }
+    try doc.beginEdit();
+    defer doc.endEdit();
+    try doc.applyRanges(ranges.items);
+    for (doc.cursors.cursors.items) |*c| {
+        c.clearSelection();
+        c.preferred_col = doc.buffer.offsetToPos(c.offset).col;
+    }
+    doc.cursors.mergeCursors();
+}
+
 fn cmdCopy(editor: *Editor, _: ?[]const u8) void {
-    const text = editor.activeDoc().selectedText() orelse return;
-    if (text.len == 0) return;
+    const text = (copiedTextAlloc(editor.allocator, editor.activeDoc()) catch {
+        editor.status_message = "Copy failed: out of memory";
+        return;
+    }) orelse return;
+    defer editor.allocator.free(text);
     editor.setClipboard(text);
 }
 
 fn cmdCut(editor: *Editor, _: ?[]const u8) void {
     const doc = editor.activeDoc();
-    const text = doc.selectedText() orelse return;
-    if (text.len == 0) return;
+    const text = (copiedTextAlloc(editor.allocator, doc) catch {
+        editor.status_message = "Cut failed: out of memory";
+        return;
+    }) orelse return;
+    defer editor.allocator.free(text);
     editor.setClipboard(text);
-    doc.deleteSelection() catch {};
+    deleteSelections(editor.allocator, doc) catch {
+        editor.status_message = "Edit failed: out of memory";
+    };
 }
 
 fn cmdPaste(editor: *Editor, _: ?[]const u8) void {
-    const text = editor.getClipboard();
-    if (text.len == 0) return;
-    editor.activeDoc().insertAtAllCursors(text) catch {
+    const clip = editor.getClipboard();
+    if (clip.len == 0) return;
+    const doc = editor.activeDoc();
+    // Line breaks follow the document: CRLF text from Windows programs
+    // landed verbatim in LF files (mixed endings on save), and LF text in
+    // CRLF files.
+    const converted = withLineEnding(editor.allocator, clip, doc.lineEnding()) catch {
+        editor.status_message = "Edit failed: out of memory";
+        return;
+    };
+    defer if (converted) |owned| editor.allocator.free(owned);
+    const text = converted orelse clip;
+    if (doc.cursors.count() > 1) {
+        const distributed = pasteDistributed(editor.allocator, doc, text) catch {
+            editor.status_message = "Edit failed: out of memory";
+            return;
+        };
+        if (distributed) return;
+    }
+    doc.insertAtAllCursors(text) catch {
         editor.status_message = "Edit failed: out of memory";
     };
+}
+
+/// `text` with every line break (`\r\n` or `\n`) written as `eol`, or null
+/// when it already is (no copy made). A lone `\r` is left alone.
+fn withLineEnding(allocator: Allocator, text: []const u8, eol: []const u8) Allocator.Error!?[]u8 {
+    const crlf = std.mem.count(u8, text, "\r\n");
+    const bare_lf = std.mem.count(u8, text, "\n") - crlf;
+    const want_crlf = std.mem.eql(u8, eol, "\r\n");
+    if (if (want_crlf) bare_lf == 0 else crlf == 0) return null;
+    const out = try allocator.alloc(u8, if (want_crlf) text.len + bare_lf else text.len - crlf);
+    var o: usize = 0;
+    for (text, 0..) |c, i| {
+        if (c == '\r' and i + 1 < text.len and text[i + 1] == '\n') continue; // the `\n` writes the break
+        if (c == '\n') {
+            @memcpy(out[o..][0..eol.len], eol);
+            o += eol.len;
+        } else {
+            out[o] = c;
+            o += 1;
+        }
+    }
+    std.debug.assert(o == out.len);
+    return out;
+}
+
+/// Multi-cursor paste of text holding exactly one line per cursor (what a
+/// multi-cursor copy produces; one trailing line break is ignored): the
+/// n-th cursor in document order gets the n-th line, as one undo step.
+/// Returns false without changing anything when the counts differ or
+/// selections overlap — the caller then pastes all of it at every cursor.
+fn pasteDistributed(allocator: Allocator, doc: *Document, text: []const u8) !bool {
+    var body = text;
+    if (std.mem.endsWith(u8, body, "\n")) {
+        body = body[0 .. body.len - 1];
+        if (std.mem.endsWith(u8, body, "\r")) body = body[0 .. body.len - 1];
+    }
+    const n = doc.cursors.count();
+    if (std.mem.count(u8, body, "\n") + 1 != n) return false;
+
+    // Cursor indices in document order; their spans must not overlap.
+    const order = try allocator.alloc(usize, n);
+    defer allocator.free(order);
+    for (order, 0..) |*o, i| o.* = i;
+    std.mem.sort(usize, order, @as([]const cursor_mod.Cursor, doc.cursors.cursors.items), struct {
+        fn less(cursors: []const cursor_mod.Cursor, a: usize, b: usize) bool {
+            return spanLess({}, cursorSpan(cursors[a]), cursorSpan(cursors[b]));
+        }
+    }.less);
+    for (order[0 .. n - 1], order[1..]) |a, b| {
+        if (cursorSpan(doc.cursors.cursors.items[a]).end > cursorSpan(doc.cursors.cursors.items[b]).start) return false;
+    }
+
+    const pieces = try allocator.alloc([]const u8, n);
+    defer allocator.free(pieces);
+    var lines = std.mem.splitScalar(u8, body, '\n');
+    for (pieces) |*p| {
+        const line = lines.next().?;
+        p.* = if (std.mem.endsWith(u8, line, "\r")) line[0 .. line.len - 1] else line;
+    }
+    const ranges = try allocator.alloc(Document.RangeEdit, n);
+    defer allocator.free(ranges);
+    const ends = try allocator.alloc(usize, n);
+    defer allocator.free(ends);
+    // Where each insertion ends once every earlier (lower) one is applied.
+    var shift: isize = 0;
+    for (order, pieces, 0..) |ci, piece, k| {
+        const s = cursorSpan(doc.cursors.cursors.items[ci]);
+        ranges[n - 1 - k] = .{ .start = s.start, .end = s.end, .text = piece };
+        const start: usize = @intCast(@as(isize, @intCast(s.start)) + shift);
+        ends[k] = start + piece.len;
+        shift += @as(isize, @intCast(piece.len)) - @as(isize, @intCast(s.end - s.start));
+    }
+
+    try doc.beginEdit();
+    defer doc.endEdit();
+    try doc.applyRanges(ranges);
+    for (order, ends) |ci, end| {
+        const c = &doc.cursors.cursors.items[ci];
+        c.anchor = null;
+        c.offset = end;
+        c.preferred_col = doc.buffer.offsetToPos(end).col;
+    }
+    doc.cursors.mergeCursors();
+    return true;
 }
 
 // --- Word movement ---
@@ -730,7 +990,9 @@ fn cmdRerunTask(editor: *Editor, _: ?[]const u8) void {
     // Request may evict old history, so retain the name independently.
     const name = editor.allocator.dupe(u8, run.config.options.name) catch return;
     defer editor.allocator.free(name);
-    editor.mode = .normal;
+    // setMode runs the leave hook: a pending save prompt is cancelled
+    // instead of blocking the rerun (TaskAlreadyWaitingForSave).
+    editor.setMode(.normal);
     cmdRunTask(editor, name);
 }
 fn cmdStopTask(editor: *Editor, _: ?[]const u8) void {
@@ -778,11 +1040,14 @@ fn cmdDebugStop(editor: *Editor, _: ?[]const u8) void {
 fn cmdDebugTerminate(editor: *Editor, _: ?[]const u8) void {
     editor.dap.stop(editor, true);
 }
+/// Stage/unstage the Changes row the user selected — re-found by path
+/// (tool_panel.selectedChange), since a refresh may have shifted the rows
+/// since the selection; the panel's own S/U keys do the same.
 fn cmdGitStage(editor: *Editor, _: ?[]const u8) void {
-    if (editor.tool_panel.kind == .changes) editor.git.stage(editor, editor.tool_panel.selected, false) else cmdGitChanges(editor, null);
+    if (editor.tool_panel.kind == .changes) editor.tool_panel.action(editor, 's') else cmdGitChanges(editor, null);
 }
 fn cmdGitUnstage(editor: *Editor, _: ?[]const u8) void {
-    if (editor.tool_panel.kind == .changes) editor.git.stage(editor, editor.tool_panel.selected, true) else cmdGitChanges(editor, null);
+    if (editor.tool_panel.kind == .changes) editor.tool_panel.action(editor, 'u') else cmdGitChanges(editor, null);
 }
 fn cmdNextProblem(editor: *Editor, _: ?[]const u8) void {
     editor.tool_panel.nextProblem(editor, true);
@@ -790,6 +1055,84 @@ fn cmdNextProblem(editor: *Editor, _: ?[]const u8) void {
 fn cmdPreviousProblem(editor: *Editor, _: ?[]const u8) void {
     editor.tool_panel.nextProblem(editor, false);
 }
+fn cmdLspReferences(editor: *Editor, _: ?[]const u8) void {
+    editor.lsp_tools.start(editor, .references);
+}
+
+fn cmdLspDocumentSymbols(editor: *Editor, _: ?[]const u8) void {
+    editor.lsp_tools.start(editor, .document_symbol);
+}
+
+fn cmdLspWorkspaceSymbols(editor: *Editor, _: ?[]const u8) void {
+    editor.lsp_tools.beginWorkspaceSymbols(editor);
+}
+
+fn cmdLspSignatureHelp(editor: *Editor, _: ?[]const u8) void {
+    editor.lsp_tools.start(editor, .signature_help);
+}
+
+/// A snapshot of every running server's stderr in a fresh read-only tab.
+fn cmdLspStderr(editor: *Editor, _: ?[]const u8) void {
+    var text: std.ArrayList(u8) = .empty;
+    defer text.deinit(editor.allocator);
+    var any = false;
+    for (editor.lsp_clients.items) |client| {
+        const peer = client.peer orelse continue;
+        const captured = peer.stderrAlloc(editor.allocator) catch continue;
+        defer editor.allocator.free(captured);
+        any = true;
+        text.print(editor.allocator, "== {s} ==\n{s}\n", .{ client.name(), if (captured.len > 0) captured else "(nothing on stderr)" }) catch return;
+    }
+    if (!any) {
+        editor.status_message = "No language server is running";
+        return;
+    }
+    const doc = editor.newDocument() catch return;
+    doc.loadText(text.items) catch return;
+    doc.readonly = true;
+    editor.status_message = "Language-server stderr (snapshot, read-only)";
+}
+
+fn cmdOpenLog(editor: *Editor, _: ?[]const u8) void {
+    const dir = lua_settings.getConfigDir() orelse {
+        editor.status_message = "No config directory";
+        return;
+    };
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    const path = std.fmt.bufPrint(&buf, "{s}/zide.log", .{dir}) catch return;
+    editor.recordNavPoint();
+    _ = editor.openFile(path) catch |err| {
+        editor.status_message = std.fmt.bufPrint(&editor.status_buf, "Cannot open zide.log: {s}", .{@errorName(err)}) catch "Cannot open zide.log";
+    };
+}
+
+test "open_log opens the log file from the config directory" {
+    const t = std.testing;
+    var tmp = t.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(t.io, .{ .sub_path = "zide.log", .data = "info: hello\n" });
+    const root = try tmp.dir.realPathFileAlloc(t.io, ".", t.allocator);
+    defer t.allocator.free(root);
+    lua_settings.test_config_dir = root;
+    defer lua_settings.test_config_dir = null;
+    var editor = try Editor.init(t.allocator, t.io);
+    defer editor.deinit();
+    try t.expect(editor.execCommand("open_log", null));
+    try t.expect(std.mem.endsWith(u8, editor.activeDoc().file_path.?, "zide.log"));
+    try t.expectEqualStrings("info: hello\n", editor.activeDoc().buffer.slice(0, editor.activeDoc().buffer.byteLen()));
+    // Without a server, the stderr tab has nothing to show.
+    try t.expect(editor.execCommand("lsp_stderr", null));
+    try t.expectEqualStrings("No language server is running", editor.status_message);
+}
+
+fn cmdReferences(editor: *Editor, _: ?[]const u8) void {
+    if (editor.lsp_tools.references.items.len == 0) {
+        editor.status_message = "No references yet: run lsp_references on a symbol";
+        return;
+    }
+    editor.tool_panel.show(editor, .references);
+}
+
 fn cmdHover(editor: *Editor, _: ?[]const u8) void {
     editor.lsp_tools.start(editor, .hover);
 }
@@ -803,22 +1146,191 @@ fn cmdFormatSelection(editor: *Editor, _: ?[]const u8) void {
     editor.lsp_tools.start(editor, .format_selection);
 }
 
+/// Tab: with a selection across lines (or covering one whole line) every
+/// covered line is indented as one undo step; otherwise the indentation is
+/// typed at each cursor (replacing a selection inside one line).
 fn cmdIndent(editor: *Editor, _: ?[]const u8) void {
     const doc = editor.activeDoc();
-    const width = @min(editor.indentWidthFor(doc), 256);
-    const tabs = if (editor.useTabsFor(doc)) width / @max(1, editor.tabWidthFor(doc)) else 0;
-    const spaces = width - tabs * editor.tabWidthFor(doc);
-    var indentation: [256]u8 = undefined;
-    @memset(indentation[0..tabs], '\t');
-    @memset(indentation[tabs..][0..spaces], ' ');
-    doc.insertAtAllCursors(indentation[0 .. tabs + spaces]) catch {
+    var buf: [256]u8 = undefined;
+    const unit = indentUnit(editor, doc, &buf);
+    if (selectionIsLineWise(doc)) {
+        indentLines(editor.allocator, doc, unit) catch {
+            editor.status_message = "Edit failed: out of memory";
+        };
+        return;
+    }
+    doc.insertAtAllCursors(unit) catch {
         editor.status_message = "Edit failed: out of memory";
     };
 }
 
+/// Shift+Tab: dedents every line the cursors cover (one undo step) — the
+/// caret line alone for a single cursor without a multi-line selection.
 fn cmdDedent(editor: *Editor, _: ?[]const u8) void {
     const doc = editor.activeDoc();
-    doc.dedentLine(editor.indentWidthFor(doc)) catch {};
+    const width = editor.indentWidthFor(doc);
+    if (doc.cursors.count() > 1 or selectionIsLineWise(doc)) {
+        dedentLines(editor.allocator, doc, width) catch {
+            editor.status_message = "Edit failed: out of memory";
+        };
+        return;
+    }
+    doc.dedentLine(width) catch {};
+}
+
+/// One indentation step for `doc`: tabs and/or spaces per its settings.
+fn indentUnit(editor: *const Editor, doc: *const Document, buf: *[256]u8) []const u8 {
+    const width = @min(editor.indentWidthFor(doc), buf.len);
+    const tab_width = @max(1, editor.tabWidthFor(doc));
+    const tabs = if (editor.useTabsFor(doc)) width / tab_width else 0;
+    const spaces = width - tabs * tab_width;
+    @memset(buf[0..tabs], '\t');
+    @memset(buf[tabs..][0..spaces], ' ');
+    return buf[0 .. tabs + spaces];
+}
+
+/// Whether Tab/Shift+Tab work on whole lines: some cursor's selection
+/// crosses a line break or covers one whole, non-empty line.
+fn selectionIsLineWise(doc: *Document) bool {
+    for (doc.cursors.cursors.items) |c| {
+        const r = c.selectionRange() orelse continue;
+        if (r.end <= r.start) continue;
+        const a = doc.buffer.offsetToPos(r.start);
+        const b = doc.buffer.offsetToPos(r.end);
+        if (a.line != b.line) return true;
+        if (a.col == 0 and b.col >= doc.buffer.lineContent(a.line).len) return true;
+    }
+    return false;
+}
+
+const LineSpan = struct { first: usize, last: usize };
+
+/// Lines the cursors cover for a line-wise Tab/Shift+Tab — each selection's
+/// lines (one that ends at column 0 stops at the line above) or a bare
+/// caret's line — sorted, overlaps merged.
+fn coveredLines(allocator: Allocator, doc: *Document) !std.ArrayList(LineSpan) {
+    var spans = try std.ArrayList(LineSpan).initCapacity(allocator, doc.cursors.count());
+    for (doc.cursors.cursors.items) |c| {
+        const s = cursorSpan(c);
+        const a = doc.buffer.offsetToPos(s.start);
+        const b = doc.buffer.offsetToPos(s.end);
+        const last = if (b.line > a.line and b.col == 0) b.line - 1 else b.line;
+        spans.appendAssumeCapacity(.{ .first = a.line, .last = last });
+    }
+    std.mem.sort(LineSpan, spans.items, {}, struct {
+        fn less(_: void, x: LineSpan, y: LineSpan) bool {
+            return x.first < y.first;
+        }
+    }.less);
+    var n: usize = 0;
+    for (spans.items) |s| {
+        if (n > 0 and s.first <= spans.items[n - 1].last) {
+            spans.items[n - 1].last = @max(spans.items[n - 1].last, s.last);
+        } else {
+            spans.items[n] = s;
+            n += 1;
+        }
+    }
+    spans.items.len = n;
+    return spans;
+}
+
+/// Indent every covered line by `unit` as one undo step. Empty lines stay
+/// empty unless every covered line is empty. A selection that starts at
+/// column 0 of an indented line keeps that edge in front of the new
+/// indentation, so whole selected lines stay selected; every other cursor
+/// position moves with its text.
+fn indentLines(allocator: Allocator, doc: *Document, unit: []const u8) !void {
+    var spans = try coveredLines(allocator, doc);
+    defer spans.deinit(allocator);
+    var all_empty = true;
+    scan: for (spans.items) |s| {
+        var ln = s.first;
+        while (ln <= s.last) : (ln += 1) {
+            if (doc.buffer.lineContent(ln).len > 0) {
+                all_empty = false;
+                break :scan;
+            }
+        }
+    }
+
+    var edits: std.ArrayList(Document.RangeEdit) = .empty;
+    defer edits.deinit(allocator);
+    var k = spans.items.len;
+    while (k > 0) {
+        k -= 1;
+        var ln = spans.items[k].last + 1;
+        while (ln > spans.items[k].first) {
+            ln -= 1;
+            if (!all_empty and doc.buffer.lineContent(ln).len == 0) continue;
+            const at = doc.buffer.line_starts.items[ln];
+            try edits.append(allocator, .{ .start = at, .end = at, .text = unit });
+        }
+    }
+
+    // Which selection edges stay put (see above): recorded before the edit.
+    const StayPut = enum { none, anchor, offset };
+    const stays = try allocator.alloc(StayPut, doc.cursors.count());
+    defer allocator.free(stays);
+    for (doc.cursors.cursors.items, stays) |c, *stay| {
+        stay.* = .none;
+        const a = c.anchor orelse continue;
+        if (a == c.offset) continue;
+        const start = @min(a, c.offset);
+        const pos = doc.buffer.offsetToPos(start);
+        if (pos.col != 0) continue;
+        if (!all_empty and doc.buffer.lineContent(pos.line).len == 0) continue;
+        stay.* = if (a < c.offset) .anchor else .offset;
+    }
+
+    try doc.beginEdit();
+    defer doc.endEdit();
+    try doc.applyRanges(edits.items);
+    for (doc.cursors.cursors.items, stays) |*c, stay| {
+        switch (stay) {
+            .none => {},
+            .anchor => if (c.anchor) |*a| {
+                a.* -= unit.len;
+            },
+            .offset => c.offset -= unit.len,
+        }
+        c.preferred_col = doc.buffer.offsetToPos(c.offset).col;
+    }
+}
+
+/// Leading whitespace one dedent removes from `line`: a tab, or up to
+/// `width` spaces (the rule of `Document.dedentLine`).
+fn dedentAmount(line: []const u8, width: usize) usize {
+    if (line.len > 0 and line[0] == '\t') return 1;
+    var n: usize = 0;
+    while (n < line.len and n < @max(width, 1) and line[n] == ' ') n += 1;
+    return n;
+}
+
+/// Dedent every covered line by one step as one undo step; cursors inside
+/// removed indentation land at the line start.
+fn dedentLines(allocator: Allocator, doc: *Document, width: usize) !void {
+    var spans = try coveredLines(allocator, doc);
+    defer spans.deinit(allocator);
+    var edits: std.ArrayList(Document.RangeEdit) = .empty;
+    defer edits.deinit(allocator);
+    var k = spans.items.len;
+    while (k > 0) {
+        k -= 1;
+        var ln = spans.items[k].last + 1;
+        while (ln > spans.items[k].first) {
+            ln -= 1;
+            const remove = dedentAmount(doc.buffer.lineContent(ln), width);
+            if (remove == 0) continue;
+            const at = doc.buffer.line_starts.items[ln];
+            try edits.append(allocator, .{ .start = at, .end = at + remove, .text = "" });
+        }
+    }
+    try doc.beginEdit();
+    defer doc.endEdit();
+    try doc.applyRanges(edits.items);
+    for (doc.cursors.cursors.items) |*c| c.preferred_col = doc.buffer.offsetToPos(c.offset).col;
+    doc.cursors.mergeCursors();
 }
 
 // --- Comment toggle ---
@@ -877,6 +1389,10 @@ fn cmdFiletreeRootUp(editor: *Editor, _: ?[]const u8) void {
     editor.filetreeRootUp();
 }
 
+fn cmdFiletreeSetRoot(editor: *Editor, _: ?[]const u8) void {
+    editor.filetreeOpenSelectedAsRoot();
+}
+
 fn cmdFiletreeReveal(editor: *Editor, _: ?[]const u8) void {
     _ = editor.ensureFiletree() orelse return;
     const doc = editor.activeDoc();
@@ -886,7 +1402,9 @@ fn cmdFiletreeReveal(editor: *Editor, _: ?[]const u8) void {
     };
     editor.filetree_visible = true;
     if (editor.filetreeRevealPath(path)) {
-        editor.filetree_focused = true;
+        // The tree takes the keyboard the one sanctioned way (from the
+        // search panel too, and in the primary window).
+        _ = editor.takeKeyboardFocus(.filetree);
     } else {
         editor.status_message = "Reveal: file not found under the tree root";
     }
@@ -1016,17 +1534,23 @@ fn cmdFiletreeRevealExplorer(editor: *Editor, _: ?[]const u8) void {
             break :blk argv_buf[0..2];
         },
     };
-    const res = std.process.run(editor.allocator, editor.io, .{
+    // Through the editor-wide spawn lock (jobs.zig), with no pipes: a file
+    // manager the launcher leaves running inherits them, and reading them
+    // to EOF (std.process.run did) waited for that window to close.
+    var child = @import("jobs.zig").spawnLocked(editor.io, .{
         .argv = argv,
-        .stdout_limit = .limited(256),
-        .stderr_limit = .limited(256),
+        .stdin = .ignore,
+        .stdout = .ignore,
+        .stderr = .ignore,
     }) catch {
         editor.status_message = "Could not open the system file manager";
         return;
     };
-    editor.allocator.free(res.stdout);
-    editor.allocator.free(res.stderr);
-    editor.status_message = "Opened in file manager";
+    const term = child.wait(editor.io) catch {
+        editor.status_message = "Could not open the system file manager";
+        return;
+    };
+    editor.status_message = if (term == .exited and term.exited == 0) "Opened in file manager" else "The system file manager reported an error";
 }
 
 extern "shell32" fn ShellExecuteW(
@@ -1056,6 +1580,7 @@ fn cmdNextTodo(editor: *Editor, _: ?[]const u8) void {
         wrapped = true;
     }
     if (found) |pos| {
+        editor.recordNavPoint();
         doc.cursors.clearSecondary();
         c.clearSelection();
         c.offset = pos;
@@ -1186,13 +1711,16 @@ fn cmdInsertNewlineAuto(editor: *Editor, _: ?[]const u8) void {
     const pos = doc.cursorPos();
     const line = doc.lineContent(pos.line);
 
-    // Count leading whitespace on current line
+    // Count leading whitespace on current line — only up to the caret: what
+    // lies right of it moves to the new line with its own indentation, so
+    // Enter at column 0 (or inside the indentation) must not add it twice.
     var indent_len: usize = 0;
     for (line) |ch| {
         if (ch == ' ' or ch == '\t') {
             indent_len += 1;
         } else break;
     }
+    indent_len = @min(indent_len, pos.col);
 
     // Markdown: continue list/quote markers ("- ", "3. ", "> ", "- [ ] ").
     if (doc.language) |lang| md: {
@@ -1241,6 +1769,38 @@ fn cmdInsertNewlineAuto(editor: *Editor, _: ?[]const u8) void {
         return;
     }
 
+    // Enter between a bracket pair ("{|}") opens it: the caret lands on its
+    // own line one level deeper and the closer moves to the line below at
+    // the original indentation — one undo step.
+    if (pos.col > 0 and pos.col < line.len and !doc.cursors.primaryConst().hasSelection() and brackets.closes(line[pos.col - 1], line[pos.col])) {
+        var sbuf: [512]u8 = undefined;
+        var w: usize = 0;
+        const term = doc.lineEnding();
+        const ind = @min(indent_len, 128);
+        @memcpy(sbuf[w .. w + term.len], term);
+        w += term.len;
+        @memcpy(sbuf[w .. w + ind], line[0..ind]);
+        w += ind;
+        if (editor.useTabsFor(doc)) {
+            sbuf[w] = '\t';
+            w += 1;
+        } else {
+            const unit = @min(editor.indentWidthFor(doc), 16);
+            @memset(sbuf[w .. w + unit], ' ');
+            w += unit;
+        }
+        const caret_at = w;
+        @memcpy(sbuf[w .. w + term.len], term);
+        w += term.len;
+        @memcpy(sbuf[w .. w + ind], line[0..ind]);
+        w += ind;
+        doc.insertAtCursor(sbuf[0..w]) catch return;
+        const c = doc.cursors.primary();
+        c.offset -= w - caret_at;
+        c.preferred_col = doc.buffer.offsetToPos(c.offset).col;
+        return;
+    }
+
     // Build newline + indent string
     var buf: [256]u8 = undefined;
     const term = doc.lineEnding();
@@ -1250,6 +1810,49 @@ fn cmdInsertNewlineAuto(editor: *Editor, _: ?[]const u8) void {
         @memcpy(buf[term.len .. term.len + copy_len], line[0..copy_len]);
     }
     doc.insertAtCursor(buf[0 .. term.len + copy_len]) catch {};
+}
+
+/// Jump between a bracket and its partner (a recorded jump, so
+/// navigate_back returns).
+fn cmdGotoMatchingBracket(editor: *Editor, _: ?[]const u8) void {
+    const doc = editor.activeDoc();
+    const caret = doc.cursors.primary().offset;
+    const here = brackets.bracketAt(&doc.buffer, caret) orelse {
+        editor.status_message = "No bracket at the cursor";
+        return;
+    };
+    const pair = brackets.matchFor(&doc.buffer, here) orelse {
+        editor.status_message = "No matching bracket";
+        return;
+    };
+    const target = if (here == pair.open) pair.close else pair.open;
+    editor.recordNavPoint();
+    const c = doc.cursors.primary();
+    c.clearSelection();
+    c.offset = target;
+    c.preferred_col = doc.buffer.offsetToPos(target).col;
+}
+
+test "Enter between a bracket pair opens it on an indented line; goto_matching_bracket jumps both ways" {
+    const t = std.testing;
+    var editor = try Editor.init(t.allocator, t.io);
+    defer editor.deinit();
+    const doc = editor.activeDoc();
+    try doc.insertAtCursor("    fn f() {}");
+    doc.cursors.primary().offset = "    fn f() {".len; // between { and }
+    try t.expect(editor.execCommand("insert_newline_auto", null));
+    try t.expectEqualStrings("    fn f() {\n        \n    }", doc.buffer.slice(0, doc.buffer.byteLen()));
+    try t.expectEqual("    fn f() {\n        ".len, doc.cursors.primary().offset);
+    // From just after the opener to the closer, then back onto the opener.
+    doc.cursors.primary().offset = "    fn f() {".len;
+    try t.expect(editor.execCommand("goto_matching_bracket", null));
+    try t.expectEqual("    fn f() {\n        \n    ".len, doc.cursors.primary().offset);
+    try t.expect(editor.execCommand("goto_matching_bracket", null));
+    try t.expectEqual("    fn f() ".len, doc.cursors.primary().offset);
+    // Enter elsewhere still only copies the indentation.
+    doc.cursors.primary().offset = "    fn f() {\n        ".len;
+    try t.expect(editor.execCommand("insert_newline_auto", null));
+    try t.expectEqualStrings("    fn f() {\n        \n        \n    }", doc.buffer.slice(0, doc.buffer.byteLen()));
 }
 
 // --- Multi-cursor commands ---
@@ -1269,8 +1872,17 @@ fn cmdAddCursorBelow(editor: *Editor, _: ?[]const u8) void {
     if (max_line + 1 >= doc.buffer.lineCount()) return;
     const target_line_len = doc.buffer.lineContent(max_line + 1).len;
     const col = @min(ref_col, target_line_len);
-    const new_offset = @import("cursor.zig").lineOffset(&doc.buffer, max_line + 1, col);
-    doc.cursors.addCursor(new_offset) catch {};
+    const new_offset = cursor_mod.lineOffset(&doc.buffer, max_line + 1, col);
+    addCursorWithColumn(doc, new_offset, ref_col);
+}
+
+/// Add a cursor at `offset` that remembers `preferred_col` for vertical
+/// motion (`CursorSet.addCursor` leaves it 0, so the next add or Up/Down
+/// snapped to column 0). No-op when a cursor is already there.
+fn addCursorWithColumn(doc: *Document, offset: usize, preferred_col: usize) void {
+    const before = doc.cursors.count();
+    doc.cursors.addCursor(offset) catch return;
+    if (doc.cursors.count() > before) doc.cursors.cursors.items[before].preferred_col = preferred_col;
 }
 
 fn cmdAddCursorAbove(editor: *Editor, _: ?[]const u8) void {
@@ -1288,8 +1900,8 @@ fn cmdAddCursorAbove(editor: *Editor, _: ?[]const u8) void {
     if (min_line == 0) return;
     const target_line_len = doc.buffer.lineContent(min_line - 1).len;
     const col = @min(ref_col, target_line_len);
-    const new_offset = @import("cursor.zig").lineOffset(&doc.buffer, min_line - 1, col);
-    doc.cursors.addCursor(new_offset) catch {};
+    const new_offset = cursor_mod.lineOffset(&doc.buffer, min_line - 1, col);
+    addCursorWithColumn(doc, new_offset, ref_col);
 }
 
 fn cmdAddNextOccurrence(editor: *Editor, _: ?[]const u8) void {
@@ -1309,6 +1921,7 @@ fn cmdAddNextOccurrence(editor: *Editor, _: ?[]const u8) void {
         if (word_end == word_start) return;
         c.anchor = word_start;
         c.offset = word_end;
+        c.preferred_col = doc.buffer.offsetToPos(word_end).col;
         return;
     }
 
@@ -1354,10 +1967,16 @@ fn cmdAddNextOccurrence(editor: *Editor, _: ?[]const u8) void {
         // Set the new cursor's anchor to select the match
         const new_cursor = &doc.cursors.cursors.items[doc.cursors.count() - 1];
         new_cursor.anchor = match_start;
+        new_cursor.preferred_col = doc.buffer.offsetToPos(match_end).col;
     }
 }
 
 fn cmdEscapeMulticursor(editor: *Editor, _: ?[]const u8) void {
+    // Escape closes the signature popup first, then thins the cursors.
+    if (editor.signature != null) {
+        editor.clearSignature();
+        return;
+    }
     editor.activeDoc().cursors.clearSecondary();
 }
 
@@ -1397,8 +2016,11 @@ fn cmdDetachTerminal(editor: *Editor, _: ?[]const u8) void {
     _ = editor.execAction("detach_terminal");
 }
 
+/// Word bytes: ASCII letters, digits, `_`, and every byte of a non-ASCII
+/// character (the rule of `cursor.isWordByte`), so words like `héllo` or
+/// `привет` are whole words.
 fn isWordCharByte(byte: u8) bool {
-    return std.ascii.isAlphanumeric(byte) or byte == '_';
+    return std.ascii.isAlphanumeric(byte) or byte == '_' or byte >= 0x80;
 }
 
 // ---- Theme commands ----
@@ -1420,39 +2042,65 @@ fn setTuiTheme(editor: *Editor, name: []const u8, preset: theme_mod.TuiTheme, sy
     editor.tui_theme = preset;
     editor.tui_syntax_theme = syn;
     editor.tui_theme_name = name;
+    // The theme files (`tui_syn_*` overrides) apply on top of the new palette.
+    reapplySyntaxThemes(editor);
     var val_buf: [32]u8 = undefined;
     const quoted = std.fmt.bufPrint(&val_buf, "\"{s}\"", .{name}) catch return;
     lua_settings.writeSettingToFile("tui_theme", quoted) catch {};
 }
 
+/// True while reapplySyntaxThemes runs the theme files, so a file that runs
+/// a theme command itself (`zide.exec("theme_dark")`) can't recurse.
+var reapplying_syntax_themes = false;
+
+/// Re-run the syntax theme files after a preset switch. A preset replaces
+/// the whole syntax palette, which dropped syntax-theme.lua's colors and
+/// left every syn_theme_<lang>.lua palette (a copy of the old globals) on
+/// the old theme. Global file first: the language files re-seed from it.
+fn reapplySyntaxThemes(editor: *Editor) void {
+    const lua = editor.lua orelse return;
+    if (reapplying_syntax_themes) return;
+    reapplying_syntax_themes = true;
+    defer reapplying_syntax_themes = false;
+    lua_settings.loadSyntaxTheme(lua);
+    lua_settings.loadLangSyntaxThemes(lua);
+}
+
 fn cmdThemeDark(editor: *Editor, _: ?[]const u8) void {
     setGuiTheme(editor, "dark", theme_mod.gui_dark, theme_mod.syn_gui_dark);
     setTuiTheme(editor, "dark", theme_mod.tui_dark, theme_mod.syn_tui_dark);
+    reapplySyntaxThemes(editor);
 }
 
 fn cmdThemeLight(editor: *Editor, _: ?[]const u8) void {
     setGuiTheme(editor, "light", theme_mod.gui_light, theme_mod.syn_gui_light);
     setTuiTheme(editor, "light", theme_mod.tui_light, theme_mod.syn_tui_light);
+    reapplySyntaxThemes(editor);
 }
 
 fn cmdThemeHighContrast(editor: *Editor, _: ?[]const u8) void {
     setGuiTheme(editor, "high_contrast", theme_mod.gui_high_contrast, theme_mod.syn_gui_high_contrast);
     setTuiTheme(editor, "high_contrast", theme_mod.tui_high_contrast, theme_mod.syn_tui_high_contrast);
+    reapplySyntaxThemes(editor);
 }
 
 fn cmdThemeTerminal(editor: *Editor, _: ?[]const u8) void {
     setTuiTheme(editor, "terminal", theme_mod.tui_terminal, theme_mod.syn_tui_terminal);
+    reapplySyntaxThemes(editor);
 }
 
 // GUI-only theme commands (don't touch TUI theme)
 fn cmdGuiThemeDark(editor: *Editor, _: ?[]const u8) void {
     setGuiTheme(editor, "dark", theme_mod.gui_dark, theme_mod.syn_gui_dark);
+    reapplySyntaxThemes(editor);
 }
 fn cmdGuiThemeLight(editor: *Editor, _: ?[]const u8) void {
     setGuiTheme(editor, "light", theme_mod.gui_light, theme_mod.syn_gui_light);
+    reapplySyntaxThemes(editor);
 }
 fn cmdGuiThemeHighContrast(editor: *Editor, _: ?[]const u8) void {
     setGuiTheme(editor, "high_contrast", theme_mod.gui_high_contrast, theme_mod.syn_gui_high_contrast);
+    reapplySyntaxThemes(editor);
 }
 
 // TUI-only theme commands (don't touch GUI theme)
@@ -1647,6 +2295,298 @@ test "all Enter commands preserve document line endings" {
     }
 }
 
+fn testText(doc: *Document) []const u8 {
+    return doc.buffer.slice(0, doc.buffer.byteLen());
+}
+
+fn expectSelection(doc: *Document, anchor: usize, offset: usize) !void {
+    try std.testing.expectEqual(@as(?usize, anchor), doc.cursors.primary().anchor);
+    try std.testing.expectEqual(offset, doc.cursors.primary().offset);
+}
+
+test "Tab and Shift+Tab with a multi-line selection work on every covered line" {
+    const t = std.testing;
+    var editor = try Editor.init(t.allocator, t.io);
+    defer editor.deinit();
+    const doc = editor.activeDoc();
+
+    try doc.loadText("alpha\nbeta\ngamma");
+    doc.cursors.primary().* = .{ .anchor = 0, .offset = 10 };
+    cmdIndent(&editor, null);
+    try t.expectEqualStrings("    alpha\n    beta\ngamma", testText(doc));
+    try expectSelection(doc, 0, 18); // still both whole lines
+    cmdIndent(&editor, null);
+    try t.expectEqualStrings("        alpha\n        beta\ngamma", testText(doc));
+    cmdDedent(&editor, null);
+    cmdDedent(&editor, null);
+    try t.expectEqualStrings("alpha\nbeta\ngamma", testText(doc));
+    try expectSelection(doc, 0, 10);
+    // Each press was one undo step that restores text and selection.
+    _ = try doc.undoAction();
+    try t.expectEqualStrings("    alpha\n    beta\ngamma", testText(doc));
+    for (0..3) |_| _ = try doc.undoAction();
+    try t.expectEqualStrings("alpha\nbeta\ngamma", testText(doc));
+    try expectSelection(doc, 0, 10);
+    try t.expect(!doc.history.canUndo());
+
+    // Ctrl+A then Tab indents every line instead of replacing the text.
+    cmdSelectAll(&editor, null);
+    cmdIndent(&editor, null);
+    try t.expectEqualStrings("    alpha\n    beta\n    gamma", testText(doc));
+    try expectSelection(doc, 0, 28);
+
+    // A backward selection keeps its caret at column 0; a selection ending
+    // at column 0 leaves that line alone; empty lines stay empty.
+    try doc.loadText("a\n\nb\nc");
+    doc.cursors.primary().* = .{ .anchor = 5, .offset = 0 };
+    cmdIndent(&editor, null);
+    try t.expectEqualStrings("    a\n\n    b\nc", testText(doc));
+    try expectSelection(doc, 13, 0);
+
+    // One whole line selected works line-wise; a part of one line is replaced
+    // by the indentation as before.
+    try doc.loadText("alpha\nbeta");
+    doc.cursors.primary().* = .{ .anchor = 0, .offset = 5 };
+    cmdIndent(&editor, null);
+    try t.expectEqualStrings("    alpha\nbeta", testText(doc));
+    try expectSelection(doc, 0, 9);
+    try doc.loadText("alpha");
+    doc.cursors.primary().* = .{ .anchor = 1, .offset = 3 };
+    cmdIndent(&editor, null);
+    try t.expectEqualStrings("a    ha", testText(doc));
+
+    // CRLF lines and tab indentation.
+    editor.use_tabs = true;
+    try doc.loadText("a\r\nb");
+    cmdSelectAll(&editor, null);
+    cmdIndent(&editor, null);
+    try t.expectEqualStrings("\ta\r\n\tb", testText(doc));
+    cmdDedent(&editor, null);
+    try t.expectEqualStrings("a\r\nb", testText(doc));
+}
+
+test "Shift+Tab with several cursors dedents every caret line" {
+    const t = std.testing;
+    var editor = try Editor.init(t.allocator, t.io);
+    defer editor.deinit();
+    const doc = editor.activeDoc();
+    try doc.loadText("    a\n    b\n    c");
+    doc.cursors.primary().offset = 4; // line 0, col 4
+    try doc.cursors.addCursor(16); // line 2, col 4
+    cmdDedent(&editor, null);
+    try t.expectEqualStrings("a\n    b\nc", testText(doc));
+    try t.expectEqual(@as(usize, 0), doc.cursors.cursors.items[0].offset);
+    try t.expectEqual(@as(usize, 8), doc.cursors.cursors.items[1].offset);
+    _ = try doc.undoAction();
+    try t.expectEqualStrings("    a\n    b\n    c", testText(doc));
+    try t.expect(!doc.history.canUndo());
+}
+
+test "Enter at column 0 or inside the indentation does not double it" {
+    const t = std.testing;
+    var editor = try Editor.init(t.allocator, t.io);
+    defer editor.deinit();
+    const doc = editor.activeDoc();
+    doc.language = editor.findLanguage("zig");
+
+    try doc.loadText("    foo");
+    doc.cursors.primary().offset = 0;
+    cmdInsertNewlineAuto(&editor, null);
+    try t.expectEqualStrings("\n    foo", testText(doc));
+    try t.expectEqual(@as(usize, 1), doc.cursors.primary().offset);
+
+    try doc.loadText("    foo");
+    doc.cursors.primary().offset = 2;
+    cmdInsertNewlineAuto(&editor, null);
+    try t.expectEqualStrings("  \n    foo", testText(doc));
+
+    // Markdown: Enter at column 0 of an indented item must not nest it.
+    doc.language = editor.findLanguage("md");
+    try doc.loadText("  - item");
+    doc.cursors.primary().offset = 0;
+    cmdInsertNewlineAuto(&editor, null);
+    try t.expectEqualStrings("\n  - item", testText(doc));
+}
+
+const TestClipboard = struct {
+    // Nothing reaches the system clipboard; paste reads editor.clipboard.
+    fn set(_: []const u8) void {}
+    fn get() []const u8 {
+        return "";
+    }
+};
+
+test "cut and copy take every selection; paste gives each cursor its line" {
+    const t = std.testing;
+    var editor = try Editor.init(t.allocator, t.io);
+    defer editor.deinit();
+    editor.clipboard_set_fn = TestClipboard.set;
+    editor.clipboard_get_fn = TestClipboard.get;
+    const doc = editor.activeDoc();
+
+    try doc.loadText("abcdef\nabcdef\nabcdef");
+    try doc.cursors.setBlockSelection(&doc.buffer, 0, 1, 2, 3);
+    cmdCopy(&editor, null);
+    try t.expectEqualStrings("bc\nbc\nbc", editor.clipboard);
+    cmdCut(&editor, null);
+    try t.expectEqualStrings("adef\nadef\nadef", testText(doc));
+    try t.expectEqual(@as(usize, 3), doc.cursors.count());
+    for (doc.cursors.cursors.items) |c| try t.expect(!c.hasSelection());
+    // One undo step brings all three spans back.
+    _ = try doc.undoAction();
+    try t.expectEqualStrings("abcdef\nabcdef\nabcdef", testText(doc));
+    try t.expect(!doc.history.canUndo());
+    _ = try doc.redoAction();
+    try t.expectEqualStrings("adef\nadef\nadef", testText(doc));
+
+    // Three lines, three cursors: one line each, carets after their text.
+    cmdPaste(&editor, null);
+    try t.expectEqualStrings("abcdef\nabcdef\nabcdef", testText(doc));
+    for (doc.cursors.cursors.items) |c| try t.expectEqual(@as(usize, 3), doc.buffer.offsetToPos(c.offset).col);
+    _ = try doc.undoAction();
+    try t.expectEqualStrings("adef\nadef\nadef", testText(doc));
+
+    // Any other line count is pasted whole at every cursor, as before.
+    editor.setClipboard("X");
+    cmdPaste(&editor, null);
+    try t.expectEqualStrings("aXdef\naXdef\naXdef", testText(doc));
+
+    // Copy joins with the document's line ending; a short line in a block
+    // selection contributes an empty line.
+    try doc.loadText("abc\r\na\r\nabc");
+    try doc.cursors.setBlockSelection(&doc.buffer, 0, 1, 2, 3);
+    cmdCopy(&editor, null);
+    try t.expectEqualStrings("bc\r\n\r\nbc", editor.clipboard);
+
+    // A single selection copies as before; nothing selected copies nothing.
+    try doc.loadText("hello world");
+    doc.cursors.primary().* = .{ .anchor = 6, .offset = 11 };
+    cmdCut(&editor, null);
+    try t.expectEqualStrings("world", editor.clipboard);
+    try t.expectEqualStrings("hello ", testText(doc));
+    cmdCopy(&editor, null);
+    try t.expectEqualStrings("world", editor.clipboard);
+}
+
+test "paste writes line breaks in the document's line ending" {
+    const t = std.testing;
+    var editor = try Editor.init(t.allocator, t.io);
+    defer editor.deinit();
+    editor.clipboard_set_fn = TestClipboard.set;
+    editor.clipboard_get_fn = TestClipboard.get;
+    const doc = editor.activeDoc();
+
+    // CRLF text from a Windows program into an LF document.
+    try doc.loadText("x\n");
+    editor.setClipboard("a\r\nb\r\n");
+    cmdPaste(&editor, null);
+    try t.expectEqualStrings("a\nb\nx\n", testText(doc));
+    // LF or mixed text into a CRLF document.
+    try doc.loadText("x\r\n");
+    try t.expect(doc.crlf);
+    editor.setClipboard("a\nb\r\nc");
+    cmdPaste(&editor, null);
+    try t.expectEqualStrings("a\r\nb\r\ncx\r\n", testText(doc));
+    // The clipboard itself keeps what was copied.
+    try t.expectEqualStrings("a\nb\r\nc", editor.clipboard);
+    // A lone CR is not a line break; matching text is pasted as it is.
+    try doc.loadText("\n");
+    editor.setClipboard("p\rq\n");
+    cmdPaste(&editor, null);
+    try t.expectEqualStrings("p\rq\n\n", testText(doc));
+
+    // One CRLF line per cursor still distributes in an LF document.
+    try doc.loadText("1\n2\n");
+    doc.cursors.primary().moveToEnd(&doc.buffer);
+    try doc.cursors.addCursor(doc.buffer.posToOffset(0, 1));
+    editor.setClipboard("A\r\nB\r\n");
+    cmdPaste(&editor, null);
+    try t.expectEqualStrings("1A\n2\nB", testText(doc));
+}
+
+test "withLineEnding converts only when needed" {
+    const t = std.testing;
+    try t.expect((try withLineEnding(t.allocator, "a\nb", "\n")) == null);
+    try t.expect((try withLineEnding(t.allocator, "a\r\nb", "\r\n")) == null);
+    try t.expect((try withLineEnding(t.allocator, "a\rb", "\r\n")) == null);
+    const lf = (try withLineEnding(t.allocator, "\r\n\r\na\r\n", "\n")).?;
+    defer t.allocator.free(lf);
+    try t.expectEqualStrings("\n\na\n", lf);
+    const crlf = (try withLineEnding(t.allocator, "\n\r\n\n", "\r\n")).?;
+    defer t.allocator.free(crlf);
+    try t.expectEqualStrings("\r\n\r\n\r\n", crlf);
+}
+
+test "added cursors keep their column for the next add" {
+    const t = std.testing;
+    var editor = try Editor.init(t.allocator, t.io);
+    defer editor.deinit();
+    const doc = editor.activeDoc();
+
+    try doc.loadText("abcdefgh\nabcdefgh\nabcdefgh\nabcdefgh");
+    doc.cursors.primary().gotoPos(&doc.buffer, 0, 5);
+    for (0..3) |_| cmdAddCursorBelow(&editor, null);
+    try t.expectEqual(@as(usize, 4), doc.cursors.count());
+    for (doc.cursors.cursors.items, 0..) |c, line| {
+        try t.expectEqual(line, doc.buffer.offsetToPos(c.offset).line);
+        try t.expectEqual(@as(usize, 5), doc.buffer.offsetToPos(c.offset).col);
+        try t.expectEqual(@as(usize, 5), c.preferred_col);
+    }
+
+    // Through a short line the column survives, above and below.
+    try doc.loadText("abcdefgh\nab\nabcdefgh");
+    doc.cursors.primary().gotoPos(&doc.buffer, 0, 5);
+    cmdAddCursorBelow(&editor, null);
+    cmdAddCursorBelow(&editor, null);
+    try t.expectEqual(@as(usize, 2), doc.buffer.offsetToPos(doc.cursors.cursors.items[1].offset).col);
+    try t.expectEqual(@as(usize, 5), doc.buffer.offsetToPos(doc.cursors.cursors.items[2].offset).col);
+    doc.cursors.clearSecondary();
+    doc.cursors.primary().gotoPos(&doc.buffer, 2, 6);
+    cmdAddCursorAbove(&editor, null);
+    cmdAddCursorAbove(&editor, null);
+    try t.expectEqual(@as(usize, 6), doc.buffer.offsetToPos(doc.cursors.cursors.items[2].offset).col);
+}
+
+test "add_next_occurrence treats non-ASCII letters as word characters" {
+    const t = std.testing;
+    var editor = try Editor.init(t.allocator, t.io);
+    defer editor.deinit();
+    const doc = editor.activeDoc();
+    try doc.loadText("h\xc3\xa9llo w\xc3\xb6rld h\xc3\xa9llo");
+    doc.cursors.primary().offset = 0;
+    cmdAddNextOccurrence(&editor, null);
+    try t.expectEqual(@as(?usize, 0), doc.cursors.primary().anchor);
+    try t.expectEqual(@as(usize, 6), doc.cursors.primary().offset);
+    cmdAddNextOccurrence(&editor, null);
+    try t.expectEqual(@as(usize, 2), doc.cursors.count());
+    try t.expectEqual(@as(?usize, 14), doc.cursors.cursors.items[1].anchor);
+    try t.expectEqual(@as(usize, 20), doc.cursors.cursors.items[1].offset);
+    try t.expectEqual(@as(usize, 20), doc.cursors.cursors.items[1].preferred_col);
+}
+
+test "execAction's own actions are palette commands; every default binding is known" {
+    const t = std.testing;
+    var editor = try Editor.init(t.allocator, t.io);
+    defer editor.deinit();
+    for (exec_action_commands) |c| try t.expect(editor.commands.get(c.name) != null);
+    var it = editor.keybinds.map.iterator();
+    while (it.next()) |entry| {
+        if (!editor.commands.isKnownAction(entry.value_ptr.*)) {
+            std.debug.print("default binding {s} -> {s} names no command\n", .{ entry.key_ptr.*, entry.value_ptr.* });
+            return error.TestUnexpectedResult;
+        }
+    }
+    try t.expect(!editor.commands.isKnownAction("no_such_command"));
+    const old_level = t.log_level;
+    t.log_level = .err;
+    defer t.log_level = old_level;
+    editor.commands.warnIfUnknownAction("ctrl+k", "no_such_command");
+
+    // The registry entries run the action itself (no recursion).
+    try t.expect(editor.execCommand("goto_line", null));
+    try t.expect(editor.mode == .goto_line);
+}
+
 test "keyboard delete commands remove complete characters" {
     const t = std.testing;
     var editor = try Editor.init(t.allocator, t.io);
@@ -1660,6 +2600,162 @@ test "keyboard delete commands remove complete characters" {
     doc.cursors.primary().moveToStart();
     cmdDeleteForward(&editor, null);
     try t.expectEqual(@as(usize, 0), doc.buffer.byteLen());
+}
+
+test "git_stage and git_unstage act on the selected file after a refresh shifted the rows" {
+    const t = std.testing;
+    var tmp = t.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(t.io, ".", t.allocator);
+    defer t.allocator.free(root);
+    var editor = try Editor.init(t.allocator, t.io);
+    defer editor.deinit();
+    editor.lsp_enabled = false;
+    editor.git.root = try t.allocator.dupe(u8, root);
+    for ([_][]const u8{ "a.txt", "z.txt" }, 0..) |name, i| {
+        try editor.git.changes.insert(t.allocator, i, .{ .path = try t.allocator.dupe(u8, name), .x = 'M', .y = 'M' });
+    }
+    // A dirty buffer per file keeps stage() at its save prompt (the
+    // mutation is recorded, no git process starts).
+    for ([_][]const u8{ "a.txt", "m.txt", "z.txt" }) |name| {
+        const doc = try editor.newDocument();
+        const path = try std.fs.path.join(t.allocator, &.{ root, name });
+        defer t.allocator.free(path);
+        try doc.setFilePath(path);
+        try doc.insertAtCursor("x");
+    }
+    editor.tool_panel.show(&editor, .changes);
+    editor.tool_panel.move(&editor, true); // z.txt
+    // A refresh lists m.txt above the selection before the command runs.
+    try editor.git.changes.insert(t.allocator, 1, .{ .path = try t.allocator.dupe(u8, "m.txt"), .x = 'M', .y = 'M' });
+    cmdGitStage(&editor, null);
+    try t.expectEqualStrings("z.txt", editor.git.mutation.?.path);
+    editor.git.resolveStage(&editor, false);
+    try t.expect(editor.git.mutation == null);
+    // Unstage (it would start git at once): the selected m.txt leaves the
+    // list, so nothing happens to the row that took its place.
+    editor.tool_panel.show(&editor, .changes);
+    editor.tool_panel.move(&editor, true); // m.txt
+    const gone = editor.git.changes.orderedRemove(1);
+    t.allocator.free(gone.path);
+    editor.status_message = "";
+    cmdGitUnstage(&editor, null);
+    try t.expect(editor.git.mutation == null);
+    try t.expect(std.mem.indexOf(u8, editor.status_message, "m.txt") != null);
+}
+
+test "rerun_task from the task save prompt cancels that prompt and asks again" {
+    const t = std.testing;
+    const tasks_mod = @import("tasks.zig");
+    var editor = try Editor.init(t.allocator, t.io);
+    defer editor.deinit();
+    editor.lsp_enabled = false;
+    // A dirty untitled buffer puts every request behind the save prompt,
+    // so nothing is spawned.
+    editor.activeDoc().dirty = true;
+    try editor.tasks.register(&editor, try tasks_mod.Config.create(t.allocator, .{ .name = "t", .argv = &.{"zide-test-no-such-task-executable"} }));
+    const first = try editor.tasks.request(&editor, "t");
+    try t.expectEqual(Editor.Mode.task_save_prompt, editor.mode);
+    try t.expectEqual(@as(?u64, first), editor.tasks.pending);
+
+    cmdRerunTask(&editor, null);
+    try t.expectEqual(tasks_mod.Status.cancelled, editor.tasks.get(first).?.status);
+    try t.expectEqual(Editor.Mode.task_save_prompt, editor.mode);
+    const second = editor.tasks.pending orelse return error.TestUnexpectedResult;
+    try t.expect(second != first);
+    editor.setMode(.normal); // cancels the second prompt the same way
+    try t.expect(editor.tasks.pending == null);
+}
+
+test "filetree_reveal hands the keyboard to the tree, from the search panel and other windows" {
+    const t = std.testing;
+    var tmp = t.tmpDir(.{});
+    defer tmp.cleanup();
+    {
+        const f = try tmp.dir.createFile(t.io, "a.txt", .{});
+        defer f.close(t.io);
+        try f.writeStreamingAll(t.io, "a\n");
+    }
+    const root = try tmp.dir.realPathFileAlloc(t.io, ".", t.allocator);
+    defer t.allocator.free(root);
+    const file = try std.fs.path.join(t.allocator, &.{ root, "a.txt" });
+    defer t.allocator.free(file);
+
+    var editor = try Editor.init(t.allocator, t.io);
+    defer editor.deinit();
+    editor.lsp_enabled = false;
+    editor.filetree_git_colors = false;
+    editor.filetree_root = try t.allocator.dupe(u8, root);
+    _ = try editor.openOrFocus(file);
+
+    // The search panel had the keyboard: reveal takes it for the tree.
+    editor.search_visible = true;
+    editor.search_focused = true;
+    cmdFiletreeReveal(&editor, null);
+    try t.expect(editor.keyboardOwner() == .filetree);
+    try t.expect(!editor.search_focused);
+
+    // From a secondary window the primary is focused, where the tree lives.
+    _ = editor.takeKeyboardFocus(.pane);
+    editor.multi_window_supported = true;
+    _ = try editor.newWindow(.{ .editor = editor.active_doc_idx });
+    try t.expect(editor.active_window != 0);
+    cmdFiletreeReveal(&editor, null);
+    try t.expectEqual(@as(usize, 0), editor.active_window);
+    try t.expect(editor.keyboardOwner() == .filetree);
+}
+
+test "a live theme switch keeps syntax-theme.lua and per-language colors on the new palette" {
+    const t = std.testing;
+    var lua = try @import("zlua").Lua.init(t.allocator);
+    defer lua.deinit();
+    lua.openLibs();
+    var editor = try Editor.init(t.allocator, t.io);
+    defer editor.deinit();
+    lua_settings.registerApi(lua, &editor);
+
+    var tmp = t.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(t.io, "themes");
+    for ([_][2][]const u8{
+        .{ "themes/syntax-theme.lua", "zide.set('syn_comment', '#0a0b0c')\n" },
+        .{ "themes/syn_theme_zig.lua", "zide.set('syn_keyword', '#010203')\n" },
+    }) |file| {
+        const f = try tmp.dir.createFile(t.io, file[0], .{});
+        defer f.close(t.io);
+        try f.writeStreamingAll(t.io, file[1]);
+    }
+    const root = try tmp.dir.realPathFileAlloc(t.io, ".", t.allocator);
+    defer t.allocator.free(root);
+    lua_settings.test_config_dir = root;
+    defer lua_settings.test_config_dir = null;
+
+    // Startup order (main.zig): the global file, then the language files.
+    lua_settings.loadSyntaxTheme(lua);
+    lua_settings.loadLangSyntaxThemes(lua);
+    const own: theme_mod.ThemeColor = .{ .r = 1, .g = 2, .b = 3 };
+    try t.expectEqual(own, editor.syntaxThemeFor("zig").keyword);
+    try t.expectEqual(@as(u8, 0x0a), editor.syntaxThemeFor("zig").comment.r);
+    try t.expectEqual(theme_mod.syn_gui_dark.string, editor.syntaxThemeFor("zig").string);
+
+    cmdThemeLight(&editor, null);
+    const light = theme_mod.syn_gui_light;
+    const zig_gui = editor.syntaxThemeFor("zig");
+    // The language keeps its own color; the rest follows the light palette…
+    try t.expectEqual(own, zig_gui.keyword);
+    try t.expectEqual(light.string, zig_gui.string);
+    try t.expectEqual(light.number, zig_gui.number);
+    try t.expectEqual(light.function, zig_gui.function);
+    // …with syntax-theme.lua's color re-applied on top (global and per language).
+    try t.expectEqual(@as(u8, 0x0a), zig_gui.comment.r);
+    try t.expectEqual(@as(u8, 0x0a), editor.syntax_theme.comment.r);
+    try t.expectEqual(light.keyword, editor.syntaxThemeFor("python").keyword);
+    // The TUI palette of the language follows as well.
+    const zig_tui = editor.tuiSyntaxThemeFor("zig");
+    try t.expectEqual(theme_mod.TuiColor{ .rgb = .{ .r = 1, .g = 2, .b = 3 } }, zig_tui.keyword);
+    try t.expectEqual(theme_mod.syn_tui_light.string, zig_tui.string);
+    // Re-running kept one override per language (re-seeded in place).
+    try t.expectEqual(@as(usize, 1), editor.lang_syntax_overrides.items.len);
 }
 
 fn cmdFileEncoding(editor: *Editor, _: ?[]const u8) void {

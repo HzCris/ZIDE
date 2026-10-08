@@ -4,7 +4,40 @@ const Editor = @import("editor.zig").Editor;
 const lsp = @import("lsp.zig");
 const diagnostics = @import("diagnostics.zig");
 const tasks = @import("tasks.zig");
-pub const Kind = enum { tasks, task_output, problems, changes, git_diff, debug };
+const git = @import("git.zig");
+pub const Kind = enum { tasks, task_output, problems, changes, git_diff, debug, references };
+
+/// `path` relative to the file tree root when it lies inside it (servers
+/// spell the drive letter and separators their own way), else its last two
+/// components — the row says "…/" when it elided.
+const DisplayPath = struct { text: []const u8, elided: bool };
+
+fn displayPath(editor: *Editor, path: []const u8) DisplayPath {
+    if (editor.filetree) |*ft| {
+        const root = ft.root_path;
+        if (path.len > root.len + 1 and samePathPrefix(path[0..root.len], root) and (path[root.len] == '/' or path[root.len] == '\\')) return .{ .text = path[root.len + 1 ..], .elided = false };
+    }
+    var seps: usize = 0;
+    var i = path.len;
+    while (i > 0) : (i -= 1) {
+        const c = path[i - 1];
+        if (c == '/' or c == '\\') {
+            seps += 1;
+            if (seps == 2) return .{ .text = path[i..], .elided = true };
+        }
+    }
+    return .{ .text = path, .elided = false };
+}
+
+fn samePathPrefix(a: []const u8, b: []const u8) bool {
+    if (a.len != b.len) return false;
+    for (a, b) |x, y| {
+        const xs: u8 = if (x == '\\') '/' else x;
+        const ys: u8 = if (y == '\\') '/' else y;
+        if (std.ascii.toLower(xs) != std.ascii.toLower(ys)) return false;
+    }
+    return true;
+}
 pub const State = struct {
     kind: Kind = .tasks,
     selected: usize = 0,
@@ -14,10 +47,19 @@ pub const State = struct {
     problem_indices: std.ArrayList(usize) = .empty,
     revision: ?u64 = null,
     problem_opened: bool = false,
+    /// Changes view: the change the user selected, by path (H5). A refresh
+    /// can insert or remove rows above it between selecting and pressing a
+    /// key, so the highlight follows the path and actions re-find it by path
+    /// instead of trusting `selected`. `change_row` is where it was last
+    /// seen; `selected` moving away from it means the user picked another row.
+    change_path: ?[]u8 = null,
+    change_old_path: ?[]u8 = null,
+    change_row: usize = 0,
 
     pub fn deinit(self: *State, allocator: std.mem.Allocator) void {
         if (self.source) |source| allocator.free(source);
         self.problem_indices.deinit(allocator);
+        self.forgetChange(allocator);
     }
     pub fn show(self: *State, editor: *Editor, kind: Kind) void {
         self.kind = kind;
@@ -25,7 +67,15 @@ pub const State = struct {
         self.scroll = 0;
         self.revision = null;
         self.problem_opened = false;
-        editor.mode = .tool_panel;
+        self.forgetChange(editor.allocator);
+        if (kind == .changes) self.captureChange(editor);
+        editor.setMode(.tool_panel);
+    }
+    /// Select row `index` (frontend clicks): the Changes view remembers the
+    /// change under it right away.
+    pub fn select(self: *State, editor: *Editor, index: usize) void {
+        self.selected = index;
+        if (self.kind == .changes) self.captureChange(editor);
     }
     pub fn title(self: *State, editor: *Editor, buf: []u8) []const u8 {
         return switch (self.kind) {
@@ -35,9 +85,10 @@ pub const State = struct {
             .git_diff => std.fmt.bufPrint(buf, "{s}: {s}{s}{s}", .{ editor.git.preview_path orelse "Diff", if (editor.git.preview_staged) "index versus HEAD" else "saved working tree versus index", if (editor.git.preview_job != null) " (loading)" else "", if (editor.git.preview.truncated) " (truncated)" else "" }) catch "Git diff",
             .task_output => blk: {
                 const run = editor.tasks.get(editor.tasks.selected_run orelse break :blk "Task output") orelse break :blk "Task output";
-                break :blk std.fmt.bufPrint(buf, "{s}: {s} (exit {any}){s} {s} | R reruns / S stops / Enter opens location", .{ run.config.options.name, @tagName(run.status), run.exit_code, if (run.truncated) " (output truncated)" else "", run.error_name orelse "" }) catch run.config.options.name;
+                break :blk std.fmt.bufPrint(buf, "{s}: {s} (exit {any}){s} {s}{s}{s} | R reruns / S stops / Enter opens location", .{ run.config.options.name, @tagName(run.status), run.exit_code, if (run.truncated) " (output truncated)" else "", run.error_name orelse "", if (run.matcher_error != null) " problem matcher failed: " else "", run.matcher_error orelse "" }) catch run.config.options.name;
             },
             .problems => std.fmt.bufPrint(buf, "Problems: {s}, {s} | F severity / S source / Enter opens", .{ if (self.severity) |severity| @tagName(severity) else "all severities", self.source orelse "all sources" }) catch "Problems",
+            .references => std.fmt.bufPrint(buf, "References to {s}: {d} | Enter opens / Esc closes", .{ editor.lsp_tools.referencesSymbol(), editor.lsp_tools.references.items.len }) catch "References",
         };
     }
 
@@ -67,8 +118,12 @@ pub const State = struct {
         const total = switch (self.kind) {
             .tasks => editor.tasks.configs.items.len,
             .debug => editor.dap.count(editor),
-            .changes => editor.git.changes.items.len,
+            .changes => blk: {
+                self.syncChange(editor);
+                break :blk editor.git.changes.items.len;
+            },
             .git_diff => editor.git.preview.count(),
+            .references => editor.lsp_tools.references.items.len,
             .problems => blk: {
                 self.refresh(editor);
                 break :blk self.problem_indices.items.len;
@@ -92,6 +147,11 @@ pub const State = struct {
                 break :blk std.fmt.bufPrint(buf, "{c}{c} {s}{s}{s}{s}", .{ change.x, change.y, change.path, if (change.old_path != null) " <- " else "", change.old_path orelse "", if (change.conflict()) " (conflict)" else "" }) catch change.path;
             },
             .git_diff => editor.git.preview.line(index),
+            .references => blk: {
+                const r = editor.lsp_tools.references.items[index];
+                const shown = displayPath(editor, r.path);
+                break :blk std.fmt.bufPrint(buf, "{s}{s}:{d}:{d}  {s}", .{ if (shown.elided) "…/" else "", shown.text, r.line + 1, r.col + 1, r.excerpt }) catch r.path;
+            },
             .task_output => blk: {
                 const run = editor.tasks.get(editor.tasks.selected_run.?).?;
                 const line = run.output.line(index);
@@ -120,16 +180,84 @@ pub const State = struct {
         const total = self.count(editor);
         if (total == 0) return;
         self.selected = if (down) @min(total - 1, self.selected +| 1) else self.selected -| 1;
+        if (self.kind == .changes) self.captureChange(editor);
+    }
+
+    fn forgetChange(self: *State, allocator: std.mem.Allocator) void {
+        if (self.change_path) |path| allocator.free(path);
+        if (self.change_old_path) |path| allocator.free(path);
+        self.change_path = null;
+        self.change_old_path = null;
+    }
+    /// Remember the change now at `selected` as the user's choice.
+    fn captureChange(self: *State, editor: *Editor) void {
+        self.forgetChange(editor.allocator);
+        self.change_row = self.selected;
+        if (self.selected >= editor.git.changes.items.len) return;
+        const change = editor.git.changes.items[self.selected];
+        const path = editor.allocator.dupe(u8, change.path) catch return;
+        const old = if (change.old_path) |old| editor.allocator.dupe(u8, old) catch {
+            editor.allocator.free(path);
+            return;
+        } else null;
+        self.change_path = path;
+        self.change_old_path = old;
+    }
+    fn sameChange(self: *const State, change: git.Change) bool {
+        const path = self.change_path orelse return false;
+        if (!std.mem.eql(u8, change.path, path)) return false;
+        const old = change.old_path orelse return self.change_old_path == null;
+        return self.change_old_path != null and std.mem.eql(u8, old, self.change_old_path.?);
+    }
+    /// Keep `selected` on the remembered change when the list changed under
+    /// it (exact match first, then the same path with another rename source).
+    /// A change that is gone stays remembered, so the next action reports it.
+    fn syncChange(self: *State, editor: *Editor) void {
+        const changes = editor.git.changes.items;
+        if (self.change_path == null or self.selected != self.change_row) return self.captureChange(editor);
+        if (self.change_row < changes.len and self.sameChange(changes[self.change_row])) return;
+        var same_path: ?usize = null;
+        const found = for (changes, 0..) |change, index| {
+            if (self.sameChange(change)) break index;
+            if (same_path == null and std.mem.eql(u8, change.path, self.change_path.?)) same_path = index;
+        } else same_path;
+        if (found) |index| {
+            self.selected = index;
+            self.captureChange(editor);
+        } else {
+            // Pin the clamped row so count()'s clamp is not taken for a user move.
+            self.selected = @min(self.selected, changes.len -| 1);
+            self.change_row = self.selected;
+        }
+    }
+    /// The Changes row the user selected, re-found by path at keypress time
+    /// (H5); null, with a status message, when that file is no longer listed.
+    /// The row now highlighted is then remembered, so pressing again acts on it.
+    pub fn selectedChange(self: *State, editor: *Editor) ?usize {
+        self.syncChange(editor);
+        const changes = editor.git.changes.items;
+        const path = self.change_path orelse return if (self.selected < changes.len) self.selected else null;
+        if (self.change_row < changes.len and self.sameChange(changes[self.change_row])) return self.change_row;
+        editor.status_message = std.fmt.bufPrint(&editor.status_buf, "Changes: {s} is no longer listed; nothing done", .{std.fs.path.basename(path)}) catch "Changes: the selected file is no longer listed; nothing done";
+        self.captureChange(editor);
+        return null;
     }
 
     pub fn activate(self: *State, editor: *Editor) void {
         if (self.selected >= self.count(editor)) return;
         switch (self.kind) {
             .debug => editor.dap.activate(editor, self.selected),
-            .changes => editor.git.previewChange(editor, self.selected, !editor.git.changes.items[self.selected].working()),
+            .changes => {
+                const index = self.selectedChange(editor) orelse return;
+                editor.git.previewChange(editor, index, !editor.git.changes.items[index].working());
+            },
             .git_diff => {},
+            .references => {
+                const r = editor.lsp_tools.references.items[self.selected];
+                self.openLocation(editor, r.path, r.line, r.col, r.columns);
+            },
             .tasks => {
-                editor.mode = .normal;
+                editor.setMode(.normal);
                 _ = editor.tasks.request(editor, editor.tasks.configs.items[self.selected].options.name) catch |err| {
                     editor.status_message = std.fmt.bufPrint(&editor.status_buf, "Task: {s}", .{@errorName(err)}) catch "Task failed";
                     return;
@@ -137,12 +265,15 @@ pub const State = struct {
                 if (editor.mode == .normal) self.show(editor, .task_output);
             },
             .task_output => {
-                const run = editor.tasks.get(editor.tasks.selected_run.?).?;
+                const run = editor.tasks.get(editor.tasks.selected_run orelse return) orelse return;
                 var buf: [1]u8 = undefined;
-                const location = tasks.zigLocation(self.row(editor, self.selected, &buf)) orelse return;
-                const path = std.fs.path.resolve(editor.allocator, &.{ run.cwd, location.path }) catch return;
-                defer editor.allocator.free(path);
-                self.openLocation(editor, path, location.line, location.col, .bytes);
+                // The run's own matcher (Lua or zig) finds the location.
+                const found = tasks.locate(editor, run, self.row(editor, self.selected, &buf)) orelse {
+                    editor.status_message = "No file location on this line";
+                    return;
+                };
+                defer editor.allocator.free(found.path);
+                self.openLocation(editor, found.path, found.line, found.col, .bytes);
             },
             .problems => {
                 const entry = editor.problems.entries.items[self.problem_indices.items[self.selected]];
@@ -152,17 +283,7 @@ pub const State = struct {
         }
     }
     fn openLocation(_: *State, editor: *Editor, path: []const u8, line: u32, col: u32, columns: diagnostics.Columns) void {
-        // Opening can call extensions which replace the diagnostic store.
-        const owned = editor.allocator.dupe(u8, path) catch return;
-        defer editor.allocator.free(owned);
-        const doc = editor.openOrFocus(owned) catch |err| {
-            editor.status_message = std.fmt.bufPrint(&editor.status_buf, "Cannot open problem: {s}", .{@errorName(err)}) catch "Cannot open problem";
-            return;
-        };
-        doc.gotoLine(line +| 1);
-        const byte_col = if (columns == .utf16) lsp.utf16ColToByte(doc.lineContent(line), col) else col;
-        doc.cursors.primary().gotoPos(&doc.buffer, line, byte_col);
-        editor.mode = .normal;
+        editor.jumpToLocation(path, line, col, columns);
     }
 
     pub fn nextProblem(self: *State, editor: *Editor, next: bool) void {
@@ -180,6 +301,7 @@ pub const State = struct {
     pub fn page(self: *State, editor: *Editor, down: bool, amount: usize) void {
         const total = self.count(editor);
         self.selected = if (down) @min(total -| 1, self.selected +| amount) else self.selected -| amount;
+        if (self.kind == .changes) self.captureChange(editor);
     }
     pub fn action(self: *State, editor: *Editor, key: u8) void {
         switch (self.kind) {
@@ -190,16 +312,20 @@ pub const State = struct {
                 else => {},
             },
             .changes => switch (key) {
-                'd' => editor.git.previewChange(editor, self.selected, true),
-                's' => editor.git.stage(editor, self.selected, false),
-                'u' => editor.git.stage(editor, self.selected, true),
-                'r' => editor.git.requestRefresh(),
-                'o' => {
-                    if (self.selected >= editor.git.changes.items.len) return;
-                    const path = std.fs.path.join(editor.allocator, &.{ editor.git.root orelse return, editor.git.changes.items[self.selected].path }) catch return;
-                    defer editor.allocator.free(path);
-                    self.openLocation(editor, path, 0, 0, .bytes);
+                'd', 's', 'u', 'o' => {
+                    const index = self.selectedChange(editor) orelse return;
+                    switch (key) {
+                        'd' => editor.git.previewChange(editor, index, true),
+                        's' => editor.git.stage(editor, index, false),
+                        'u' => editor.git.stage(editor, index, true),
+                        else => {
+                            const path = std.fs.path.join(editor.allocator, &.{ editor.git.root orelse return, editor.git.changes.items[index].path }) catch return;
+                            defer editor.allocator.free(path);
+                            self.openLocation(editor, path, 0, 0, .bytes);
+                        },
+                    }
                 },
+                'r' => editor.git.requestRefresh(),
                 else => {},
             },
             .git_diff => {},
@@ -217,7 +343,7 @@ pub const State = struct {
                 },
                 else => {},
             },
-            .tasks => {},
+            .tasks, .references => {},
         }
     }
 
@@ -237,3 +363,111 @@ pub const State = struct {
         self.revision = null;
     }
 };
+
+fn testChange(editor: *Editor, index: usize, name: []const u8) !void {
+    try editor.git.changes.insert(editor.allocator, index, .{ .path = try editor.allocator.dupe(u8, name), .x = ' ', .y = 'M' });
+}
+
+test "Changes actions follow the selected file when a refresh inserts or removes rows above it" {
+    const t = std.testing;
+    var tmp = t.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(t.io, ".", t.allocator);
+    defer t.allocator.free(root);
+    var editor = try Editor.init(t.allocator, t.io);
+    defer editor.deinit();
+    editor.lsp_enabled = false;
+    editor.git.root = try t.allocator.dupe(u8, root);
+    try testChange(&editor, 0, "a.txt");
+    try testChange(&editor, 1, "z.txt");
+    // A dirty buffer for every candidate keeps stage() at its save prompt
+    // (it records the mutation without starting a git process).
+    for ([_][]const u8{ "a.txt", "m.txt", "z.txt" }) |name| {
+        const doc = try editor.newDocument();
+        const path = try std.fs.path.join(t.allocator, &.{ root, name });
+        defer t.allocator.free(path);
+        try doc.setFilePath(path);
+        try doc.insertAtCursor("x");
+    }
+    const panel = &editor.tool_panel;
+    panel.show(&editor, .changes);
+    panel.move(&editor, true);
+    try t.expectEqual(@as(usize, 1), panel.selected); // z.txt
+    // A refresh lists m.txt above the selection before S is pressed.
+    try testChange(&editor, 1, "m.txt");
+    panel.action(&editor, 's');
+    try t.expectEqualStrings("z.txt", editor.git.mutation.?.path);
+    try t.expectEqual(@as(usize, 2), panel.selected); // the highlight followed it
+    editor.git.resolveStage(&editor, false);
+    try t.expect(editor.git.mutation == null);
+
+    // The selected file leaves the list: nothing happens, and the user is told.
+    panel.show(&editor, .changes);
+    panel.move(&editor, true);
+    try t.expectEqualStrings("m.txt", panel.change_path.?);
+    var gone = editor.git.changes.orderedRemove(1);
+    t.allocator.free(gone.path);
+    gone.path = &.{};
+    editor.status_message = "";
+    panel.action(&editor, 'u');
+    try t.expect(editor.git.mutation == null);
+    try t.expect(std.mem.indexOf(u8, editor.status_message, "m.txt") != null);
+    // The row now highlighted is remembered for the next press.
+    try t.expectEqualStrings(editor.git.changes.items[panel.selected].path, panel.change_path.?);
+    // A click (select) remembers its row immediately.
+    panel.select(&editor, 0);
+    try testChange(&editor, 0, "b.txt");
+    panel.action(&editor, 's');
+    try t.expectEqualStrings("a.txt", editor.git.mutation.?.path);
+    editor.git.resolveStage(&editor, false);
+}
+
+test "Enter on a Task Output line uses the run's own Lua problem matcher" {
+    const t = std.testing;
+    const zlua = @import("zlua");
+    var tmp = t.tmpDir(.{});
+    defer tmp.cleanup();
+    const base = try tmp.dir.realPathFileAlloc(t.io, ".", t.allocator);
+    defer t.allocator.free(base);
+    const target = try std.fs.path.join(t.allocator, &.{ base, "target.txt" });
+    defer t.allocator.free(target);
+    try @import("text_file.zig").atomicWrite(t.allocator, t.io, target, "one\ntwo\nthree\n");
+    var lua = try zlua.Lua.init(t.allocator);
+    defer lua.deinit();
+    lua.openLibs();
+    var editor = try Editor.init(t.allocator, t.io);
+    defer editor.deinit();
+    editor.lsp_enabled = false;
+    @import("lua_settings.zig").registerApi(lua, &editor);
+    try lua.doString(
+        \\assert(zide.register_task({name='custom', argv={'unused'}, problem_matcher=function(line)
+        \\  local file, row = line:match('^problem in (%S+) at (%d+)$')
+        \\  if file then return {file=file, line=tonumber(row), col=2, message='m'} end
+        \\end}))
+    );
+    // A finished run of that task, as request() would have made it.
+    const source = editor.tasks.configs.items[0];
+    const config = try tasks.Config.create(t.allocator, source.options);
+    _ = lua.getIndexRaw(zlua.registry_index, source.matcher_ref.?);
+    config.matcher_ref = lua.ref(zlua.registry_index);
+    const run = t.allocator.create(tasks.Run) catch |err| {
+        config.destroy(&editor);
+        return err;
+    };
+    run.* = .{ .id = 77, .config = config, .cwd = try t.allocator.dupe(u8, base), .producer = try t.allocator.dupe(u8, "task:custom"), .status = .succeeded };
+    try editor.tasks.runs.append(t.allocator, run);
+    editor.tasks.selected_run = run.id;
+    try run.output.append(t.allocator, "noise\nproblem in target.txt at 2\n");
+    const panel = &editor.tool_panel;
+    panel.show(&editor, .task_output);
+    panel.activate(&editor); // "noise": no location
+    try t.expectEqual(Editor.Mode.tool_panel, editor.mode);
+    try t.expectEqualStrings("No file location on this line", editor.status_message);
+    panel.move(&editor, true);
+    panel.activate(&editor);
+    try t.expectEqual(Editor.Mode.normal, editor.mode);
+    const doc = editor.activeDoc();
+    try t.expect(std.mem.endsWith(u8, doc.file_path.?, "target.txt"));
+    try t.expectEqual(@as(usize, 5), doc.cursors.primary().offset); // line 2, column 2
+    try t.expect(!editor.tasks.pumping);
+}

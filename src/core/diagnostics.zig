@@ -81,8 +81,32 @@ pub const Store = struct {
         self.revision +%= 1;
     }
 
+    /// Drop the versioned LSP entries for `path` when its document stops
+    /// being open there (close, rename, re-language). Their versions belong
+    /// to that document instance: a reopened document restarts `lsp_version`
+    /// at 0, and `replace` would drop the server's fresh publishes until the
+    /// new version passed the old one. Unversioned (workspace) entries stay.
+    pub fn forgetVersioned(self: *Store, path: []const u8) void {
+        // A path without a key never got entries (replace keys every path).
+        const key = identity.key(self.allocator, self.io, path) catch return;
+        defer self.allocator.free(key);
+        var removed = false;
+        var i: usize = 0;
+        while (i < self.entries.items.len) {
+            const entry = self.entries.items[i];
+            if (entry.kind == .lsp and entry.version != null and identity.equalKeys(entry.path, key)) {
+                entry.deinit(self.allocator);
+                _ = self.entries.orderedRemove(i);
+                removed = true;
+            } else i += 1;
+        }
+        if (removed) self.revision +%= 1;
+    }
+
     /// Convert protocol columns only after a document's text is available.
+    /// Quick-open previews never show diagnostics.
     pub fn project(self: *Store, doc: *Document, kind: Kind) !void {
+        if (doc.preview) return;
         const path = doc.file_path orelse return;
         const key = try identity.key(self.allocator, self.io, path);
         defer self.allocator.free(key);
@@ -130,4 +154,39 @@ test "diagnostics preserve other producers and annotate a later-opened file" {
     try store.project(&doc, .task);
     try t.expectEqual(@as(usize, 1), doc.diagnostics.items.len);
     try t.expectEqual(@as(usize, 1), doc.lint_diagnostics.items.len);
+
+    // A quick-open preview of the same file gets none.
+    var peek = try Document.init(t.allocator);
+    defer peek.deinit();
+    try peek.setFilePath("later.txt");
+    try peek.loadText("abc");
+    peek.preview = true;
+    try store.project(&peek, .lsp);
+    try store.project(&peek, .task);
+    try t.expectEqual(@as(usize, 0), peek.diagnostics.items.len + peek.lint_diagnostics.items.len);
+}
+
+test "closing a document forgets its versioned LSP diagnostics" {
+    const t = std.testing;
+    var store: Store = .{ .allocator = t.allocator, .io = t.io };
+    defer store.deinit();
+    const diagnostic: lsp.Diagnostic = .{ .start_line = 0, .start_col = 0, .end_line = 0, .end_col = 1, .severity = .err, .message = "problem" };
+    try store.replace("reopened.txt", "server", .lsp, 57, .utf16, &.{diagnostic});
+    try store.replace("reopened.txt", "workspace", .lsp, null, .utf16, &.{diagnostic});
+    try store.replace("reopened.txt", "linter", .lua, null, .bytes, &.{diagnostic});
+    try store.replace("other.txt", "server", .lsp, 57, .utf16, &.{diagnostic});
+    // Without the close, a reopened document's version 1 loses to 57.
+    try store.replace("reopened.txt", "server", .lsp, 1, .utf16, &.{});
+    try t.expectEqual(@as(usize, 4), store.entries.items.len);
+    store.forgetVersioned("reopened.txt");
+    try t.expectEqual(@as(usize, 3), store.entries.items.len);
+    for (store.entries.items) |entry| try t.expect(entry.version == null or std.mem.endsWith(u8, entry.path, "other.txt"));
+    try store.replace("reopened.txt", "server", .lsp, 1, .utf16, &.{diagnostic});
+    var doc = try Document.init(t.allocator);
+    defer doc.deinit();
+    try doc.setFilePath("reopened.txt");
+    try doc.loadText("abc");
+    doc.lsp_version = 1;
+    try store.project(&doc, .lsp);
+    try t.expectEqual(@as(usize, 2), doc.diagnostics.items.len);
 }

@@ -77,15 +77,120 @@ pub var process_environ: ?*std.process.Environ.Map = null;
 /// Io instance from std.process.Init; set once in main().
 pub var global_io: ?std.Io = null;
 
-/// Load the user's init.lua from the config directory.
-/// Returns true if a config file was found and loaded successfully.
+/// Load the user's init.lua from the config directory. True when it exists
+/// and ran without error; a failure is logged and shown in the status bar
+/// ("init.lua:3: unexpected symbol near 'x'").
 pub fn loadConfig(lua: *Lua) bool {
-    const config_path = getConfigPath() orelse return false;
-    lua.doFile(config_path) catch |err| {
-        std.log.err("Error loading init.lua: {}", .{err});
-        return false;
+    const config_path = getConfigPathAlways() orelse return false;
+    return runLuaFile(lua, config_path, "init.lua") == .loaded;
+}
+
+/// Outcome of running one Lua file from the config directory.
+pub const LoadOutcome = enum { loaded, missing, failed };
+
+/// Largest Lua file the loaders read (init.lua, theme files, extensions).
+const max_lua_file_bytes = 16 * 1024 * 1024;
+
+/// Load failures since startup and the status line of the latest one.
+/// main() compares the count around its startup loads so it can show the
+/// message again after the later startup steps (project folder, CLI files)
+/// wrote their own status; reload_extensions compares it to choose between
+/// "Extensions reloaded" and the error. Main thread only, like the state.
+var load_failures: usize = 0;
+var last_load_error_buf: [128]u8 = undefined;
+var last_load_error_len: usize = 0;
+
+pub fn loadFailureCount() usize {
+    return load_failures;
+}
+
+/// Status line of the most recent load failure ("init.lua:3: ..."), or "".
+pub fn lastLoadError() []const u8 {
+    return last_load_error_buf[0..last_load_error_len];
+}
+
+/// Run one Lua file (init.lua, a theme file or an extension) in `lua`.
+///
+/// The bytes are read through Zig and compiled with loadBuffer:
+/// luaL_loadfile's CRT fopen reads the UTF-8 path in the ANSI code page on
+/// Windows, so a non-ASCII profile folder broke every config file. The
+/// chunk is named "@<path>", so Lua positions read ".../init.lua:3:". The
+/// Lua stack is restored whatever happens (results and error objects used
+/// to pile up on it with every reload). A failure is logged with the path
+/// and shown in the status bar; a missing file is not an error.
+fn runLuaFile(lua: *Lua, path: []const u8, label: []const u8) LoadOutcome {
+    const io = loaderIo(lua) orelse return .missing;
+    const allocator = lua.allocator();
+    const bytes = std.Io.Dir.cwd().readFileAlloc(io, path, allocator, .limited(max_lua_file_bytes)) catch |err| switch (err) {
+        error.FileNotFound => return .missing,
+        else => {
+            noteLoadFailure(lua, path, label, @errorName(err));
+            return .failed;
+        },
     };
-    return true;
+    defer allocator.free(bytes);
+    const chunk_name = std.fmt.allocPrintSentinel(allocator, "@{s}", .{path}, 0) catch {
+        noteLoadFailure(lua, path, label, "OutOfMemory");
+        return .failed;
+    };
+    defer allocator.free(chunk_name);
+
+    const top = lua.getTop();
+    defer lua.setTop(top);
+    lua.loadBuffer(chunkSource(bytes), chunk_name, .binary_text) catch {
+        noteLoadFailure(lua, path, label, luaErrorText(lua));
+        return .failed;
+    };
+    lua.protectedCall(.{}) catch {
+        noteLoadFailure(lua, path, label, luaErrorText(lua));
+        return .failed;
+    };
+    return .loaded;
+}
+
+/// The part of a file luaL_loadfile would compile: a UTF-8 BOM and a first
+/// line starting with '#' are skipped (keeping that line's newline, so line
+/// numbers still match the file).
+fn chunkSource(bytes: []const u8) []const u8 {
+    var text = bytes;
+    if (std.mem.startsWith(u8, text, "\xEF\xBB\xBF")) text = text[3..];
+    if (std.mem.startsWith(u8, text, "#")) text = text[std.mem.indexOfScalar(u8, text, '\n') orelse text.len ..];
+    return text;
+}
+
+/// The error object at the top of the stack as text.
+fn luaErrorText(lua: *Lua) []const u8 {
+    return lua.toString(-1) catch "(non-string error)";
+}
+
+/// Io for the loaders: the registered editor's, else main()'s.
+fn loaderIo(lua: *Lua) ?std.Io {
+    if (getEditor(@ptrCast(lua))) |editor| return editor.io;
+    return global_io;
+}
+
+fn noteLoadFailure(lua: *Lua, path: []const u8, label: []const u8, msg: []const u8) void {
+    load_failures +%= 1;
+    // warn, not err: a broken config file is a user-script problem the
+    // editor survives (and err-level logs fail `zig build test`).
+    std.log.warn("Error loading {s}: {s}", .{ path, msg });
+    var line_buf: [256]u8 = undefined;
+    last_load_error_len = lua_api.statusText(&last_load_error_buf, loadErrorLine(&line_buf, label, msg)).len;
+    if (getEditor(@ptrCast(lua))) |editor| lua_api.setStatusText(editor, "", lastLoadError());
+}
+
+/// Status line for a load error: the first line of `msg`, starting at the
+/// file name when Lua's position prefix names this file ("init.lua:3: ..."
+/// out of "C:/Users/.../.config/zide/init.lua:3: ..."), else "<label>: <msg>".
+fn loadErrorLine(buf: []u8, label: []const u8, msg: []const u8) []const u8 {
+    const first = msg[0 .. std.mem.indexOfAny(u8, msg, "\r\n") orelse msg.len];
+    if (std.mem.indexOf(u8, first, label)) |at| {
+        const after = at + label.len;
+        const starts_name = at == 0 or first[at - 1] == '/' or first[at - 1] == '\\' or first[at - 1] == '.';
+        if (starts_name and after < first.len and first[after] == ':') return first[at..];
+    }
+    const room = buf.len -| (label.len + 2);
+    return std.fmt.bufPrint(buf, "{s}: {s}", .{ label, first[0..@min(first.len, room)] }) catch first;
 }
 
 /// Load optional theme override files after init.lua.
@@ -93,7 +198,7 @@ pub fn loadConfig(lua: *Lua) bool {
 /// Also ensures the folder hierarchy exists (themes/, extensions/).
 pub fn loadThemeFiles(lua: *Lua) void {
     const dir = getConfigDir() orelse return;
-    const io = global_io orelse return;
+    const io = loaderIo(lua) orelse return;
 
     // Ensure subdirectory hierarchy exists
     var sub_buf: [512]u8 = undefined;
@@ -104,35 +209,16 @@ pub fn loadThemeFiles(lua: *Lua) void {
         std.Io.Dir.cwd().createDirPath(io, p) catch {};
     } else |_| {}
 
-    // gui-theme.lua — create template if missing, then load
-    var gui_buf: [512]u8 = undefined;
-    if (std.fmt.bufPrint(&gui_buf, "{s}/themes/gui-theme.lua", .{dir})) |path| {
-        if (path.len < gui_buf.len) {
-            gui_buf[path.len] = 0;
-            const z_path: [:0]const u8 = gui_buf[0..path.len :0];
-            createGuiThemeTemplate(z_path);
-            if (std.Io.Dir.cwd().access(io, z_path, .{})) |_| {
-                lua.doFile(z_path) catch |err| {
-                    std.log.err("Error loading gui-theme.lua: {}", .{err});
-                };
-            } else |_| {}
-        }
-    } else |_| {}
+    // Create each template if missing, then load it.
+    loadThemeFile(lua, dir, "gui-theme.lua", &createGuiThemeTemplate);
+    loadThemeFile(lua, dir, "tui-theme.lua", &createTuiThemeTemplate);
+}
 
-    // tui-theme.lua — create template if missing, then load
-    var tui_buf: [512]u8 = undefined;
-    if (std.fmt.bufPrint(&tui_buf, "{s}/themes/tui-theme.lua", .{dir})) |path| {
-        if (path.len < tui_buf.len) {
-            tui_buf[path.len] = 0;
-            const z_path: [:0]const u8 = tui_buf[0..path.len :0];
-            createTuiThemeTemplate(z_path);
-            if (std.Io.Dir.cwd().access(io, z_path, .{})) |_| {
-                lua.doFile(z_path) catch |err| {
-                    std.log.err("Error loading tui-theme.lua: {}", .{err});
-                };
-            } else |_| {}
-        }
-    } else |_| {}
+fn loadThemeFile(lua: *Lua, dir: []const u8, name: []const u8, create_template: *const fn ([:0]const u8) void) void {
+    var path_buf: [512]u8 = undefined;
+    const path = std.fmt.bufPrintZ(&path_buf, "{s}/themes/{s}", .{ dir, name }) catch return;
+    create_template(path);
+    _ = runLuaFile(lua, path, name);
 }
 
 /// Create gui-theme.lua template with commented defaults if the file doesn't exist.
@@ -238,17 +324,9 @@ fn createTuiThemeTemplate(path: [:0]const u8) void {
     ) catch {};
 }
 
-/// Get the path to init.lua (only if it exists).
+/// Get the path to init.lua (even if it doesn't exist yet).
 /// All platforms: ~/.config/zide/init.lua
 /// (Windows: %USERPROFILE%/.config/zide/init.lua)
-fn getConfigPath() ?[:0]const u8 {
-    const p = getConfigPathAlways() orelse return null;
-    const io = global_io orelse return null;
-    std.Io.Dir.cwd().access(io, p, .{}) catch return null;
-    return p;
-}
-
-/// Get the path to init.lua (even if it doesn't exist yet).
 pub fn getConfigPathAlways() ?[:0]const u8 {
     const S = struct {
         var buf: [512]u8 = undefined;
@@ -273,6 +351,10 @@ pub fn getConfigPathAlways() ?[:0]const u8 {
 
 /// Write a single setting to init.lua. Updates existing `zide.set("key"` line or appends.
 /// Creates the config directory and file if they don't exist.
+/// `value` is Lua source (`true`, `4`, a string literal): build string
+/// literals with quoteLuaString (or call writeStringSettingToFile). A value
+/// that doesn't compile is refused (error.InvalidSettingValue) instead of
+/// written, so init.lua keeps loading.
 pub fn writeSettingToFile(key: []const u8, value: []const u8) !void {
     const config_path = getConfigPathAlways() orelse return error.NoConfigPath;
     const io = global_io orelse return error.NoConfigPath;
@@ -281,14 +363,79 @@ pub fn writeSettingToFile(key: []const u8, value: []const u8) !void {
     try writeSettingAt(std.heap.page_allocator, io, config_path, key, value);
 }
 
+/// Persist a string setting: `zide.set("key", "<value>")` with `value`
+/// quoted by quoteLuaString, so Windows paths, quotes and control bytes
+/// read back exactly.
+pub fn writeStringSettingToFile(key: []const u8, value: []const u8) !void {
+    const allocator = std.heap.page_allocator;
+    const buf = try allocator.alloc(u8, quotedLenMax(value.len));
+    defer allocator.free(buf);
+    const quoted = quoteLuaString(buf, value) orelse return error.OutOfMemory; // sized for the worst case
+    try writeSettingToFile(key, quoted);
+}
+
+/// Longest literal quoteLuaString can produce for `len` input bytes.
+fn quotedLenMax(len: usize) usize {
+    return 2 + 4 * len; // quotes + one `\ddd` per byte
+}
+
+/// `s` as a double-quoted Lua string literal written into `buf`, or null
+/// when it doesn't fit. `\\`, `\"`, `\n`, `\r` and `\t` get their short
+/// escapes and every other control byte (and DEL) a three-digit `\ddd`, so
+/// the literal is one line and reads back byte-for-byte: Windows paths
+/// such as `C:\Users\x\t` included (spliced raw between quotes, `\U` is a
+/// syntax error that stops the whole init.lua from loading). Valid UTF-8
+/// passes through as-is; malformed text has every byte >= 0x80 escaped.
+pub fn quoteLuaString(buf: []u8, s: []const u8) ?[]const u8 {
+    const escape_high = !std.unicode.utf8ValidateSlice(s);
+    var w: std.Io.Writer = .fixed(buf);
+    w.writeByte('"') catch return null;
+    for (s) |c| {
+        const written = switch (c) {
+            '\\' => w.writeAll("\\\\"),
+            '"' => w.writeAll("\\\""),
+            '\n' => w.writeAll("\\n"),
+            '\r' => w.writeAll("\\r"),
+            '\t' => w.writeAll("\\t"),
+            0...8, 11, 12, 14...31, 127 => w.print("\\{d:0>3}", .{c}),
+            else => if (c >= 0x80 and escape_high) w.print("\\{d:0>3}", .{c}) else w.writeByte(c),
+        };
+        written catch return null;
+    }
+    w.writeByte('"') catch return null;
+    return w.buffered();
+}
+
+/// Setting keys are plain identifiers; anything else would be spliced into
+/// Lua source unquoted.
+fn isSettingKey(key: []const u8) bool {
+    if (key.len == 0) return false;
+    for (key) |c| if (!std.ascii.isAlphanumeric(c) and c != '_') return false;
+    return true;
+}
+
+/// A setting line must compile on its own: a malformed value (a Windows
+/// path spliced between quotes without escaping) would stop the whole
+/// init.lua from loading on the next launch. Compiles only; nothing runs.
+fn checkSettingLine(allocator: std.mem.Allocator, line: []const u8) !void {
+    const probe = try Lua.init(allocator);
+    defer probe.deinit();
+    probe.loadBuffer(line, "=setting", .text) catch |err| return switch (err) {
+        error.LuaSyntax => error.InvalidSettingValue,
+        error.OutOfMemory => error.OutOfMemory,
+    };
+}
+
 fn writeSettingAt(allocator: std.mem.Allocator, io: std.Io, path: []const u8, key: []const u8, value: []const u8) !void {
+    if (!isSettingKey(key)) return error.InvalidSettingKey;
+    const line = try std.fmt.allocPrint(allocator, "zide.set(\"{s}\", {s})", .{ key, value });
+    defer allocator.free(line);
+    try checkSettingLine(allocator, line);
     const existing = std.Io.Dir.cwd().readFileAlloc(io, path, allocator, .limited(1024 * 1024)) catch |err| switch (err) {
         error.FileNotFound => try allocator.dupe(u8, "-- ZIDE settings\n"),
         else => return err,
     };
     defer allocator.free(existing);
-    const line = try std.fmt.allocPrint(allocator, "zide.set(\"{s}\", {s})", .{ key, value });
-    defer allocator.free(line);
     const pattern = try std.fmt.allocPrint(allocator, "zide.set(\"{s}\",", .{key});
     defer allocator.free(pattern);
     var output: std.ArrayList(u8) = .empty;
@@ -336,8 +483,273 @@ test "settings persistence preserves comments and propagates read failures" {
     try t.expectEqual(@as(u64, huge.len), st.size);
 }
 
+test "quoteLuaString reads back byte-for-byte through the Lua parser" {
+    const t = std.testing;
+    var lua = try Lua.init(t.allocator);
+    defer lua.deinit();
+    const cases = [_][]const u8{
+        "",
+        "plain",
+        "C:\\Users\\x\\t", // `\U` unescaped is a syntax error; `\t` a tab
+        "quote \" and backslash \\",
+        "tab\tnl\ncr\rend",
+        "\x00\x01\x1f\x7f",
+        "\x01" ++ "2", // a digit after a \ddd escape stays a digit
+        "\u{e9}\u{1F600}\u{754C}",
+        "bad \xff\xfe utf-8",
+    };
+    for (cases) |s| {
+        var buf: [256]u8 = undefined;
+        const quoted = quoteLuaString(&buf, s).?;
+        try t.expect(std.mem.indexOfAny(u8, quoted, "\r\n") == null); // one line
+        const code = try std.fmt.allocPrintSentinel(t.allocator, "v = {s}", .{quoted}, 0);
+        defer t.allocator.free(code);
+        try lua.doString(code);
+        _ = lua.getGlobal("v");
+        defer lua.pop(1);
+        try t.expectEqualSlices(u8, s, try lua.toString(-1));
+    }
+    var small: [4]u8 = undefined;
+    try t.expect(quoteLuaString(&small, "abc") == null);
+    try t.expectEqualStrings("\"ab\"", quoteLuaString(&small, "ab").?);
+}
+
+test "a quoted Windows path survives init.lua; an unquoted one is refused" {
+    const t = std.testing;
+    t.log_level = .err;
+    defer t.log_level = .warn;
+    var tmp = t.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(t.io, ".", t.allocator);
+    defer t.allocator.free(root);
+    const path = try std.fs.path.join(t.allocator, &.{ root, "init.lua" });
+    defer t.allocator.free(path);
+    try @import("text_file.zig").atomicWrite(t.allocator, t.io, path, "zide.set(\"tab_width\", 2)\n");
+
+    // What the settings dialog writes for "C:\Users\x\t" once it quotes.
+    var buf: [64]u8 = undefined;
+    try writeSettingAt(t.allocator, t.io, path, "filetree_root", quoteLuaString(&buf, "C:\\Users\\x\\t").?);
+    // The old splice ("\"" ++ path ++ "\"") no longer reaches the file...
+    try t.expectError(error.InvalidSettingValue, writeSettingAt(t.allocator, t.io, path, "filetree_root", "\"C:\\Users\\GHz\\proj\""));
+    // ...nor do keys that aren't identifiers.
+    try t.expectError(error.InvalidSettingKey, writeSettingAt(t.allocator, t.io, path, "x\", 1) os.exit() --", "1"));
+
+    var lua = try Lua.init(t.allocator);
+    defer lua.deinit();
+    lua.openLibs();
+    var editor = try Editor.init(t.allocator, t.io);
+    defer editor.deinit();
+    registerApi(lua, &editor);
+    try t.expectEqual(LoadOutcome.loaded, runLuaFile(lua, path, "init.lua"));
+    try t.expectEqualStrings("C:\\Users\\x\\t", editor.filetree_root.?);
+    try t.expectEqual(@as(usize, 2), editor.tab_width);
+}
+
+test "Lua files load from a non-ASCII directory, with a BOM and a #! line" {
+    const t = std.testing;
+    var tmp = t.tmpDir(.{});
+    defer tmp.cleanup();
+    // luaL_loadfile's CRT fopen read this UTF-8 path in the ANSI code page.
+    try tmp.dir.createDirPath(t.io, "Jos\u{e9}/\u{754C}");
+    {
+        const f = try tmp.dir.createFile(t.io, "Jos\u{e9}/\u{754C}/init.lua", .{});
+        defer f.close(t.io);
+        try f.writeStreamingAll(t.io, "\xEF\xBB\xBF#!/usr/bin/env lua\nloaded_ok = true\nreturn 'result'\n");
+    }
+    const dir = try tmp.dir.realPathFileAlloc(t.io, "Jos\u{e9}/\u{754C}", t.allocator);
+    defer t.allocator.free(dir);
+    const path = try std.fs.path.join(t.allocator, &.{ dir, "init.lua" });
+    defer t.allocator.free(path);
+
+    var lua = try Lua.init(t.allocator);
+    defer lua.deinit();
+    lua.openLibs();
+    const saved_io = global_io;
+    global_io = t.io; // no editor registered: the loader falls back to main()'s Io
+    defer global_io = saved_io;
+    const top = lua.getTop();
+    try t.expectEqual(LoadOutcome.loaded, runLuaFile(lua, path, "init.lua"));
+    try t.expectEqual(top, lua.getTop()); // the chunk's result is dropped
+    _ = lua.getGlobal("loaded_ok");
+    defer lua.pop(1);
+    try t.expect(lua.toBoolean(-1));
+    const missing = try std.fs.path.join(t.allocator, &.{ dir, "absent.lua" });
+    defer t.allocator.free(missing);
+    try t.expectEqual(LoadOutcome.missing, runLuaFile(lua, missing, "absent.lua"));
+}
+
+test "init.lua errors reach the status bar with the Lua message; the stack stays level" {
+    const t = std.testing;
+    t.log_level = .err; // the load errors warn
+    defer t.log_level = .warn;
+    var tmp = t.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(t.io, ".", t.allocator);
+    defer t.allocator.free(root);
+    const path = try std.fs.path.join(t.allocator, &.{ root, "init.lua" });
+    defer t.allocator.free(path);
+
+    var lua = try Lua.init(t.allocator);
+    defer lua.deinit();
+    lua.openLibs();
+    var editor = try Editor.init(t.allocator, t.io);
+    defer editor.deinit();
+    registerApi(lua, &editor);
+    const top = lua.getTop();
+
+    // Syntax error: the message names the file and line, directory dropped.
+    try @import("text_file.zig").atomicWrite(t.allocator, t.io, path, "zide.set(\"tab_width\", 2)\nzide.set(\"theme\" \"dark\")\n");
+    const failures = loadFailureCount();
+    try t.expectEqual(LoadOutcome.failed, runLuaFile(lua, path, "init.lua"));
+    try t.expectEqual(failures + 1, loadFailureCount());
+    try t.expect(std.mem.startsWith(u8, editor.status_message, "init.lua:2: "));
+    try t.expect(std.mem.indexOf(u8, editor.status_message, "expected") != null);
+    try t.expectEqualStrings(editor.status_message, lastLoadError());
+    try t.expectEqual(top, lua.getTop());
+    try t.expectEqual(@as(usize, 4), editor.tab_width); // nothing ran
+
+    // Runtime error: the lines before it ran; a multi-line message keeps
+    // its first line only.
+    try @import("text_file.zig").atomicWrite(t.allocator, t.io, path, "zide.set(\"tab_width\", 2)\nerror('first line\\nsecond line')\n");
+    try t.expectEqual(LoadOutcome.failed, runLuaFile(lua, path, "init.lua"));
+    try t.expectEqualStrings("init.lua:2: first line", editor.status_message);
+    try t.expectEqual(@as(usize, 2), editor.tab_width);
+    // An error object without a position gets the file name as its prefix.
+    try @import("text_file.zig").atomicWrite(t.allocator, t.io, path, "error('no position', 0)\n");
+    try t.expectEqual(LoadOutcome.failed, runLuaFile(lua, path, "init.lua"));
+    try t.expectEqualStrings("init.lua: no position", editor.status_message);
+    try t.expectEqual(top, lua.getTop());
+}
+
+test "zide.bind warns about unknown commands in the global map and in language overlays" {
+    const t = std.testing;
+    const old_level = t.log_level;
+    t.log_level = .err; // the warnings themselves
+    defer t.log_level = old_level;
+    var lua = try Lua.init(t.allocator);
+    defer lua.deinit();
+    lua.openLibs();
+    var editor = try Editor.init(t.allocator, t.io);
+    defer editor.deinit();
+    registerApi(lua, &editor);
+
+    try lua.doString("zide.bind('ctrl+alt+k', 'save'); zide.bind('ctrl+alt+j', 'save', { language = 'zig' })");
+    try t.expectEqual(@as(u32, 0), editor.commands.unknown_action_warnings);
+    try lua.doString("zide.bind('ctrl+alt+k', 'no_such_command')");
+    try t.expectEqual(@as(u32, 1), editor.commands.unknown_action_warnings);
+    try lua.doString("zide.bind('ctrl+alt+j', 'no_such_command', { language = 'zig' })");
+    try t.expectEqual(@as(u32, 2), editor.commands.unknown_action_warnings);
+    // The binds stand: a command registered later makes them work.
+    try t.expectEqualStrings("no_such_command", editor.keybinds.get("ctrl+alt+k").?);
+    try t.expectEqualStrings("no_such_command", (try editor.langProfile("zig")).keybinds.get("ctrl+alt+j").?);
+    try lua.doString("zide.command('no_such_command', '', function() end); zide.bind('ctrl+alt+l', 'no_such_command')");
+    try t.expectEqual(@as(u32, 2), editor.commands.unknown_action_warnings);
+}
+
+test "zide.set filetree_visible false takes the keyboard from the hidden tree only" {
+    const t = std.testing;
+    var lua = try Lua.init(t.allocator);
+    defer lua.deinit();
+    lua.openLibs();
+    var editor = try Editor.init(t.allocator, t.io);
+    defer editor.deinit();
+    registerApi(lua, &editor);
+
+    editor.filetree_visible = true;
+    editor.filetree_focused = true;
+    try lua.doString("zide.set('filetree_visible', false)");
+    try t.expect(!editor.filetree_visible);
+    try t.expect(!editor.filetree_focused);
+    try t.expect(editor.keyboardOwner() == .editor);
+
+    // Hiding the tree leaves a focused search panel alone.
+    editor.search_visible = true;
+    editor.search_focused = true;
+    try lua.doString("zide.set('filetree_visible', false)");
+    try t.expect(editor.keyboardOwner() == .search);
+    // Showing the tree doesn't steal the keyboard either.
+    try lua.doString("zide.set('filetree_visible', true)");
+    try t.expect(editor.filetree_visible);
+    try t.expect(editor.keyboardOwner() == .search);
+}
+
+test "zide.set filetree_root drops the root-relative clipboard and move" {
+    const t = std.testing;
+    var lua = try Lua.init(t.allocator);
+    defer lua.deinit();
+    lua.openLibs();
+    var editor = try Editor.init(t.allocator, t.io);
+    defer editor.deinit();
+    registerApi(lua, &editor);
+
+    try editor.filetree_clip_paths.append(t.allocator, try t.allocator.dupe(u8, "src/main.zig"));
+    editor.filetree_clip_cut = true;
+    editor.filetree_move_src = try t.allocator.dupe(u8, "src/lib.zig");
+    try lua.doString("zide.set('filetree_root', 'C:/some/other/project')");
+    try t.expectEqual(@as(usize, 0), editor.filetree_clip_paths.items.len);
+    try t.expect(!editor.filetree_clip_cut);
+    try t.expect(editor.filetree_move_src == null);
+    try t.expectEqualStrings("C:/some/other/project", editor.filetree_root.?);
+}
+
+test "zide.set filetree_root from an open hook leaves the clicked tree usable until the next pump" {
+    const t = std.testing;
+    var tmp = t.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(t.io, "a");
+    try tmp.dir.createDirPath(t.io, "b");
+    {
+        const f = try tmp.dir.createFile(t.io, "a/f.txt", .{});
+        f.close(t.io);
+    }
+    const root_a = try tmp.dir.realPathFileAlloc(t.io, "a", t.allocator);
+    defer t.allocator.free(root_a);
+    const root_b = try tmp.dir.realPathFileAlloc(t.io, "b", t.allocator);
+    defer t.allocator.free(root_b);
+
+    var lua = try Lua.init(t.allocator);
+    defer lua.deinit();
+    lua.openLibs();
+    var editor = try Editor.init(t.allocator, t.io);
+    defer editor.deinit();
+    editor.lsp_enabled = false;
+    editor.filetree_git_colors = false;
+    registerApi(lua, &editor);
+    try t.expect(editor.setFiletreeRoot(root_a));
+    const ft = editor.ensureFiletree().?;
+    const idx = ft.findByPath("f.txt").?;
+    ft.selected = ft.rowOf(idx).?;
+
+    // What a tree click does (gui.zig openFiletreeFile, then drag arming):
+    // open the file — the hook re-roots — then keep using `ft`.
+    const script = try std.fmt.allocPrintSentinel(t.allocator, "zide.on('open', function() zide.set('filetree_root', [[{s}]]) end)", .{root_b}, 0);
+    defer t.allocator.free(script);
+    try lua.doString(script);
+    const abs = try ft.absPathAlloc(t.allocator, idx);
+    defer t.allocator.free(abs);
+    _ = try editor.openOrFocus(abs);
+    try t.expectEqualStrings(root_b, editor.filetree_root.?);
+    const paths = try ft.selectionRelPaths(t.allocator); // freed tree before the fix
+    defer {
+        for (paths) |p| t.allocator.free(p);
+        t.allocator.free(paths);
+    }
+    try t.expectEqual(@as(usize, 1), paths.len);
+    try t.expectEqualStrings("f.txt", paths[0]);
+
+    // The next main-loop pump drops it; the next use opens the new root.
+    editor.pumpLuaJobs();
+    try t.expect(editor.filetree == null);
+    try t.expect(editor.pathsEqual(editor.ensureFiletree().?.root_path, root_b));
+}
+
+/// Tests point the config directory at a temporary folder (the extension
+/// loader tests); never set outside tests.
+pub var test_config_dir: ?[]const u8 = null;
+
 /// Get the config directory path (~/.config/zide/).
 pub fn getConfigDir() ?[]const u8 {
+    if (@import("builtin").is_test) if (test_config_dir) |dir| return dir;
     const full_path = getConfigPathAlways() orelse return null;
     const path: []const u8 = full_path;
     // Find last '/' to get directory
@@ -380,6 +792,9 @@ fn currentLangOverride(lua: *Lua, editor: *Editor) ?*Editor.LangSyntaxOverride {
     return &editor.lang_syntax_overrides.items[editor.lang_syntax_overrides.items.len - 1];
 }
 
+/// The editor registered on this state, or null (none yet, or detached by
+/// Editor.deinit: the state outlives the editor, and `__gc` finalizers run
+/// during lua.deinit() must not reach a dead one).
 pub fn getEditor(state: ?*zlua.LuaState) ?*Editor {
     var lua: *Lua = @ptrCast(@alignCast(state orelse return null));
     _ = lua.getField(zlua.registry_index, EDITOR_KEY);
@@ -391,8 +806,27 @@ pub fn getEditor(state: ?*zlua.LuaState) ?*Editor {
     return editor;
 }
 
+/// Forget `editor` on this state (Editor.deinit via lua_api.deinitLua):
+/// every zide.* call afterwards is a no-op. Leaves a different editor
+/// registered later on the same state alone.
+pub fn detachEditor(lua: *Lua, editor: *const Editor) void {
+    const current = getEditor(@ptrCast(lua)) orelse return;
+    if (current != editor) return;
+    lua.pushNil();
+    lua.setField(zlua.registry_index, EDITOR_KEY);
+}
+
+/// Push t[key] for the table at `index` without metamethods (lua_rawget).
+/// Option tables come from user scripts; a raising `__index` would
+/// longjmp through the Zig frames reading them, skipping their cleanup.
+pub fn getFieldRaw(lua: *Lua, index: i32, key: [:0]const u8) zlua.LuaType {
+    const table = lua.absIndex(index);
+    _ = lua.pushString(key);
+    return lua.getTableRaw(table);
+}
+
 /// zide.set(key, value)
-/// Supported keys: "tab_width", "use_tabs", "word_wrap", "auto_close_brackets", "page_size"
+/// Supported keys: "tab_width", "use_tabs", "word_wrap", "auto_close_brackets", "completion_auto", "completion_min_chars", "signature_help_auto", "page_size"
 fn luaSet(state: ?*zlua.LuaState) callconv(.c) c_int {
     var lua: *Lua = @ptrCast(@alignCast(state orelse return 0));
     const editor = getEditor(state) orelse return 0;
@@ -419,6 +853,10 @@ fn luaSet(state: ?*zlua.LuaState) callconv(.c) c_int {
         editor.word_wrap = lua.toBoolean(2);
     } else if (std.mem.eql(u8, key_str, "auto_close_brackets")) {
         editor.auto_close_brackets = lua.toBoolean(2);
+    } else if (std.mem.eql(u8, key_str, "completion_auto")) {
+        editor.completion_auto = lua.toBoolean(2);
+    } else if (std.mem.eql(u8, key_str, "signature_help_auto")) {
+        editor.signature_help_auto = lua.toBoolean(2);
     } else if (std.mem.eql(u8, key_str, "page_size")) {
         const val = lua.toInteger(2) catch return 0;
         if (val >= 5 and val <= 200) {
@@ -442,6 +880,11 @@ fn luaSet(state: ?*zlua.LuaState) callconv(.c) c_int {
         if (val >= 1 and val <= 10) {
             editor.gutter_min_digits = @intCast(val);
         }
+    } else if (std.mem.eql(u8, key_str, "completion_min_chars")) {
+        const val = lua.toInteger(2) catch return 0;
+        if (val >= 1 and val <= 8) {
+            editor.completion_min_chars = @intCast(val);
+        }
     } else if (std.mem.eql(u8, key_str, "click_clears_cursors")) {
         editor.click_clears_cursors = lua.toBoolean(2);
     } else if (std.mem.eql(u8, key_str, "session_persistence")) {
@@ -462,6 +905,9 @@ fn luaSet(state: ?*zlua.LuaState) callconv(.c) c_int {
         }
     } else if (std.mem.eql(u8, key_str, "filetree_visible")) {
         editor.filetree_visible = lua.toBoolean(2);
+        // A hidden tree can't keep the keyboard; the focused pane gets it
+        // back (a focused search panel keeps it).
+        if (!editor.filetree_visible) editor.filetree_focused = false;
     } else if (std.mem.eql(u8, key_str, "filetree_auto_reveal")) {
         editor.filetree_auto_reveal = lua.toBoolean(2);
     } else if (std.mem.eql(u8, key_str, "tui_filetree_icons")) {
@@ -501,16 +947,22 @@ fn luaSet(state: ?*zlua.LuaState) callconv(.c) c_int {
         // zide.set("filetree_root", "C:/path/to/project") — "" = cwd
         const val = lua.toString(2) catch return 0;
         const val_str: []const u8 = val;
+        // Root-relative state can't survive a root swap (as in
+        // Editor.setFiletreeRoot): a cut taken under the old root would
+        // otherwise paste/move same-named files under the new one.
+        editor.filetreeClipClear();
+        editor.cancelFiletreeMove();
         if (editor.filetree_root) |old| editor.allocator.free(old);
         editor.filetree_root = if (val_str.len == 0)
             null
         else
             editor.allocator.dupe(u8, val_str) catch null;
-        // Drop any existing tree so the next use re-opens the new root
-        if (editor.filetree) |*ft| {
-            ft.deinit();
-            editor.filetree = null;
-        }
+        // Drop the existing tree so the next use re-opens the new root — at
+        // the next main-loop pump, not now: this can run inside a
+        // frontend's tree handler (an "open" hook fired by a tree click)
+        // that keeps using the tree after the hook returns. The tree owns
+        // its root_path, so it stays valid until then.
+        if (editor.filetree != null) lua_api.deferTreeReset(editor);
     } else if (std.mem.eql(u8, key_str, "max_undo_history")) {
         const val = lua.toInteger(2) catch return 0;
         if (val >= 0 and val <= 100000) {
@@ -662,6 +1114,12 @@ fn luaGet(state: ?*zlua.LuaState) callconv(.c) c_int {
     } else if (std.mem.eql(u8, key_str, "auto_close_brackets")) {
         lua.pushBoolean(editor.auto_close_brackets);
         return 1;
+    } else if (std.mem.eql(u8, key_str, "completion_auto")) {
+        lua.pushBoolean(editor.completion_auto);
+        return 1;
+    } else if (std.mem.eql(u8, key_str, "signature_help_auto")) {
+        lua.pushBoolean(editor.signature_help_auto);
+        return 1;
     } else if (std.mem.eql(u8, key_str, "page_size")) {
         lua.pushInteger(@intCast(editor.page_size));
         return 1;
@@ -673,6 +1131,9 @@ fn luaGet(state: ?*zlua.LuaState) callconv(.c) c_int {
         return 1;
     } else if (std.mem.eql(u8, key_str, "gutter_min_digits")) {
         lua.pushInteger(@intCast(editor.gutter_min_digits));
+        return 1;
+    } else if (std.mem.eql(u8, key_str, "completion_min_chars")) {
+        lua.pushInteger(@intCast(editor.completion_min_chars));
         return 1;
     } else if (std.mem.eql(u8, key_str, "click_clears_cursors")) {
         lua.pushBoolean(editor.click_clears_cursors);
@@ -763,13 +1224,19 @@ fn luaBind(state: ?*zlua.LuaState) callconv(.c) c_int {
         };
         prof.keybinds.set(key_str, cmd_str) catch {
             std.log.err("zide.bind: failed to set keybinding", .{});
+            return 0;
         };
+        // A typo'd command name no longer fails silently (the bind stands:
+        // an extension may register the command later).
+        editor.commands.warnIfUnknownAction(key_str, cmd_str);
         return 0;
     }
 
     editor.keybinds.set(key_str, cmd_str) catch {
         std.log.err("zide.bind: failed to set keybinding", .{});
+        return 0;
     };
+    editor.commands.warnIfUnknownAction(key_str, cmd_str);
 
     return 0;
 }
@@ -803,7 +1270,7 @@ fn luaUnbind(state: ?*zlua.LuaState) callconv(.c) c_int {
 /// call) — copy it before the next collection point if it must persist.
 fn bindLanguageOpt(lua: *Lua, index: i32) ?[]const u8 {
     if (lua.typeOf(index) != .table) return null;
-    _ = lua.getField(index, "language");
+    _ = getFieldRaw(lua, index, "language");
     defer lua.pop(1);
     if (lua.typeOf(-1) != .string) return null;
     const s: []const u8 = lua.toString(-1) catch return null;
@@ -900,14 +1367,14 @@ fn applyLanguageSettingsTable(lua: *Lua, editor: *Editor, tbl: i32, name: []cons
 }
 
 fn readOptBool(lua: *Lua, tbl: i32, field: [:0]const u8) ?bool {
-    _ = lua.getField(tbl, field);
+    _ = getFieldRaw(lua, tbl, field);
     defer lua.pop(1);
     if (lua.typeOf(-1) != .boolean) return null;
     return lua.toBoolean(-1);
 }
 
 fn readOptInteger(lua: *Lua, tbl: i32, field: [:0]const u8) ?i64 {
-    _ = lua.getField(tbl, field);
+    _ = getFieldRaw(lua, tbl, field);
     defer lua.pop(1);
     if (lua.typeOf(-1) != .number) return null;
     return lua.toInteger(-1) catch null;
@@ -935,12 +1402,18 @@ fn luaRegisterLanguage(state: ?*zlua.LuaState) callconv(.c) c_int {
         arena.deinit();
         return 0;
     };
+    // The name is drawn in the status bar; the GUI can't draw malformed UTF-8.
+    if (!std.unicode.utf8ValidateSlice(name)) {
+        std.log.warn("zide.register_language: 'name' must be valid UTF-8", .{});
+        arena.deinit();
+        return 0;
+    }
 
     // Optional tokenizer selection: "generic" (default, table-driven) or
     // "markdown" (the structural native tokenizer). Read without allocating.
     var tokenizer_given = false;
     const tokenizer: syntax.TokenizerKind = blk: {
-        _ = lua.getField(1, "tokenizer");
+        _ = getFieldRaw(lua, 1, "tokenizer");
         defer lua.pop(1);
         if (lua.typeOf(-1) != .string) break :blk .generic;
         tokenizer_given = true;
@@ -1035,7 +1508,7 @@ fn luaRegisterLsp(state: ?*zlua.LuaState) callconv(.c) c_int {
 
     // languages = {...} wins over language = "..."
     const langs: []const []const u8 = readTableStringArrayAlloc(lua, gpa, 1, "languages") orelse blk: {
-        _ = lua.getField(1, "language");
+        _ = getFieldRaw(lua, 1, "language");
         defer lua.pop(1);
         const s: []const u8 = lua.toString(-1) catch {
             std.log.warn("zide.register_lsp: 'language' (or 'languages') field required", .{});
@@ -1055,7 +1528,7 @@ fn luaRegisterLsp(state: ?*zlua.LuaState) callconv(.c) c_int {
 
     // command: string = argv[0] only (paths with spaces work); table = argv
     const argv: []const []const u8 = blk: {
-        _ = lua.getField(1, "command");
+        _ = getFieldRaw(lua, 1, "command");
         defer lua.pop(1);
         switch (lua.typeOf(-1)) {
             .string => {
@@ -1085,7 +1558,7 @@ fn luaRegisterLsp(state: ?*zlua.LuaState) callconv(.c) c_int {
     var cfg = lsp_mod.ServerConfig.fromArgv(gpa, langs, argv) catch return 0;
 
     // language_id: string (exactly one language) or { [language] = id }
-    _ = lua.getField(1, "language_id");
+    _ = getFieldRaw(lua, 1, "language_id");
     switch (lua.typeOf(-1)) {
         .string => {
             if (langs.len == 1) {
@@ -1111,8 +1584,8 @@ fn luaRegisterLsp(state: ?*zlua.LuaState) callconv(.c) c_int {
     }
     lua.pop(1);
 
-    cfg.settings_json = lua_json.tableFieldToJsonAlloc(lua, gpa, 1, "settings");
-    cfg.init_options_json = lua_json.tableFieldToJsonAlloc(lua, gpa, 1, "init_options");
+    cfg.settings_json = lua_json.tableFieldToJsonAllocFor(lua, gpa, 1, "settings", "zide.register_lsp");
+    cfg.init_options_json = lua_json.tableFieldToJsonAllocFor(lua, gpa, 1, "init_options", "zide.register_lsp");
     cfg.from_extension = editor.loading_extensions;
 
     editor.lsp_configs.append(gpa, cfg) catch {
@@ -1135,7 +1608,7 @@ fn luaRegisterLsp(state: ?*zlua.LuaState) callconv(.c) c_int {
 /// empty (callers fall back to their single-value form).
 fn readTableStringArrayAlloc(lua: *Lua, gpa: std.mem.Allocator, table_index: i32, field: [:0]const u8) ?[]const []const u8 {
     const tidx = lua.absIndex(table_index);
-    _ = lua.getField(tidx, field);
+    _ = getFieldRaw(lua, tidx, field);
     defer lua.pop(1);
     if (lua.typeOf(-1) != .table) return null;
     return lua_api.readArgvAlloc(lua, gpa, -1);
@@ -1143,7 +1616,7 @@ fn readTableStringArrayAlloc(lua: *Lua, gpa: std.mem.Allocator, table_index: i32
 
 /// Read a string field from the Lua table at stack position 1.
 fn readTableString(lua: *Lua, alloc: std.mem.Allocator, field: [:0]const u8) ?[]const u8 {
-    _ = lua.getField(1, field);
+    _ = getFieldRaw(lua, 1, field);
     defer lua.pop(1);
     const s = lua.toString(-1) catch return null;
     const str: []const u8 = s;
@@ -1153,7 +1626,7 @@ fn readTableString(lua: *Lua, alloc: std.mem.Allocator, field: [:0]const u8) ?[]
 
 /// Read a string array field from the Lua table at stack position 1.
 fn readTableStringArray(lua: *Lua, alloc: std.mem.Allocator, field: [:0]const u8) []const []const u8 {
-    _ = lua.getField(1, field);
+    _ = getFieldRaw(lua, 1, field);
     defer lua.pop(1);
     if (lua.typeOf(-1) != .table) return &.{};
 
@@ -1179,14 +1652,14 @@ fn readTableStringArray(lua: *Lua, alloc: std.mem.Allocator, field: [:0]const u8
 
 /// Read a boolean field from the Lua table at stack position 1.
 fn readTableBool(lua: *Lua, field: [:0]const u8) bool {
-    _ = lua.getField(1, field);
+    _ = getFieldRaw(lua, 1, field);
     defer lua.pop(1);
     return lua.toBoolean(-1);
 }
 
 /// Read a single-character field from the Lua table at stack position 1.
 fn readTableChar(lua: *Lua, field: [:0]const u8) ?u8 {
-    _ = lua.getField(1, field);
+    _ = getFieldRaw(lua, 1, field);
     defer lua.pop(1);
     const s = lua.toString(-1) catch return null;
     const str: []const u8 = s;
@@ -1203,7 +1676,7 @@ fn readTableChar(lua: *Lua, field: [:0]const u8) ?u8 {
 /// (zide.command / zide.on / …) alike.
 pub fn loadExtensions(lua: *Lua) void {
     const dir = getConfigDir() orelse return;
-    const io = global_io orelse return;
+    const io = loaderIo(lua) orelse return;
     var ext_buf: [512]u8 = undefined;
     const ext_path = std.fmt.bufPrint(&ext_buf, "{s}/extensions", .{dir}) catch return;
     std.Io.Dir.cwd().createDirPath(io, ext_path) catch {};
@@ -1230,15 +1703,7 @@ pub fn loadExtensions(lua: *Lua) void {
 
         var path_buf: [512]u8 = undefined;
         const full_path = std.fmt.bufPrint(&path_buf, "{s}/extensions/{s}", .{ dir, entry.name }) catch continue;
-        if (full_path.len < path_buf.len) {
-            path_buf[full_path.len] = 0;
-            const z_path: [:0]const u8 = path_buf[0..full_path.len :0];
-            lua.doFile(z_path) catch |err| {
-                std.log.err("Error loading extension {s}: {}", .{ entry.name, err });
-                continue;
-            };
-            std.log.info("Loaded extension: {s}", .{entry.name});
-        }
+        if (runLuaFile(lua, full_path, entry.name) == .loaded) std.log.info("Loaded extension: {s}", .{entry.name});
     }
 }
 
@@ -1463,25 +1928,27 @@ fn createMarkdownExtensionTemplate() void {
 pub fn loadSyntaxTheme(lua: *Lua) void {
     const dir = getConfigDir() orelse return;
     var path_buf: [512]u8 = undefined;
-    const path = std.fmt.bufPrint(&path_buf, "{s}/themes/syntax-theme.lua", .{dir}) catch return;
-    if (path.len >= path_buf.len) return;
-    path_buf[path.len] = 0;
-    const z_path: [:0]const u8 = path_buf[0..path.len :0];
-
-    createSyntaxThemeTemplate(z_path);
-
-    const io = global_io orelse return;
-    if (std.Io.Dir.cwd().access(io, z_path, .{})) |_| {
-        lua.doFile(z_path) catch |err| {
-            std.log.err("Error loading syntax-theme.lua: {}", .{err});
-        };
-    } else |_| {}
+    const path = std.fmt.bufPrintZ(&path_buf, "{s}/themes/syntax-theme.lua", .{dir}) catch return;
+    createSyntaxThemeTemplate(path);
+    _ = runLuaFile(lua, path, "syntax-theme.lua");
 }
 
 /// Load per-language syntax theme files from ~/.config/zide/themes/syn_theme_*.lua.
+/// Safe to re-run after a theme switch (commands.zig theme_*, the GUI theme
+/// menu) once loadSyntaxTheme has rebuilt the global palette: a language's
+/// palette is a full copy of the globals taken when its file first ran
+/// (currentLangOverride), so every existing one is re-seeded from the
+/// current globals first and the file then puts back only its own colors.
+/// Re-seeded in place — the frontends hold syntaxThemeFor pointers.
 pub fn loadLangSyntaxThemes(lua: *Lua) void {
+    if (getEditor(@ptrCast(lua))) |editor| {
+        for (editor.lang_syntax_overrides.items) |*ov| {
+            ov.gui_theme = editor.syntax_theme;
+            ov.tui_theme = editor.tui_syntax_theme;
+        }
+    }
     const dir = getConfigDir() orelse return;
-    const io = global_io orelse return;
+    const io = loaderIo(lua) orelse return;
     var themes_buf: [512]u8 = undefined;
     const themes_path = std.fmt.bufPrint(&themes_buf, "{s}/themes", .{dir}) catch return;
 
@@ -1496,30 +1963,24 @@ pub fn loadLangSyntaxThemes(lua: *Lua) void {
 
         var path_buf: [512]u8 = undefined;
         const full_path = std.fmt.bufPrint(&path_buf, "{s}/themes/{s}", .{ dir, entry.name }) catch continue;
-        if (full_path.len < path_buf.len) {
-            path_buf[full_path.len] = 0;
-            const z_path: [:0]const u8 = path_buf[0..full_path.len :0];
 
-            // Extract language name: syn_theme_<name>.lua → <name>
-            const prefix_len = "syn_theme_".len;
-            const suffix_len = ".lua".len;
-            if (entry.name.len <= prefix_len + suffix_len) continue;
-            const lang_name = entry.name[prefix_len .. entry.name.len - suffix_len];
+        // Extract language name: syn_theme_<name>.lua → <name>
+        const prefix_len = "syn_theme_".len;
+        const suffix_len = ".lua".len;
+        if (entry.name.len <= prefix_len + suffix_len) continue;
+        const lang_name = entry.name[prefix_len .. entry.name.len - suffix_len];
 
-            // Set a temporary global so zide.set("syn_*") routes to per-language override
-            _ = lua.pushString(lang_name);
-            lua.setField(zlua.registry_index, "_zide_syn_lang");
+        // Set a temporary global so zide.set("syn_*") routes to per-language override
+        _ = lua.pushString(lang_name);
+        lua.setField(zlua.registry_index, "_zide_syn_lang");
 
-            lua.doFile(z_path) catch |err| {
-                std.log.err("Error loading {s}: {}", .{ entry.name, err });
-            };
+        const outcome = runLuaFile(lua, full_path, entry.name);
 
-            // Clear the temporary lang context
-            lua.pushNil();
-            lua.setField(zlua.registry_index, "_zide_syn_lang");
+        // Clear the temporary lang context
+        lua.pushNil();
+        lua.setField(zlua.registry_index, "_zide_syn_lang");
 
-            std.log.info("Loaded syntax theme: {s}", .{entry.name});
-        }
+        if (outcome == .loaded) std.log.info("Loaded syntax theme: {s}", .{entry.name});
     }
 }
 

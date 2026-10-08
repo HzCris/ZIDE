@@ -55,9 +55,7 @@ pub const Config = struct {
 };
 pub const View = enum { overview, configurations, threads, stack, variables, breakpoints, output };
 const overview = [_][]const u8{ "Choose launch / attach configuration", "Threads", "Stack frames", "Scopes and variables", "Source breakpoints", "Debug output", "Continue", "Pause", "Step over", "Step in", "Step out", "Stop (launch: terminate; attach: detach)" };
-test {
-    _ = @import("dap_integration.zig");
-}
+
 pub const State = struct {
     adapters: std.ArrayList(*Adapter) = .empty,
     configs: std.ArrayList(Config) = .empty,
@@ -105,10 +103,25 @@ pub const State = struct {
     pub fn setWake(self: *State, wake: ?*const fn () void) void {
         if (self.session) |session| if (session.peer) |peer| peer.setWake(wake);
     }
+    /// Switch breakpoints to `workspace`'s file under `base`. A file that
+    /// cannot be used is reported here once, with its name: the store still
+    /// switches to the workspace (so `tick` does not retry and report it every
+    /// check) but keeps no storage path, so toggles are neither written into
+    /// that file nor into the previous workspace's (G5).
     pub fn configureStorage(self: *State, editor: *Editor, base: []const u8, workspace: []const u8) void {
         if (self.storage_base == null) self.storage_base = editor.allocator.dupe(u8, base) catch null;
-        self.breakpoints.configure(editor.allocator, editor.io, base, workspace) catch |err| report(editor, @errorName(err));
         self.binding_hash = null;
+        const loaded = self.breakpoints.configure(editor.allocator, editor.io, base, workspace) catch |err| {
+            report(editor, @errorName(err));
+            return;
+        };
+        if (loaded.failure) |err| {
+            std.log.warn("Breakpoint file {s} in {s}: {s}; breakpoints of this workspace are not saved", .{ loaded.name(), base, @errorName(err) });
+            editor.status_message = std.fmt.bufPrint(&editor.status_buf, "Debug: breakpoint file {s}: {s} (not saved)", .{ loaded.name(), @errorName(err) }) catch "Debug: breakpoint file unusable (not saved)";
+        } else if (loaded.skipped > 0) {
+            std.log.warn("Breakpoint file {s} in {s}: skipped {d} invalid entries", .{ loaded.name(), base, loaded.skipped });
+            editor.status_message = std.fmt.bufPrint(&editor.status_buf, "Debug: breakpoint file {s}: skipped {d} invalid entries", .{ loaded.name(), loaded.skipped }) catch "Debug: skipped invalid breakpoints";
+        }
     }
     pub fn registerAdapter(self: *State, editor: *Editor, adapter: *Adapter) !void {
         for (self.adapters.items) |*old| if (std.mem.eql(u8, old.*.name, adapter.name)) {
@@ -207,8 +220,13 @@ pub const State = struct {
         var hash = std.hash.Wyhash.init(0);
         hash.update(std.mem.asBytes(&self.breakpoints.sources.items.len));
         for (editor.documents.items) |doc| {
+            const path = doc.file_path orelse "";
             hash.update(std.mem.asBytes(&doc.id));
-            hash.update(doc.file_path orelse "");
+            hash.update(std.mem.asBytes(&path.len));
+            hash.update(path);
+            // findDocument skips previews, and quick-open promotes one in
+            // place (same id and path): the flag must rebind too (G4).
+            hash.update(&.{@intFromBool(doc.preview)});
         }
         const fingerprint = hash.final();
         if (self.binding_hash == fingerprint) return;
@@ -253,7 +271,7 @@ pub const State = struct {
         const session = self.session.?;
         for (session.nodes.items, 0..) |node, index| if (node.parent == parent) {
             self.variable_indices.append(editor.allocator, index) catch return;
-            if (node.expanded and node.depth < 32) self.walkNodes(editor, node.id);
+            if (node.expanded and node.depth < session_mod.max_variable_depth) self.walkNodes(editor, node.id);
         };
     }
     pub fn count(self: *State, editor: *Editor) usize {
@@ -341,10 +359,13 @@ pub const State = struct {
                 if (self.pumping) return;
                 self.pumping = true;
                 defer self.pumping = false;
-                try self.session.?.selectFrame(editor, index, true);
-                editor.mode = .normal;
+                // An unavailable source keeps the panel open on its note.
+                if (try self.session.?.selectFrame(editor, index, true)) setNormal(editor);
             },
-            .variables => try self.session.?.expand(self.variable_indices.items[index]),
+            .variables => self.session.?.expand(self.variable_indices.items[index]) catch |err| switch (err) {
+                error.VariableDepthLimit => report(editor, "variables nest deeper than 32 levels"),
+                else => return err,
+            },
             .breakpoints => {
                 var offset = index;
                 for (self.breakpoints.sources.items) |source| {
@@ -355,9 +376,9 @@ pub const State = struct {
                     const point = source.points.items[offset];
                     const path = try editor.allocator.dupe(u8, source.path);
                     defer editor.allocator.free(path);
-                    const doc = try editor.openOrFocus(path);
+                    const doc = try editor.navOpen(path);
                     doc.gotoLine(point.actual_line orelse point.line);
-                    editor.mode = .normal;
+                    setNormal(editor);
                     break;
                 }
             },
@@ -365,9 +386,104 @@ pub const State = struct {
         }
     }
 };
+/// Leave the tool panel through Editor.setMode (its leave hooks) once the
+/// editor agent's setMode has landed.
+fn setNormal(editor: *Editor) void {
+    editor.setMode(.normal);
+}
 fn report(editor: *Editor, message: []const u8) void {
     editor.status_message = std.fmt.bufPrint(&editor.status_buf, "Debug: {s}", .{message}) catch "Debugger error";
 }
+test "breakpoint markers rebind when a quick-open preview is promoted in place" {
+    const t = std.testing;
+    var tmp = t.tmpDir(.{});
+    defer tmp.cleanup();
+    const base = try tmp.dir.realPathFileAlloc(t.io, ".", t.allocator);
+    defer t.allocator.free(base);
+    const path = try std.fs.path.join(t.allocator, &.{ base, "peek.zig" });
+    defer t.allocator.free(path);
+    try @import("text_file.zig").atomicWrite(t.allocator, t.io, path, "a\nb\n");
+    var editor = try Editor.init(t.allocator, t.io);
+    defer editor.deinit();
+    editor.lsp_enabled = false;
+    _ = try editor.dap.breakpoints.toggle(t.allocator, t.io, path, 2);
+    const id = blk: {
+        var doc = try @import("document.zig").Document.init(t.allocator);
+        errdefer doc.deinit();
+        try doc.open(t.io, path);
+        doc.preview = true;
+        try editor.documents.append(t.allocator, doc); // the editor owns it now
+        break :blk doc.id;
+    };
+    const now = std.Io.Clock.now(.awake, t.io).nanoseconds;
+    editor.dap.tick(&editor, now);
+    try t.expect(editor.dap.marker(id, 1) == .none); // previews are not bound
+    // finderCommit promotes the preview in place: same id, same path.
+    editor.documents.items[editor.documents.items.len - 1].preview = false;
+    editor.dap.tick(&editor, now);
+    try t.expect(editor.dap.marker(id, 1) == .unverified);
+}
+
+test "an unusable breakpoint file is reported once and never receives another workspace's toggles" {
+    const t = std.testing;
+    var tmp = t.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(t.io, "config");
+    try tmp.dir.createDirPath(t.io, "one");
+    try tmp.dir.createDirPath(t.io, "two");
+    const root = try tmp.dir.realPathFileAlloc(t.io, ".", t.allocator);
+    defer t.allocator.free(root);
+    const config = try std.fs.path.join(t.allocator, &.{ root, "config" });
+    defer t.allocator.free(config);
+    const one = try std.fs.path.join(t.allocator, &.{ root, "one" });
+    defer t.allocator.free(one);
+    const two = try std.fs.path.join(t.allocator, &.{ root, "two" });
+    defer t.allocator.free(two);
+    var editor = try Editor.init(t.allocator, t.io);
+    defer editor.deinit();
+    editor.lsp_enabled = false;
+
+    // Workspace one: a normal file that takes saves.
+    editor.filetree_root = try t.allocator.dupe(u8, one);
+    editor.dap.configureStorage(&editor, config, one);
+    const one_file = try t.allocator.dupe(u8, editor.dap.breakpoints.storage.?);
+    defer t.allocator.free(one_file);
+    const first = try std.fs.path.join(t.allocator, &.{ one, "a.zig" });
+    defer t.allocator.free(first);
+    _ = try editor.dap.breakpoints.toggle(t.allocator, t.io, first, 1);
+    try editor.dap.breakpoints.save(t.allocator, t.io);
+    const saved = try std.Io.Dir.cwd().readFileAlloc(t.io, one_file, t.allocator, .limited(4096));
+    defer t.allocator.free(saved);
+
+    // Workspace two's file has an unknown schema.
+    var probe: @import("breakpoints.zig").Store = .{};
+    defer probe.deinit(t.allocator);
+    _ = try probe.configure(t.allocator, t.io, config, two);
+    try @import("text_file.zig").atomicWrite(t.allocator, t.io, probe.storage.?, "{\"schema\":2,\"sources\":[]}");
+    const two_name = std.fs.path.basename(probe.storage.?);
+
+    t.allocator.free(editor.filetree_root.?);
+    editor.filetree_root = try t.allocator.dupe(u8, two);
+    const now = std.Io.Clock.now(.awake, t.io).nanoseconds;
+    editor.dap.tick(&editor, now);
+    try t.expect(std.mem.indexOf(u8, editor.status_message, two_name) != null);
+    try t.expect(editor.dap.breakpoints.storage == null);
+    try t.expectEqual(@as(usize, 0), editor.dap.breakpoints.sources.items.len);
+    // Later workspace checks stay quiet.
+    editor.status_message = "";
+    editor.dap.tick(&editor, now + 2 * std.time.ns_per_s);
+    editor.dap.tick(&editor, now + 4 * std.time.ns_per_s);
+    try t.expectEqualStrings("", editor.status_message);
+    // A toggle in workspace two is kept in memory only.
+    const second = try std.fs.path.join(t.allocator, &.{ two, "b.zig" });
+    defer t.allocator.free(second);
+    _ = try editor.dap.breakpoints.toggle(t.allocator, t.io, second, 5);
+    try editor.dap.breakpoints.save(t.allocator, t.io);
+    const after = try std.Io.Dir.cwd().readFileAlloc(t.io, one_file, t.allocator, .limited(4096));
+    defer t.allocator.free(after);
+    try t.expectEqualStrings(saved, after);
+}
+
 fn expandWorkspace(a: Allocator, value: *std.json.Value, root: []const u8) !void {
     switch (value.*) {
         .string => |text| {

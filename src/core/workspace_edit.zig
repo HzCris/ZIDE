@@ -9,14 +9,21 @@ const lsp = @import("lsp.zig");
 pub const Encoding = enum { utf8, utf16 };
 pub const TextEdit = struct { range: lsp.LspRange, newText: []const u8 };
 
+/// Byte offset of a server position, per LSP 3.17: a `character` past the
+/// end of its line means the end of that line (before the line break), and
+/// the line just past the last one is the end of the document (pylsp ends
+/// whole-file edits at `{line: lineCount, character: 0}`). A position inside
+/// a code point, or further down, is rejected.
 pub fn offset(doc: *Document, position: lsp.LspPosition, encoding: Encoding) !usize {
-    if (position.line >= doc.buffer.lineCount()) return error.InvalidRange;
+    const line_count = doc.buffer.lineCount();
+    if (position.line > line_count) return error.InvalidRange;
+    if (position.line == line_count) return doc.buffer.byteLen();
     const line = doc.buffer.lineContent(position.line);
     const col = switch (encoding) {
         .utf16 => try lsp.checkedUtf16ColToByte(line, position.character),
         .utf8 => blk: {
-            const col = position.character;
-            if (col > line.len or (col < line.len and line[col] & 0xc0 == 0x80)) return error.InvalidRange;
+            const col = @min(position.character, line.len);
+            if (col < line.len and line[col] & 0xc0 == 0x80) return error.InvalidRange;
             break :blk col;
         },
     };
@@ -59,16 +66,19 @@ pub const Plan = struct {
     }
 
     /// Parse text operations only. No source file is written by this service.
+    /// A `documentChanges` array wins over `changes` (LSP 3.17: clients that
+    /// support it ignore `changes`).
     pub fn parse(editor: anytype, value: std.json.Value, encoding: Encoding) !Plan {
         if (value != .object) return error.InvalidWorkspaceEdit;
         var plan: Plan = .{ .allocator = editor.allocator };
         errdefer plan.deinit();
-        if (value.object.get("changes")) |changes| {
-            if (changes != .object or value.object.contains("documentChanges")) return error.InvalidWorkspaceEdit;
+        const document_changes = value.object.get("documentChanges");
+        if (document_changes == null) if (value.object.get("changes")) |changes| {
+            if (changes != .object) return error.InvalidWorkspaceEdit;
             var files = changes.object.iterator();
             while (files.next()) |file| try plan.add(editor, file.key_ptr.*, null, file.value_ptr.*, encoding);
-        }
-        if (value.object.get("documentChanges")) |changes| {
+        };
+        if (document_changes) |changes| {
             if (changes != .array) return error.InvalidWorkspaceEdit;
             for (changes.array.items) |change| {
                 if (change != .object) return error.InvalidWorkspaceEdit;
@@ -132,14 +142,20 @@ pub const Plan = struct {
             errdefer self.allocator.free(text);
             try file.ranges.append(self.allocator, .{ .start = start, .end = end, .text = text });
         }
-        std.mem.sort(Document.RangeEdit, file.ranges.items, {}, struct {
+        // Apply back to front. Edits may share a start (LSP 3.17: several
+        // inserts, then at most one remove/replace, in that array order):
+        // reversed first, the stable sort keeps them in reverse array order,
+        // so each insert lands before the text of the ones after it and the
+        // inserted strings read in array order, ahead of the replacement.
+        std.mem.reverse(Document.RangeEdit, file.ranges.items);
+        std.sort.block(Document.RangeEdit, file.ranges.items, {}, struct {
             fn less(_: void, a: Document.RangeEdit, b: Document.RangeEdit) bool {
                 return a.start > b.start;
             }
         }.less);
+        // Only the first edit applied at a start may remove text.
         for (file.ranges.items, 0..) |range, i| if (i > 0) {
-            const previous = file.ranges.items[i - 1];
-            if (range.end > previous.start or range.start == previous.start) return error.OverlappingEdits;
+            if (range.end > file.ranges.items[i - 1].start) return error.OverlappingEdits;
         };
         try self.files.append(self.allocator, file);
         self.edit_count += file.ranges.items.len;
@@ -192,3 +208,86 @@ pub const Plan = struct {
         }
     }
 };
+
+/// Reset the active document to `text`, apply `edit_json` (a WorkspaceEdit)
+/// and return the resulting text (valid until the buffer is touched again).
+fn applyToActive(editor: anytype, text: []const u8, edit_json: []const u8, encoding: Encoding) ![]const u8 {
+    try editor.activeDoc().loadText(text);
+    const parsed = try std.json.parseFromSlice(std.json.Value, editor.allocator, edit_json, .{});
+    defer parsed.deinit();
+    var plan = try Plan.parse(editor, parsed.value, encoding);
+    defer plan.deinit();
+    try plan.apply(editor);
+    const doc = editor.activeDoc();
+    return doc.buffer.slice(0, doc.buffer.byteLen());
+}
+
+test "workspace edits follow LSP 3.17 positions, same-start ordering and documentChanges" {
+    const t = std.testing;
+    const Editor = @import("editor.zig").Editor;
+    var tmp = t.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(t.io, .{ .sub_path = "a.txt", .data = "a\nb" });
+    const path = try tmp.dir.realPathFileAlloc(t.io, "a.txt", t.allocator);
+    defer t.allocator.free(path);
+    const uri = try lsp.pathToUri(t.allocator, path);
+    defer t.allocator.free(uri);
+    var editor = try Editor.init(t.allocator, t.io);
+    defer editor.deinit();
+    editor.lsp_enabled = false;
+    try editor.openIntoActive(path);
+
+    const Case = struct { edits: []const u8, expected: anyerror![]const u8, encoding: Encoding = .utf16 };
+    const cases = [_]Case{
+        // A character past the end of its line means the line's end.
+        .{ .edits =
+        \\[{"range":{"start":{"line":0,"character":5},"end":{"line":0,"character":9}},"newText":"X"}]
+        , .expected = "aX\nb" },
+        .{ .encoding = .utf8, .edits =
+        \\[{"range":{"start":{"line":1,"character":7},"end":{"line":1,"character":7}},"newText":"X"}]
+        , .expected = "a\nbX" },
+        // `{line: lineCount, character: 0}` is the end of the document
+        // (pylsp formatting a file without a trailing newline).
+        .{ .edits =
+        \\[{"range":{"start":{"line":0,"character":0},"end":{"line":2,"character":0}},"newText":"c\nd\n"}]
+        , .expected = "c\nd\n" },
+        // Same-start inserts read in array order...
+        .{ .edits =
+        \\[{"range":{"start":{"line":1,"character":0},"end":{"line":1,"character":0}},"newText":"1"},
+        \\ {"range":{"start":{"line":1,"character":0},"end":{"line":1,"character":0}},"newText":"2"}]
+        , .expected = "a\n12b" },
+        // ...ahead of one replace that starts there too.
+        .{ .edits =
+        \\[{"range":{"start":{"line":1,"character":0},"end":{"line":1,"character":0}},"newText":"1"},
+        \\ {"range":{"start":{"line":1,"character":0},"end":{"line":1,"character":1}},"newText":"B"},
+        \\ {"range":{"start":{"line":0,"character":0},"end":{"line":0,"character":1}},"newText":"A"}]
+        , .expected = "A\n1B" },
+        // A replace listed before an insert at its start overlaps it.
+        .{ .edits =
+        \\[{"range":{"start":{"line":1,"character":0},"end":{"line":1,"character":1}},"newText":"B"},
+        \\ {"range":{"start":{"line":1,"character":0},"end":{"line":1,"character":0}},"newText":"1"}]
+        , .expected = error.OverlappingEdits },
+        // Lines past the end-of-document position stay invalid.
+        .{ .edits =
+        \\[{"range":{"start":{"line":3,"character":0},"end":{"line":3,"character":0}},"newText":"X"}]
+        , .expected = error.InvalidRange },
+    };
+    for (cases) |case| {
+        const json = try std.fmt.allocPrint(t.allocator, "{{\"changes\":{{\"{s}\":{s}}}}}", .{ uri, case.edits });
+        defer t.allocator.free(json);
+        if (case.expected) |expected| {
+            try t.expectEqualStrings(expected, try applyToActive(&editor, "a\nb", json, case.encoding));
+        } else |err| {
+            try t.expectError(err, applyToActive(&editor, "a\nb", json, case.encoding));
+            try t.expectEqualStrings("a\nb", editor.activeDoc().buffer.slice(0, editor.activeDoc().buffer.byteLen()));
+        }
+    }
+
+    // With both forms present, documentChanges wins and changes is ignored.
+    const both = try std.fmt.allocPrint(t.allocator,
+        \\{{"changes":{{"{s}":[{{"range":{{"start":{{"line":0,"character":0}},"end":{{"line":0,"character":1}}}},"newText":"WRONG"}}]}},
+        \\ "documentChanges":[{{"textDocument":{{"uri":"{s}","version":null}},"edits":[{{"range":{{"start":{{"line":0,"character":0}},"end":{{"line":0,"character":1}}}},"newText":"right"}}]}}]}}
+    , .{ uri, uri });
+    defer t.allocator.free(both);
+    try t.expectEqualStrings("right\nb", try applyToActive(&editor, "a\nb", both, .utf16));
+}

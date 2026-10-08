@@ -544,6 +544,8 @@ pub const Document = struct {
         if (!try self.history.undoCursors(&self.buffer, &self.cursors)) return false;
         self.markDirty();
         self.invalidateLineStates(0);
+        // Undoing a line-ending normalization must bring the old ending back.
+        self.detectLineEndings();
         return true;
     }
     pub fn redoAction(self: *Document) !bool {
@@ -551,6 +553,7 @@ pub const Document = struct {
         if (!try self.history.redoCursors(&self.buffer, &self.cursors)) return false;
         self.markDirty();
         self.invalidateLineStates(0);
+        self.detectLineEndings();
         return true;
     }
 
@@ -977,9 +980,12 @@ pub const Document = struct {
     }
 
     /// Go to a specific line number (1-based), placing cursor at start.
+    /// Secondary cursors are dropped: typing after a jump must not also
+    /// edit positions that are now off-screen.
     pub fn gotoLine(self: *Document, line_num: usize) void {
         const target = if (line_num > 0) line_num - 1 else 0;
         const clamped = @min(target, self.buffer.lineCount() -| 1);
+        self.cursors.clearSecondary();
         const c = self.cursors.primary();
         c.offset = self.buffer.posToOffset(clamped, 0);
         c.preferred_col = 0;
@@ -1014,20 +1020,21 @@ pub const Document = struct {
         self.display_name = self.allocator.dupe(u8, basename) catch default_display_name;
     }
 
+    /// Line ending of the first line break within the first 8 KiB. No break
+    /// there means LF (the default), so a reused document (the quick-open
+    /// preview) never keeps the previous content's CRLF flag. Walks bytes:
+    /// no allocation, and the shared scratch slice is left alone.
     pub fn detectLineEndings(self: *Document) void {
-        // Scan first few KB for \r\n
+        self.crlf = false;
         const scan_len = @min(self.buffer.byteLen(), 8192);
-        const content = self.buffer.slice(0, scan_len);
-        for (content) |byte| {
-            if (byte == '\r') {
+        for (0..scan_len) |i| switch (self.buffer.byteAt(i).?) {
+            '\r' => {
                 self.crlf = true;
                 return;
-            }
-            if (byte == '\n') {
-                self.crlf = false;
-                return;
-            }
-        }
+            },
+            '\n' => return,
+            else => {},
+        };
     }
 
     /// File extension of `file_path` without the leading dot — null when the
@@ -1055,32 +1062,29 @@ pub const Document = struct {
     }
 
     /// Ensure line states are computed up to (and including) `target_line`.
-    /// Returns the state entering `target_line`.
+    /// Returns the state entering `target_line`. The cache holds the state
+    /// ENTERING each line, so extending it starts by re-tokenizing the last
+    /// cached line for the state LEAVING it: the renderers extend the cache
+    /// one line at a time, and resuming from the entering state lost every
+    /// line's transition (fences, block comments) until a full rebuild.
     pub fn ensureLineState(self: *Document, target_line: usize) syntax.LineState {
         const lang = self.language orelse return .normal;
-
-        // Compute states from where we left off
-        var line_idx = self.line_states.items.len;
-        var state: syntax.LineState = if (line_idx > 0)
-            self.line_states.items[line_idx - 1]
-        else
-            .normal;
+        if (target_line < self.line_states.items.len) return self.line_states.items[target_line];
 
         var span_buf: [syntax.MAX_SPANS]syntax.HighlightSpan = undefined;
-
-        while (line_idx <= target_line) : (line_idx += 1) {
+        var line_idx = self.line_states.items.len;
+        var state: syntax.LineState = .normal;
+        if (line_idx > 0) {
+            const last = line_idx - 1;
+            state = syntax.tokenizeLine(self.buffer.lineContent(last), lang, self.line_states.items[last], &span_buf).state;
+        }
+        while (true) : (line_idx += 1) {
             // Store state entering this line
             self.line_states.append(self.allocator, state) catch return .normal;
+            if (line_idx == target_line) return state;
             // Tokenize to get state exiting this line
-            const line_content = self.buffer.lineContent(line_idx);
-            const result = syntax.tokenizeLine(line_content, lang, state, &span_buf);
-            state = result.state;
+            state = syntax.tokenizeLine(self.buffer.lineContent(line_idx), lang, state, &span_buf).state;
         }
-
-        if (target_line < self.line_states.items.len) {
-            return self.line_states.items[target_line];
-        }
-        return .normal;
     }
 };
 
@@ -1104,6 +1108,12 @@ fn lineIsCommented(trimmed: []const u8, prefix: []const u8, suffix: ?[]const u8)
 }
 
 // ---- Tests ----
+
+test {
+    // main.zig's test-import list omits text_file.zig, so its tests (save
+    // encoding, atomic replacement) only run through this reference.
+    _ = text_file;
+}
 
 test "document new and load text" {
     const allocator = std.testing.allocator;
@@ -1180,6 +1190,32 @@ test "document delete backward" {
     try doc.deleteBackward(1);
     try std.testing.expect(doc.dirty);
     try std.testing.expectEqualStrings("hell", doc.lineContent(0));
+}
+
+test "delete word backward removes one non-ASCII word and joins lines one break at a time" {
+    const t = std.testing;
+    var doc = try Document.init(t.allocator);
+    defer doc.deinit();
+    const Case = struct { text: []const u8, caret: usize, expected: []const u8 };
+    const cases = [_]Case{
+        // Used to delete the whole line: Cyrillic bytes counted as punctuation.
+        .{ .text = "foo привет мир", .caret = "foo привет мир".len, .expected = "foo привет " },
+        // At a line start only that line's break goes (it used to eat "bar\n\n").
+        .{ .text = "foo bar\n\nbaz", .caret = 9, .expected = "foo bar\nbaz" },
+        .{ .text = "    return x;\n}", .caret = 14, .expected = "    return x;}" },
+        .{ .text = "    return x;\r\n}", .caret = 15, .expected = "    return x;}" },
+        // Inside the indentation: back to the line start, not into the line above.
+        .{ .text = "a;\n    b", .caret = 7, .expected = "a;\nb" },
+    };
+    for (cases) |case| {
+        try doc.loadText(case.text);
+        doc.cursors.primary().offset = case.caret;
+        try doc.deleteWordBackward();
+        try t.expectEqualStrings(case.expected, doc.buffer.slice(0, doc.buffer.byteLen()));
+        try t.expectEqual(case.caret - (case.text.len - case.expected.len), doc.cursors.primary().offset);
+        try t.expect(try doc.undoAction());
+        try t.expectEqualStrings(case.text, doc.buffer.slice(0, doc.buffer.byteLen()));
+    }
 }
 
 test "document selection delete" {
@@ -1529,6 +1565,95 @@ test "document line ending detection" {
 
     try doc.loadText("hello\nworld");
     try std.testing.expect(!doc.crlf);
+
+    // No line break at all means LF: the flag never survives from the
+    // previous content (quick-open reuses its preview document).
+    try doc.loadText("a\r\nb");
+    try std.testing.expect(doc.crlf);
+    try doc.loadText("one line");
+    try std.testing.expect(!doc.crlf);
+
+    // Undo/redo re-detect, e.g. across a CRLF to LF save normalization.
+    try doc.loadText("x\r\ny\r\n");
+    try std.testing.expect(doc.crlf);
+    try doc.applyRanges(&.{ .{ .start = 4, .end = 5, .text = "" }, .{ .start = 1, .end = 2, .text = "" } });
+    doc.detectLineEndings();
+    try std.testing.expect(!doc.crlf);
+    try std.testing.expect(try doc.undoAction());
+    try std.testing.expectEqualStrings("x\r\ny\r\n", doc.buffer.slice(0, doc.buffer.byteLen()));
+    try std.testing.expect(doc.crlf);
+    try std.testing.expect(try doc.redoAction());
+    try std.testing.expect(!doc.crlf);
+}
+
+test "gotoLine drops secondary cursors and the selection" {
+    const t = std.testing;
+    var doc = try Document.init(t.allocator);
+    defer doc.deinit();
+    try doc.loadText("one\ntwo\nthree");
+    try doc.cursors.addCursor(1);
+    try doc.cursors.addCursor(5);
+    doc.cursors.primary().anchor = 0;
+    doc.gotoLine(3);
+    try t.expectEqual(@as(usize, 1), doc.cursors.count());
+    try t.expectEqual(@as(usize, 8), doc.cursors.primary().offset);
+    try t.expect(!doc.cursors.primary().hasSelection());
+    // Typing after the jump edits only the target line.
+    try doc.insertAtAllCursors("> ");
+    try t.expectEqualStrings("one\ntwo\n> three", doc.buffer.slice(0, doc.buffer.byteLen()));
+    doc.gotoLine(99); // clamps to the last line
+    try t.expectEqual(@as(usize, 2), doc.cursorPos().line);
+    doc.gotoLine(0);
+    try t.expectEqual(@as(usize, 0), doc.cursors.primary().offset);
+}
+
+test "line state cache resumes from the exit state of the last cached line" {
+    const t = std.testing;
+    const c_like = syntax.LanguageDef{
+        .name = "c",
+        .extensions = &.{"c"},
+        .keywords = &.{ "int", "return" },
+        .types = &.{},
+        .constants = &.{},
+        .builtins = &.{},
+        .line_comment = "//",
+        .block_comment_start = "/*",
+        .block_comment_end = "*/",
+        .string_delimiters = "\"",
+        .has_char_literals = true,
+        .builtin_prefix = null,
+        .preproc_prefix = '#',
+        .arena = null,
+    };
+    const Case = struct { lang: *const syntax.LanguageDef, text: []const u8, inside: []const usize, state: syntax.LineState };
+    const cases = [_]Case{
+        .{ .lang = &syntax.lang_markdown, .text = "# Title\n```zig\nconst x = 1;\n# not a heading\n```\nafter", .inside = &.{ 2, 3, 4 }, .state = .in_code_fence },
+        .{ .lang = &c_like, .text = "int x; /* open\nstill inside\n  more */ int y;\nint z;", .inside = &.{ 1, 2 }, .state = .in_block_comment },
+    };
+    for (cases) |case| {
+        var whole = try Document.init(t.allocator);
+        defer whole.deinit();
+        try whole.loadText(case.text);
+        whole.language = case.lang;
+        const last = whole.lineCount() - 1;
+        _ = whole.ensureLineState(last);
+
+        var stepped = try Document.init(t.allocator);
+        defer stepped.deinit();
+        try stepped.loadText(case.text);
+        stepped.language = case.lang;
+        // Both renderers fill the cache one line at a time, top to bottom.
+        for (0..last + 1) |line| _ = stepped.ensureLineState(line);
+        try t.expectEqualSlices(syntax.LineState, whole.line_states.items, stepped.line_states.items);
+        for (case.inside) |line| try t.expectEqual(case.state, stepped.line_states.items[line]);
+        try t.expectEqual(syntax.LineState.normal, stepped.line_states.items[last]);
+
+        // An edit invalidates from its line; refilling line by line resumes
+        // inside the fence or comment instead of restarting as normal.
+        stepped.invalidateLineStates(2);
+        for (2..last + 1) |line| try t.expectEqual(whole.line_states.items[line], stepped.ensureLineState(line));
+        try t.expectEqualSlices(syntax.LineState, whole.line_states.items, stepped.line_states.items);
+    }
 }
 
 test "document external change detection and reload" {

@@ -136,12 +136,15 @@ pub const Layout = struct {
 
     /// Close a pane. Replaces its parent split with the sibling and recycles
     /// the orphaned node and pane slots.
-    /// Returns true if the pane was closed, false if it's the last pane.
-    pub fn closePane(self: *Layout, pane_id: u8) bool {
-        if (self.paneCount() <= 1) return false;
+    /// Returns the pane that should take focus: the first leaf of the closed
+    /// pane's sibling subtree — its spatial neighbour (in `[A | [B / C]]`
+    /// closing C gives B, where traversal order would wrap to A). Null when
+    /// nothing was closed (the last pane, or an id not in the live tree).
+    pub fn closePane(self: *Layout, pane_id: u8) ?u8 {
+        if (self.paneCount() <= 1) return null;
 
-        const leaf_node_idx = self.findLeafNode(pane_id) orelse return false;
-        const parent_info = self.findParent(leaf_node_idx) orelse return false;
+        const leaf_node_idx = self.findLeafNode(pane_id) orelse return null;
+        const parent_info = self.findParent(leaf_node_idx) orelse return null;
         const parent_idx = parent_info.parent_idx;
         const split = self.nodes.items[parent_idx].split;
 
@@ -161,7 +164,8 @@ pub const Layout = struct {
         self.panes.items[pane_id] = .{ .content = .{ .editor = 0 } };
         self.free_panes.append(self.allocator, pane_id) catch {};
 
-        return true;
+        // The sibling's subtree now lives at the parent's slot.
+        return self.firstLeafPane(@intCast(parent_idx));
     }
 
     /// Find the node index of the leaf that contains the given pane_id.
@@ -300,8 +304,8 @@ test "layout close pane" {
     _ = try layout.splitPane(0, .horizontal, .{ .editor = 1 });
     try std.testing.expectEqual(@as(usize, 2), layout.paneCount());
 
-    // Close pane 1 — root should become a leaf again
-    try std.testing.expect(layout.closePane(1));
+    // Close pane 1 — root should become a leaf again, focus goes to pane 0
+    try std.testing.expectEqual(@as(?u8, 0), layout.closePane(1));
 
     switch (layout.nodes.items[0]) {
         .leaf => |pid| try std.testing.expectEqual(@as(u8, 0), pid),
@@ -314,7 +318,35 @@ test "layout cannot close last pane" {
     var layout = try Layout.init(allocator);
     defer layout.deinit();
 
-    try std.testing.expect(!layout.closePane(0));
+    try std.testing.expectEqual(@as(?u8, null), layout.closePane(0));
+    // An id that is not in the live tree closes nothing either
+    _ = try layout.splitPane(0, .horizontal, .{ .editor = 1 });
+    try std.testing.expectEqual(@as(?u8, null), layout.closePane(7));
+    try std.testing.expectEqual(@as(usize, 2), layout.paneCount());
+}
+
+test "layout closePane returns the closed pane's sibling leaf" {
+    const allocator = std.testing.allocator;
+    var layout = try Layout.init(allocator);
+    defer layout.deinit();
+
+    // [A | [B / C]] with A = pane 0, B = pane 1, C = pane 2.
+    _ = try layout.splitPane(0, .horizontal, .{ .editor = 1 });
+    const c = try layout.splitPane(1, .vertical, .{ .editor = 2 });
+    try std.testing.expectEqual(@as(u8, 2), c);
+    // Traversal order wraps from C to the far pane A; the neighbour is B.
+    try std.testing.expectEqual(@as(?u8, 0), layout.nextPane(c));
+    try std.testing.expectEqual(@as(?u8, 1), layout.closePane(c));
+    try std.testing.expectEqual(@as(usize, 2), layout.paneCount());
+
+    // [A | [B / C]] again: closing A hands focus to the first leaf of [B / C].
+    const c2 = try layout.splitPane(1, .vertical, .{ .editor = 2 });
+    try std.testing.expectEqual(@as(?u8, 1), layout.closePane(0));
+    try std.testing.expectEqual(@as(usize, 2), layout.paneCount());
+    // [B / C]: closing B leaves C, and C is then the last pane.
+    try std.testing.expectEqual(@as(?u8, c2), layout.closePane(1));
+    try std.testing.expectEqual(@as(?u8, null), layout.closePane(c2));
+    try std.testing.expectEqual(@as(usize, 1), layout.paneCount());
 }
 
 test "layout survives split/close churn past 255 slots" {
@@ -328,7 +360,7 @@ test "layout survives split/close churn past 255 slots" {
     while (i < 300) : (i += 1) {
         const new_pane = try layout.splitPane(0, .horizontal, .{ .editor = 1 });
         try std.testing.expectEqual(@as(usize, 2), layout.paneCount());
-        try std.testing.expect(layout.closePane(new_pane));
+        try std.testing.expectEqual(@as(?u8, 0), layout.closePane(new_pane));
         try std.testing.expectEqual(@as(usize, 1), layout.paneCount());
     }
     // Slot recycling keeps the backing arrays tiny

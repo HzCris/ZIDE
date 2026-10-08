@@ -36,12 +36,75 @@ pub const Candidate = struct {
     }
 };
 
+/// Owned copy of what a snapshot records, taken on the main thread (the
+/// only one allowed to read a live Document). Encoding — path identity
+/// lookups plus JSON of up to 32 MiB of text — happens later, inside the
+/// Write task, so a snapshot costs the editor loop one copy.
+const Capture = struct {
+    document_id: u64,
+    version: u64,
+    file_path: ?[]u8,
+    format: text_file.TextFormat,
+    disk_stamp: ?text_file.Stamp,
+    external_changed: bool,
+    cursors: []Cursor,
+    scroll_top: usize,
+    scroll_left: usize,
+    text: []u8,
+
+    fn init(allocator: Allocator, doc: *const Document) !Capture {
+        if (doc.buffer.byteLen() > max_text or doc.cursors.cursors.items.len > 4096) return error.SnapshotTooLarge;
+        const text = try doc.buffer.textAlloc(allocator);
+        errdefer allocator.free(text);
+        const cursors = try allocator.dupe(Cursor, doc.cursors.cursors.items);
+        errdefer allocator.free(cursors);
+        const file_path = if (doc.file_path) |p| try allocator.dupe(u8, p) else null;
+        return .{
+            .document_id = doc.id,
+            .version = doc.buffer.version,
+            .file_path = file_path,
+            .format = doc.format,
+            .disk_stamp = doc.disk_stamp,
+            .external_changed = doc.external_changed,
+            .cursors = cursors,
+            .scroll_top = doc.scroll_top,
+            .scroll_left = doc.scroll_left,
+            .text = text,
+        };
+    }
+
+    fn deinit(self: Capture, allocator: Allocator) void {
+        allocator.free(self.text);
+        allocator.free(self.cursors);
+        if (self.file_path) |p| allocator.free(p);
+    }
+
+    fn encode(self: *const Capture, allocator: Allocator, io: std.Io) ![]u8 {
+        const path = if (self.file_path) |p| try identity.absolute(allocator, io, p) else null;
+        defer if (path) |p| allocator.free(p);
+        const key = if (path) |p| try identity.key(allocator, io, p) else null;
+        defer if (key) |p| allocator.free(p);
+        return std.json.Stringify.valueAlloc(allocator, Snapshot{
+            .document_id = self.document_id,
+            .version = self.version,
+            .path = path,
+            .identity = key,
+            .format = self.format,
+            .disk_stamp = self.disk_stamp,
+            .external_changed = self.external_changed,
+            .cursors = self.cursors,
+            .scroll_top = self.scroll_top,
+            .scroll_left = self.scroll_left,
+            .text = self.text,
+        }, .{});
+    }
+};
+
 const Write = struct {
     allocator: Allocator,
     io: std.Io,
     path: []u8,
-    bytes: []u8,
-    version: u64,
+    capture: Capture,
     future: ?std.Io.Future(void) = null,
     done: std.atomic.Value(bool) = .init(false),
     failure: ?anyerror = null,
@@ -49,7 +112,7 @@ const Write = struct {
     wake: ?*const fn () void,
 
     fn run(self: *Write) void {
-        text_file.atomicWrite(self.allocator, self.io, self.path, self.bytes) catch |err| {
+        self.write() catch |err| {
             self.failure = err;
         };
         self.mutex.lockUncancelable(self.io);
@@ -57,12 +120,17 @@ const Write = struct {
         self.done.store(true, .release);
         if (self.wake) |wake| wake();
     }
+    fn write(self: *Write) !void {
+        const bytes = try self.capture.encode(self.allocator, self.io);
+        defer self.allocator.free(bytes);
+        try text_file.atomicWrite(self.allocator, self.io, self.path, bytes);
+    }
     fn deinit(self: *Write, cancel: bool) void {
         if (self.future) |*future| {
             if (cancel) future.cancel(self.io) else future.await(self.io);
         }
         self.allocator.free(self.path);
-        self.allocator.free(self.bytes);
+        self.capture.deinit(self.allocator);
         self.allocator.destroy(self);
     }
 };
@@ -129,6 +197,10 @@ pub const Manager = struct {
         for (self.claims.items) |file| file.close(self.io);
         self.claims.deinit(self.allocator);
         self.lock.close(self.io);
+        // Nothing left to recover (a clean exit): drop this instance's
+        // directory, lock included, so leftovers don't pile up per launch.
+        // Snapshots written by flush() keep it for the next launch to claim.
+        if (!holdsSnapshots(self.io, self.instance)) deleteInstance(self.io, self.root, std.fs.path.basename(self.instance));
         self.allocator.free(self.instance);
         self.allocator.free(self.root);
     }
@@ -146,6 +218,12 @@ pub const Manager = struct {
     fn scan(self: *Manager) !void {
         var root_dir = try std.Io.Dir.cwd().openDir(self.io, self.root, .{ .iterate = true });
         defer root_dir.close(self.io);
+        // Dead instances with nothing to recover, deleted after the walk.
+        var empty: std.ArrayList([]u8) = .empty;
+        defer {
+            for (empty.items) |name| self.allocator.free(name);
+            empty.deinit(self.allocator);
+        }
         var instances = root_dir.iterate();
         while (try instances.next(self.io)) |entry| {
             if (entry.kind != .directory or entry.name.len != 32 or !hexName(entry.name)) continue;
@@ -169,15 +247,26 @@ pub const Manager = struct {
                 lock.close(self.io);
                 return err;
             };
+            var snapshots = false;
             var files = dir.iterate();
             while (try files.next(self.io)) |file| {
                 if (file.kind != .file or !std.mem.endsWith(u8, file.name, ".json")) continue;
+                snapshots = true;
                 self.readCandidate(dir, entry.name, file.name) catch |err| {
                     // Keep damaged snapshots for inspection instead of deleting them.
                     self.failure = err;
                 };
             }
+            if (!snapshots) {
+                // Nothing to offer: release the claim now instead of holding
+                // the lock (an fd) all session, and delete the directory.
+                _ = self.claims.pop();
+                lock.close(self.io);
+                const name = self.allocator.dupe(u8, entry.name) catch continue;
+                empty.append(self.allocator, name) catch self.allocator.free(name);
+            }
         }
+        for (empty.items) |name| root_dir.deleteTree(self.io, name) catch {};
     }
 
     fn readCandidate(self: *Manager, dir: std.Io.Dir, instance_name: []const u8, file_name: []const u8) !void {
@@ -204,29 +293,6 @@ pub const Manager = struct {
         return std.fs.path.join(self.allocator, &.{ self.instance, try std.fmt.bufPrint(&buf, "{d}.json", .{id}) });
     }
 
-    fn serialize(self: *Manager, doc: *const Document) ![]u8 {
-        if (doc.buffer.byteLen() > max_text or doc.cursors.cursors.items.len > 4096) return error.SnapshotTooLarge;
-        const text = try doc.buffer.textAlloc(self.allocator);
-        defer self.allocator.free(text);
-        const path = if (doc.file_path) |p| try identity.absolute(self.allocator, self.io, p) else null;
-        defer if (path) |p| self.allocator.free(p);
-        const key = if (path) |p| try identity.key(self.allocator, self.io, p) else null;
-        defer if (key) |p| self.allocator.free(p);
-        return std.json.Stringify.valueAlloc(self.allocator, Snapshot{
-            .document_id = doc.id,
-            .version = doc.buffer.version,
-            .path = path,
-            .identity = key,
-            .format = doc.format,
-            .disk_stamp = doc.disk_stamp,
-            .external_changed = doc.external_changed,
-            .cursors = doc.cursors.cursors.items,
-            .scroll_top = doc.scroll_top,
-            .scroll_left = doc.scroll_left,
-            .text = text,
-        }, .{});
-    }
-
     fn trackFor(self: *Manager, doc: *const Document, now: i128) !*Track {
         const entry = try self.tracks.getOrPut(self.allocator, doc.id);
         if (!entry.found_existing) entry.value_ptr.* = .{ .observed = doc.buffer.version, .changed_at = now, .first_change = now };
@@ -236,11 +302,11 @@ pub const Manager = struct {
     fn startWrite(self: *Manager, doc: *const Document, track: *Track) !void {
         const path = try self.snapshotPath(doc.id);
         errdefer self.allocator.free(path);
-        const bytes = try self.serialize(doc);
-        errdefer self.allocator.free(bytes);
+        const capture = try Capture.init(self.allocator, doc);
+        errdefer capture.deinit(self.allocator);
         const pending = try self.allocator.create(Write);
         errdefer self.allocator.destroy(pending);
-        pending.* = .{ .allocator = self.allocator, .io = self.io, .path = path, .bytes = bytes, .version = doc.buffer.version, .wake = self.wake };
+        pending.* = .{ .allocator = self.allocator, .io = self.io, .path = path, .capture = capture, .wake = self.wake };
         pending.future = try self.io.concurrent(Write.run, .{pending});
         track.pending = pending;
     }
@@ -265,7 +331,7 @@ pub const Manager = struct {
                     self.failure = err;
                     track.retry_at = now + 10 * second;
                 } else {
-                    track.captured = pending.version;
+                    track.captured = pending.capture.version;
                     track.retry_at = 0;
                 }
                 pending.deinit(false);
@@ -296,7 +362,9 @@ pub const Manager = struct {
             pending.deinit(false);
             track.pending = null;
         }
-        const bytes = try self.serialize(doc);
+        const capture = try Capture.init(self.allocator, doc);
+        defer capture.deinit(self.allocator);
+        const bytes = try capture.encode(self.allocator, self.io);
         defer self.allocator.free(bytes);
         const path = try self.snapshotPath(doc.id);
         defer self.allocator.free(path);
@@ -343,6 +411,26 @@ pub const Manager = struct {
         self.discarded = true;
     }
 };
+
+/// Whether an instance directory holds any snapshot (`.json`, damaged ones
+/// included). Unreadable counts as yes: never delete what can't be seen.
+fn holdsSnapshots(io: std.Io, instance: []const u8) bool {
+    var dir = std.Io.Dir.cwd().openDir(io, instance, .{ .iterate = true }) catch return true;
+    defer dir.close(io);
+    var files = dir.iterate();
+    while (files.next(io) catch return true) |file| {
+        if (file.kind == .file and std.mem.endsWith(u8, file.name, ".json")) return true;
+    }
+    return false;
+}
+
+/// Best effort; the instance's lock must already be closed. A directory
+/// without snapshots holds only its lock and stray atomic-write temporaries.
+fn deleteInstance(io: std.Io, root: []const u8, name: []const u8) void {
+    var root_dir = std.Io.Dir.cwd().openDir(io, root, .{}) catch return;
+    defer root_dir.close(io);
+    root_dir.deleteTree(io, name) catch {};
+}
 
 fn deleteSnapshot(io: std.Io, path: []const u8) !void {
     std.Io.Dir.cwd().deleteFile(io, path) catch |err| switch (err) {
@@ -472,6 +560,121 @@ test "recovery preserves the previous snapshot after a failed capture and retain
     try t.expectEqual(@as(usize, 1), next.candidates.items.len);
     try t.expectEqualStrings("keep me", next.candidates.items[0].parsed.value.text);
     try t.expect((try text_file.Stamp.read(t.io, damaged)) != null);
+}
+
+test "recovery: clean exits and dead instances without snapshots leave no directories" {
+    const t = std.testing;
+    const cwd = std.Io.Dir.cwd();
+    var tmp = t.tmpDir(.{});
+    defer tmp.cleanup();
+    const base = try tmp.dir.realPathFileAlloc(t.io, ".", t.allocator);
+    defer t.allocator.free(base);
+
+    // Clean exit, nothing dirty: the instance directory goes, lock and all.
+    var first = try Manager.init(t.allocator, t.io, base, base);
+    const workspace_root = try t.allocator.dupe(u8, first.root);
+    defer t.allocator.free(workspace_root);
+    const first_instance = try t.allocator.dupe(u8, first.instance);
+    defer t.allocator.free(first_instance);
+    first.deinit();
+    try t.expectError(error.FileNotFound, cwd.access(t.io, first_instance, .{}));
+
+    // An instance that exits with a dirty buffer keeps its snapshot...
+    var doc = try Document.init(t.allocator);
+    defer doc.deinit();
+    try doc.insertAtCursor("unsaved");
+    const dirty_instance = blk: {
+        var dirty = try Manager.init(t.allocator, t.io, base, base);
+        defer dirty.deinit();
+        try dirty.captureSync(&doc);
+        break :blk try t.allocator.dupe(u8, dirty.instance);
+    };
+    defer t.allocator.free(dirty_instance);
+    try cwd.access(t.io, dirty_instance, .{});
+    // ...while a dead one that never wrote a snapshot (killed before any
+    // edit) holds only its lock and a stray atomic-write temporary.
+    const stale = try std.fs.path.join(t.allocator, &.{ workspace_root, "0123456789abcdef0123456789abcdef" });
+    defer t.allocator.free(stale);
+    try cwd.createDirPath(t.io, stale);
+    for ([_][]const u8{ "lock", "5f3a9c0e1b2d4f6a" }) |name| {
+        const path = try std.fs.path.join(t.allocator, &.{ stale, name });
+        defer t.allocator.free(path);
+        const file = try cwd.createFile(t.io, path, .{});
+        file.close(t.io);
+    }
+
+    // The next launch deletes the empty one instead of holding its lock
+    // all session, and claims and offers the one with a snapshot.
+    {
+        var next = try Manager.init(t.allocator, t.io, base, base);
+        defer next.deinit();
+        try t.expectError(error.FileNotFound, cwd.access(t.io, stale, .{}));
+        try t.expectEqual(@as(usize, 1), next.claims.items.len);
+        try t.expectEqual(@as(usize, 1), next.candidates.items.len);
+        try t.expectEqualStrings("unsaved", next.candidates.items[0].parsed.value.text);
+        try cwd.access(t.io, dirty_instance, .{});
+        // Restored or discarded: its directory is empty from now on.
+        try next.removeCandidate(0);
+    }
+    // The launch after that removes it too; only the live instance's own
+    // directory remains.
+    var last = try Manager.init(t.allocator, t.io, base, base);
+    defer last.deinit();
+    try t.expectError(error.FileNotFound, cwd.access(t.io, dirty_instance, .{}));
+    try t.expectEqual(@as(usize, 0), last.claims.items.len);
+    var root_dir = try cwd.openDir(t.io, workspace_root, .{ .iterate = true });
+    defer root_dir.close(t.io);
+    var instances: usize = 0;
+    var it = root_dir.iterate();
+    while (try it.next(t.io)) |_| instances += 1;
+    try t.expectEqual(@as(usize, 1), instances);
+}
+
+test "recovery: a background snapshot is encoded from a copy and round-trips" {
+    const t = std.testing;
+    var tmp = t.tmpDir(.{});
+    defer tmp.cleanup();
+    const base = try tmp.dir.realPathFileAlloc(t.io, ".", t.allocator);
+    defer t.allocator.free(base);
+    const source = try std.fs.path.join(t.allocator, &.{ base, "café notes.txt" });
+    defer t.allocator.free(source);
+    var manager = try Manager.init(t.allocator, t.io, base, base);
+    defer manager.deinit();
+    var docs = [_]Document{try Document.init(t.allocator)};
+    defer docs[0].deinit();
+    try docs[0].setFilePath(source);
+    try docs[0].insertAtCursor("é😀 \"quoted\"\\\n\tline two");
+    docs[0].format = .{ .encoding = .utf16_le, .bom = true };
+    docs[0].scroll_top = 1;
+    manager.tick(&docs, 0, true);
+    manager.tick(&docs, 2 * second, true); // idle deadline: the task starts
+    const pending = manager.tracks.get(docs[0].id).?.pending.?;
+    const captured_version = docs[0].buffer.version;
+    // Editing while the task encodes can't reach the snapshot: it owns a copy.
+    try docs[0].insertAtCursor(" typed later");
+    pending.future.?.await(t.io);
+    try t.expectEqual(@as(?anyerror, null), pending.failure);
+    manager.tick(&docs, 2 * second, true);
+    try t.expectEqual(@as(?u64, captured_version), manager.tracks.get(docs[0].id).?.captured);
+
+    const path = try manager.snapshotPath(docs[0].id);
+    defer t.allocator.free(path);
+    const bytes = try std.Io.Dir.cwd().readFileAlloc(t.io, path, t.allocator, .limited(1 << 20));
+    defer t.allocator.free(bytes);
+    const parsed = try std.json.parseFromSlice(Snapshot, t.allocator, bytes, .{ .allocate = .alloc_always, .ignore_unknown_fields = true });
+    defer parsed.deinit();
+    const snap = parsed.value;
+    try t.expectEqualStrings("é😀 \"quoted\"\\\n\tline two", snap.text);
+    try t.expectEqual(docs[0].id, snap.document_id);
+    try t.expectEqual(captured_version, snap.version);
+    try t.expectEqualDeep(docs[0].format, snap.format);
+    try t.expectEqual(@as(usize, 1), snap.scroll_top);
+    try t.expectEqual(@as(usize, 1), snap.cursors.len);
+    try t.expect(try identity.same(t.allocator, t.io, source, snap.path.?));
+    try t.expect(snap.identity != null);
+    var restored = try restore(t.allocator, t.io, snap, true);
+    defer restored.deinit();
+    try t.expectEqualStrings("é😀 \"quoted\"\\\n\tline two", restored.buffer.slice(0, restored.buffer.byteLen()));
 }
 
 test "abrupt exit after multi-file rename recovers dirty named and untitled buffers without source writes" {

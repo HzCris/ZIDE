@@ -4,6 +4,24 @@ const builtin = @import("builtin");
 const Allocator = std.mem.Allocator;
 const windows = builtin.os.tag == .windows;
 
+/// Held across every child-process spawn in the editor. On Windows, std's
+/// spawn creates inheritable pipe ends and calls CreateProcessW with
+/// bInheritHandles=TRUE and no handle list, so a child created while another
+/// spawn is in flight inherits that spawn's pipe write ends: the other
+/// child's stdout never reaches EOF while the inheritor lives (a git job next
+/// to a language server started in the same frame never finishes). std
+/// closes its copies of the child ends before `spawn` returns, so mutual
+/// exclusion is sufficient. POSIX pipes are close-on-exec; the lock is cheap
+/// there and keeps one code path.
+pub var spawn_mutex: std.Io.Mutex = .init;
+
+/// `std.process.spawn` under `spawn_mutex`. Use this for every spawn.
+pub fn spawnLocked(io: std.Io, options: std.process.SpawnOptions) std.process.SpawnError!std.process.Child {
+    spawn_mutex.lockUncancelable(io);
+    defer spawn_mutex.unlock(io);
+    return std.process.spawn(io, options);
+}
+
 pub const Options = struct {
     argv: []const []const u8,
     cwd: ?[]const u8 = null,
@@ -45,6 +63,11 @@ pub const Job = struct {
     done: bool = false,
     revision: u64 = 0,
     wake_fn: ?*const fn () void = null,
+    /// The running child's process group, published while its output is
+    /// being read. `cancel` kills it first: a pipe read blocked on a silent
+    /// child is not interrupted by future cancellation on Windows, so
+    /// cancelling would otherwise wait for the child to exit on its own.
+    live_group: ?ProcessGroup = null,
 
     pub fn snapshot(self: *Job, allocator: Allocator, consume: bool) !Snapshot {
         self.mutex.lockUncancelable(self.io);
@@ -67,29 +90,48 @@ pub const Job = struct {
 
     pub fn cancel(self: *Job) void {
         self.mutex.lockUncancelable(self.io);
-        if (!self.done) self.cancelled = true;
+        if (!self.done) {
+            self.cancelled = true;
+            // Closing the child's pipes ends the blocked read at once.
+            if (self.live_group) |*group| group.terminate();
+        }
         self.mutex.unlock(self.io);
         if (self.future) |*future| future.cancel(self.io);
         self.future = null;
     }
 
-    fn changed(self: *Job) void {
+    /// Publish (or retract, with null) the group `cancel` may kill. A cancel
+    /// that arrived before the child was attached takes effect here.
+    fn publishGroup(self: *Job, group: ?ProcessGroup) void {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        self.live_group = group;
+        if (self.cancelled) if (self.live_group) |*live| live.terminate();
+    }
+
+    /// Bump the revision (caller holds `mutex`) and return the wake to call
+    /// once the caller has unlocked: a wake may block (a full frontend event
+    /// queue), and it must never do so while holding `mutex`.
+    fn changed(self: *Job) ?*const fn () void {
         self.revision +%= 1;
-        if (self.wake_fn) |wake| wake();
+        return self.wake_fn;
     }
 
     fn append(self: *Job, stream: usize, bytes: []const u8) !void {
         if (bytes.len == 0) return;
-        self.mutex.lockUncancelable(self.io);
-        defer self.mutex.unlock(self.io);
-        const out = if (stream == 0) &self.stdout else &self.stderr;
-        const available = self.options.output_limit -| (self.stdout.items.len + self.stderr.items.len);
-        if (bytes.len > available and self.options.strict_output) return error.StreamTooLong;
-        const count = @min(available, bytes.len);
-        try out.appendSlice(self.allocator, bytes[0..count]);
-        const newly_truncated = count < bytes.len and !self.truncated;
-        self.truncated = self.truncated or count < bytes.len;
-        if (count != 0 or newly_truncated) self.changed();
+        const wake = blk: {
+            self.mutex.lockUncancelable(self.io);
+            defer self.mutex.unlock(self.io);
+            const out = if (stream == 0) &self.stdout else &self.stderr;
+            const available = self.options.output_limit -| (self.stdout.items.len + self.stderr.items.len);
+            if (bytes.len > available and self.options.strict_output) return error.StreamTooLong;
+            const count = @min(available, bytes.len);
+            try out.appendSlice(self.allocator, bytes[0..count]);
+            const newly_truncated = count < bytes.len and !self.truncated;
+            self.truncated = self.truncated or count < bytes.len;
+            break :blk if (count != 0 or newly_truncated) self.changed() else null;
+        };
+        if (wake) |f| f();
     }
 
     fn run(self: *Job) void {
@@ -98,16 +140,21 @@ pub const Job = struct {
             self.failure = err;
             self.mutex.unlock(self.io);
         };
+        self.finish();
+    }
+
+    fn finish(self: *Job) void {
         self.mutex.lockUncancelable(self.io);
         self.done = true;
-        self.changed();
+        const wake = self.changed();
         self.mutex.unlock(self.io);
+        if (wake) |f| f();
     }
 
     fn runProcess(self: *Job) !void {
         var group = try ProcessGroup.init();
         defer group.deinit();
-        var child = try std.process.spawn(self.io, .{
+        var child = try spawnLocked(self.io, .{
             .argv = self.options.argv,
             .cwd = if (self.options.cwd) |path| .{ .path = path } else .inherit,
             .environ_map = self.options.environ,
@@ -122,6 +169,10 @@ pub const Job = struct {
         try group.attach(&child);
         // Terminate the owned group before child.kill closes pipes on cancellation.
         defer if (child.id != null) group.terminate();
+        self.publishGroup(group);
+        // Retracted before the handle closes (and, below, before a POSIX
+        // group leader is reaped and its id could be reused).
+        defer self.publishGroup(null);
         var buffers: std.Io.File.MultiReader.Buffer(2) = undefined;
         var reader: std.Io.File.MultiReader = undefined;
         reader.init(self.allocator, self.io, buffers.toStreams(), &.{ child.stdout.?, child.stderr.? });
@@ -140,6 +191,7 @@ pub const Job = struct {
             if (finished) break;
         }
         try reader.checkAnyError();
+        self.publishGroup(null);
         const term = try child.wait(self.io);
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
@@ -317,4 +369,88 @@ test "managed jobs report output and cancel a running process" {
     const cancelled = try manager.get(slow).?.snapshot(t.allocator, false);
     defer cancelled.deinit(t.allocator);
     try t.expect(cancelled.cancelled and cancelled.done);
+}
+
+test "Windows: a short job finishes while a long job spawned beside it still runs" {
+    // Without spawn_mutex the long child inherits the short job's stdout
+    // write end and the short job never sees EOF (reproduced 12/12 rounds).
+    if (!windows) return error.SkipZigTest;
+    const t = std.testing;
+    var manager: Manager = .{ .allocator = t.allocator, .io = t.io };
+    defer manager.deinit();
+    const echo: []const []const u8 = &.{ "cmd", "/c", "echo hi" };
+    const ping: []const []const u8 = &.{ "ping", "-n", "3", "127.0.0.1" };
+    for (0..4) |round| {
+        const short_first = round % 2 == 0;
+        const first = try manager.start(.{ .argv = if (short_first) echo else ping });
+        const second = try manager.start(.{ .argv = if (short_first) ping else echo });
+        const short = if (short_first) first else second;
+        const long = if (short_first) second else first;
+        const job = manager.get(short).?;
+        const deadline = std.Io.Clock.now(.awake, t.io).nanoseconds + std.time.ns_per_s;
+        while (!job.isDone() and std.Io.Clock.now(.awake, t.io).nanoseconds < deadline) {
+            try std.Io.sleep(t.io, .fromMilliseconds(5), .awake);
+        }
+        try t.expect(job.isDone());
+        try t.expect(!manager.get(long).?.isDone());
+        const result = try job.snapshot(t.allocator, false);
+        defer result.deinit(t.allocator);
+        try t.expectEqual(@as(?u8, 0), result.code);
+        try t.expect(std.mem.indexOf(u8, result.stdout, "hi") != null);
+        manager.remove(short);
+        manager.remove(long);
+    }
+}
+
+test "cancel kills a silent job instead of waiting for it to exit" {
+    const t = std.testing;
+    var manager: Manager = .{ .allocator = t.allocator, .io = t.io };
+    defer manager.deinit();
+    const id = try manager.start(.{ .argv = if (windows) &.{ "cmd", "/c", "ping -n 30 127.0.0.1 >nul" } else &.{ "sh", "-c", "sleep 30" } });
+    try std.Io.sleep(t.io, .fromMilliseconds(300), .awake);
+    const before = std.Io.Clock.now(.awake, t.io).nanoseconds;
+    manager.cancel(id);
+    try t.expect(std.Io.Clock.now(.awake, t.io).nanoseconds - before < 3 * std.time.ns_per_s);
+    const result = try manager.get(id).?.snapshot(t.allocator, false);
+    defer result.deinit(t.allocator);
+    try t.expect(result.cancelled and result.done);
+}
+
+/// Wake probe: records whether a wake ran while its caller still held the
+/// mutex (tryLock fails then — the probe runs on the locking thread).
+const WakeProbe = struct {
+    var mutex: ?*std.Io.Mutex = null;
+    var io: std.Io = undefined;
+    var calls: usize = 0;
+    var under_lock: usize = 0;
+
+    fn wake() void {
+        calls += 1;
+        const m = mutex orelse return;
+        if (m.tryLock()) m.unlock(io) else under_lock += 1;
+    }
+};
+
+test "job wakes run after the job mutex is released" {
+    const t = std.testing;
+    var job: Job = .{ .id = 1, .allocator = t.allocator, .io = t.io, .arena = std.heap.ArenaAllocator.init(t.allocator), .options = .{ .argv = &.{"unused"}, .output_limit = 4 }, .wake_fn = &WakeProbe.wake };
+    defer {
+        job.stdout.deinit(t.allocator);
+        job.stderr.deinit(t.allocator);
+        job.arena.deinit();
+    }
+    WakeProbe.mutex = &job.mutex;
+    WakeProbe.io = t.io;
+    WakeProbe.calls = 0;
+    WakeProbe.under_lock = 0;
+    defer WakeProbe.mutex = null;
+    try job.append(0, "ab");
+    try job.append(1, "cdef"); // truncated at the output limit: still one wake
+    try job.append(0, "gh"); // nothing fits and nothing newly truncated: no wake
+    job.finish();
+    try t.expectEqual(@as(usize, 3), WakeProbe.calls);
+    try t.expectEqual(@as(usize, 0), WakeProbe.under_lock);
+    try t.expectEqualStrings("ab", job.stdout.items);
+    try t.expectEqualStrings("cd", job.stderr.items);
+    try t.expect(job.truncated and job.done and job.revision == 3);
 }

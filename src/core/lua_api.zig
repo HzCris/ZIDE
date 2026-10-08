@@ -5,11 +5,20 @@
 //! main loops, and worker threads must never touch the state. Every
 //! callback runs under protectedCall — a broken extension reports to the
 //! status bar and the log; it can never crash the editor.
+//!
+//! Positions are 1-based lines and 1-based BYTE columns (not characters):
+//! "é" occupies columns 1-2. Columns that land inside a UTF-8 sequence are
+//! snapped back to the character's start, and text entering the buffer or
+//! the status bar must be valid UTF-8 — the GUI measures and draws these
+//! slices directly, and dvui panics on a split or malformed sequence.
 
 const std = @import("std");
 const zlua = @import("zlua");
 const Editor = @import("editor.zig").Editor;
 const Document = @import("document.zig").Document;
+const Buffer = @import("buffer.zig").Buffer;
+const cursor_mod = @import("cursor.zig");
+const text_input = @import("text_input.zig");
 const lua_settings = @import("lua_settings.zig");
 const lsp_mod = @import("lsp.zig");
 const filetree_mod = @import("filetree.zig");
@@ -103,9 +112,64 @@ fn reportLuaError(editor: *Editor, lua: *Lua, what: []const u8) void {
     // warn, not err: extension bugs are user-script problems the editor
     // survives (and err-level logs fail `zig build test`).
     std.log.warn("Lua {s} failed: {s}", .{ what, err_msg });
-    const shown = err_msg[0..@min(err_msg.len, 100)];
-    editor.status_message = std.fmt.bufPrint(&editor.status_buf, "Extension error: {s}", .{shown}) catch "Extension error (see zide.log)";
+    setStatusText(editor, "Extension error: ", err_msg);
     lua.pop(1);
+}
+
+/// Show `prefix` + `text` in the status bar, copied into the editor's
+/// status buffer by statusText (valid one-line UTF-8, cut on a code-point
+/// boundary). `prefix` must be ASCII and `text` must not alias
+/// `editor.status_buf`.
+pub fn setStatusText(editor: *Editor, prefix: []const u8, text: []const u8) void {
+    const buf = &editor.status_buf;
+    const p = @min(prefix.len, buf.len);
+    @memcpy(buf[0..p], prefix[0..p]);
+    const body = statusText(buf[p..], text);
+    editor.status_message = buf[0 .. p + body.len];
+}
+
+/// Copy `text` into `out` as one line of valid UTF-8 and return the filled
+/// prefix of `out`: malformed bytes become U+FFFD, control characters
+/// spaces, and the copy ends at the last whole code point that fits. The
+/// GUI measures and draws status text directly; a split or malformed
+/// sequence panics dvui.
+pub fn statusText(out: []u8, text: []const u8) []const u8 {
+    if (std.unicode.utf8ValidateSlice(text) and !hasControlByte(text)) {
+        const n = text_input.floor(text, out.len);
+        @memcpy(out[0..n], text[0..n]);
+        return out[0..n];
+    }
+    var len: usize = 0;
+    var i: usize = 0;
+    while (i < text.len) {
+        var step: usize = 1;
+        var piece: []const u8 = &std.unicode.replacement_character_utf8;
+        if (std.unicode.utf8ByteSequenceLength(text[i])) |seq_len| {
+            if (seq_len <= text.len - i) {
+                if (std.unicode.utf8Decode(text[i..][0..seq_len])) |cp| {
+                    step = seq_len;
+                    piece = if (cp < 0x20 or cp == 0x7f) " " else text[i..][0..seq_len];
+                } else |_| {}
+            }
+        } else |_| {}
+        if (piece.len > out.len - len) break;
+        @memcpy(out[len..][0..piece.len], piece);
+        len += piece.len;
+        i += step;
+    }
+    return out[0..len];
+}
+
+fn hasControlByte(text: []const u8) bool {
+    for (text) |b| if (b < 0x20 or b == 0x7f) return true;
+    return false;
+}
+
+/// Owned copy of `text` with malformed UTF-8 replaced by U+FFFD (for Lua
+/// strings the GUI draws later: diagnostic messages, command descriptions).
+fn dupeUtf8(allocator: std.mem.Allocator, text: []const u8) ![]u8 {
+    if (std.unicode.utf8ValidateSlice(text)) return allocator.dupe(u8, text);
+    return std.fmt.allocPrint(allocator, "{f}", .{std.unicode.fmtUtf8(text)});
 }
 
 /// Fire an event for `doc` to every registered handler whose language
@@ -200,12 +264,22 @@ pub fn cleanupLuaRefs(editor: *Editor) void {
 
 /// Full teardown for Editor.deinit (also frees the ref lists). Must run
 /// before the command registry deinits and while the Lua state is alive.
+/// Ends by detaching the editor from the state: main.zig's state outlives
+/// the editor, and `__gc` finalizers run by lua.deinit() (or any callback
+/// after this) must find no editor rather than a dangling pointer. Refs
+/// released later in Editor.deinit (task matchers) are then skipped; the
+/// state frees them when it closes.
 pub fn deinitLua(editor: *Editor) void {
     cleanupLuaRefs(editor);
     inline for (comptime std.meta.tags(LuaEvent)) |ev| {
         editor.lua_event_handlers.getPtr(ev).deinit(editor.allocator);
     }
     editor.lua_jobs.deinit(editor.allocator);
+    if (tree_reset_for) |target| if (target == editor) {
+        tree_reset_for = null; // Editor.deinit frees the tree itself
+    };
+    if (editor.lua) |lua| lua_settings.detachEditor(lua, editor);
+    editor.lua = null;
 }
 
 /// Re-run every extensions/*.lua after dropping prior Lua commands and
@@ -224,6 +298,7 @@ pub fn reloadExtensions(editor: *Editor) void {
     editor.dropExtensionSnippets();
     editor.tasks.dropExtensions(editor);
     editor.dap.dropExtensions(editor);
+    const failures = lua_settings.loadFailureCount();
     lua_settings.loadExtensions(lua);
     editor.reconcileLspClients();
     // Extensions may have (re)registered languages: re-detect every open
@@ -231,15 +306,19 @@ pub fn reloadExtensions(editor: *Editor) void {
     // re-registration keeps existing pointers valid, so documents whose
     // language is unchanged are left alone (no LSP close/open churn).
     for (editor.documents.items) |*doc| editor.relanguageDoc(doc);
-    editor.status_message = "Extensions reloaded";
+    // A file that failed to load already put its error in the status bar
+    // ("broken.lua:3: ..."); keep it there.
+    if (lua_settings.loadFailureCount() == failures) editor.status_message = "Extensions reloaded";
 }
 
 // ---------------------------------------------------------------------------
 // zide.* callback implementations
 // ---------------------------------------------------------------------------
 
+/// String field of the option table at stack index 1 (raw access: see
+/// lua_settings.getFieldRaw). The slice stays valid while the table does.
 fn snippetStringField(lua: *Lua, key: [:0]const u8) ?[]const u8 {
-    _ = lua.getField(1, key);
+    _ = lua_settings.getFieldRaw(lua, 1, key);
     defer lua.pop(1);
     return if (lua.typeOf(-1) == .string) lua.toString(-1) catch null else null;
 }
@@ -257,7 +336,7 @@ fn luaRegisterSnippet(state: ?*zlua.LuaState) callconv(.c) c_int {
     const language = snippetStringField(lua, "language") orelse return snippetError(lua, "Snippet language (string) is required");
     const prefix = snippetStringField(lua, "prefix") orelse return snippetError(lua, "Snippet prefix (string) is required");
     const body = snippetStringField(lua, "body") orelse return snippetError(lua, "Snippet body (string) is required");
-    _ = lua.getField(1, "description");
+    _ = lua_settings.getFieldRaw(lua, 1, "description");
     const valid_description = lua.isNil(-1) or lua.typeOf(-1) == .string;
     lua.pop(1);
     if (!valid_description) return snippetError(lua, "Snippet description must be a string");
@@ -283,6 +362,11 @@ fn luaCommand(state: ?*zlua.LuaState) callconv(.c) c_int {
         std.log.warn("zide.command: name must not be empty", .{});
         return 0;
     }
+    // The palette draws command names; the GUI can't draw malformed UTF-8.
+    if (!std.unicode.utf8ValidateSlice(name)) {
+        std.log.warn("zide.command: name must be valid UTF-8", .{});
+        return 0;
+    }
     const desc: []const u8 = if (lua.typeOf(2) == .string) (lua.toString(2) catch "") else "";
     if (!lua.isFunction(3)) {
         std.log.warn("zide.command: third argument must be a function", .{});
@@ -297,7 +381,7 @@ fn luaCommand(state: ?*zlua.LuaState) callconv(.c) c_int {
         lua.unref(zlua.registry_index, ref);
         return 0;
     };
-    const owned_desc = a.dupe(u8, desc) catch {
+    const owned_desc = dupeUtf8(a, desc) catch {
         a.free(owned_name);
         lua.unref(zlua.registry_index, ref);
         return 0;
@@ -335,7 +419,7 @@ fn luaOn(state: ?*zlua.LuaState) callconv(.c) c_int {
     // only for documents of that language.
     var language: ?[]const u8 = null;
     if (lua.typeOf(3) == .table) {
-        _ = lua.getField(3, "language");
+        _ = lua_settings.getFieldRaw(lua, 3, "language");
         if (lua.typeOf(-1) == .string) {
             const s: []const u8 = lua.toString(-1) catch "";
             language = editor.allocator.dupe(u8, s) catch null;
@@ -366,24 +450,32 @@ fn luaExec(state: ?*zlua.LuaState) callconv(.c) c_int {
     return 1;
 }
 
-/// zide.status(msg) — show a transient message in the status bar.
+/// zide.status(msg) — show a transient message in the status bar. Long
+/// messages are cut at a character boundary (the bar holds 128 bytes);
+/// malformed UTF-8 shows as U+FFFD and control characters as spaces.
 fn luaStatus(state: ?*zlua.LuaState) callconv(.c) c_int {
     var lua: *Lua = @ptrCast(@alignCast(state orelse return 0));
     const editor = lua_settings.getEditor(state) orelse return 0;
     const msg_z = lua.toString(1) catch return 0;
-    const msg: []const u8 = msg_z;
-    // Copy: the Lua string is GC-owned and dies with the callback.
-    const n = @min(msg.len, editor.status_buf.len);
-    @memcpy(editor.status_buf[0..n], msg[0..n]);
-    editor.status_message = editor.status_buf[0..n];
+    // Copied: the Lua string is GC-owned and dies with the callback.
+    setStatusText(editor, "", msg_z);
     return 0;
 }
 
 // ---------------------------------------------------------------------------
 // Buffer API — all calls act on the active document. Lines and columns
-// are 1-based on the Lua side. Mutations go through Document ops only,
-// so undo history and LSP sync stay correct.
+// are 1-based on the Lua side; columns count BYTES (see the module doc).
+// Mutations go through Document ops only, so undo history and LSP sync
+// stay correct. Mutators return true, or nil plus a message.
 // ---------------------------------------------------------------------------
+
+/// `nil, message` for a buffer call that changed nothing.
+fn editFailure(lua: *Lua, comptime api: []const u8, message: []const u8) c_int {
+    std.log.warn(api ++ ": {s}", .{message});
+    lua.pushNil();
+    _ = lua.pushString(message);
+    return 2;
+}
 
 /// zide.line_count() -> integer
 fn luaLineCount(state: ?*zlua.LuaState) callconv(.c) c_int {
@@ -421,7 +513,8 @@ fn luaGetText(state: ?*zlua.LuaState) callconv(.c) c_int {
     return 1;
 }
 
-/// zide.cursor() -> line, col (primary cursor, both 1-based).
+/// zide.cursor() -> line, col (primary cursor; 1-based line and 1-based
+/// byte column).
 fn luaCursor(state: ?*zlua.LuaState) callconv(.c) c_int {
     var lua: *Lua = @ptrCast(@alignCast(state orelse return 0));
     const editor = lua_settings.getEditor(state) orelse return 0;
@@ -431,8 +524,10 @@ fn luaCursor(state: ?*zlua.LuaState) callconv(.c) c_int {
     return 2;
 }
 
-/// zide.set_cursor(line, col) — move the primary cursor (clamped); drops
-/// secondary cursors and any selection.
+/// zide.set_cursor(line, col) — move the primary cursor; drops secondary
+/// cursors and any selection. 1-based line and byte column, clamped to the
+/// document and the line end; a column inside a multi-byte character lands
+/// at that character's start.
 fn luaSetCursor(state: ?*zlua.LuaState) callconv(.c) c_int {
     var lua: *Lua = @ptrCast(@alignCast(state orelse return 0));
     const editor = lua_settings.getEditor(state) orelse return 0;
@@ -441,14 +536,14 @@ fn luaSetCursor(state: ?*zlua.LuaState) callconv(.c) c_int {
     const col_arg = lua.toInteger(2) catch 1;
 
     const line: usize = @intCast(std.math.clamp(line_arg, 1, @as(i64, @intCast(doc.lineCount()))) - 1);
-    const line_len = doc.lineContent(line).len;
-    const col: usize = @intCast(std.math.clamp(col_arg - 1, 0, @as(i64, @intCast(line_len))));
+    const col: usize = if (col_arg < 1) 0 else std.math.cast(usize, col_arg - 1) orelse std.math.maxInt(usize);
+    const offset = cursor_mod.lineOffset(&doc.buffer, line, col);
 
     doc.cursors.clearSecondary();
     const c = doc.cursors.primary();
     c.clearSelection();
-    c.offset = doc.buffer.posToOffset(line, col);
-    c.preferred_col = col;
+    c.offset = offset;
+    c.preferred_col = offset - doc.buffer.line_starts.items[line];
     return 0;
 }
 
@@ -488,59 +583,73 @@ fn luaSelection(state: ?*zlua.LuaState) callconv(.c) c_int {
     return 1;
 }
 
-/// zide.insert(text) — insert at the primary cursor; an active selection
-/// is replaced (single undo step). This is also the "replace selection".
+/// zide.insert(text) -> true | nil, err — insert at the primary cursor; an
+/// active selection is replaced (single undo step). This is also the
+/// "replace selection". Text that isn't valid UTF-8 is refused.
 fn luaInsert(state: ?*zlua.LuaState) callconv(.c) c_int {
     var lua: *Lua = @ptrCast(@alignCast(state orelse return 0));
     const editor = lua_settings.getEditor(state) orelse return 0;
-    const text_z = lua.toString(1) catch {
-        std.log.warn("zide.insert: text (string) required", .{});
-        return 0;
-    };
-    editor.activeDoc().insertAtCursor(text_z) catch |err| {
-        std.log.warn("zide.insert failed: {s}", .{@errorName(err)});
-    };
-    return 0;
+    const text: []const u8 = lua.toString(1) catch return editFailure(lua, "zide.insert", "text (string) required");
+    if (!std.unicode.utf8ValidateSlice(text)) return editFailure(lua, "zide.insert", "invalid UTF-8");
+    const doc = editor.activeDoc();
+    // Carets only sit between characters; snap one that arrived inside a
+    // sequence so the insert can't split it.
+    const c = doc.cursors.primary();
+    c.offset = cursor_mod.floorBoundary(&doc.buffer, c.offset);
+    if (c.anchor) |a| c.anchor = cursor_mod.floorBoundary(&doc.buffer, a);
+    doc.insertAtCursor(text) catch |err| return editFailure(lua, "zide.insert", @errorName(err));
+    lua.pushBoolean(true);
+    return 1;
 }
 
-/// zide.set_line(n, text) — replace line n's content (one undo step).
-/// Out-of-range lines are ignored.
+/// zide.set_line(n, text) -> true | nil, err — replace line n's content
+/// (one undo step). Every caret and selection end on that line keeps its
+/// byte column (clamped to the new line, snapped to a character start);
+/// secondary cursors stay. Out-of-range lines and text that isn't valid
+/// UTF-8 change nothing.
 fn luaSetLine(state: ?*zlua.LuaState) callconv(.c) c_int {
     var lua: *Lua = @ptrCast(@alignCast(state orelse return 0));
     const editor = lua_settings.getEditor(state) orelse return 0;
     const doc = editor.activeDoc();
-    const n = lua.toInteger(1) catch return 0;
-    const text_z = lua.toString(2) catch {
-        std.log.warn("zide.set_line: text (string) required", .{});
-        return 0;
-    };
-    if (n < 1 or @as(usize, @intCast(n)) > doc.lineCount()) {
-        std.log.warn("zide.set_line: line {d} out of range", .{n});
-        return 0;
-    }
+    const n = lua.toInteger(1) catch return editFailure(lua, "zide.set_line", "line number (integer) required");
+    const text: []const u8 = lua.toString(2) catch return editFailure(lua, "zide.set_line", "text (string) required");
+    if (n < 1 or n > doc.lineCount()) return editFailure(lua, "zide.set_line", "line out of range");
+    if (!std.unicode.utf8ValidateSlice(text)) return editFailure(lua, "zide.set_line", "invalid UTF-8");
     const line: usize = @intCast(n - 1);
-    const start = doc.buffer.posToOffset(line, 0);
+    const start = doc.buffer.line_starts.items[line];
     const old_len = doc.lineContent(line).len;
 
-    doc.beginEdit() catch return 0;
-    defer doc.endEdit();
-    doc.cursors.clearSecondary();
-    const c = doc.cursors.primary();
-    if (old_len > 0) {
-        c.anchor = start;
-        c.offset = start + old_len;
-        doc.deleteSelection() catch |err| {
-            std.log.warn("zide.set_line failed: {s}", .{@errorName(err)});
-            return 0;
-        };
-    } else {
-        c.clearSelection();
-        c.offset = start;
-    }
-    doc.insertAtCursor(text_z) catch |err| {
-        std.log.warn("zide.set_line failed: {s}", .{@errorName(err)});
+    // Byte column of every caret / anchor on the line, restored after the
+    // edit (Document.commit moves carets at the replaced range to its end).
+    const Saved = struct { offset: ?usize, anchor: ?usize };
+    const saved = editor.allocator.alloc(Saved, doc.cursors.count()) catch return editFailure(lua, "zide.set_line", "OutOfMemory");
+    defer editor.allocator.free(saved);
+    for (doc.cursors.cursors.items, saved) |c, *s| s.* = .{
+        .offset = columnOnLine(c.offset, start, old_len),
+        .anchor = if (c.anchor) |a| columnOnLine(a, start, old_len) else null,
     };
-    return 0;
+
+    // One explicit edit so the undo entry records the restored carets.
+    doc.beginEdit() catch |err| return editFailure(lua, "zide.set_line", @errorName(err));
+    defer doc.endEdit();
+    doc.applyRanges(&.{.{ .start = start, .end = start + old_len, .text = text }}) catch |err| return editFailure(lua, "zide.set_line", @errorName(err));
+    const kept = @min(doc.cursors.cursors.items.len, saved.len); // the edit adds or drops no cursor
+    for (doc.cursors.cursors.items[0..kept], saved[0..kept]) |*c, s| {
+        if (s.offset) |col| {
+            c.offset = cursor_mod.lineOffset(&doc.buffer, line, col);
+            c.preferred_col = c.offset - start;
+        }
+        if (s.anchor) |col| c.anchor = cursor_mod.lineOffset(&doc.buffer, line, col);
+    }
+    doc.cursors.mergeCursors();
+    lua.pushBoolean(true);
+    return 1;
+}
+
+/// Column of `offset` on the line spanning [start, start + len] (its end
+/// included: a caret at the line end), or null when it lies elsewhere.
+fn columnOnLine(offset: usize, start: usize, len: usize) ?usize {
+    return if (offset >= start and offset <= start + len) offset - start else null;
 }
 
 // ---------------------------------------------------------------------------
@@ -600,7 +709,30 @@ pub fn setLuaWake(editor: *Editor, wake: ?*const fn () void) void {
     for (editor.lsp_clients.items) |client| client.setWake(wake);
 }
 
+/// Editor whose file tree is rebuilt at its next pumpLuaJobs (a runtime
+/// zide.set("filetree_root"); see deferTreeReset). Main thread only.
+var tree_reset_for: ?*Editor = null;
+
+/// Drop `editor`'s file tree at the next main-loop pump instead of now.
+/// zide.set can run inside a frontend's tree handler (an "open" hook fired
+/// by a tree click), which keeps using the tree after the hook returns;
+/// both frontends pump after input handling and before drawing.
+pub fn deferTreeReset(editor: *Editor) void {
+    tree_reset_for = editor;
+}
+
+fn applyTreeReset(editor: *Editor) void {
+    const target = tree_reset_for orelse return;
+    if (target != editor) return;
+    tree_reset_for = null;
+    if (editor.filetree) |*ft| {
+        ft.deinit();
+        editor.filetree = null; // recreated from filetree_root on next use
+    }
+}
+
 pub fn pumpLuaJobs(editor: *Editor) void {
+    applyTreeReset(editor);
     var index: usize = 0;
     while (index < editor.lua_jobs.items.len) {
         const pending = editor.lua_jobs.items[index];
@@ -646,39 +778,87 @@ fn pushRunResult(lua: *Lua, code: ?i64, stdout_text: []const u8, stderr_text: []
     }
 }
 
+/// Longest zide.run timeout: 2^40 ms (~35 years). Far inside the i96
+/// nanosecond range of Io timestamps, so the deadline math can't overflow.
+const max_run_timeout_ms: i64 = 1 << 40;
+
+/// zide.run's timeout argument in milliseconds, or null for no deadline
+/// (absent, nil or not a number). Clamped to [0, max_run_timeout_ms]; a
+/// fractional value is floored (2.5 → 2 ms) and NaN counts as 0.
+fn runTimeoutMs(lua: *Lua, index: i32) ?i64 {
+    if (lua.typeOf(index) != .number) return null;
+    if (lua.isInteger(index)) {
+        const ms = lua.toInteger(index) catch return null;
+        return std.math.clamp(ms, 0, max_run_timeout_ms);
+    }
+    const f = lua.toNumber(index) catch return null;
+    if (!(f > 0)) return 0; // negative, zero or NaN
+    if (f >= @as(f64, @floatFromInt(max_run_timeout_ms))) return max_run_timeout_ms;
+    return @intFromFloat(@floor(f));
+}
+
+/// `nil, message` from zide.run.
+fn runFailure(lua: *Lua, message: []const u8) c_int {
+    lua.pushNil();
+    _ = lua.pushString(message);
+    return 2;
+}
+
 /// zide.run(argv [, timeout_ms]) -> table | nil, err — run a tool and
 /// block until it exits (UI freezes meanwhile: fast tools only; use
-/// zide.spawn for anything slow). On timeout the child is killed.
+/// zide.spawn for anything slow).
+///
+/// Runs through the job manager like zide.spawn: the tool and everything
+/// it starts share one process group (a job object on Windows), and the
+/// timeout is a total deadline. When it passes the whole group is killed
+/// and `nil, "Timeout"` returns — a tool that keeps printing (ping -t, a
+/// watcher) can't hold the UI past it. Output beyond the cap (4 MiB +
+/// 256 KiB, stdout and stderr together) is dropped; the tool runs on.
 fn luaRun(state: ?*zlua.LuaState) callconv(.c) c_int {
-    var lua: *Lua = @ptrCast(@alignCast(state orelse return 0));
+    const lua: *Lua = @ptrCast(@alignCast(state orelse return 0));
     const editor = lua_settings.getEditor(state) orelse return 0;
 
-    const argv = readArgvAlloc(lua, editor.allocator, 1) orelse {
-        lua.pushNil();
-        _ = lua.pushString("zide.run: argv table of strings required");
-        return 2;
-    };
+    const argv = readArgvAlloc(lua, editor.allocator, 1) orelse return runFailure(lua, "zide.run: argv table of strings required");
     defer freeArgv(editor.allocator, argv);
+    const timeout_ms = runTimeoutMs(lua, 2);
 
-    const timeout_ms: ?i64 = if (lua.typeOf(2) == .number) (lua.toInteger(2) catch null) else null;
-
-    const res = std.process.run(editor.allocator, editor.io, .{
+    const id = editor.jobs.start(.{
         .argv = argv,
-        .stdout_limit = .limited(spawn_stdout_limit),
-        .stderr_limit = .limited(spawn_stderr_limit),
-        .timeout = if (timeout_ms) |ms| .{ .duration = .{ .raw = .fromMilliseconds(ms), .clock = .awake } } else .none,
-    }) catch |err| {
-        lua.pushNil();
-        _ = lua.pushString(@errorName(err));
-        return 2;
-    };
-    defer editor.allocator.free(res.stdout);
-    defer editor.allocator.free(res.stderr);
-    const code: ?i64 = switch (res.term) {
-        .exited => |c| c,
-        else => null,
-    };
-    pushRunResult(lua, code, res.stdout, res.stderr, if (code == null) "AbnormalExit" else null);
+        .output_limit = spawn_stdout_limit + spawn_stderr_limit,
+        .strict_output = false,
+    }) catch |err| return runFailure(lua, @errorName(err));
+    defer editor.jobs.remove(id);
+    const job = editor.jobs.get(id) orelse return runFailure(lua, "JobVanished");
+
+    // A total deadline (what Io.Timeout.toDeadline computes), checked
+    // between polls; std.process.run's timeout restarted on every read.
+    const deadline: ?std.Io.Clock.Timestamp = if (timeout_ms) |ms|
+        .fromNow(editor.io, .{ .raw = .fromMilliseconds(ms), .clock = .awake })
+    else
+        null;
+    // Poll with a short backoff: fast tools return within a millisecond or
+    // two of exiting; long ones cost ~100 wakeups a second.
+    var nap_ms: i64 = 1;
+    while (!job.isDone()) {
+        if (deadline) |d| {
+            if (std.Io.Clock.Timestamp.now(editor.io, .awake).compare(.gte, d)) {
+                editor.jobs.cancel(id); // kills the process group; returns once the worker finished
+                break;
+            }
+        }
+        editor.io.sleep(.fromMilliseconds(nap_ms), .awake) catch {
+            editor.jobs.cancel(id);
+            break;
+        };
+        nap_ms = @min(nap_ms * 2, 10);
+    }
+
+    const result = job.snapshot(editor.allocator, true) catch |err| return runFailure(lua, @errorName(err));
+    defer result.deinit(editor.allocator);
+    // `cancelled` is only set when the cancel beat the tool's exit.
+    if (result.cancelled) return runFailure(lua, "Timeout");
+    if (result.failure) |err| if (err != error.AbnormalExit) return runFailure(lua, @errorName(err));
+    pushRunResult(lua, if (result.code) |code| @as(i64, code) else null, result.stdout, result.stderr, if (result.failure) |err| @errorName(err) else null);
     return 1;
 }
 
@@ -717,20 +897,62 @@ fn luaSpawn(state_arg: ?*zlua.LuaState) callconv(.c) c_int {
 // marker, underline, status bar) via Document.diagIter.
 // ---------------------------------------------------------------------------
 
-/// Integer field of the diagnostic table at the top of the stack.
+/// Integer field of the diagnostic table at the top of the stack (raw
+/// access: see lua_settings.getFieldRaw). Floats with no integer value
+/// read as absent.
 fn diagFieldInt(lua: *Lua, field: [:0]const u8) ?i64 {
-    _ = lua.getField(-1, field);
+    _ = lua_settings.getFieldRaw(lua, -1, field);
     defer lua.pop(1);
     if (lua.typeOf(-1) != .number) return null;
     return lua.toInteger(-1) catch null;
 }
 
-/// String field of the diagnostic table at the top of the stack.
+/// String field of the diagnostic table at the top of the stack (raw
+/// access). The slice stays valid while the table does.
 fn diagFieldString(lua: *Lua, field: [:0]const u8) ?[:0]const u8 {
-    _ = lua.getField(-1, field);
+    _ = lua_settings.getFieldRaw(lua, -1, field);
     defer lua.pop(1);
     if (lua.typeOf(-1) != .string) return null;
     return lua.toString(-1) catch null;
+}
+
+/// diagnostics.Store.replace refuses more per call; later entries are
+/// dropped (with a warning) instead of losing the whole list.
+const max_lint_diagnostics = 10_000;
+
+/// A 1-based column from Lua as a 1-based u32 (garbled linter numbers
+/// saturate instead of overflowing; snapping then clamps to the line).
+fn clampColumn(col: i64) u32 {
+    return @intCast(std.math.clamp(col, 1, std.math.maxInt(u32)));
+}
+
+/// 0-based byte span of one diagnostic on `line`. With the document open,
+/// both ends are snapped to character starts within the line — the GUI
+/// slices the line text at these columns — and a missing end covers the
+/// character at `start` (one byte used to split "é", CJK and emoji).
+/// Otherwise the columns are kept (the GUI clamps them when the file opens).
+fn diagnosticSpan(doc: ?*const Document, line: u32, start: u32, end: ?u32) struct { start: u32, end: u32 } {
+    const d = doc orelse return .{ .start = start, .end = @max(end orelse start +| 1, start) };
+    if (line >= d.buffer.lineCount()) return .{ .start = start, .end = @max(end orelse start +| 1, start) };
+    const buf: *const Buffer = &d.buffer;
+    const line_start = buf.line_starts.items[line];
+    const line_end = cursor_mod.lineOffset(buf, line, std.math.maxInt(usize));
+    const s = cursor_mod.lineOffset(buf, line, start);
+    const e = if (end) |col|
+        @max(cursor_mod.lineOffset(buf, line, col), s)
+    else if (s < line_end)
+        @min(cursor_mod.nextBoundary(buf, s), line_end)
+    else
+        s;
+    return .{ .start = std.math.lossyCast(u32, s - line_start), .end = std.math.lossyCast(u32, e - line_start) };
+}
+
+/// The open document for `path` (separator/case-insensitive match), if any.
+fn openDocument(editor: *Editor, path: []const u8) ?*Document {
+    for (editor.documents.items) |*doc| {
+        if (doc.file_path) |p| if (editor.pathsEqual(p, path)) return doc;
+    }
+    return null;
 }
 
 fn severityFromName(name: []const u8) lsp_mod.DiagnosticSeverity {
@@ -740,12 +962,6 @@ fn severityFromName(name: []const u8) lsp_mod.DiagnosticSeverity {
     return .err; // "error" and anything else — linters mostly report errors
 }
 
-/// zide.set_diagnostics(path, {{line, col, end_col, severity, message}, …})
-/// Replaces the extension diagnostics of the open document at `path`
-/// (1-based positions; severity: "error"/"warning"/"info"/"hint", default
-/// "error"). Pass an empty table to clear. Paths that aren't open are
-/// ignored. Positions go stale as the user edits — same as LSP, the next
-/// lint run replaces them.
 /// zide.set_icon(key, kind [, "#rrggbb"]) — override a file tree icon.
 /// `key` is an extension ("zig") or exact basename ("Makefile", "src");
 /// `kind` is one of the fileicons.IconKind tag names ("code", "image",
@@ -784,6 +1000,17 @@ fn luaSetIcon(state: ?*zlua.LuaState) callconv(.c) c_int {
     return 0;
 }
 
+/// zide.set_diagnostics(path, {{line, col, end_col, severity, message}, …})
+/// Replaces the extension diagnostics of the open document at `path`
+/// (severity: "error"/"warning"/"info"/"hint", default "error"). Pass an
+/// empty table to clear. Findings for paths that aren't open are kept for
+/// when they open. Positions go stale as the user edits — same as LSP, the
+/// next lint run replaces them.
+///
+/// `line` is 1-based; `col`/`end_col` are 1-based BYTE columns (default
+/// col 1; default end: one character past col). A line that isn't a
+/// positive 32-bit number drops that entry; huge columns saturate, and
+/// columns are snapped to character starts of the open document's line.
 fn luaSetDiagnostics(state: ?*zlua.LuaState) callconv(.c) c_int {
     var lua: *Lua = @ptrCast(@alignCast(state orelse return 0));
     const editor = lua_settings.getEditor(state) orelse return 0;
@@ -796,32 +1023,38 @@ fn luaSetDiagnostics(state: ?*zlua.LuaState) callconv(.c) c_int {
         std.log.warn("zide.set_diagnostics: second argument must be a table", .{});
         return 0;
     }
-    const source = lua.toString(3) catch "lint";
-    var diagnostics: std.ArrayList(@import("lsp.zig").Diagnostic) = .empty;
+    const source: []const u8 = blk: {
+        const s: []const u8 = lua.toString(3) catch break :blk "lint";
+        break :blk if (std.unicode.utf8ValidateSlice(s)) s else "lint";
+    };
+    const target = openDocument(editor, path_z);
+    var diagnostics: std.ArrayList(lsp_mod.Diagnostic) = .empty;
     defer {
         for (diagnostics.items) |diagnostic| diagnostic.deinit(editor.allocator);
         diagnostics.deinit(editor.allocator);
     }
     const len = lua.lenRaw(2);
+    if (len > max_lint_diagnostics) std.log.warn("zide.set_diagnostics: {d} entries; keeping the first {d}", .{ len, max_lint_diagnostics });
     var i: usize = 1;
-    while (i <= len) : (i += 1) {
+    while (i <= @min(len, max_lint_diagnostics)) : (i += 1) {
         _ = lua.getIndexRaw(2, @intCast(i));
         defer lua.pop(1);
         if (lua.typeOf(-1) != .table) continue;
 
-        const line = diagFieldInt(lua, "line") orelse continue;
+        const line = std.math.cast(u32, diagFieldInt(lua, "line") orelse continue) orelse continue;
         if (line < 1) continue;
-        const col = @max(diagFieldInt(lua, "col") orelse 1, 1);
-        const end_col = @max(diagFieldInt(lua, "end_col") orelse (col + 1), col);
+        const col = clampColumn(diagFieldInt(lua, "col") orelse 1);
+        const end_col: ?u32 = if (diagFieldInt(lua, "end_col")) |e| clampColumn(e) else null;
         const severity = severityFromName(diagFieldString(lua, "severity") orelse "error");
         const message = diagFieldString(lua, "message") orelse "";
+        const span = diagnosticSpan(target, line - 1, col - 1, if (end_col) |e| e - 1 else null);
 
-        const owned_msg = editor.allocator.dupe(u8, message) catch continue;
+        const owned_msg = dupeUtf8(editor.allocator, message) catch continue;
         diagnostics.append(editor.allocator, .{
-            .start_line = @intCast(line - 1),
-            .start_col = @intCast(col - 1),
-            .end_line = @intCast(line - 1),
-            .end_col = @intCast(end_col - 1),
+            .start_line = line - 1,
+            .start_col = span.start,
+            .end_line = line - 1,
+            .end_col = span.end,
             .severity = severity,
             .message = owned_msg,
         }) catch {
@@ -1065,6 +1298,9 @@ test "buffer API: reads, cursor round-trip, clamping" {
         \\zide.set_cursor(99, 99) -- clamps to end of last line
         \\l, c = zide.cursor()
         \\assert(l == 2 and c == 5)
+        \\zide.set_cursor(math.mininteger, math.mininteger) -- clamps without i64 overflow
+        \\l, c = zide.cursor()
+        \\assert(l == 1 and c == 1)
     );
 }
 
@@ -1142,6 +1378,139 @@ test "buffer API: set_line on an empty line and language()" {
     try testing.expectEqualStrings(editor.languages.items[0].name, editor.status_message);
 }
 
+test "buffer API: byte columns inside a character snap to its start" {
+    var lua = try Lua.init(testing.allocator);
+    defer lua.deinit();
+    lua.openLibs();
+    var editor = try Editor.init(testing.allocator, testing.io);
+    defer editor.deinit();
+    lua_settings.registerApi(lua, &editor);
+
+    const doc = editor.activeDoc();
+    try doc.loadText("\u{e9}a\n\u{1F600}z");
+    // Column 2 is the second byte of "é": the caret lands before "é".
+    try lua.doString(
+        \\zide.set_cursor(1, 2)
+        \\local l, c = zide.cursor()
+        \\assert(l == 1 and c == 1, l .. ':' .. c)
+        \\zide.set_cursor(1, 3) -- "a" starts at byte 3
+        \\l, c = zide.cursor()
+        \\assert(c == 3)
+        \\zide.set_cursor(2, 4) -- inside the 4-byte emoji
+        \\l, c = zide.cursor()
+        \\assert(l == 2 and c == 1)
+    );
+    try testing.expectEqual(@as(usize, 4), doc.cursors.primary().offset);
+    // Inserting there keeps the text valid (it used to split the emoji).
+    try lua.doString("assert(zide.insert('x') == true)");
+    try testing.expectEqualStrings("\u{e9}a\nx\u{1F600}z", doc.buffer.slice(0, doc.buffer.byteLen()));
+}
+
+test "buffer API: insert and set_line refuse invalid UTF-8" {
+    testing.log_level = .err; // the refusals warn
+    defer testing.log_level = .warn;
+    var lua = try Lua.init(testing.allocator);
+    defer lua.deinit();
+    lua.openLibs();
+    var editor = try Editor.init(testing.allocator, testing.io);
+    defer editor.deinit();
+    lua_settings.registerApi(lua, &editor);
+
+    const doc = editor.activeDoc();
+    try doc.loadText("keep");
+    try lua.doString(
+        \\local ok, err = zide.insert('\xC3\x28')
+        \\assert(ok == nil and err == 'invalid UTF-8', tostring(err))
+        \\ok, err = zide.set_line(1, 'bad\xFF')
+        \\assert(ok == nil and err == 'invalid UTF-8', tostring(err))
+        \\ok, err = zide.set_line(9, 'x')
+        \\assert(ok == nil and err == 'line out of range', tostring(err))
+        \\assert(zide.set_line(1, 'kept \u{E9}') == true)
+    );
+    try testing.expectEqualStrings("kept \u{e9}", doc.buffer.slice(0, doc.buffer.byteLen()));
+    _ = try doc.undoAction();
+    try testing.expectEqualStrings("keep", doc.buffer.slice(0, doc.buffer.byteLen()));
+    try testing.expect(!try doc.undoAction()); // the refused calls left no history
+}
+
+test "buffer API: set_line keeps caret columns and secondary cursors" {
+    var lua = try Lua.init(testing.allocator);
+    defer lua.deinit();
+    lua.openLibs();
+    var editor = try Editor.init(testing.allocator, testing.io);
+    defer editor.deinit();
+    lua_settings.registerApi(lua, &editor);
+
+    const doc = editor.activeDoc();
+    try doc.loadText("- [ ] task one\nsecond line");
+    doc.cursors.primary().offset = 3; // inside the checkbox
+    try doc.cursors.addCursor(20); // on line 2
+    // The shipped markdown.lua toggle_checkbox body, verbatim.
+    try lua.doString(
+        \\zide.command("toggle_checkbox", "Toggle markdown task checkbox on cursor line", function()
+        \\  local line = zide.cursor()
+        \\  local text = zide.get_line(line)
+        \\  if text == nil then return end
+        \\  local s, n = text:gsub("%[ %]", "[x]", 1)
+        \\  if n == 0 then
+        \\    s, n = text:gsub("%[[xX]%]", "[ ]", 1)
+        \\  end
+        \\  if n > 0 then
+        \\    zide.set_line(line, s)
+        \\  else
+        \\    zide.status("No checkbox on this line")
+        \\  end
+        \\end)
+    );
+    try testing.expect(editor.execCommand("toggle_checkbox", null));
+    try testing.expectEqualStrings("- [x] task one\nsecond line", doc.buffer.slice(0, doc.buffer.byteLen()));
+    try testing.expectEqual(@as(usize, 3), doc.cursors.primary().offset);
+    try testing.expectEqual(@as(usize, 2), doc.cursors.count());
+    try testing.expectEqual(@as(usize, 20), doc.cursors.cursors.items[1].offset);
+
+    // A shorter line clamps the caret to its end, a line with the caret in
+    // a multi-byte character snaps it to that character's start, and later
+    // lines shift with the edit.
+    doc.cursors.primary().offset = 10;
+    try lua.doString("assert(zide.set_line(1, 'ab') == true)");
+    try testing.expectEqualStrings("ab\nsecond line", doc.buffer.slice(0, doc.buffer.byteLen()));
+    try testing.expectEqual(@as(usize, 2), doc.cursors.primary().offset);
+    try testing.expectEqual(@as(usize, 8), doc.cursors.cursors.items[1].offset);
+    doc.cursors.primary().offset = 2;
+    try lua.doString("assert(zide.set_line(1, '\u{E9}\u{E9}') == true)");
+    try testing.expectEqual(@as(usize, 2), doc.cursors.primary().offset);
+    try lua.doString("zide.set_line(1, 'x\u{E9}')"); // byte 2 is inside the new "é"
+    try testing.expectEqual(@as(usize, 1), doc.cursors.primary().offset);
+    // Undo restores the text and the caret the edit started from.
+    _ = try doc.undoAction();
+    try testing.expectEqualStrings("\u{e9}\u{e9}\nsecond line", doc.buffer.slice(0, doc.buffer.byteLen()));
+    try testing.expectEqual(@as(usize, 2), doc.cursors.primary().offset);
+}
+
+test "zide.status and extension errors are cut on a character boundary" {
+    testing.log_level = .err; // the reported Lua error warns
+    defer testing.log_level = .warn;
+    var lua = try Lua.init(testing.allocator);
+    defer lua.deinit();
+    lua.openLibs();
+    var editor = try Editor.init(testing.allocator, testing.io);
+    defer editor.deinit();
+    lua_settings.registerApi(lua, &editor);
+
+    // 201 bytes: the 128-byte bar would end mid-"é" at 128; it stops at 127.
+    try lua.doString("zide.status('a' .. string.rep('\u{E9}', 100))");
+    try testing.expectEqual(@as(usize, 127), editor.status_message.len);
+    try testing.expect(std.unicode.utf8ValidateSlice(editor.status_message));
+    // Malformed bytes show as U+FFFD, control characters as spaces.
+    try lua.doString("zide.status('bad\\xFF\\nline')");
+    try testing.expectEqualStrings("bad\u{FFFD} line", editor.status_message);
+    try lua.doString("zide.command('boom', '', function() error(string.rep('\u{1F600}', 60)) end)");
+    try testing.expect(editor.execCommand("boom", null));
+    try testing.expect(std.mem.startsWith(u8, editor.status_message, "Extension error: "));
+    try testing.expect(std.unicode.utf8ValidateSlice(editor.status_message));
+    try testing.expect(editor.status_message.len <= editor.status_buf.len);
+}
+
 test "zide.run executes a tool and returns code/stdout" {
     if (@import("builtin").os.tag != .windows) return error.SkipZigTest;
     var lua = try Lua.init(testing.allocator);
@@ -1173,6 +1542,71 @@ test "zide.run reports a missing tool as nil, err" {
         \\assert(r == nil)
         \\assert(type(err) == 'string')
     );
+}
+
+/// Milliseconds on the awake clock, for timing zide.run.
+fn nowMs() i64 {
+    return @intCast(@divTrunc(std.Io.Clock.now(.awake, testing.io).nanoseconds, std.time.ns_per_ms));
+}
+
+test "zide.run timeout is a total deadline, even for a tool that keeps printing" {
+    var lua = try Lua.init(testing.allocator);
+    defer lua.deinit();
+    lua.openLibs();
+    var editor = try Editor.init(testing.allocator, testing.io);
+    defer editor.deinit();
+    lua_settings.registerApi(lua, &editor);
+
+    // Output never pauses, so the old per-read timeout never fired (and on
+    // Windows the loop would run for minutes). The whole group is killed.
+    try lua.doString(if (@import("builtin").os.tag == .windows)
+        \\ticker = { 'cmd', '/c', 'for /L %i in (1,1,100000000) do @echo tick' }
+    else
+        \\ticker = { 'sh', '-c', 'while :; do echo tick; sleep 0.2; done' }
+    );
+    const t0 = nowMs();
+    try lua.doString(
+        \\local r, err = zide.run(ticker, 1000)
+        \\assert(r == nil and err == 'Timeout', tostring(err))
+    );
+    const elapsed = nowMs() - t0;
+    try testing.expect(elapsed >= 1000);
+    try testing.expect(elapsed < 4000); // generous for a loaded machine
+    try testing.expectEqual(@as(usize, 0), editor.jobs.jobs.items.len);
+}
+
+test "zide.run clamps huge, negative and fractional timeouts" {
+    var lua = try Lua.init(testing.allocator);
+    defer lua.deinit();
+    lua.openLibs();
+    var editor = try Editor.init(testing.allocator, testing.io);
+    defer editor.deinit();
+    lua_settings.registerApi(lua, &editor);
+
+    try lua.doString(if (@import("builtin").os.tag == .windows)
+        \\quick = { 'cmd', '/c', 'echo quick' }
+        \\slow = { 'ping', '-n', '3', '127.0.0.1' }
+    else
+        \\quick = { 'sh', '-c', 'echo quick' }
+        \\slow = { 'sh', '-c', 'sleep 2' }
+    );
+    try lua.doString(
+        \\-- math.maxinteger used to panic inside std; now it's ~35 years.
+        \\local r, err = zide.run(quick, math.maxinteger)
+        \\assert(r and r.code == 0 and r.stdout:find('quick'), tostring(err))
+        \\r, err = zide.run(quick, math.huge)
+        \\assert(r and r.code == 0, tostring(err))
+        \\-- Negative clamps to 0: the deadline has passed before the tool ends.
+        \\r, err = zide.run(slow, -5)
+        \\assert(r == nil and err == 'Timeout', tostring(err))
+        \\-- 2.5 is floored to 2 ms (it used to mean "no timeout").
+        \\r, err = zide.run(slow, 2.5)
+        \\assert(r == nil and err == 'Timeout', tostring(err))
+        \\-- nil and non-numbers mean no deadline.
+        \\r, err = zide.run(quick, nil)
+        \\assert(r and r.code == 0, tostring(err))
+    );
+    try testing.expectEqual(@as(usize, 0), editor.jobs.jobs.items.len);
 }
 
 test "zide.spawn delivers the result through pumpLuaJobs" {
@@ -1269,6 +1703,75 @@ test "zide.set_diagnostics fills, replaces, merges, and clears" {
     // Empty table clears
     try lua.doString("zide.set_diagnostics('C:/fake/lint_target.zig', {})");
     try testing.expectEqual(@as(usize, 0), doc.lint_diagnostics.items.len);
+}
+
+test "zide.set_diagnostics snaps columns to character starts" {
+    var lua = try Lua.init(testing.allocator);
+    defer lua.deinit();
+    lua.openLibs();
+    var editor = try Editor.init(testing.allocator, testing.io);
+    defer editor.deinit();
+    lua_settings.registerApi(lua, &editor);
+
+    const doc = editor.activeDoc();
+    try doc.loadText("\u{e9}lan \u{1F600}!\r\n\u{754C}");
+    try doc.setFilePath("C:/fake/utf8_lint.zig");
+    try lua.doString(
+        \\zide.set_diagnostics('C:/fake/utf8_lint.zig', {
+        \\  { line = 1, message = 'default end covers the whole é' },
+        \\  { line = 1, col = 2, end_col = 9, message = 'both ends inside characters' },
+        \\  { line = 1, col = 99, message = 'past the end of a CRLF line' },
+        \\  { line = 2, col = 2, message = 'inside a CJK character' },
+        \\  { line = 7, col = 3, message = 'no such line: kept as given' },
+        \\})
+    );
+    const d = doc.lint_diagnostics.items;
+    try testing.expectEqual(@as(usize, 5), d.len);
+    const expected = [_][2]u32{ .{ 0, 2 }, .{ 0, 6 }, .{ 11, 11 }, .{ 0, 3 }, .{ 2, 3 } };
+    for (d, expected) |diag, want| {
+        try testing.expectEqual(want[0], diag.start_col);
+        try testing.expectEqual(want[1], diag.end_col);
+    }
+    // Every snapped end is a character boundary of its line.
+    for (d[0..4]) |diag| {
+        const text = doc.lineContent(diag.start_line);
+        for ([_]u32{ diag.start_col, diag.end_col }) |col| {
+            try testing.expect(col <= text.len);
+            if (col < text.len) try testing.expect(text[col] & 0xC0 != 0x80);
+        }
+    }
+}
+
+test "zide.set_diagnostics survives out-of-range numbers" {
+    var lua = try Lua.init(testing.allocator);
+    defer lua.deinit();
+    lua.openLibs();
+    var editor = try Editor.init(testing.allocator, testing.io);
+    defer editor.deinit();
+    lua_settings.registerApi(lua, &editor);
+
+    const doc = editor.activeDoc();
+    try doc.loadText("short\n");
+    try doc.setFilePath("C:/fake/huge_numbers.zig");
+    // These used to panic: @intCast of 5e9 to u32, and col + 1 overflowing.
+    try lua.doString(
+        \\zide.set_diagnostics('C:/fake/huge_numbers.zig', {
+        \\  { line = 5000000000, message = 'dropped: no 32-bit line' },
+        \\  { line = math.mininteger, message = 'dropped' },
+        \\  { line = 1, col = math.maxinteger, message = 'kept at the line end' },
+        \\  { line = 1, col = math.mininteger, end_col = math.maxinteger, message = 'whole line' },
+        \\  { line = 1, col = 2.5, message = 'non-integer col reads as absent' },
+        \\})
+    );
+    const d = doc.lint_diagnostics.items;
+    try testing.expectEqual(@as(usize, 3), d.len);
+    try testing.expectEqual(@as(u32, 5), d[0].start_col);
+    try testing.expectEqual(@as(u32, 5), d[0].end_col);
+    try testing.expectEqual(@as(u32, 0), d[1].start_col);
+    try testing.expectEqual(@as(u32, 5), d[1].end_col);
+    try testing.expectEqual(@as(u32, 0), d[2].start_col);
+    // A file that isn't open keeps saturated columns without overflow.
+    try lua.doString("zide.set_diagnostics('C:/fake/not_open.zig', { { line = 1, col = math.maxinteger, message = 'x' } })");
 }
 
 test "lint-zig template pattern parses ast-check output (drive-letter paths)" {
@@ -1382,6 +1885,110 @@ test "reload_extensions drops Lua commands and handlers" {
     editor.noteFileSaved(false, editor.activeDoc());
     // Handler is gone — the reload message survives the (non-)event.
     try testing.expectEqualStrings("Extensions reloaded", editor.status_message);
+}
+
+test "reload_extensions: a broken file reaches the status bar and the Lua stack stays level" {
+    testing.log_level = .err; // the load error warns
+    defer testing.log_level = .warn;
+    var lua = try Lua.init(testing.allocator);
+    defer lua.deinit();
+    lua.openLibs();
+    var editor = try Editor.init(testing.allocator, testing.io);
+    defer editor.deinit();
+    lua_settings.registerApi(lua, &editor);
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(testing.io, "extensions");
+    for ([_][2][]const u8{
+        .{ "extensions/broken.lua", "zide.command('x', '', function() end\n" },
+        // Chunk results used to stay on the host stack with every load.
+        .{ "extensions/module.lua", "zide.command('from_module', '', function() end)\nreturn {}, 'extra'\n" },
+    }) |file| {
+        const f = try tmp.dir.createFile(testing.io, file[0], .{});
+        defer f.close(testing.io);
+        try f.writeStreamingAll(testing.io, file[1]);
+    }
+    const root = try tmp.dir.realPathFileAlloc(testing.io, ".", testing.allocator);
+    defer testing.allocator.free(root);
+    lua_settings.test_config_dir = root;
+    defer lua_settings.test_config_dir = null;
+
+    const top = lua.getTop();
+    for (0..2) |_| {
+        reloadExtensions(&editor);
+        try testing.expectEqual(top, lua.getTop());
+        // "broken.lua:2: ')' expected near <eof>" (the directory is dropped)
+        try testing.expect(std.mem.startsWith(u8, editor.status_message, "broken.lua:"));
+        try testing.expect(std.mem.indexOf(u8, editor.status_message, "expected") != null);
+        try testing.expect(editor.commands.get("from_module") != null);
+    }
+    // Once the file is fixed the reload reports success again.
+    {
+        const f = try tmp.dir.createFile(testing.io, "extensions/broken.lua", .{});
+        defer f.close(testing.io);
+        try f.writeStreamingAll(testing.io, "zide.command('x', '', function() end)\n");
+    }
+    reloadExtensions(&editor);
+    try testing.expectEqualStrings("Extensions reloaded", editor.status_message);
+    try testing.expect(editor.commands.get("x") != null);
+    try testing.expectEqual(top, lua.getTop());
+}
+
+test "zide.* calls after the editor is gone are no-ops (finalizers run by lua.deinit)" {
+    var lua = try Lua.init(testing.allocator);
+    defer lua.deinit(); // runs `late`'s finalizer with no editor: must not crash
+    lua.openLibs();
+    {
+        var editor = try Editor.init(testing.allocator, testing.io);
+        defer editor.deinit();
+        lua_settings.registerApi(lua, &editor);
+        try lua.doString(
+            \\probe = setmetatable({}, { __gc = function()
+            \\  gc_saw = (zide.get_text() == nil) and 'no editor' or 'editor'
+            \\  zide.status('bye'); zide.set_line(1, 'x'); zide.insert('y')
+            \\end })
+            \\late = setmetatable({}, { __gc = function() zide.status(zide.get_text() or 'none') end })
+        );
+    }
+    try testing.expect(lua_settings.getEditor(@ptrCast(lua)) == null);
+    try lua.doString("probe = nil; collectgarbage(); collectgarbage()");
+    _ = lua.getGlobal("gc_saw");
+    defer lua.pop(1);
+    try testing.expectEqualStrings("no editor", try lua.toString(-1));
+}
+
+test "option tables are read raw: a raising __index can't unwind through Zig" {
+    testing.log_level = .err;
+    defer testing.log_level = .warn;
+    var lua = try Lua.init(testing.allocator);
+    defer lua.deinit();
+    lua.openLibs();
+    var editor = try Editor.init(testing.allocator, testing.io);
+    defer editor.deinit();
+    lua_settings.registerApi(lua, &editor);
+    const doc = editor.activeDoc();
+    try doc.loadText("one\n");
+    try doc.setFilePath("C:/fake/raw_access.zig");
+
+    // Every field these APIs read is absent from the table itself, so a
+    // non-raw read would call the raising __index — outside any pcall of
+    // ours, i.e. a longjmp past the arena/list the reader owns (leaked).
+    try lua.doString(
+        \\local mt = { __index = function(_, k) error('boom: ' .. tostring(k)) end }
+        \\local function hostile(t) return setmetatable(t, mt) end
+        \\assert(pcall(zide.register_language, hostile({ name = 'leaky' })))
+        \\assert(pcall(zide.register_lsp, hostile({ language = 'leaky', command = 'srv' })))
+        \\assert(pcall(zide.set_language, 'leaky', hostile({ tab_width = 3 })))
+        \\assert(pcall(zide.set_diagnostics, 'C:/fake/raw_access.zig', { hostile({ line = 1 }) }))
+        \\assert(pcall(zide.on, 'save', function() end, hostile({})))
+        \\assert(pcall(zide.bind, 'ctrl+alt+k', 'x', hostile({})))
+        \\assert(pcall(zide.register_snippet, hostile({ language = '*', prefix = 'rw', body = 'b' })))
+    );
+    try testing.expect(editor.findLanguageByName("leaky") != null);
+    try testing.expect(editor.lspConfigFor("leaky") != null);
+    try testing.expectEqual(@as(usize, 1), doc.lint_diagnostics.items.len);
+    try testing.expect(editor.commands.get("snippet.*.rw") != null);
 }
 
 test "register_language re-registration replaces the definition in place" {

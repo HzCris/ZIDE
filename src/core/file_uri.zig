@@ -40,9 +40,8 @@ pub fn decode(allocator: Allocator, uri: []const u8, windows: bool) ![]const u8 
     if (remote) {
         try out.appendSlice(allocator, "\\\\");
         try out.appendSlice(allocator, authority);
-    } else if (path.len >= 4 and std.ascii.isAlphabetic(path[1]) and path[2] == ':' and path[3] == '/') {
-        path = path[1..];
     }
+    const local_start = out.items.len;
     var i: usize = 0;
     while (i < path.len) {
         var c = path[i];
@@ -57,6 +56,14 @@ pub fn decode(allocator: Allocator, uri: []const u8, windows: bool) ![]const u8 
         } else i += 1;
         if (c == 0) return error.InvalidFileUri;
         try out.append(allocator, if (windows and c == '/') '\\' else c);
+    }
+    // A drive letter is checked after decoding: vscode-uri servers write
+    // `file:///c%3A/Users/…`, which must not become the rooted `\c:\Users\…`.
+    if (!remote) {
+        const local = out.items[local_start..];
+        const sep: u8 = if (windows) '\\' else '/';
+        if (local.len >= 4 and local[0] == sep and std.ascii.isAlphabetic(local[1]) and local[2] == ':' and local[3] == sep)
+            _ = out.orderedRemove(local_start);
     }
     if (!std.unicode.utf8ValidateSlice(out.items)) return error.InvalidFileUri;
     return out.toOwnedSlice(allocator);
@@ -82,4 +89,26 @@ test "file URI preserves roots and reserved filename bytes on both platforms" {
         try t.expectError(error.InvalidFileUri, decode(t.allocator, bad, false));
     try t.expectError(error.UnsupportedUriScheme, decode(t.allocator, "https://example.com", false));
     try t.expectError(error.UnsupportedFileAuthority, decode(t.allocator, "file://remote/share/x", false));
+}
+
+test "file URI decodes vscode-style percent-encoded drive letters" {
+    const t = std.testing;
+    const cases = [_]struct { uri: []const u8, path: []const u8, windows: bool }{
+        .{ .uri = "file:///c%3A/Users/x/a.ts", .path = "c:\\Users\\x\\a.ts", .windows = true },
+        .{ .uri = "file:///C%3a/Users/x/a.ts", .path = "C:\\Users\\x\\a.ts", .windows = true },
+        .{ .uri = "file:///C:/x", .path = "C:\\x", .windows = true },
+        .{ .uri = "file://localhost/c%3A/x", .path = "c:\\x", .windows = true },
+        .{ .uri = "file://server/c%24/a%20b.ts", .path = "\\\\server\\c$\\a b.ts", .windows = true },
+        .{ .uri = "file:///c%3A/x/a.ts", .path = "c:/x/a.ts", .windows = false },
+        .{ .uri = "file:///tmp/a%3Ab", .path = "/tmp/a:b", .windows = false },
+    };
+    for (cases) |case| {
+        const path = try decode(t.allocator, case.uri, case.windows);
+        defer t.allocator.free(path);
+        try t.expectEqualStrings(case.path, path);
+        if (case.windows) try t.expect(std.fs.path.isAbsoluteWindows(path));
+    }
+    // Encoded separators are still refused, before or after the drive.
+    for ([_][]const u8{ "file:///c%3A%2FUsers/x", "file:///c%3A/Users%2Fx", "file:///c%3A/Users%5Cx" }) |bad|
+        try t.expectError(error.InvalidFileUri, decode(t.allocator, bad, true));
 }

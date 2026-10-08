@@ -233,8 +233,16 @@ pub const Pairs = struct {
     }
 };
 
+const utf8_bom = "\xef\xbb\xbf";
+
+/// A BOM glued to the first line would hide `root = true` or a leading
+/// section header (`[*]`), dropping that line's meaning.
+fn withoutBom(bytes: []const u8) []const u8 {
+    return if (std.mem.startsWith(u8, bytes, utf8_bom)) bytes[utf8_bom.len..] else bytes;
+}
+
 pub fn applyFile(properties: *Properties, bytes: []const u8, relative_path: []const u8) void {
-    var pairs: Pairs = .{ .bytes = bytes, .path = relative_path };
+    var pairs: Pairs = .{ .bytes = withoutBom(bytes), .path = relative_path };
     while (pairs.next()) |pair| properties.apply(pair.key, pair.value);
 }
 
@@ -255,8 +263,12 @@ pub const Cache = struct {
 
     fn read(self: *Cache, path: []const u8) !File {
         const stamp = try text_file.Stamp.read(self.io, path);
-        const bytes = if (stamp != null) try std.Io.Dir.cwd().readFileAlloc(self.io, path, self.allocator, .limited(1024 * 1024)) else try self.allocator.dupe(u8, "");
-        return .{ .bytes = bytes, .stamp = stamp };
+        if (stamp == null) return .{ .bytes = try self.allocator.dupe(u8, ""), .stamp = null };
+        const bytes = try std.Io.Dir.cwd().readFileAlloc(self.io, path, self.allocator, .limited(1024 * 1024));
+        if (withoutBom(bytes).len == bytes.len) return .{ .bytes = bytes, .stamp = stamp };
+        // Cache BOM-free bytes: isRoot and every section scan see line 1 as written.
+        defer self.allocator.free(bytes);
+        return .{ .bytes = try self.allocator.dupe(u8, withoutBom(bytes)), .stamp = stamp };
     }
 
     fn get(self: *Cache, path: []const u8) ![]const u8 {
@@ -269,17 +281,22 @@ pub const Cache = struct {
         return file.bytes;
     }
 
+    /// Re-read every cached config whose stamp changed; true when any did.
+    /// An entry that cannot be checked or read right now (replaced by a
+    /// directory, an unreachable share, a sharing violation, OOM) keeps its
+    /// last good bytes and counts as unchanged, so one bad ancestor never
+    /// fails the caller's save; the next refresh retries it. A deleted
+    /// config (FileNotFound) is a real change to "no rules".
     pub fn refresh(self: *Cache) !bool {
         var changed = false;
         var it = self.files.iterator();
         while (it.next()) |entry| {
-            const stamp = try text_file.Stamp.read(self.io, entry.key_ptr.*);
-            if (!std.meta.eql(stamp, entry.value_ptr.stamp)) {
-                const replacement = try self.read(entry.key_ptr.*);
-                self.allocator.free(entry.value_ptr.bytes);
-                entry.value_ptr.* = replacement;
-                changed = true;
-            }
+            const stamp = text_file.Stamp.read(self.io, entry.key_ptr.*) catch continue;
+            if (std.meta.eql(stamp, entry.value_ptr.stamp)) continue;
+            const replacement = self.read(entry.key_ptr.*) catch continue;
+            self.allocator.free(entry.value_ptr.bytes);
+            entry.value_ptr.* = replacement;
+            changed = true;
         }
         return changed;
     }
@@ -364,6 +381,76 @@ test "EditorConfig matching, precedence, unset, and whitespace properties" {
     const empty = try normalize(t.allocator, "", props, false);
     defer t.allocator.free(empty);
     try t.expectEqualStrings("", empty);
+}
+
+fn writeTestConfig(dir: std.Io.Dir, sub_path: []const u8, data: []const u8) !void {
+    try dir.writeFile(std.testing.io, .{ .sub_path = sub_path, .data = data });
+}
+
+test "EditorConfig: a UTF-8 BOM hides neither root = true nor a leading section" {
+    const t = std.testing;
+    var props: Properties = .{};
+    applyFile(&props, "\xef\xbb\xbf[*]\nindent_size=3\n", "a.txt");
+    try t.expectEqual(@as(?u16, 3), props.indent_size);
+
+    var tmp = t.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDir(t.io, "sub", .default_dir);
+    try writeTestConfig(tmp.dir, ".editorconfig", "[*]\nindent_size=8\ntrim_trailing_whitespace=true\n");
+    try writeTestConfig(tmp.dir, "sub/.editorconfig", "\xef\xbb\xbfroot = true\n[*]\nindent_size=2\n");
+    try tmp.dir.createDir(t.io, "sub/bom_section", .default_dir);
+    try writeTestConfig(tmp.dir, "sub/bom_section/.editorconfig", "\xef\xbb\xbf[*.txt]\ntab_width=5\n");
+    const root = try tmp.dir.realPathFileAlloc(t.io, ".", t.allocator);
+    defer t.allocator.free(root);
+    var cache: Cache = .{ .allocator = t.allocator, .io = t.io };
+    defer cache.deinit();
+
+    // root = true after the BOM stops the walk: the parent's rules stay out.
+    const file = try std.fs.path.join(t.allocator, &.{ root, "sub", "x.txt" });
+    defer t.allocator.free(file);
+    const p = try cache.resolve(file);
+    try t.expectEqual(@as(?u16, 2), p.indent_size);
+    try t.expectEqual(@as(?bool, null), p.trim);
+
+    // A section header right after the BOM still applies its properties.
+    const nested = try std.fs.path.join(t.allocator, &.{ root, "sub", "bom_section", "y.txt" });
+    defer t.allocator.free(nested);
+    const q = try cache.resolve(nested);
+    try t.expectEqual(@as(?u16, 5), q.tab_width);
+    try t.expectEqual(@as(?u16, 2), q.indent_size);
+}
+
+test "EditorConfig cache refresh keeps an unreadable entry instead of failing" {
+    const t = std.testing;
+    var tmp = t.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDir(t.io, "sub", .default_dir);
+    try writeTestConfig(tmp.dir, "sub/.editorconfig", "root=true\n[*]\ntrim_trailing_whitespace=true\n");
+    const root = try tmp.dir.realPathFileAlloc(t.io, ".", t.allocator);
+    defer t.allocator.free(root);
+    const file = try std.fs.path.join(t.allocator, &.{ root, "sub", "x.txt" });
+    defer t.allocator.free(file);
+    var cache: Cache = .{ .allocator = t.allocator, .io = t.io };
+    defer cache.deinit();
+    try t.expectEqual(@as(?bool, true), (try cache.resolve(file)).trim);
+
+    // A config replaced by a directory used to fail refresh (NotFile), and
+    // with it every save. Now it is "unchanged" and the last rules stay.
+    try tmp.dir.deleteFile(t.io, "sub/.editorconfig");
+    try tmp.dir.createDir(t.io, "sub/.editorconfig", .default_dir);
+    try t.expect(!(try cache.refresh()));
+    try t.expectEqual(@as(?bool, true), (try cache.resolve(file)).trim);
+
+    // Once it is readable again the change is picked up.
+    try tmp.dir.deleteDir(t.io, "sub/.editorconfig");
+    try writeTestConfig(tmp.dir, "sub/.editorconfig", "root=true\n[*]\ntrim_trailing_whitespace=false\n");
+    try t.expect(try cache.refresh());
+    try t.expectEqual(@as(?bool, false), (try cache.resolve(file)).trim);
+
+    // A deleted config is a real change: its rules go away.
+    try tmp.dir.deleteFile(t.io, "sub/.editorconfig");
+    try t.expect(try cache.refresh());
+    try t.expect(!(try cache.refresh()));
 }
 
 test "EditorConfig upstream core glob fixtures with explicit 0.17.2 bracket updates" {

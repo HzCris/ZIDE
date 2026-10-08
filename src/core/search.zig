@@ -1,7 +1,8 @@
 //! Workspace-wide find & replace engine behind the search panel.
 //!
 //! A background worker walks the workspace (same skips as quick-open:
-//! dot-entries, zig-out, binaries, oversized files) and streams matches
+//! dot-entries and walk_ignore.zig names — zig-out, root `.gitignore`
+//! entries; plus binaries and oversized files) and streams matches
 //! into `pending_*` under the mutex; frontends call `drain()` each
 //! frame/wake to move them into the display lists. Open documents are
 //! searched on the MAIN thread before the worker starts (their buffers
@@ -12,9 +13,11 @@
 
 const std = @import("std");
 const text_file = @import("text_file.zig");
+const identity = @import("file_identity.zig");
 const input = @import("text_input.zig");
 const Document = @import("document.zig").Document;
 const filetree_mod = @import("filetree.zig");
+const WalkIgnore = @import("walk_ignore.zig").WalkIgnore;
 
 pub const max_matches = 2000;
 const max_file_bytes = 8 * 1024 * 1024;
@@ -58,6 +61,7 @@ const SearchSpec = struct {
         const filter = try a.dupe(u8, sp.filter());
         errdefer a.free(filter);
         const exclude = try a.dupe(u8, sp.exclude());
+        errdefer a.free(exclude);
         normalizePathSeparators(root);
         normalizeSeparators(filter);
         normalizeSeparators(exclude);
@@ -93,6 +97,18 @@ fn pathAllowed(path: []const u8, include: []const u8, exclude: []const u8) bool 
 }
 
 const BufferSource = struct { id: u64, version: u64 };
+
+const DocKey = struct {
+    /// The document path the key was computed from (owned copy).
+    path: []u8,
+    /// Its identity key, or the absolute raw path when it can't be keyed.
+    key: []u8,
+
+    fn deinit(self: DocKey, a: std.mem.Allocator) void {
+        a.free(self.path);
+        a.free(self.key);
+    }
+};
 
 pub const SearchPanel = struct {
     allocator: std.mem.Allocator,
@@ -136,6 +152,11 @@ pub const SearchPanel = struct {
     /// Bumped by every start() — lets views reset per-search state
     /// (e.g. the GUI's collapsed-file set).
     generation: u64 = 0,
+    /// Identity key per open document id. The replace confirm row asks
+    /// every frame which result files are open, and keying a path costs
+    /// realpath calls, so each document is keyed once per search (and
+    /// again only if its path changes). Cleared with the results.
+    doc_keys: std.AutoHashMapUnmanaged(u64, DocKey) = .empty,
 
     // --- Worker plumbing (guarded by mutex unless noted) ---
     mutex: std.Io.Mutex = .init,
@@ -156,6 +177,7 @@ pub const SearchPanel = struct {
         self.paths.deinit(self.allocator);
         self.matches.deinit(self.allocator);
         self.sources.deinit(self.allocator);
+        self.doc_keys.deinit(self.allocator);
         self.pending_paths.deinit(self.allocator);
         self.pending_matches.deinit(self.allocator);
     }
@@ -316,11 +338,33 @@ pub const SearchPanel = struct {
         }
         // Open documents: search buffers on the main thread, and have the
         // worker skip their paths so they aren't double-counted from disk.
+        // Each key also seeds `doc_keys` for the replace confirm row.
         for (editor.documents.items) |*doc| {
             if (doc.preview) continue;
             const p = doc.file_path orelse continue;
             const key = text_file.pathKey(self.allocator, self.io, p) catch {
-                ok = false;
+                // Unkeyable (reserved device name, unreachable share, access
+                // denied): a result under this path couldn't be opened, so the
+                // buffer is left out and counted as skipped. Its raw path
+                // still keeps the worker off the file, and the disk scan runs.
+                const raw = rawAbsolute(self.allocator, self.io, p) orelse {
+                    ok = false;
+                    continue;
+                };
+                if (self.pathEligible(raw)) {
+                    // No worker yet (cancelJoin above): no lock needed.
+                    self.pending_skipped += 1;
+                    self.files_skipped = self.pending_skipped;
+                    self.files_searched_open += 1;
+                    self.files_searched = self.files_searched_open;
+                }
+                if (self.allocator.dupe(u8, raw)) |copy| {
+                    _ = self.storeDocKey(doc.id, p, copy);
+                } else |_| {}
+                ctx.open_paths.append(self.allocator, raw) catch {
+                    self.allocator.free(raw);
+                    ok = false;
+                };
                 continue;
             };
             normalizePathSeparators(key);
@@ -329,6 +373,9 @@ pub const SearchPanel = struct {
                 ok = false;
                 continue;
             };
+            if (self.allocator.dupe(u8, key)) |copy| {
+                _ = self.storeDocKey(doc.id, p, copy);
+            } else |_| {}
             if (!self.pathEligible(key)) continue;
             const text = doc.buffer.slice(0, doc.buffer.byteLen());
             const first_path = self.paths.items.len;
@@ -424,6 +471,9 @@ pub const SearchPanel = struct {
         if (self.spec) |spec| spec.deinit(self.allocator);
         self.spec = null;
         self.sources.clearRetainingCapacity();
+        var keys = self.doc_keys.valueIterator();
+        while (keys.next()) |entry| entry.deinit(self.allocator);
+        self.doc_keys.clearRetainingCapacity();
         for (self.paths.items) |p| self.allocator.free(p);
         self.paths.clearRetainingCapacity();
         for (self.matches.items) |m| self.allocator.free(m.excerpt);
@@ -581,17 +631,8 @@ pub const SearchPanel = struct {
             previous = m.path_idx;
             const p = self.paths.items[m.path_idx];
             if (!self.pathEligible(p)) continue;
-            var open_doc: ?*Document = null;
-            for (editor.documents.items) |*doc| {
-                if (doc.preview) continue;
-                const dp = doc.file_path orelse continue;
-                if (editor.pathsEqual(dp, p)) {
-                    open_doc = doc;
-                    break;
-                }
-            }
             var n: usize = 0;
-            if (open_doc) |doc| {
+            if (self.openDocFor(editor, p)) |doc| {
                 n = replaceAllInDoc(doc, needle, repl, self.case_sensitive, self.whole_word) catch {
                     failed += 1;
                     continue;
@@ -611,6 +652,8 @@ pub const SearchPanel = struct {
     }
 
     /// How many result files are open docs vs on disk (for the confirm row).
+    /// Runs every frame while the row is up: no disk access once each open
+    /// document has been keyed (see `docKey`).
     pub fn replaceTargets(self: *SearchPanel, editor: anytype) struct { open: usize, disk: usize } {
         var open: usize = 0;
         var disk: usize = 0;
@@ -621,27 +664,73 @@ pub const SearchPanel = struct {
             previous = m.path_idx;
             const p = self.paths.items[m.path_idx];
             if (!self.pathEligible(p)) continue;
-            var is_open = false;
-            for (editor.documents.items) |*doc| {
-                if (doc.preview) continue;
-                const dp = doc.file_path orelse continue;
-                if (editor.pathsEqual(dp, p)) {
-                    is_open = true;
-                    break;
-                }
-            }
-            if (is_open) open += 1 else disk += 1;
+            if (self.openDocFor(editor, p) != null) open += 1 else disk += 1;
         }
         return .{ .open = open, .disk = disk };
     }
+
+    /// The open (non-preview) document whose file is result path `path`.
+    /// Result paths are identity keys already — open-document hits are
+    /// keyed in start(), disk hits join the keyed root with walked names —
+    /// so comparing against each document's cached key replaces the
+    /// per-pair realpath probes of `editor.pathsEqual`.
+    fn openDocFor(self: *SearchPanel, editor: anytype, path: []const u8) ?*Document {
+        for (editor.documents.items) |*doc| {
+            if (doc.preview) continue;
+            const key = self.docKey(doc) orelse continue;
+            if (identity.equalKeys(key, path)) return doc;
+        }
+        return null;
+    }
+
+    /// `doc`'s identity key, computed on first use per search and document
+    /// path. A path that can't be keyed (reserved name, unreachable share)
+    /// falls back to its absolute raw spelling, as start() records it.
+    fn docKey(self: *SearchPanel, doc: *const Document) ?[]const u8 {
+        const p = doc.file_path orelse return null;
+        if (self.doc_keys.get(doc.id)) |cached| {
+            if (std.mem.eql(u8, cached.path, p)) return cached.key;
+        }
+        const key = text_file.pathKey(self.allocator, self.io, p) catch (rawAbsolute(self.allocator, self.io, p) orelse return null);
+        return self.storeDocKey(doc.id, p, key);
+    }
+
+    /// Cache `key` (ownership taken) for document `id` at `doc_path`.
+    /// Returns it, or null when out of memory (`key` freed).
+    fn storeDocKey(self: *SearchPanel, id: u64, doc_path: []const u8, key: []u8) ?[]const u8 {
+        const path = self.allocator.dupe(u8, doc_path) catch {
+            self.allocator.free(key);
+            return null;
+        };
+        const entry = self.doc_keys.getOrPut(self.allocator, id) catch {
+            self.allocator.free(path);
+            self.allocator.free(key);
+            return null;
+        };
+        if (entry.found_existing) entry.value_ptr.deinit(self.allocator);
+        entry.value_ptr.* = .{ .path = path, .key = key };
+        return key;
+    }
 };
+
+/// `path` made absolute without touching it on disk (only the working
+/// directory is resolved), '/'-separated on Windows like result paths.
+/// Null only when out of memory.
+fn rawAbsolute(a: std.mem.Allocator, io: std.Io, path: []const u8) ?[]u8 {
+    const raw = identity.absolute(a, io, path) catch (a.dupe(u8, path) catch return null);
+    normalizePathSeparators(raw);
+    return raw;
+}
 
 // ---------------------------------------------------------------------------
 // Matching / replacing primitives (pure, testable)
 // ---------------------------------------------------------------------------
 
+/// Same rule as cursor.zig's word motion: any byte of a multi-byte UTF-8
+/// sequence counts as a word byte, so whole-word search works on `día`
+/// and doesn't find `ber` inside `über`.
 fn isWordChar(c: u8) bool {
-    return std.ascii.isAlphanumeric(c) or c == '_';
+    return std.ascii.isAlphanumeric(c) or c == '_' or c >= 0x80;
 }
 
 /// Find `needle` in `text` at or after `from`, honoring case sensitivity
@@ -806,7 +895,9 @@ pub fn workerMain(ctx: *WorkerCtx) void {
     if (std.Io.Dir.cwd().openDir(ctx.io, open_root, .{ .iterate = true })) |dir| {
         var d = dir;
         defer d.close(ctx.io);
-        walkDir(ctx, d, "", 0);
+        var ignore = WalkIgnore.load(ctx.allocator, ctx.io, d);
+        defer ignore.deinit(ctx.allocator);
+        walkDir(ctx, d, &ignore, "", 0);
     } else |_| {}
 
     sp.mutex.lockUncancelable(sp.io);
@@ -816,7 +907,7 @@ pub fn workerMain(ctx: *WorkerCtx) void {
     if (wake) |w| w();
 }
 
-fn walkDir(ctx: *WorkerCtx, dir: std.Io.Dir, prefix: []const u8, depth: usize) void {
+fn walkDir(ctx: *WorkerCtx, dir: std.Io.Dir, ignore: *const WalkIgnore, prefix: []const u8, depth: usize) void {
     if (depth > max_depth or ctx.stopped) return;
     const sp = ctx.sp;
     var it = dir.iterate();
@@ -826,15 +917,15 @@ fn walkDir(ctx: *WorkerCtx, dir: std.Io.Dir, prefix: []const u8, depth: usize) v
             return;
         }
         if (entry.name.len == 0 or entry.name[0] == '.') continue;
+        if (ignore.skips(entry.name, prefix.len == 0)) continue;
         switch (entry.kind) {
             .file => searchDiskFile(ctx, dir, prefix, entry.name),
             .directory => {
-                if (std.mem.eql(u8, entry.name, "zig-out")) continue;
                 var sub = dir.openDir(ctx.io, entry.name, .{ .iterate = true }) catch continue;
                 defer sub.close(ctx.io);
                 const sub_prefix = std.fmt.allocPrint(ctx.allocator, "{s}{s}/", .{ prefix, entry.name }) catch continue;
                 defer ctx.allocator.free(sub_prefix);
-                walkDir(ctx, sub, sub_prefix, depth + 1);
+                walkDir(ctx, sub, ignore, sub_prefix, depth + 1);
             },
             else => {},
         }
@@ -844,7 +935,7 @@ fn walkDir(ctx: *WorkerCtx, dir: std.Io.Dir, prefix: []const u8, depth: usize) v
 fn searchDiskFile(ctx: *WorkerCtx, dir: std.Io.Dir, prefix: []const u8, name: []const u8) void {
     const sp = ctx.sp;
     var rel_buf: [1024]u8 = undefined;
-    const rel = std.fmt.bufPrint(&rel_buf, "{s}{s}", .{ prefix, name }) catch return;
+    const rel = std.fmt.bufPrint(&rel_buf, "{s}{s}", .{ prefix, name }) catch return noteSkipped(sp);
     if (!pathAllowed(rel, ctx.filter, ctx.exclude)) return;
 
     // Full (root-joined) path — what results store and openOrFocus uses.
@@ -852,9 +943,16 @@ fn searchDiskFile(ctx: *WorkerCtx, dir: std.Io.Dir, prefix: []const u8, name: []
     const full = if (ctx.root.len == 0)
         rel
     else
-        std.fmt.bufPrint(&full_buf, "{s}/{s}", .{ ctx.root, rel }) catch return;
+        std.fmt.bufPrint(&full_buf, "{s}/{s}", .{ ctx.root, rel }) catch return noteSkipped(sp);
 
-    const key = text_file.pathKey(ctx.allocator, ctx.io, full) catch return;
+    const key = text_file.pathKey(ctx.allocator, ctx.io, full) catch {
+        // An open document that couldn't be keyed either was already
+        // counted as skipped, under its raw path.
+        for (ctx.open_paths.items) |op| {
+            if (filetree_mod.normPathEql(op, full)) return;
+        }
+        return noteSkipped(sp);
+    };
     defer ctx.allocator.free(key);
     // Open documents were already searched on the main thread.
     for (ctx.open_paths.items) |op| {
@@ -869,13 +967,7 @@ fn searchDiskFile(ctx: *WorkerCtx, dir: std.Io.Dir, prefix: []const u8, name: []
             break;
         }
     }
-    const decoded = text_file.read(ctx.allocator, ctx.io, full, encoding, max_file_bytes) catch {
-        sp.mutex.lockUncancelable(sp.io);
-        sp.pending_skipped += 1;
-        sp.pending_files += 1;
-        sp.mutex.unlock(sp.io);
-        return;
-    };
+    const decoded = text_file.read(ctx.allocator, ctx.io, full, encoding, max_file_bytes) catch return noteSkipped(sp);
     defer ctx.allocator.free(decoded.text);
     const bytes = decoded.text;
 
@@ -952,6 +1044,13 @@ fn bumpFiles(sp: *SearchPanel) void {
     sp.mutex.unlock(sp.io);
 }
 
+fn noteSkipped(sp: *SearchPanel) void {
+    sp.mutex.lockUncancelable(sp.io);
+    sp.pending_skipped += 1;
+    sp.pending_files += 1;
+    sp.mutex.unlock(sp.io);
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -968,6 +1067,23 @@ test "findInText: case and whole-word rules" {
     try t.expectEqual(@as(?usize, 8), findInText("cat and cat", "cat", false, false, 1));
     // snake_case counts as one word
     try t.expectEqual(@as(?usize, null), findInText("foo_bar", "foo", false, true, 0));
+}
+
+test "findInText: whole-word treats non-ASCII letters as word characters" {
+    const t = std.testing;
+    // Pieces of a word next to a multi-byte letter are not whole words...
+    try t.expectEqual(@as(?usize, null), findInText("über", "ber", false, true, 0));
+    try t.expectEqual(@as(?usize, null), findInText("naïve", "na", false, true, 0));
+    try t.expectEqual(@as(?usize, null), findInText("cafés", "café", false, true, 0));
+    // ...while non-ASCII words between separators are.
+    try t.expectEqual(@as(?usize, 2), findInText("x día y", "día", false, true, 0));
+    try t.expectEqual(@as(?usize, 0), findInText("café au lait", "café", false, true, 0));
+    try t.expectEqual(@as(?usize, 7), findInText("日本 語", "語", false, true, 0));
+    try t.expectEqual(@as(?usize, null), findInText("日本語", "語", false, true, 0));
+    const r = try replaceInText(t.allocator, "über ber aber", "ber", "x", true, true);
+    defer t.allocator.free(r.out);
+    try t.expectEqual(@as(usize, 1), r.count);
+    try t.expectEqualStrings("über x aber", r.out);
 }
 
 test "replaceInText counts and rewrites" {
@@ -1056,4 +1172,144 @@ test "every replace-all allocation failure leaves content cursors and history un
         }
     }
     return error.ExpectedSuccess;
+}
+
+/// Stand-in for Editor: just what SearchPanel reads through `anytype`.
+const TestEditor = struct {
+    filetree_root: ?[]const u8 = null,
+    documents: std.ArrayList(Document) = .empty,
+    encoding_choices: std.ArrayList(struct { path: []const u8, encoding: text_file.TextEncoding }) = .empty,
+
+    fn deinit(self: *TestEditor) void {
+        for (self.documents.items) |*doc| doc.deinit();
+        self.documents.deinit(std.testing.allocator);
+        self.encoding_choices.deinit(std.testing.allocator);
+    }
+    /// The returned pointer dies with the next addDoc.
+    fn addDoc(self: *TestEditor, path: ?[]const u8, text: []const u8) !*Document {
+        var doc = try Document.init(std.testing.allocator);
+        errdefer doc.deinit();
+        try doc.loadText(text);
+        if (path) |p| try doc.setFilePath(p);
+        try self.documents.append(std.testing.allocator, doc);
+        return &self.documents.items[self.documents.items.len - 1];
+    }
+    pub fn knownEncoding(_: *const TestEditor, _: []const u8) ?text_file.TextEncoding {
+        return null;
+    }
+};
+
+fn finishTestSearch(sp: *SearchPanel) !void {
+    for (0..2000) |_| {
+        if (!sp.searching) break;
+        _ = sp.drain();
+        if (sp.searching) try std.Io.sleep(std.testing.io, .fromMilliseconds(5), .awake);
+    }
+    try std.testing.expect(!sp.searching);
+}
+
+test "replace targets: 300 result files and 8 open documents need no per-frame disk probes" {
+    const t = std.testing;
+    var tmp = t.tmpDir(.{});
+    defer tmp.cleanup();
+    var name_buf: [16]u8 = undefined;
+    for (0..300) |i| {
+        const name = try std.fmt.bufPrint(&name_buf, "f{d:0>3}.txt", .{i});
+        try tmp.dir.writeFile(t.io, .{ .sub_path = name, .data = "needle\n" });
+    }
+    const root = try tmp.dir.realPathFileAlloc(t.io, ".", t.allocator);
+    defer t.allocator.free(root);
+    var editor: TestEditor = .{ .filetree_root = root };
+    defer editor.deinit();
+    // Eight open files spelled through a `.` segment: only their identity
+    // keys, not the raw strings, match the result paths.
+    for (0..8) |i| {
+        const name = try std.fmt.bufPrint(&name_buf, "f{d:0>3}.txt", .{i * 37});
+        const path = try std.fs.path.join(t.allocator, &.{ root, ".", name });
+        defer t.allocator.free(path);
+        _ = try editor.addDoc(path, "needle (edited in the buffer)\n");
+    }
+    // A quick-open preview and an untitled buffer never count as open files.
+    const peek = try std.fs.path.join(t.allocator, &.{ root, "f001.txt" });
+    defer t.allocator.free(peek);
+    (try editor.addDoc(peek, "needle\n")).preview = true;
+    _ = try editor.addDoc(null, "needle in an untitled buffer\n");
+
+    var sp: SearchPanel = .{ .allocator = t.allocator, .io = t.io };
+    defer sp.deinit();
+    sp.appendText("needle");
+    sp.start(&editor);
+    try finishTestSearch(&sp);
+    try t.expectEqual(@as(usize, 300), sp.resultFileCount());
+
+    // Every frame while the confirm row is up. The fastest of five calls
+    // (immune to a scheduler hiccup) must sit far inside a frame; probing
+    // identities per pair took ~1 s here.
+    var best: i96 = std.math.maxInt(i96);
+    for (0..5) |_| {
+        const started = std.Io.Clock.now(.awake, t.io).nanoseconds;
+        const targets = sp.replaceTargets(&editor);
+        best = @min(best, std.Io.Clock.now(.awake, t.io).nanoseconds - started);
+        try t.expectEqual(@as(usize, 8), targets.open);
+        try t.expectEqual(@as(usize, 292), targets.disk);
+    }
+    try t.expect(best < 50 * std.time.ns_per_ms);
+
+    // Documents opened after the search started are keyed once, on first use.
+    var cached = sp.doc_keys.valueIterator();
+    while (cached.next()) |entry| entry.deinit(t.allocator);
+    sp.doc_keys.clearRetainingCapacity();
+    const cold_start = std.Io.Clock.now(.awake, t.io).nanoseconds;
+    const cold = sp.replaceTargets(&editor);
+    try t.expect(std.Io.Clock.now(.awake, t.io).nanoseconds - cold_start < 250 * std.time.ns_per_ms);
+    try t.expectEqual(@as(usize, 8), cold.open);
+    try t.expectEqual(@as(usize, 292), cold.disk);
+    try t.expectEqual(@as(usize, 8), sp.doc_keys.count());
+
+    // Replace All uses the same lookup: exactly the eight buffers change.
+    sp.field = .replace;
+    sp.appendText("done");
+    const result = sp.executeReplace(&editor, .open_only);
+    try t.expectEqual(@as(usize, 8), result.files);
+    for (editor.documents.items) |*doc| {
+        const text = doc.buffer.slice(0, doc.buffer.byteLen());
+        if (doc.file_path == null or doc.preview) {
+            try t.expect(std.mem.startsWith(u8, text, "needle"));
+        } else try t.expectEqualStrings("done (edited in the buffer)\n", text);
+    }
+}
+
+test "workspace search: an open document whose path can't be keyed doesn't cancel the disk scan" {
+    const t = std.testing;
+    var tmp = t.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(t.io, .{ .sub_path = "disk.txt", .data = "needle on disk\n" });
+    const root = try tmp.dir.realPathFileAlloc(t.io, ".", t.allocator);
+    defer t.allocator.free(root);
+    // A name component longer than file systems allow can't be keyed on
+    // any platform — like a reserved device name or an unreachable share.
+    const odd = try std.fs.path.join(t.allocator, &.{ root, "x" ** 300 ++ ".txt" });
+    defer t.allocator.free(odd);
+    if (text_file.pathKey(t.allocator, t.io, odd)) |key| {
+        t.allocator.free(key);
+        return error.SkipZigTest;
+    } else |_| {}
+
+    var editor: TestEditor = .{ .filetree_root = root };
+    defer editor.deinit();
+    _ = try editor.addDoc(odd, "needle in an odd buffer\n");
+    _ = try editor.addDoc(null, "needle in an untitled buffer\n");
+    var sp: SearchPanel = .{ .allocator = t.allocator, .io = t.io };
+    defer sp.deinit();
+    sp.appendText("needle");
+    sp.start(&editor);
+    try finishTestSearch(&sp);
+    // The disk scan still ran; the odd buffer is reported, not searched.
+    try t.expectEqual(@as(usize, 1), sp.matches.items.len);
+    try t.expect(std.mem.endsWith(u8, sp.paths.items[sp.matches.items[0].path_idx], "disk.txt"));
+    try t.expectEqual(@as(usize, 1), sp.files_skipped);
+    try t.expectEqual(@as(usize, 2), sp.files_searched);
+    const targets = sp.replaceTargets(&editor);
+    try t.expectEqual(@as(usize, 0), targets.open);
+    try t.expectEqual(@as(usize, 1), targets.disk);
 }

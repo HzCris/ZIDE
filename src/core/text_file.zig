@@ -51,13 +51,24 @@ const cp1252 = [_]u21{
     0x2dc,  0x2122, 0x161,  0x203a, 0x153,  0,      0x17e,  0x178,
 };
 
-pub fn validate(text: []const u8) !void {
-    const view = std.unicode.Utf8View.init(text) catch return error.MalformedEncoding;
-    var it = view.iterator();
-    while (it.nextCodepoint()) |cp| {
-        if ((cp < 32 and cp != '\t' and cp != '\n' and cp != '\r' and cp != 12) or
-            (cp >= 0x7f and cp <= 0x9f)) return error.BinaryFile;
-    }
+/// Load-time check: valid UTF-8 that contains no NUL. NUL is the classic
+/// binary marker (git uses the same rule); every other control character
+/// is legitimate text — ANSI colour codes in a log, an Office soft line
+/// break (VT), a C1 code point — and a file that saved fine must open
+/// again, so those are not "binary".
+pub fn validateLoad(text: []const u8) !void {
+    if (!std.unicode.utf8ValidateSlice(text)) return error.MalformedEncoding;
+    if (std.mem.indexOfScalar(u8, text, 0) != null) return error.BinaryFile;
+}
+
+/// The load-time check under its original name (workspace edits use it).
+pub const validate = validateLoad;
+
+/// Save-time check: the buffer only has to be valid UTF-8. A pasted control
+/// character (an Office soft line break is VT) must never make a document
+/// unsaveable; representability in the target encoding is `encode`'s job.
+pub fn validateSave(text: []const u8) !void {
+    if (!std.unicode.utf8ValidateSlice(text)) return error.MalformedEncoding;
 }
 
 fn appendUtf8(out: *std.ArrayList(u8), allocator: Allocator, cp: u21) !void {
@@ -111,12 +122,12 @@ pub fn decode(allocator: Allocator, bytes: []const u8, override: ?TextEncoding) 
             try appendUtf8(&out, allocator, cp);
         },
     }
-    try validate(out.items);
+    try validateLoad(out.items);
     return .{ .text = try out.toOwnedSlice(allocator), .format = format };
 }
 
 pub fn encode(allocator: Allocator, text: []const u8, format: TextFormat) ![]u8 {
-    try validate(text);
+    try validateSave(text);
     var out: std.ArrayList(u8) = .empty;
     errdefer out.deinit(allocator);
     if (format.bom) try out.appendSlice(allocator, switch (format.encoding) {
@@ -306,7 +317,41 @@ test "all formats round trip strictly with BOM and line endings intact" {
     try std.testing.expectError(error.MalformedEncoding, decode(a, "\x81", .windows1252));
     try std.testing.expectError(error.BinaryFile, decode(a, "a\x00b", null));
     try std.testing.expectError(error.BinaryFile, decode(a, "\xff\xfe\x00\x00", null));
+    try std.testing.expectError(error.BinaryFile, decode(a, "MZ\x00\x01\x02binary\x00bytes", null));
     try std.testing.expectError(error.UnrepresentableText, encode(a, "😀", .{ .encoding = .windows1252 }));
+}
+
+test "saving accepts pasted control characters but still rejects malformed UTF-8" {
+    const a = std.testing.allocator;
+    // VT (an Office soft line break), ESC, NUL, BEL and a C1 control used to
+    // fail every save with BinaryFile.
+    const text = "title\x0bsub\x1b[0m\x00\x07\u{85}\n";
+    for ([_]TextFormat{ .{}, .{ .bom = true }, .{ .encoding = .utf16_le, .bom = true }, .{ .encoding = .utf16_be } }) |format| {
+        const bytes = try encode(a, text, format);
+        defer a.free(bytes);
+        // The NUL inside still marks the content as binary on load.
+        try std.testing.expectError(error.BinaryFile, decode(a, bytes, if (format.bom) null else format.encoding));
+    }
+    // Without a NUL the same control characters open again: what saved must load.
+    const reopen = try encode(a, "title\x0bsub\x1b[0m\x07\u{85}\n", .{});
+    defer a.free(reopen);
+    const reopened = try decode(a, reopen, null);
+    defer a.free(reopened.text);
+    try std.testing.expectEqualStrings("title\x0bsub\x1b[0m\x07\u{85}\n", reopened.text);
+    const vt = try encode(a, "title\x0bsub\n", .{});
+    defer a.free(vt);
+    try std.testing.expectEqualStrings("title\x0bsub\n", vt);
+    // Windows-1252 has no C1 controls: that is an encoding problem, not "binary".
+    try std.testing.expectError(error.UnrepresentableText, encode(a, "\u{85}", .{ .encoding = .windows1252 }));
+    const cp = try encode(a, "\x1b\x0b", .{ .encoding = .windows1252 });
+    defer a.free(cp);
+    try std.testing.expectEqualStrings("\x1b\x0b", cp);
+    try std.testing.expectError(error.MalformedEncoding, encode(a, "caf\xe9", .{}));
+    try std.testing.expectError(error.MalformedEncoding, validateSave("\xed\xa0\x80")); // UTF-8-encoded surrogate
+    try validateSave("");
+    try validate("plain\ttext\r\n\x0c");
+    try validate("esc\x1b");
+    try std.testing.expectError(error.BinaryFile, validate("nul\x00"));
 }
 
 test "atomic write failures keep original and remove temporary siblings" {

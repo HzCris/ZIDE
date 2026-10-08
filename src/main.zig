@@ -93,6 +93,8 @@ const SDLBackend = if (build_options.has_gui) @import("sdl-backend") else struct
 
 const Editor = @import("core/editor.zig").Editor;
 const lua_settings = @import("core/lua_settings.zig");
+const lua_api = @import("core/lua_api.zig");
+const file_identity = @import("core/file_identity.zig");
 const gui = @import("frontend/gui.zig");
 const tui = @import("frontend/tui.zig");
 
@@ -118,7 +120,7 @@ const welcome_text =
     \\//   Ctrl+Q            quit
     \\//
     \\// Edit
-    \\//   Ctrl+Z / Ctrl+Y   undo / redo
+    \\//   Ctrl+Z / Ctrl+Y   undo / redo        Ctrl+Shift+Z     redo
     \\//   Ctrl+X / C / V    cut / copy / paste
     \\//   Ctrl+A            select all
     \\//   Ctrl+Shift+D      duplicate line     Ctrl+K           delete line
@@ -130,6 +132,8 @@ const welcome_text =
     \\//   Ctrl+G            go to line         Ctrl+P           command palette
     \\//   Ctrl+E            open file by fuzzy name (arrows live-preview, Esc restores)
     \\//   Ctrl+Shift+F      workspace search & replace   F4/Shift+F4  cycle results
+    \\//   Ctrl+Alt+Left/Rt  go back / forward  F7 / Shift+F7    go back / forward
+    \\//   Alt+M             jump to matching bracket
     \\//   Ctrl+Left/Right   jump by word       Ctrl+Home/End    file start / end
     \\//   (add Shift to the two above to select while moving)
     \\//
@@ -142,6 +146,7 @@ const welcome_text =
     \\// Tabs & panes (a pane is a split, a tab is a document)
     \\//   Ctrl+W            close tab          Ctrl+Tab         next tab
     \\//   Ctrl+Shift+Tab    previous tab       (also Ctrl+PgDn / Ctrl+PgUp)
+    \\//   Ctrl+Shift+T      reopen closed tab
     \\//   Alt+\             split vertical     Alt+Shift+\      split horizontal
     \\//   Alt+Left/Right    focus pane         Ctrl+Alt+Q       close split pane
     \\//   Ctrl+Shift+N      open in new window (GUI; also Ctrl+Alt+N; TUI: split)
@@ -155,7 +160,10 @@ const welcome_text =
     \\//   Ctrl+`            toggle terminal    Ctrl+Shift+`     terminal in split
     \\//   Ctrl+Alt+`        detach terminal to its own window (GUI)
     \\//   Ctrl+B            toggle file tree   Ctrl+Space       completion (LSP)
-    \\//   F12               go to definition
+    \\//   Ctrl+Shift+O      open folder as project   (palette: recent_projects; tree: o)
+    \\//   F12               go to definition   Shift+F12        find references
+    \\//   Ctrl+F12          symbols in file    Ctrl+T           workspace symbols
+    \\//   Ctrl+Shift+Space  signature help (also after "(" and ",")
     \\
 ;
 
@@ -281,7 +289,77 @@ fn applyProjectDir(editor: *Editor, project_dir: ?[]const u8) void {
     const dir = project_dir orelse return;
     if (!editor.setFiletreeRoot(dir)) {
         std.log.warn("Cannot open project folder {s}: {s}", .{ dir, editor.status_message });
+        return;
     }
+    editor.rememberProject();
+}
+
+/// Run init.lua, then the theme files and extensions. Returns the status
+/// line of a load failure copied into `buf` (init.lua's when it failed,
+/// else the latest one; "" when everything loaded). The loaders already
+/// show it, but the startup steps after them (project folder, CLI files)
+/// write their own status — startup shows it again once they are done.
+fn loadUserConfig(lua: *zlua.Lua, buf: []u8) []const u8 {
+    const failures = lua_settings.loadFailureCount();
+    if (lua_settings.loadConfig(lua)) {
+        std.log.info("Loaded user config (init.lua)", .{});
+    }
+    var kept = keepLoadError(failures, buf);
+    lua_settings.loadThemeFiles(lua);
+    lua_settings.loadSyntaxTheme(lua);
+    lua_settings.loadExtensions(lua);
+    lua_settings.loadLangSyntaxThemes(lua);
+    if (kept.len == 0) kept = keepLoadError(failures, buf);
+    return kept;
+}
+
+fn keepLoadError(failures_before: usize, buf: []u8) []const u8 {
+    if (lua_settings.loadFailureCount() == failures_before) return buf[0..0];
+    const msg = lua_settings.lastLoadError();
+    const n = @min(msg.len, buf.len); // both 128 bytes; msg is valid UTF-8
+    @memcpy(buf[0..n], msg[0..n]);
+    return buf[0..n];
+}
+
+/// Open the command-line files: the first replaces the startup document,
+/// the rest open as tabs. A path that doesn't exist becomes an empty
+/// document bound to it (`zide newfile.zig`, then Ctrl+S creates the
+/// file); any other failure is logged and shown in the status bar. Files
+/// that need an encoding choice get the editor's encoding picker instead.
+fn openCliFiles(editor: *Editor, cli_files: []const []const u8) void {
+    for (cli_files, 0..) |path, i| {
+        openCliFile(editor, path, i == 0) catch |err| {
+            if (err == error.EncodingRequired or err == error.BinaryFile) continue;
+            if (err == error.FileNotFound) {
+                bindNewFile(editor, path, i == 0) catch |bind_err| reportOpenFailure(editor, path, bind_err);
+            } else reportOpenFailure(editor, path, err);
+        };
+    }
+}
+
+fn openCliFile(editor: *Editor, path: []const u8, into_active: bool) anyerror!void {
+    // openIntoActive: language detect + LSP notify + extension event
+    if (into_active) return editor.openIntoActive(path);
+    _ = try editor.openFile(path);
+}
+
+/// An empty document bound to `path`, which doesn't exist yet: the startup
+/// document for the first argument, a new tab otherwise.
+fn bindNewFile(editor: *Editor, path: []const u8, into_active: bool) !void {
+    const abs = try file_identity.absolute(editor.allocator, editor.io, path);
+    defer editor.allocator.free(abs);
+    const doc = if (into_active) editor.activeDoc() else try editor.newDocument();
+    try editor.setDocPath(doc, abs); // language, EditorConfig; LSP opens it on the next tick
+    lua_api.setStatusText(editor, "New file: ", std.fs.path.basename(abs));
+}
+
+fn reportOpenFailure(editor: *Editor, path: []const u8, err: anyerror) void {
+    std.log.warn("Failed to open {s}: {s}", .{ path, @errorName(err) });
+    var buf: [128]u8 = undefined;
+    const msg = std.fmt.bufPrint(&buf, "Cannot open {s}: {s}", .{ path, @errorName(err) }) catch
+        std.fmt.bufPrint(&buf, "Cannot open {s}: {s}", .{ std.fs.path.basename(path), @errorName(err) }) catch
+        "Cannot open a command-line file";
+    lua_api.setStatusText(editor, "", msg);
 }
 
 extern "kernel32" fn GetConsoleProcessList(lpdwProcessList: [*]u32, dwProcessCount: u32) callconv(.winapi) u32;
@@ -338,13 +416,8 @@ fn runGui(allocator: std.mem.Allocator, io: std.Io, lua: *zlua.Lua, cli_files: [
     // init.lua may override the server command via zide.register_lsp
     // (e.g. a full path to a toolchain-matched zls).
     lua_settings.registerApi(lua, &editor);
-    if (lua_settings.loadConfig(lua)) {
-        std.log.info("Loaded user config (init.lua)", .{});
-    }
-    lua_settings.loadThemeFiles(lua);
-    lua_settings.loadSyntaxTheme(lua);
-    lua_settings.loadExtensions(lua);
-    lua_settings.loadLangSyntaxThemes(lua);
+    var load_error_buf: [128]u8 = undefined;
+    const load_error = loadUserConfig(lua, &load_error_buf);
 
     // Language servers start lazily when a document of a registered
     // language opens (Editor.lspNotifyOpen / lspTick) and are stopped by
@@ -354,18 +427,9 @@ fn runGui(allocator: std.mem.Allocator, io: std.Io, lua: *zlua.Lua, cli_files: [
 
     // Open CLI files, or show welcome text
     if (cli_files.len > 0) {
-        // Replace the default empty document with the first file
-        // (openIntoActive: language detect + LSP notify + extension event)
-        editor.openIntoActive(cli_files[0]) catch |err| {
-            std.log.err("Failed to open {s}: {}", .{ cli_files[0], err });
-        };
-        // Open additional files as new tabs
-        for (cli_files[1..]) |path| {
-            _ = editor.openFile(path) catch |err| {
-                std.log.err("Failed to open {s}: {}", .{ path, err });
-                continue;
-            };
-        }
+        // The first file replaces the default empty document; the rest
+        // open as tabs.
+        openCliFiles(&editor, cli_files);
     } else if (project_dir == null) {
         // Opt-in session restore (session_persistence); welcome text otherwise
         if (editor.restoreSession() == 0) {
@@ -378,6 +442,8 @@ fn runGui(allocator: std.mem.Allocator, io: std.Io, lua: *zlua.Lua, cli_files: [
 
     editor.startRecovery();
     editor.startDebugWorkspace();
+    // A broken init.lua / extension outranks the startup chatter above.
+    if (load_error.len > 0) lua_api.setStatusText(&editor, "", load_error);
 
     // Per-window GUI state (mono font bytes, per-window pane/drop state).
     // Declared before the dvui window so it outlives every window's font
@@ -424,8 +490,8 @@ fn runGui(allocator: std.mem.Allocator, io: std.Io, lua: *zlua.Lua, cli_files: [
     // waitEventTimeout — wake it so the grid repaints promptly (the TUI does
     // the same through vaxis).
     editor.terminal_wake_fn = &guiWake;
-    @import("core/lua_api.zig").setLuaWake(&editor, &guiWake);
-    defer @import("core/lua_api.zig").setLuaWake(&editor, null);
+    lua_api.setLuaWake(&editor, &guiWake);
+    defer lua_api.setLuaWake(&editor, null);
 
     var interrupted = false;
 
@@ -481,13 +547,8 @@ fn runTui(allocator: std.mem.Allocator, io: std.Io, lua: *zlua.Lua, cli_files: [
     // Register Lua API and load user config BEFORE starting the LSP —
     // init.lua may override the server command via zide.register_lsp.
     lua_settings.registerApi(lua, &editor);
-    if (lua_settings.loadConfig(lua)) {
-        std.log.info("Loaded user config (init.lua)", .{});
-    }
-    lua_settings.loadThemeFiles(lua);
-    lua_settings.loadSyntaxTheme(lua);
-    lua_settings.loadExtensions(lua);
-    lua_settings.loadLangSyntaxThemes(lua);
+    var load_error_buf: [128]u8 = undefined;
+    const load_error = loadUserConfig(lua, &load_error_buf);
 
     // Language servers start lazily (see runGui) — nothing to set up here.
 
@@ -495,16 +556,7 @@ fn runTui(allocator: std.mem.Allocator, io: std.Io, lua: *zlua.Lua, cli_files: [
 
     // Open CLI files, or show welcome text
     if (cli_files.len > 0) {
-        // openIntoActive: language detect + LSP notify + extension event
-        editor.openIntoActive(cli_files[0]) catch |err| {
-            std.log.err("Failed to open {s}: {}", .{ cli_files[0], err });
-        };
-        for (cli_files[1..]) |path| {
-            _ = editor.openFile(path) catch |err| {
-                std.log.err("Failed to open {s}: {}", .{ path, err });
-                continue;
-            };
-        }
+        openCliFiles(&editor, cli_files);
     } else if (project_dir == null) {
         // Opt-in session restore (session_persistence); welcome text otherwise
         if (editor.restoreSession() == 0) {
@@ -517,6 +569,8 @@ fn runTui(allocator: std.mem.Allocator, io: std.Io, lua: *zlua.Lua, cli_files: [
 
     editor.startRecovery();
     editor.startDebugWorkspace();
+    // A broken init.lua / extension outranks the startup chatter above.
+    if (load_error.len > 0) lua_api.setStatusText(&editor, "", load_error);
     try tui.run(allocator, &editor);
 
     // Record the session for the next bare launch (no-op unless enabled).
@@ -573,6 +627,48 @@ test "isDirectory tells project folders from files" {
     try std.testing.expect(!isDirectory(io, "definitely/not/a/real/path"));
 }
 
+test "CLI files: a missing path becomes a new document bound to it; other failures show" {
+    const t = std.testing;
+    t.log_level = .err; // the open failure warns
+    defer t.log_level = .warn;
+    var tmp = t.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(t.io, "adir");
+    const root = try tmp.dir.realPathFileAlloc(t.io, ".", t.allocator);
+    defer t.allocator.free(root);
+    const fresh = try std.fs.path.join(t.allocator, &.{ root, "newfile.zig" });
+    defer t.allocator.free(fresh);
+    const other = try std.fs.path.join(t.allocator, &.{ root, "notes.txt" });
+    defer t.allocator.free(other);
+    const dir_path = try std.fs.path.join(t.allocator, &.{ root, "adir" });
+    defer t.allocator.free(dir_path);
+
+    var editor = try Editor.init(t.allocator, t.io);
+    defer editor.deinit();
+    editor.lsp_enabled = false;
+    openCliFiles(&editor, &.{ fresh, other, dir_path });
+
+    // The first bound the startup document, the second a new tab; the
+    // directory failed with a status message instead of only a log line.
+    try t.expectEqual(@as(usize, 2), editor.documents.items.len);
+    const first = &editor.documents.items[0];
+    try t.expect(editor.pathsEqual(first.file_path.?, fresh));
+    try t.expectEqualStrings("newfile.zig", first.display_name);
+    try t.expectEqualStrings("zig", first.language.?.name);
+    try t.expect(!first.dirty);
+    try t.expect(editor.pathsEqual(editor.documents.items[1].file_path.?, other));
+    try t.expect(std.mem.startsWith(u8, editor.status_message, "Cannot open "));
+    try t.expect(std.mem.indexOf(u8, editor.status_message, "adir") != null);
+
+    // Ctrl+S creates the file.
+    try editor.documents.items[0].insertAtCursor("const x = 1;\n");
+    const saved = editor.saveDocument(editor.documents.items[0].id, .{ .interactive = false });
+    try t.expect(saved == .saved);
+    const bytes = try tmp.dir.readFileAlloc(t.io, "newfile.zig", t.allocator, .limited(64));
+    defer t.allocator.free(bytes);
+    try t.expectEqualStrings("const x = 1;\n", bytes);
+}
+
 // Pull in core module tests
 comptime {
     _ = @import("core/buffer.zig");
@@ -589,6 +685,8 @@ comptime {
     _ = @import("core/fileicons.zig");
     _ = @import("core/lsp.zig");
     _ = @import("core/lua_json.zig");
+    _ = @import("core/lua_settings.zig");
+    _ = @import("core/lua_api.zig");
     _ = @import("core/ansi.zig");
     _ = @import("core/terminal.zig");
     _ = @import("core/pty.zig");
@@ -613,6 +711,19 @@ comptime {
     _ = @import("core/dap_session.zig");
     _ = @import("core/dap_lua.zig");
     _ = @import("core/dap_integration.zig");
+    _ = @import("core/walk_ignore.zig");
+    _ = @import("core/text_file.zig");
+    _ = @import("core/text_input.zig");
+    // Every core file with tests must be listed: tests in files that are
+    // only imported by other files are never discovered by the test runner.
+    _ = @import("core/clipboard.zig");
+    _ = @import("core/dap.zig");
+    _ = @import("core/filetree.zig");
+    _ = @import("core/layout.zig");
+    _ = @import("core/lsp_tools.zig");
+    _ = @import("core/search.zig");
+    _ = @import("core/task_lua.zig");
+    _ = @import("core/tool_panel.zig");
     _ = @import("frontend/gui.zig");
     _ = @import("frontend/tui.zig");
 }

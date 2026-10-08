@@ -207,14 +207,29 @@ pub const UndoHistory = struct {
         if (self.group_depth > 0) return self.active_group;
         if (self.merge_allowed and self.undo_stack.items.len > 0) {
             const prev = self.undo_stack.items[self.undo_stack.items.len - 1];
-            if (text.len == 1 and prev.text.len == 1 and text[0] != '\n' and prev.text[0] != '\n' and kind == prev.op_type) {
-                if ((kind == .insert and offset == prev.offset + 1) or (kind == .delete and (offset == prev.offset -| 1 or offset == prev.offset))) return prev.group_id;
+            if (isSingleChar(text) and isSingleChar(prev.text) and kind == prev.op_type) {
+                // Typing continues after the previous character; Backspace
+                // deletes the character just before it, Delete the one at it.
+                const adjacent = switch (kind) {
+                    .insert => offset == prev.offset + prev.text.len,
+                    .delete => offset + text.len == prev.offset or offset == prev.offset,
+                };
+                if (adjacent) return prev.group_id;
             }
         }
         defer self.next_group_id += 1;
         return self.next_group_id;
     }
 };
+
+/// One typed or deleted character for undo coalescing: a single whole
+/// UTF-8 code point (so "é" or "界" coalesces like "e"), or a single byte
+/// that is not valid UTF-8 on its own. Line breaks always start a group.
+fn isSingleChar(text: []const u8) bool {
+    if (text.len == 0 or text[0] == '\n' or text[0] == '\r') return false;
+    const len = std.unicode.utf8ByteSequenceLength(text[0]) catch return text.len == 1;
+    return text.len == len and std.unicode.utf8ValidateSlice(text);
+}
 
 // ---- Tests ----
 
@@ -302,6 +317,53 @@ test "grouping adjacent inserts" {
     // All three should be in the same group → single undo removes all
     _ = try hist.undo(&buf);
     try std.testing.expectEqualStrings("", buf.slice(0, buf.byteLen()));
+}
+
+test "typing and deleting non-ASCII characters coalesces like ASCII" {
+    const allocator = std.testing.allocator;
+    var buf = try @import("buffer.zig").Buffer.init(allocator);
+    defer buf.deinit();
+    try buf.loadText("");
+    var hist = UndoHistory.init(allocator);
+    defer hist.deinit();
+
+    // Type "héé界" one character at a time: one undo step.
+    var at: usize = 0;
+    for ([_][]const u8{ "h", "\xc3\xa9", "\xc3\xa9", "\xe7\x95\x8c" }) |ch| {
+        _ = try buf.insert(at, ch);
+        try hist.recordInsert(at, ch, at, at + ch.len);
+        at += ch.len;
+    }
+    try std.testing.expectEqual(@as(usize, 4), hist.undo_stack.items.len);
+    for (hist.undo_stack.items) |op| try std.testing.expectEqual(hist.undo_stack.items[0].group_id, op.group_id);
+    _ = try hist.undo(&buf);
+    try std.testing.expectEqualStrings("", buf.slice(0, buf.byteLen()));
+    _ = try hist.redo(&buf);
+    try std.testing.expectEqualStrings("h\xc3\xa9\xc3\xa9\xe7\x95\x8c", buf.slice(0, buf.byteLen()));
+
+    // Backspace "界" then "é" (undo/redo ended the typing run): one step.
+    _ = buf.delete(5, 3);
+    try hist.recordDelete(5, "\xe7\x95\x8c", 8, 5);
+    _ = buf.delete(3, 2);
+    try hist.recordDelete(3, "\xc3\xa9", 5, 3);
+    try std.testing.expectEqualStrings("h\xc3\xa9", buf.slice(0, buf.byteLen()));
+    _ = try hist.undo(&buf);
+    try std.testing.expectEqualStrings("h\xc3\xa9\xc3\xa9\xe7\x95\x8c", buf.slice(0, buf.byteLen()));
+
+    // Forward-delete "é" twice at the same offset: one step.
+    _ = buf.delete(1, 2);
+    try hist.recordDelete(1, "\xc3\xa9", 1, 1);
+    _ = buf.delete(1, 2);
+    try hist.recordDelete(1, "\xc3\xa9", 1, 1);
+    try std.testing.expectEqualStrings("h\xe7\x95\x8c", buf.slice(0, buf.byteLen()));
+    _ = try hist.undo(&buf);
+    try std.testing.expectEqualStrings("h\xc3\xa9\xc3\xa9\xe7\x95\x8c", buf.slice(0, buf.byteLen()));
+
+    // Two characters inserted at once (paste, IME commit) and CRLF stay separate.
+    try std.testing.expect(!isSingleChar("\xc3\xa9\xc3\xa9"));
+    try std.testing.expect(!isSingleChar("\r\n") and !isSingleChar("\n") and !isSingleChar(""));
+    try std.testing.expect(!isSingleChar("\xc3")); // truncated sequence
+    try std.testing.expect(isSingleChar("\xf0\x9f\x98\x80") and isSingleChar("\t") and isSingleChar("\xff"));
 }
 
 test "newline breaks group" {

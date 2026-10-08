@@ -495,8 +495,8 @@ pub const FileTree = struct {
         return cur;
     }
 
-    /// Rescan from the root, preserving expansion and selection by path
-    /// (indices are meaningless across a rebuild).
+    /// Rescan from the root, preserving expansion, the selection and the
+    /// multi-selection by path (indices are meaningless across a rebuild).
     pub fn refresh(self: *FileTree) !void {
         var expanded_paths: std.ArrayList([]u8) = .empty;
         defer {
@@ -513,6 +513,24 @@ pub const FileTree = struct {
         else
             null;
         defer if (sel_path) |p| self.allocator.free(p);
+        // The multi-selection and range anchor go by path too: a delete
+        // confirm left open across the 1.5 s auto-refresh must still act
+        // on every selected entry, not just the primary one.
+        var multi_paths: std.ArrayList([]u8) = .empty;
+        defer {
+            for (multi_paths.items) |p| self.allocator.free(p);
+            multi_paths.deinit(self.allocator);
+        }
+        try multi_paths.ensureTotalCapacity(self.allocator, self.multi.count());
+        var mit = self.multi.keyIterator();
+        while (mit.next()) |k| {
+            multi_paths.appendAssumeCapacity(try self.allocator.dupe(u8, self.nodes.items[k.*].rel_path));
+        }
+        const anchor_path: ?[]u8 = if (self.sel_anchor_node) |an|
+            try self.allocator.dupe(u8, self.nodes.items[an].rel_path)
+        else
+            null;
+        defer if (anchor_path) |p| self.allocator.free(p);
 
         self.clearNodes();
         try self.initRoot();
@@ -530,22 +548,77 @@ pub const FileTree = struct {
         }
         try self.rebuildVisible();
         self.selected = 0;
+        var primary_found = false;
         if (sel_path) |p| {
             if (self.findByPath(p)) |idx| {
-                if (self.rowOf(idx)) |row| self.selected = row;
+                if (self.rowOf(idx)) |row| {
+                    self.selected = row;
+                    primary_found = true;
+                }
             }
         }
+        self.restoreMulti(multi_paths.items, anchor_path, primary_found);
         self.clampSelection();
+    }
+
+    /// Re-select `paths` after a rebuild. Entries gone from disk drop out;
+    /// ones under a collapsed parent are re-found by scanning that parent
+    /// without expanding it. If the primary row vanished, the first
+    /// visible survivor becomes primary; a lone survivor is a plain
+    /// selection again.
+    fn restoreMulti(self: *FileTree, paths: []const []u8, anchor: ?[]const u8, primary_found: bool) void {
+        for (paths) |p| {
+            const idx = (self.loadByPath(p) catch null) orelse continue;
+            self.multi.put(self.allocator, idx, {}) catch {};
+        }
+        if (anchor) |p| self.sel_anchor_node = self.findByPath(p);
+        if (!primary_found and self.multi.count() > 0) {
+            for (self.visible.items, 0..) |v, row| {
+                if (self.multi.contains(v)) {
+                    self.selected = row;
+                    break;
+                }
+            }
+        }
+        if (self.multi.count() <= 1) self.multi.clearRetainingCapacity();
+    }
+
+    /// Like `findByPath`, but scans unloaded ancestor directories (without
+    /// expanding them) instead of giving up at the first one.
+    fn loadByPath(self: *FileTree, rel: []const u8) !?u32 {
+        var cur: u32 = 0;
+        var it = std.mem.splitScalar(u8, rel, '/');
+        while (it.next()) |seg| {
+            if (seg.len == 0) continue;
+            if (self.nodes.items[cur].kind != .dir) return null;
+            if (!self.nodes.items[cur].loaded) try self.loadChildren(cur);
+            var found: ?u32 = null;
+            for (self.nodes.items[cur].children.items) |c| {
+                if (std.mem.eql(u8, self.nodes.items[c].name, seg)) {
+                    found = c;
+                    break;
+                }
+            }
+            cur = found orelse return null;
+        }
+        return cur;
     }
 
     /// Create a file or directory under `parent_idx` from prompt input.
     /// A trailing '/' (or '\') creates a directory; embedded separators
     /// create intermediate directories. Returns the created entry's
     /// rel_path, owned by `allocator`, without trailing separator.
+    /// Absolute and drive-relative input (`/x`, `C:/x`, `D:\x`, `C:x`) is
+    /// refused — the root handle would create it outside the tree — and
+    /// every segment must pass `nameAllowed`.
     pub fn createEntry(self: *FileTree, allocator: Allocator, parent_idx: u32, input: []const u8) ![]u8 {
         if (input.len == 0) return error.InvalidName;
-        if (std.mem.indexOf(u8, input, "..") != null) return error.InvalidName;
-        if (input[0] == '/' or input[0] == '\\') return error.InvalidName;
+        if (input[0] == '/' or input[0] == '\\' or hasDrivePrefix(input)) return error.InvalidName;
+        var it = std.mem.splitAny(u8, input, "/\\");
+        while (it.next()) |seg| {
+            // Empty segments are separators (`a//b`, the trailing `/`).
+            if (seg.len > 0 and !nameAllowed(seg)) return error.InvalidName;
+        }
         const is_dir = input[input.len - 1] == '/' or input[input.len - 1] == '\\';
         const trimmed = std.mem.trimEnd(u8, input, "/\\");
         if (trimmed.len == 0) return error.InvalidName;
@@ -570,14 +643,15 @@ pub const FileTree = struct {
         return rel;
     }
 
-    /// Rename node `idx` to `new_name` (basename only — no separators).
+    /// Rename node `idx` to `new_name` (basename only — no separators, no
+    /// drive prefix, and it must pass `nameAllowed`).
     /// Refuses to clobber an existing entry (error.PathAlreadyExists).
     /// Returns the new rel_path, owned by `allocator`.
     pub fn renameEntry(self: *FileTree, allocator: Allocator, idx: u32, new_name: []const u8) ![]u8 {
         if (idx == 0) return error.InvalidName;
         if (new_name.len == 0) return error.InvalidName;
         if (std.mem.indexOfAny(u8, new_name, "/\\") != null) return error.InvalidName;
-        if (std.mem.indexOf(u8, new_name, "..") != null) return error.InvalidName;
+        if (hasDrivePrefix(new_name) or !nameAllowed(new_name)) return error.InvalidName;
         const node = self.nodes.items[idx];
         const dir_part = node.rel_path[0 .. node.rel_path.len - node.name.len];
         const new_rel = try std.mem.concat(allocator, u8, &.{ dir_part, new_name });
@@ -819,12 +893,19 @@ pub const FileTree = struct {
     /// Path of `abs` relative to the tree root ('/'-normalized, owned by
     /// `allocator`), or null if `abs` is outside the root.
     pub fn relFromAbs(self: *const FileTree, allocator: Allocator, abs: []const u8) !?[]u8 {
-        if (abs.len < self.root_path.len) return null;
-        if (!normPathEql(abs[0..self.root_path.len], self.root_path)) return null;
-        var rest = abs[self.root_path.len..];
+        const root = self.root_path;
+        if (abs.len < root.len) return null;
+        if (!normPathEql(abs[0..root.len], root)) return null;
+        var rest = abs[root.len..];
         if (rest.len == 0) return try allocator.dupe(u8, "");
-        if (rest[0] != '/' and rest[0] != '\\') return null;
-        rest = rest[1..];
+        // A drive or filesystem root (`C:\`, `/`) already ends in the
+        // separator; any other root needs one next so `C:\code` doesn't
+        // claim `C:\code2`.
+        const root_has_sep = root.len > 0 and (root[root.len - 1] == '/' or root[root.len - 1] == '\\');
+        if (!root_has_sep) {
+            if (rest[0] != '/' and rest[0] != '\\') return null;
+            rest = rest[1..];
+        }
         const out = try allocator.dupe(u8, rest);
         normalizeSeps(out);
         return out;
@@ -880,6 +961,47 @@ fn pathWithin(source: []const u8, candidate: []const u8) bool {
     const root = std.mem.trimEnd(u8, source, "/\\");
     if (candidate.len < root.len or !normPathEql(root, candidate[0..root.len])) return false;
     return candidate.len == root.len or normPathChar(candidate[root.len]) == '/';
+}
+
+/// `X:` at the start: drive-absolute (`C:/x`) or drive-relative (`C:x`,
+/// resolved against that drive's current directory) on Windows. Refused
+/// on every platform so a typed name means the same thing everywhere.
+fn hasDrivePrefix(s: []const u8) bool {
+    return s.len >= 2 and std.ascii.isAlphabetic(s[0]) and s[1] == ':';
+}
+
+/// Whether one segment typed into the tree's Create/Rename prompt is an
+/// acceptable name. Everywhere: not `.` or `..`. On Windows also refuses
+/// what Win32 can't open even though Zig's NT-path calls would create
+/// it: the characters `<>:"|?*` and control bytes, a trailing `.` or
+/// space (Win32 strips them), and reserved device names with or without
+/// an extension — `nul`, `con.txt` or `notes.` would land on disk, but
+/// Explorer, git and ZIDE's own absolute-path open can't touch them.
+fn nameAllowed(seg: []const u8) bool {
+    if (seg.len == 0 or std.mem.eql(u8, seg, ".") or std.mem.eql(u8, seg, "..")) return false;
+    if (builtin.os.tag != .windows) return true;
+    for (seg) |c| {
+        if (c < 0x20 or std.mem.indexOfScalar(u8, "<>:\"|?*", c) != null) return false;
+    }
+    if (seg[seg.len - 1] == '.' or seg[seg.len - 1] == ' ') return false;
+    return !isReservedDeviceName(seg);
+}
+
+/// Win32 reserved device names: CON, PRN, AUX, NUL, CONIN$, CONOUT$,
+/// COM1-9 and LPT1-9 (the superscripts ¹²³ count as digits too). The
+/// name swallows any extension (`NUL.tar.gz` is NUL) and spaces before
+/// it (`con .txt`). Pure, so it is tested on every platform.
+fn isReservedDeviceName(name: []const u8) bool {
+    const stem_end = std.mem.indexOfScalar(u8, name, '.') orelse name.len;
+    const stem = std.mem.trimEnd(u8, name[0..stem_end], " ");
+    for ([_][]const u8{ "CON", "PRN", "AUX", "NUL", "CONIN$", "CONOUT$" }) |reserved| {
+        if (std.ascii.eqlIgnoreCase(stem, reserved)) return true;
+    }
+    if (stem.len < 4) return false;
+    if (!std.ascii.eqlIgnoreCase(stem[0..3], "COM") and !std.ascii.eqlIgnoreCase(stem[0..3], "LPT")) return false;
+    const number = stem[3..];
+    if (number.len == 1) return number[0] >= '1' and number[0] <= '9';
+    return std.mem.eql(u8, number, "¹") or std.mem.eql(u8, number, "²") or std.mem.eql(u8, number, "³");
 }
 
 // ---- Tests ----
@@ -1005,6 +1127,57 @@ test "filetree: refresh preserves expansion and selection, drops vanished" {
     try t.expectEqualStrings("k.txt", ft.nodes.items[ft.selectedNodeIdx().?].name);
 }
 
+test "filetree: refresh keeps the multi-selection by path" {
+    var tmp = t.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    for ([_][]const u8{ "a.txt", "b.txt", "c.txt", "d.txt" }) |name| try touch(t.io, tmp.dir, name);
+    try tmp.dir.createDirPath(t.io, "sub");
+    try touch(t.io, tmp.dir, "sub/inner.txt");
+
+    var ft = try testTree(&tmp);
+    defer ft.deinit();
+    const Paths = struct {
+        fn expect(tree: *const FileTree, want: []const []const u8) !void {
+            const got = try tree.selectionRelPaths(t.allocator);
+            defer {
+                for (got) |p| t.allocator.free(p);
+                t.allocator.free(got);
+            }
+            try t.expectEqual(want.len, got.len);
+            for (want, got) |w, g| try t.expectEqualStrings(w, g);
+        }
+    };
+
+    // {a.txt, c.txt} with c.txt primary, plus sub/inner.txt selected before
+    // its parent was collapsed (still loaded, no longer visible): a delete
+    // confirm open across the auto-refresh must still see all three.
+    _ = try ft.expandToPath("sub/inner.txt");
+    const inner = ft.findByPath("sub/inner.txt").?;
+    try ft.collapse(ft.findByPath("sub").?);
+    ft.selected = ft.rowOf(ft.findByPath("a.txt").?).?;
+    try ft.toggleMultiAt(ft.rowOf(ft.findByPath("c.txt").?).?);
+    try ft.multi.put(t.allocator, inner, {});
+    try ft.refresh();
+    try t.expectEqual(@as(usize, 3), ft.selectionCount());
+    try Paths.expect(&ft, &.{ "a.txt", "c.txt", "sub/inner.txt" });
+    try t.expectEqualStrings("c.txt", ft.nodes.items[ft.selectedNodeIdx().?].rel_path);
+    try t.expect(!ft.nodes.items[ft.findByPath("sub").?].expanded); // re-found, not expanded
+    try t.expectEqualStrings("c.txt", ft.nodes.items[ft.sel_anchor_node.?].rel_path);
+
+    // The primary vanished: the first visible survivor becomes primary.
+    try tmp.dir.deleteFile(t.io, "c.txt");
+    try ft.refresh();
+    try Paths.expect(&ft, &.{ "a.txt", "sub/inner.txt" });
+    try t.expectEqualStrings("a.txt", ft.nodes.items[ft.selectedNodeIdx().?].rel_path);
+
+    // A lone survivor is a plain selection again.
+    try tmp.dir.deleteTree(t.io, "sub");
+    try ft.refresh();
+    try t.expectEqual(@as(usize, 0), ft.multi.count());
+    try t.expectEqual(@as(usize, 1), ft.selectionCount());
+    try t.expectEqualStrings("a.txt", ft.nodes.items[ft.selectedNodeIdx().?].rel_path);
+}
+
 test "filetree: createEntry file, nested file, and trailing-slash dir" {
     var tmp = t.tmpDir(.{ .iterate = true });
     defer tmp.cleanup();
@@ -1027,11 +1200,19 @@ test "filetree: createEntry file, nested file, and trailing-slash dir" {
     try t.expectEqualStrings("x/y.txt", f2);
     try tmp.dir.access(t.io, "x/y.txt", .{});
 
+    // ".." is only rejected as a whole path component
+    const f3 = try ft.createEntry(t.allocator, 0, "test..zig");
+    defer t.allocator.free(f3);
+    try t.expectEqualStrings("test..zig", f3);
+    try tmp.dir.access(t.io, "test..zig", .{});
+
     // Existing file is not clobbered
     try t.expectError(error.PathAlreadyExists, ft.createEntry(t.allocator, 0, "plain.txt"));
     // Bad names rejected
     try t.expectError(error.InvalidName, ft.createEntry(t.allocator, 0, ""));
     try t.expectError(error.InvalidName, ft.createEntry(t.allocator, 0, "../escape.txt"));
+    try t.expectError(error.InvalidName, ft.createEntry(t.allocator, 0, "a/../b"));
+    try t.expectError(error.InvalidName, ft.createEntry(t.allocator, 0, "a\\..\\b"));
 }
 
 test "filetree: renameEntry no-clobber and doc-visible result" {
@@ -1039,6 +1220,7 @@ test "filetree: renameEntry no-clobber and doc-visible result" {
     defer tmp.cleanup();
     try touch(t.io, tmp.dir, "old.txt");
     try touch(t.io, tmp.dir, "taken.txt");
+    try touch(t.io, tmp.dir, "dots.txt");
     try tmp.dir.createDirPath(t.io, "sub");
     try touch(t.io, tmp.dir, "sub/deep.txt");
 
@@ -1061,6 +1243,74 @@ test "filetree: renameEntry no-clobber and doc-visible result" {
     try t.expectEqualStrings("sub/deeper.txt", deep_rel);
 
     try t.expectError(error.InvalidName, ft.renameEntry(t.allocator, idx, "no/seps"));
+
+    // ".." is only rejected as the whole name
+    const dots_idx = ft.findByPath("dots.txt").?;
+    try t.expectError(error.InvalidName, ft.renameEntry(t.allocator, dots_idx, ".."));
+    const dotted = try ft.renameEntry(t.allocator, dots_idx, "test..txt");
+    defer t.allocator.free(dotted);
+    try t.expectEqualStrings("test..txt", dotted);
+    try tmp.dir.access(t.io, "test..txt", .{});
+}
+
+test "filetree: create and rename refuse drive paths and names Windows cannot open" {
+    var tmp = t.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    try touch(t.io, tmp.dir, "victim.txt");
+
+    var ft = try testTree(&tmp);
+    defer ft.deinit();
+    const victim = ft.findByPath("victim.txt").?;
+
+    // Absolute / drive-relative input would escape the root handle
+    // (`C:/tmp/x.txt` was created at that absolute location); `.`
+    // segments are refused like `..`. Every platform.
+    for ([_][]const u8{ "C:/tmp/x.txt", "D:\\x", "C:x", "/abs.txt", "\\abs.txt", "./x.txt", "a/./b.txt", "a/../b.txt" }) |bad| {
+        try t.expectError(error.InvalidName, ft.createEntry(t.allocator, 0, bad));
+    }
+    for ([_][]const u8{ "C:x", ".", ".." }) |bad| {
+        try t.expectError(error.InvalidName, ft.renameEntry(t.allocator, victim, bad));
+    }
+    // Names Win32 can't open afterwards: device names (any case, with or
+    // without an extension), trailing dot/space, reserved characters.
+    if (builtin.os.tag == .windows) {
+        const bad_names = [_][]const u8{ "nul", "con.txt", "aux", "notes.", "report ", "NUL", "Com1", "lpt9.tar.gz", "CONIN$", "conout$.log", "con .txt", "PRN.x", "a<b", "a>b", "a\"b", "a|b", "a?b", "a*b", "a:b", "tab\there" };
+        for (bad_names) |name| {
+            try t.expectError(error.InvalidName, ft.createEntry(t.allocator, 0, name));
+            try t.expectError(error.InvalidName, ft.renameEntry(t.allocator, victim, name));
+        }
+        // A bad segment anywhere in a nested create is refused too.
+        try t.expectError(error.InvalidName, ft.createEntry(t.allocator, 0, "sub/nul/x.txt"));
+        try t.expectError(error.InvalidName, ft.createEntry(t.allocator, 0, "dir./x.txt"));
+        try t.expectError(error.InvalidName, ft.createEntry(t.allocator, 0, "dir /"));
+    }
+    // Nothing was created and the victim was not renamed.
+    var it = tmp.dir.iterate();
+    var entries: usize = 0;
+    while (try it.next(t.io)) |_| entries += 1;
+    try t.expectEqual(@as(usize, 1), entries);
+    try tmp.dir.access(t.io, "victim.txt", .{});
+
+    // Look-alikes stay legal (today's `..`-inside-a-name fix included).
+    for ([_][]const u8{ "test..zig", "COM10.txt", "console.log", "nullable.zig", "auxiliary", ".hidden", "sub/.keep" }) |ok| {
+        const rel = try ft.createEntry(t.allocator, 0, ok);
+        defer t.allocator.free(rel);
+        try t.expectEqualStrings(ok, rel);
+        try tmp.dir.access(t.io, ok, .{});
+    }
+    const renamed = try ft.renameEntry(t.allocator, victim, "lpt.txt");
+    defer t.allocator.free(renamed);
+    try tmp.dir.access(t.io, "lpt.txt", .{});
+}
+
+test "filetree: reserved Windows device names" {
+    for ([_][]const u8{ "CON", "con", "Nul.txt", "aux.tar.gz", "COM1", "com9.log", "LPT3", "CONIN$", "conout$.x", "PRN", "con .txt", "COM¹", "lpt³.txt" }) |name| {
+        try t.expect(isReservedDeviceName(name));
+    }
+    for ([_][]const u8{ "", "CONSOLE", "COM10", "COM", "LPT", "COMA", "nullable", "auxiliary.txt", "x.con", ".nul" }) |name| {
+        try t.expect(!isReservedDeviceName(name));
+    }
+    try t.expect(hasDrivePrefix("C:x") and hasDrivePrefix("d:\\x") and !hasDrivePrefix("1:x") and !hasDrivePrefix("C"));
 }
 
 test "filetree: deleteEntry file and recursive dir" {
@@ -1429,6 +1679,36 @@ test "filetree: absPathAlloc uses native separators" {
         try t.expectEqual(@as(?usize, null), std.mem.indexOfScalar(u8, abs, '/'));
     }
     try t.expect(std.mem.endsWith(u8, abs, if (builtin.os.tag == .windows) "sub\\deep.txt" else "sub/deep.txt"));
+}
+
+test "filetree: relFromAbs under a drive or filesystem root" {
+    var tmp = t.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var ft = try testTree(&tmp);
+    defer ft.deinit();
+    const windows = builtin.os.tag == .windows;
+
+    // Ordinary root: separator boundary required, sibling prefixes rejected.
+    t.allocator.free(ft.root_path);
+    ft.root_path = try t.allocator.dupe(u8, if (windows) "C:\\code" else "/code");
+    const inside = (try ft.relFromAbs(t.allocator, if (windows) "C:\\code\\src\\main.zig" else "/code/src/main.zig")).?;
+    defer t.allocator.free(inside);
+    try t.expectEqualStrings("src/main.zig", inside);
+    try t.expectEqual(@as(?[]u8, null), try ft.relFromAbs(t.allocator, if (windows) "C:\\code2\\x.zig" else "/code2/x.zig"));
+
+    // Root that already ends in a separator (`C:\` / `/`): every path under it.
+    t.allocator.free(ft.root_path);
+    ft.root_path = try t.allocator.dupe(u8, if (windows) "C:\\" else "/");
+    const nested = (try ft.relFromAbs(t.allocator, if (windows) "C:\\code\\src\\main.zig" else "/code/src/main.zig")).?;
+    defer t.allocator.free(nested);
+    try t.expectEqualStrings("code/src/main.zig", nested);
+    const top = (try ft.relFromAbs(t.allocator, if (windows) "c:/readme.md" else "/readme.md")).?;
+    defer t.allocator.free(top);
+    try t.expectEqualStrings("readme.md", top);
+    const itself = (try ft.relFromAbs(t.allocator, ft.root_path)).?;
+    defer t.allocator.free(itself);
+    try t.expectEqualStrings("", itself);
+    if (windows) try t.expectEqual(@as(?[]u8, null), try ft.relFromAbs(t.allocator, "D:\\code\\x.zig"));
 }
 
 test "filetree: pathTail left-truncation" {

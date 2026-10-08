@@ -1,12 +1,160 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 
+/// Longest canonical key combo. Longer strings are never stored or matched
+/// (real combos are under 30 bytes: "ctrl+alt+shift+page_down").
+pub const max_combo_len = 64;
+
+/// A key combo in canonical form: lowercase, modifiers in the order
+/// `ctrl+alt+shift+` (duplicates dropped), then the key name. Aliases map
+/// onto the frontends' vocabulary (`pageup` → `page_up`, `esc` → `escape`,
+/// `return` → `enter`, `del` → `delete`, `ins` → `insert`, `\` →
+/// `backslash`, a literal space → `space`, dvui-style punctuation names
+/// such as `slash` → `/`). The key is everything after the last `+`; a
+/// trailing `+` is the plus key itself (`ctrl++`).
+pub const Combo = struct {
+    /// Canonical spelling (a slice of the caller's buffer).
+    text: []const u8,
+    /// The key part of `text`.
+    key: []const u8,
+    ctrl: bool,
+    alt: bool,
+    shift: bool,
+    /// Whether `key` is a name the frontends send (`isKnownKey`).
+    known_key: bool,
+    /// First modifier that is not ctrl/control, alt or shift (a slice of the
+    /// input). Such modifiers stay in `text`, after the known ones, so a
+    /// binding that uses one can never collapse onto a plainer chord.
+    unknown_modifier: ?[]const u8,
+};
+
+/// Key names both frontends emit besides single letters, digits and the
+/// punctuation in `key_punctuation`.
+const key_names = [_][]const u8{
+    "up",     "down",   "left", "right", "home",   "end",       "page_up",   "page_down",
+    "insert", "delete", "tab",  "enter", "escape", "backspace", "backslash", "space",
+    "f1",     "f2",     "f3",   "f4",    "f5",     "f6",        "f7",        "f8",
+    "f9",     "f10",    "f11",  "f12",
+};
+const key_punctuation = "[];',./-=`";
+
+const key_aliases = [_]struct { []const u8, []const u8 }{
+    .{ "pageup", "page_up" },  .{ "pagedown", "page_down" }, .{ "pgup", "page_up" },
+    .{ "pgdn", "page_down" },  .{ "esc", "escape" },         .{ "return", "enter" },
+    .{ "del", "delete" },      .{ "ins", "insert" },         .{ "\\", "backslash" },
+    .{ "slash", "/" },         .{ "minus", "-" },            .{ "equal", "=" },
+    .{ "comma", "," },         .{ "period", "." },           .{ "semicolon", ";" },
+    .{ "apostrophe", "'" },    .{ "grave", "`" },            .{ "left_bracket", "[" },
+    .{ "right_bracket", "]" },
+};
+
+/// Whether `key` (canonical, lowercase) is a key name the frontends send.
+pub fn isKnownKey(key: []const u8) bool {
+    if (key.len == 1) {
+        const c = key[0];
+        return std.ascii.isLower(c) or std.ascii.isDigit(c) or std.mem.indexOfScalar(u8, key_punctuation, c) != null;
+    }
+    for (key_names) |name| {
+        if (std.mem.eql(u8, name, key)) return true;
+    }
+    return false;
+}
+
+/// Canonical form of `combo` (see `Combo`) written into `buf`, or null when
+/// it does not fit.
+pub fn canonicalize(buf: *[max_combo_len]u8, combo: []const u8) ?Combo {
+    var key_raw: []const u8 = combo;
+    var mods_raw: []const u8 = "";
+    if (combo.len > 0 and combo[combo.len - 1] == '+') {
+        key_raw = "+";
+        mods_raw = combo[0 .. combo.len - 1];
+    } else if (std.mem.lastIndexOfScalar(u8, combo, '+')) |p| {
+        key_raw = combo[p + 1 ..];
+        mods_raw = combo[0..p];
+    }
+
+    var ctrl = false;
+    var alt = false;
+    var shift = false;
+    var unknown_modifier: ?[]const u8 = null;
+    var others: [max_combo_len]u8 = undefined;
+    var others_len: usize = 0;
+    var mods = std.mem.splitScalar(u8, mods_raw, '+');
+    while (mods.next()) |raw| {
+        const mod = std.mem.trim(u8, raw, " \t");
+        if (mod.len == 0) continue;
+        if (std.ascii.eqlIgnoreCase(mod, "ctrl") or std.ascii.eqlIgnoreCase(mod, "control")) {
+            ctrl = true;
+        } else if (std.ascii.eqlIgnoreCase(mod, "alt")) {
+            alt = true;
+        } else if (std.ascii.eqlIgnoreCase(mod, "shift")) {
+            shift = true;
+        } else {
+            if (unknown_modifier == null) unknown_modifier = mod;
+            if (others_len + mod.len + 1 > others.len) return null;
+            _ = std.ascii.lowerString(others[others_len..][0..mod.len], mod);
+            others[others_len + mod.len] = '+';
+            others_len += mod.len + 1;
+        }
+    }
+
+    // A key of nothing but spaces is the space bar ("ctrl+ " is what a
+    // terminal reports for Ctrl+Space); otherwise surrounding blanks go.
+    var lower: [max_combo_len]u8 = undefined;
+    const key: []const u8 = key: {
+        if (key_raw.len > 0 and std.mem.trim(u8, key_raw, " ").len == 0) break :key "space";
+        const trimmed = std.mem.trim(u8, key_raw, " \t");
+        if (trimmed.len > lower.len) return null;
+        const lowered = std.ascii.lowerString(lower[0..trimmed.len], trimmed);
+        for (key_aliases) |alias| {
+            if (std.mem.eql(u8, alias[0], lowered)) break :key alias[1];
+        }
+        break :key lowered;
+    };
+
+    var len: usize = 0;
+    const parts = [_][]const u8{
+        if (ctrl) "ctrl+" else "",
+        if (alt) "alt+" else "",
+        if (shift) "shift+" else "",
+        others[0..others_len],
+        key,
+    };
+    for (parts) |part| {
+        if (len + part.len > buf.len) return null;
+        @memcpy(buf[len..][0..part.len], part);
+        len += part.len;
+    }
+    return .{
+        .text = buf[0..len],
+        .key = buf[len - key.len .. len],
+        .ctrl = ctrl,
+        .alt = alt,
+        .shift = shift,
+        .known_key = isKnownKey(key),
+        .unknown_modifier = unknown_modifier,
+    };
+}
+
+/// Whether a frontend may retry an unbound shift chord without `shift+`.
+/// Never for letters — Ctrl+Shift+K is its own chord, and falling back ran
+/// Ctrl+K's delete_line (Ctrl+Shift+Z ran undo) — but yes for keys such as
+/// punctuation or F-keys whose shifted form rarely has a binding of its own.
+pub fn allowsShiftFallback(combo: []const u8) bool {
+    var buf: [max_combo_len]u8 = undefined;
+    const c = canonicalize(&buf, combo) orelse return false;
+    return c.shift and !(c.key.len == 1 and std.ascii.isLower(c.key[0]));
+}
+
 /// Data-driven keybinding map.
-/// Maps key combo strings (e.g. "ctrl+s") to action names (command names or special actions).
+/// Maps key combo strings (e.g. "ctrl+s") to action names. Combos are
+/// stored and looked up in canonical form (`canonicalize`), so "Shift+Ctrl+K"
+/// binds the same chord the frontends report as "ctrl+shift+k".
 ///
-/// Special action names (not in command registry, handled by frontend):
-///   "quit", "save", "find", "find_replace", "file_open",
-///   "command_palette", "goto_line", "new_document"
+/// Every default action is a command-registry name (the palette lists them
+/// all); the frontends and `Editor.execAction` handle some specially:
+///   "quit", "save", "save_as", "find", "find_replace", "file_open",
+///   "command_palette", "goto_line", "new_document", …
 pub const KeybindMap = struct {
     map: std.StringHashMapUnmanaged([]const u8),
     allocator: Allocator,
@@ -25,29 +173,51 @@ pub const KeybindMap = struct {
     }
 
     /// Set or override a keybinding. Dupes both key and action strings.
+    /// The combo is canonicalized; one warning is logged when it cannot fire
+    /// (unknown modifier or key name) and a combo with no key or longer than
+    /// `max_combo_len` is ignored. Whether `action` names a command is the
+    /// caller's check (`CommandRegistry.warnIfUnknownAction`).
     pub fn set(self: *KeybindMap, key_str: []const u8, action: []const u8) !void {
-        if (self.map.fetchRemove(key_str)) |kv| {
+        var buf: [max_combo_len]u8 = undefined;
+        const combo = canonicalize(&buf, key_str) orelse {
+            std.log.warn("keybind '{s}' is too long to be a key combo; ignored", .{key_str});
+            return;
+        };
+        if (combo.key.len == 0) {
+            std.log.warn("keybind '{s}' names no key; ignored", .{key_str});
+            return;
+        }
+        if (combo.unknown_modifier) |mod| {
+            std.log.warn("keybind '{s}': unknown modifier '{s}' (use ctrl, alt, shift) — it will never fire", .{ key_str, mod });
+        } else if (!combo.known_key) {
+            std.log.warn("keybind '{s}': unknown key name '{s}' — it will never fire", .{ key_str, combo.key });
+        }
+        if (self.map.fetchRemove(combo.text)) |kv| {
             self.allocator.free(kv.key);
             self.allocator.free(kv.value);
         }
-        const k = try self.allocator.dupe(u8, key_str);
+        const k = try self.allocator.dupe(u8, combo.text);
         errdefer self.allocator.free(k);
         const v = try self.allocator.dupe(u8, action);
         errdefer self.allocator.free(v);
         try self.map.put(self.allocator, k, v);
     }
 
-    /// Remove a keybinding.
+    /// Remove a keybinding (any spelling of the combo).
     pub fn remove(self: *KeybindMap, key_str: []const u8) void {
-        if (self.map.fetchRemove(key_str)) |kv| {
+        var buf: [max_combo_len]u8 = undefined;
+        const combo = canonicalize(&buf, key_str) orelse return;
+        if (self.map.fetchRemove(combo.text)) |kv| {
             self.allocator.free(kv.key);
             self.allocator.free(kv.value);
         }
     }
 
-    /// Look up the action for a key combo.
+    /// Look up the action for a key combo (any spelling of it).
     pub fn get(self: *const KeybindMap, key_str: []const u8) ?[]const u8 {
-        return self.map.get(key_str);
+        var buf: [max_combo_len]u8 = undefined;
+        const combo = canonicalize(&buf, key_str) orelse return null;
+        return self.map.get(combo.text);
     }
 
     /// Populate with CUA defaults.
@@ -59,6 +229,9 @@ pub const KeybindMap = struct {
         try self.set("ctrl+shift+s", "save_as");
         try self.set("ctrl+z", "undo");
         try self.set("ctrl+y", "redo");
+        // Exact match beats the frontends' shift-stripped fallback, which
+        // would otherwise turn Ctrl+Shift+Z into undo.
+        try self.set("ctrl+shift+z", "redo");
         try self.set("ctrl+n", "new_document");
         try self.set("ctrl+c", "copy");
         try self.set("ctrl+x", "cut");
@@ -124,6 +297,18 @@ pub const KeybindMap = struct {
         // LSP shortcuts
         try self.set("ctrl+space", "lsp_completion");
         try self.set("f12", "lsp_goto_definition");
+        // Navigation history (F7 twins for terminals that eat Ctrl+Alt+arrows)
+        try self.set("ctrl+alt+left", "navigate_back");
+        try self.set("ctrl+alt+right", "navigate_forward");
+        try self.set("f7", "navigate_back");
+        try self.set("shift+f7", "navigate_forward");
+        try self.set("ctrl+shift+t", "reopen_closed_tab");
+        try self.set("alt+m", "goto_matching_bracket");
+        try self.set("ctrl+shift+o", "open_folder");
+        try self.set("shift+f12", "lsp_references");
+        try self.set("ctrl+f12", "lsp_document_symbols");
+        try self.set("ctrl+t", "lsp_workspace_symbols");
+        try self.set("ctrl+shift+space", "lsp_signature_help");
         // Terminal
         try self.set("ctrl+`", "toggle_terminal");
         try self.set("ctrl+shift+`", "open_terminal_right");
@@ -173,9 +358,115 @@ test "keybind defaults" {
     try std.testing.expectEqualStrings("close_pane", kb.get("ctrl+f4").?);
     try std.testing.expectEqualStrings("move_line_up", kb.get("ctrl+shift+page_up").?);
     try std.testing.expectEqualStrings("lsp_goto_definition", kb.get("f12").?);
+    try std.testing.expectEqualStrings("navigate_back", kb.get("ctrl+alt+left").?);
+    try std.testing.expectEqualStrings("navigate_forward", kb.get("shift+f7").?);
+    try std.testing.expectEqualStrings("reopen_closed_tab", kb.get("ctrl+shift+t").?);
+    try std.testing.expectEqualStrings("goto_matching_bracket", kb.get("alt+m").?);
+    try std.testing.expectEqualStrings("open_folder", kb.get("ctrl+shift+o").?);
+    try std.testing.expectEqualStrings("lsp_references", kb.get("shift+f12").?);
+    try std.testing.expectEqualStrings("lsp_document_symbols", kb.get("ctrl+f12").?);
+    try std.testing.expectEqualStrings("lsp_workspace_symbols", kb.get("ctrl+t").?);
+    try std.testing.expectEqualStrings("lsp_signature_help", kb.get("ctrl+shift+space").?);
     try std.testing.expectEqualStrings("toggle_filetree", kb.get("ctrl+b").?);
     // Windows
     try std.testing.expectEqualStrings("open_in_new_window", kb.get("ctrl+shift+n").?);
     try std.testing.expectEqualStrings("open_in_new_window", kb.get("ctrl+alt+n").?);
     try std.testing.expectEqualStrings("detach_terminal", kb.get("ctrl+alt+`").?);
+    // Ctrl+Shift+Z is redo, not the shift-stripped Ctrl+Z fallback
+    try std.testing.expectEqualStrings("redo", kb.get("ctrl+shift+z").?);
+    // The completion chord as either frontend spells it (a terminal may
+    // report the key as a literal space)
+    try std.testing.expectEqualStrings("lsp_completion", kb.get("ctrl+space").?);
+    try std.testing.expectEqualStrings("lsp_completion", kb.get("ctrl+ ").?);
+    try std.testing.expectEqualStrings("lsp_completion", kb.get("Ctrl+Space").?);
+
+    // Every default is stored canonically with a key the frontends send.
+    var it = kb.map.iterator();
+    while (it.next()) |entry| {
+        var buf: [max_combo_len]u8 = undefined;
+        const combo = canonicalize(&buf, entry.key_ptr.*).?;
+        try std.testing.expectEqualStrings(entry.key_ptr.*, combo.text);
+        try std.testing.expect(combo.known_key);
+        try std.testing.expect(combo.unknown_modifier == null);
+    }
+}
+
+test "keybind combos are canonical: case, modifier order, aliases" {
+    const t = std.testing;
+    var kb = KeybindMap.init(t.allocator);
+    defer kb.deinit();
+
+    try kb.set("Ctrl+Shift+K", "kill");
+    try t.expectEqualStrings("kill", kb.get("ctrl+shift+k").?);
+    try t.expectEqualStrings("kill", kb.get("shift+ctrl+k").?);
+    try t.expectEqualStrings("kill", kb.get("SHIFT+CONTROL+K").?);
+    try t.expect(kb.get("ctrl+k") == null);
+    // Re-binding another spelling replaces the same entry.
+    try kb.set("shift+ctrl+k", "kill2");
+    try t.expectEqual(@as(u32, 1), kb.map.count());
+    try t.expectEqualStrings("kill2", kb.get("ctrl+shift+k").?);
+
+    try kb.set("ctrl+pageup", "prev");
+    try t.expectEqualStrings("prev", kb.get("ctrl+page_up").?);
+    try t.expectEqualStrings("prev", kb.get("Ctrl+PageUp").?);
+    kb.remove("CTRL+Page_Up");
+    try t.expect(kb.get("ctrl+page_up") == null);
+
+    try kb.set("alt+\\", "split");
+    try t.expectEqualStrings("split", kb.get("alt+backslash").?);
+
+    var buf: [max_combo_len]u8 = undefined;
+    const Case = struct { in: []const u8, out: []const u8 };
+    for ([_]Case{
+        .{ .in = "shift+alt+ctrl+x", .out = "ctrl+alt+shift+x" },
+        .{ .in = "ctrl+ctrl+s", .out = "ctrl+s" },
+        .{ .in = "Control+Esc", .out = "ctrl+escape" },
+        .{ .in = "alt+Return", .out = "alt+enter" },
+        .{ .in = "shift+del", .out = "shift+delete" },
+        .{ .in = "ctrl+ins", .out = "ctrl+insert" },
+        .{ .in = "ctrl+pagedown", .out = "ctrl+page_down" },
+        .{ .in = "ctrl+slash", .out = "ctrl+/" },
+        .{ .in = "ctrl + shift + f", .out = "ctrl+shift+f" },
+        .{ .in = "F5", .out = "f5" },
+        .{ .in = "ctrl+`", .out = "ctrl+`" },
+        .{ .in = "ctrl+1", .out = "ctrl+1" },
+    }) |c| {
+        const combo = canonicalize(&buf, c.in).?;
+        try t.expectEqualStrings(c.out, combo.text);
+        try t.expect(combo.known_key);
+        try t.expect(combo.unknown_modifier == null);
+    }
+
+    // Combos that can never fire: flagged, and kept apart from plainer chords.
+    const plus = canonicalize(&buf, "ctrl++").?;
+    try t.expectEqualStrings("ctrl++", plus.text);
+    try t.expect(!plus.known_key);
+    try t.expect(!canonicalize(&buf, "ctrl+numpad5").?.known_key);
+    const cmd = canonicalize(&buf, "Shift+Cmd+S").?;
+    try t.expectEqualStrings("shift+cmd+s", cmd.text);
+    try t.expectEqualStrings("Cmd", cmd.unknown_modifier.?);
+    try t.expect(canonicalize(&buf, "ctrl+" ++ "x" ** max_combo_len) == null);
+
+    // Such binds are stored (after one warning) but never shadow real chords;
+    // an empty key or an over-long combo is ignored.
+    const old_level = t.log_level;
+    t.log_level = .err;
+    defer t.log_level = old_level;
+    try kb.set("cmd+s", "nope");
+    try t.expect(kb.get("s") == null);
+    try t.expectEqualStrings("nope", kb.get("CMD+S").?);
+    const before = kb.map.count();
+    try kb.set("", "nothing");
+    try kb.set("ctrl+" ++ "x" ** max_combo_len, "nothing");
+    try t.expectEqual(before, kb.map.count());
+}
+
+test "shift fallback is for punctuation and special keys, never letters" {
+    const t = std.testing;
+    try t.expect(!allowsShiftFallback("ctrl+shift+z"));
+    try t.expect(!allowsShiftFallback("Shift+Ctrl+K"));
+    try t.expect(!allowsShiftFallback("ctrl+/")); // no shift to strip
+    try t.expect(allowsShiftFallback("ctrl+shift+/"));
+    try t.expect(allowsShiftFallback("ctrl+shift+backslash"));
+    try t.expect(allowsShiftFallback("shift+f12"));
 }

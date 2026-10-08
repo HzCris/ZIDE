@@ -90,6 +90,13 @@ test "regression: a delayed formatting save closes only the confirmed document" 
         return err;
     };
     client.config = try lsp.ServerConfig.fromArgv(t.allocator, &.{"zig"}, &.{"test-server"});
+    // Documents route to the newest registration for their language, so the
+    // fake server must be registered, not just running.
+    var registration = try client.config.?.clone(t.allocator);
+    editor.lsp_configs.append(t.allocator, registration) catch |err| {
+        registration.deinit(t.allocator);
+        return err;
+    };
     client.capabilities.format_document = true;
     var pending = request;
     pending.generation = client.generation;
@@ -102,6 +109,9 @@ test "regression: a delayed formatting save closes only the confirmed document" 
     try t.expectEqual(@as(?u64, id), editor.close_after_save_id);
     editor.switchToDoc(editor.docIndexForId(other_id).?);
     editor.lsp_tools.response(&editor, client, pending, "{\"result\":[]}");
+    // The formatted save runs on the next tick, not inside the reply.
+    try t.expect(editor.docIndexForId(id) != null);
+    editor.lsp_tools.tick(&editor);
     try t.expect(editor.docIndexForId(id) == null);
     const surviving = &editor.documents.items[editor.docIndexForId(other_id).?];
     try t.expect(surviving.dirty);
@@ -183,6 +193,31 @@ test "regression: word commands cross complete newlines and preserve undo" {
         try t.expectEqual(2 + 2 * eol.len, doc.cursors.primary().offset);
         doc.cursors.primary().moveToEnd(&doc.buffer);
         _ = editor.execAction("delete_word_forward");
+        try t.expectEqualStrings(original, doc.buffer.slice(0, doc.buffer.byteLen()));
+
+        // Backward, the mirror rule: from a line start exactly one complete
+        // line break is crossed (CRLF as a whole); inside a line the word
+        // before the caret is taken, never more than the line.
+        _ = editor.execAction("cursor_word_left");
+        try t.expectEqual(2 + 2 * eol.len, doc.cursors.primary().offset);
+        _ = editor.execAction("cursor_word_left");
+        try t.expectEqual(2 + eol.len, doc.cursors.primary().offset);
+        _ = editor.execAction("cursor_word_left");
+        try t.expectEqual(@as(usize, 2), doc.cursors.primary().offset);
+        _ = editor.execAction("cursor_word_left"); // é is a word character
+        try t.expectEqual(@as(usize, 0), doc.cursors.primary().offset);
+        doc.cursors.primary().* = .{ .offset = 2 + 2 * eol.len };
+        _ = editor.execAction("cursor_word_left_select");
+        try t.expectEqualStrings(eol, doc.selectedText().?);
+        // Ctrl+Backspace at a line start joins it with the line above only.
+        doc.cursors.primary().* = .{ .offset = 2 + 2 * eol.len };
+        _ = editor.execAction("delete_word_backward");
+        try t.expectEqualStrings(joined, doc.buffer.slice(0, doc.buffer.byteLen()));
+        try t.expectEqual(2 + eol.len, doc.cursors.primary().offset);
+        try t.expect(try doc.undoAction());
+        try t.expectEqualStrings(original, doc.buffer.slice(0, doc.buffer.byteLen()));
+        doc.cursors.primary().* = .{ .offset = 0 };
+        _ = editor.execAction("delete_word_backward");
         try t.expectEqualStrings(original, doc.buffer.slice(0, doc.buffer.byteLen()));
     }
 }
@@ -308,7 +343,7 @@ test "regression: disk search refresh selects its document across Lua open hooks
     defer editor.deinit();
     editor.lsp_enabled = false;
     @import("lua_settings.zig").registerApi(lua, &editor);
-    try lua.doString("zide.on('open', function() zide.exec('prev_doc') end)");
+    try lua.doString("zide.on('open', function() hook_runs = (hook_runs or 0) + 1; zide.exec('prev_doc') end)");
     try t.expect(editor.setFiletreeRoot(root));
     editor.search.appendText("X");
     editor.searchStart();
@@ -316,6 +351,10 @@ test "regression: disk search refresh selects its document across Lua open hooks
     try t.expectEqual(@as(usize, 1), editor.search.matches.items.len);
     try writeFile(tmp.dir, "file.txt", "a😀X");
     editor.searchOpenSelected();
+    // The hook really ran (and switched away) while the result opened.
+    _ = lua.getGlobal("hook_runs");
+    defer lua.pop(1);
+    try t.expectEqual(@as(zlua.Integer, 1), try lua.toInteger(-1));
     try t.expect(editor.activeDoc().file_path != null);
     try t.expectEqualStrings("X", editor.activeDoc().selectedText().?);
     try t.expectEqual(@as(u32, 5), editor.search.matches.items[0].col);
@@ -464,6 +503,15 @@ test "recovery retains named and untitled edits and uses the external-change sav
     try t.expectEqual(Editor.Mode.recovery_picker, editor.mode);
     editor.resolveRecovery(.recover);
     try t.expectEqual(@as(usize, 0), editor.recovery.?.candidates.items.len);
+    // The untitled buffer comes back as an untitled, unsaved document.
+    var untitled_recovered: usize = 0;
+    for (editor.documents.items) |*doc| {
+        if (doc.file_path != null) continue;
+        if (!std.mem.eql(u8, doc.buffer.slice(0, doc.buffer.byteLen()), "untitled 😀")) continue;
+        try t.expect(doc.dirty);
+        untitled_recovered += 1;
+    }
+    try t.expectEqual(@as(usize, 1), untitled_recovered);
     const named = &editor.documents.items[(try editor.findDocument(path)).?];
     try t.expectEqualStrings("unsaved original", named.buffer.slice(0, named.buffer.byteLen()));
     try t.expect(named.external_changed and named.dirty);
@@ -635,6 +683,10 @@ test "closing an untitled document survives the destination confirmation" {
     try t.expectEqual(Editor.SaveOutcome.destination_exists, editor.finishSaveAs(path));
     editor.resolveOverwrite(.overwrite);
     try t.expect(editor.docIndexForId(id) == null);
+    // Closed only after its text reached the confirmed destination.
+    const disk = try tmp.dir.readFileAlloc(t.io, "target.txt", t.allocator, .limited(100));
+    defer t.allocator.free(disk);
+    try t.expectEqualStrings("source", disk);
 }
 
 test "window quit action keeps dirty documents until a decision" {
@@ -660,7 +712,10 @@ test "regression: invalid terminal scroll region must be ignored" {
         .scroll_bottom = 7,
     };
     term.processOutput("\x1b[999;1000r\x1b[T");
-    try t.expect(term.scroll_top < term.rows);
+    // The region is unchanged — a clamped one (7..7) is in bounds too, and
+    // would still break scrolling.
+    try t.expectEqual(@as(u16, 0), term.scroll_top);
+    try t.expectEqual(@as(u16, 7), term.scroll_bottom);
 }
 
 test "regression: workspace replacement keeps an open alias off disk" {

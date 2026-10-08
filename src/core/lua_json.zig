@@ -1,5 +1,6 @@
 //! Lua table → JSON text. Used by zide.register_lsp to forward `settings`
-//! and `init_options` tables to language servers verbatim.
+//! and `init_options` tables to language servers verbatim (and by the task
+//! and debugger registrations for `env` / `arguments`).
 //!
 //! Rules:
 //! - nil → null; booleans; numbers (Lua integers as integers, floats as
@@ -40,23 +41,34 @@ pub fn stackValueToJson(lua: *Lua, gpa: std.mem.Allocator, index: i32, out: *std
 
 /// JSON text for `field` of the table at `table_index`, or null when the
 /// field is nil/absent. Non-table values are rejected with a warning.
-/// Caller frees.
+/// Caller frees. Warnings name the option only; tableFieldToJsonAllocFor
+/// prefixes them with the calling API.
 pub fn tableFieldToJsonAlloc(lua: *Lua, gpa: std.mem.Allocator, table_index: i32, field: [:0]const u8) ?[]u8 {
+    return tableFieldToJsonAllocFor(lua, gpa, table_index, field, "zide");
+}
+
+/// tableFieldToJsonAlloc with the calling API named in its warnings
+/// (`context`, e.g. "zide.register_lsp"). The field is read raw: option
+/// tables come from user scripts, and a raising `__index` would longjmp
+/// through this frame. (Traversal below is raw already: lua_next,
+/// lua_rawgeti, lua_rawlen.)
+pub fn tableFieldToJsonAllocFor(lua: *Lua, gpa: std.mem.Allocator, table_index: i32, field: [:0]const u8, context: []const u8) ?[]u8 {
     const tidx = lua.absIndex(table_index);
     const top = lua.getTop();
     defer lua.setTop(top); // also discards traversal leftovers after an error
-    _ = lua.getField(tidx, field);
+    _ = lua.pushString(field);
+    _ = lua.getTableRaw(tidx);
     switch (lua.typeOf(-1)) {
         .nil, .none => return null,
         .table => {},
         else => {
-            std.log.warn("zide.register_lsp: '{s}' must be a table (ignored)", .{field});
+            std.log.warn("{s}: '{s}' must be a table (ignored)", .{ context, field });
             return null;
         },
     }
     var out: std.ArrayList(u8) = .empty;
     stackValueToJson(lua, gpa, -1, &out, 0) catch |err| {
-        std.log.warn("zide.register_lsp: could not serialize '{s}' ({s}) — ignored", .{ field, @errorName(err) });
+        std.log.warn("{s}: could not serialize '{s}' ({s}) — ignored", .{ context, field, @errorName(err) });
         out.deinit(gpa);
         return null;
     };
@@ -220,7 +232,28 @@ test "lua→json: tableFieldToJsonAlloc" {
     testing.log_level = .err;
     defer testing.log_level = .warn;
     try testing.expect(tableFieldToJsonAlloc(lua, testing.allocator, -1, "bad") == null);
+    try testing.expect(tableFieldToJsonAllocFor(lua, testing.allocator, -1, "bad", "zide.register_task") == null);
     try testing.expectEqual(top, lua.getTop()); // stack balanced
+}
+
+test "lua→json: option fields are read raw, never through __index" {
+    var lua = try Lua.init(testing.allocator);
+    defer lua.deinit();
+    lua.openLibs();
+
+    // A raising __index would longjmp through the Zig reader (no pcall
+    // around a C function's own frame); raw access never calls it.
+    try lua.doString(
+        \\cfg = setmetatable({ settings = { a = 1 } }, { __index = function() error('boom') end })
+    );
+    _ = lua.getGlobal("cfg");
+    defer lua.pop(1);
+    const top = lua.getTop();
+    const s = tableFieldToJsonAllocFor(lua, testing.allocator, -1, "settings", "test").?;
+    defer testing.allocator.free(s);
+    try testing.expectEqualStrings("{\"a\":1}", s);
+    try testing.expect(tableFieldToJsonAllocFor(lua, testing.allocator, -1, "init_options", "test") == null);
+    try testing.expectEqual(top, lua.getTop());
 }
 
 test "lua→json: depth cap" {

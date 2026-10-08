@@ -1279,7 +1279,8 @@ pub fn addEvent(self: *SDLBackend, win: *dvui.Window, event: c.SDL_Event) !bool 
             return try win.addEventText(.{ .text = txt });
         },
         if (sdl3) c.SDL_EVENT_TEXT_EDITING else c.SDL_TEXTEDITING => {
-            const strlen: u8 = @intCast(c.SDL_strlen(if (sdl3) event.edit.text else &event.edit.text));
+            // ZIDE patch: usize, not u8 — an IME composition longer than 255 bytes panicked the @intCast.
+            const strlen: usize = @intCast(c.SDL_strlen(if (sdl3) event.edit.text else &event.edit.text));
             if (self.log_events) {
                 log.debug("event TEXTEDITING {s} start {d} len {d} strlen {d}\n", .{ event.edit.text, event.edit.start, event.edit.length, strlen });
             }
