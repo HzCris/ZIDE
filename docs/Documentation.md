@@ -41,15 +41,15 @@ All of these features share their commands, state and keyboard navigation betwee
 
 Register tasks in `init.lua` or an extension with `zide.register_task({name, argv, cwd, env, problem_matcher})`. `name` and the argv array are required. The workspace is the default cwd; relative cwd values resolve against it. `env` is a table of string overrides. Arguments are passed directly to the executable; shell syntax requires an explicit shell in argv. Registration returns true or nil plus an error and never starts a command (a failure also shows `register_task: <Error>` in the status bar); env keys must be non-empty and contain no `=`, with string values. Re-registering a name replaces the task and cancels its running or waiting run; at most 256 tasks can be registered. `zide.run_task(name)` returns a task ID or nil plus an error (`EditorBusy` while a prompt is open, `TaskAlreadyWaitingForSave`, `TaskNotFound`, `TaskHistoryFull`), and starting a task cancels a still-running earlier run of the same task; the save-before-run prompt covers dirty files inside the workspace root plus untitled buffers. `zide.cancel_task(id)` cancels that run and its owned processes. `rerun_task` while a save-before-run prompt is open cancels that prompt and asks again.
 
-`problem_matcher = "zig"` parses Zig diagnostics. A Lua matcher receives an output line and returns nil or `{file, line, col, severity, message}` (`path` is accepted in place of `file`; `message` is required; `line` and `col` default to 1 and 0 is rejected; an unknown severity counts as `error`); a matcher that raises an error loses only that line, and the first error with its Lua message appears in the Task Output title and once in the status bar. Enter on a Task Output line finds its location with the matcher of the run that produced it. Lines and UTF-8 byte columns are one-based; filenames resolve against the task cwd. Severity accepts `error`, `warning`, `info`, or `hint`. [examples/tasks.lua](examples/tasks.lua) contains commented registrations. Each run replaces only its own producer's findings; locations from an edited buffer are marked possibly stale. Output is bounded at 4 MiB, individual matcher lines at 64 KiB, and findings at 10,000 per run; truncation is shown. Finished run history retains up to 64 runs.
+`problem_matcher = "zig"` parses Zig diagnostics. A Lua matcher receives an output line and returns nil or `{file, line, col, severity, message}` (`path` is accepted in place of `file`; `message` is required; `line` and `col` default to 1 and 0 is rejected; an unknown severity counts as `error`); a matcher that raises an error loses only that line, and the first error with its Lua message appears in the Task Output title and once in the status bar. Enter on a Task Output line finds its location with the matcher of the run that produced it. Lines and UTF-8 byte columns are one-based; filenames resolve against the task cwd. Severity accepts `error`, `warning`, `info`, or `hint`. [examples/tasks.lua](../examples/tasks.lua) contains commented registrations. Each run replaces only its own producer's findings; locations from an edited buffer are marked possibly stale. Output is bounded at 4 MiB, individual matcher lines at 64 KiB, and findings at 10,000 per run; truncation is shown. Finished run history retains up to 64 runs.
 
 The Changes panel uses the Git CLI on PATH. Enter previews saved working-tree changes against the index; D previews the index against HEAD; S stages; U unstages; O opens the file; R refreshes. The `git_stage` / `git_unstage` commands do what S / U do. Actions follow the highlighted file by path across refreshes; if it has left the list, nothing happens and the status bar says so. Dirty files offer Save and stage or Cancel. Save As during that prompt cancels staging and asks for a refreshed selection. Renames retain both paths and repositories without a first commit are supported. Conflicts have an explanatory read-only preview. Gutters compare the in-memory buffer, including unsaved edits, with the index, ignoring CRLF/LF differences (a `core.autocrlf` working copy shows only real changes); previews use saved disk contents. The marks render as `+` added / `~` modified / `-` deleted in the TUI and as a colored edge bar (short for deletions) in the GUI, in the `color_git_added/modified/deleted` theme colors; buffers over 4 MiB, comparisons past 200,000 combined lines and overly complex diffs silently show no marks, and there is no setting to turn the gutter marks off (disabling tree colors keeps them). Every Git command runs with `-c core.fsmonitor=false`, so a repository's own config cannot start an fsmonitor hook; clean/smudge filters still run. Status and index checks run on deadlines, and background results are discarded when their inputs change. Commits, network operations, hunk staging and a merge editor are deferred.
 
-Register a debug adapter with `zide.register_debug_adapter({name, argv})`, then `zide.register_debug_config({name, adapter, request, arguments})`. `request` is `launch` (default) or `attach`; `arguments` is required (an empty `{}` is fine) and is the adapter's JSON-compatible argument table — a configuration that asks for an interactive terminal (`runInTerminal = true`, or `console` of `integratedTerminal`/`externalTerminal`) is refused at registration. Re-registering a name replaces it (limits: 64 adapters, 256 configurations), `cwd` defaults to the workspace root when `arguments` has none, and the adapter's program is only checked when debugging starts (`start_debug` errors: `DebuggerBusy`, `DebugSessionAlreadyActive`, `DebugConfigurationNotFound`, `DebugAdapterNotFound`). `${workspaceFolder}` expands in string values. Empty tables under list-typed options (`args`, `argv`, and keys ending in `Args` or `Commands`, at any depth) are sent as `[]`; other empty tables stay `{}`. `zide.start_debug(name)` starts a configuration; `zide.stop_debug()` applies normal Stop behavior. `zide.stop_debug(true)` requests attached-target termination when supported. Registrations and start return true or nil plus an error. See [examples/debug.lua](examples/debug.lua) for LLDB configurations and optional bindings.
+Register a debug adapter with `zide.register_debug_adapter({name, argv})`, then `zide.register_debug_config({name, adapter, request, arguments})`. `request` is `launch` (default) or `attach`; `arguments` is required (an empty `{}` is fine) and is the adapter's JSON-compatible argument table — a configuration that asks for an interactive terminal (`runInTerminal = true`, or `console` of `integratedTerminal`/`externalTerminal`) is refused at registration. Re-registering a name replaces it (limits: 64 adapters, 256 configurations), `cwd` defaults to the workspace root when `arguments` has none, and the adapter's program is only checked when debugging starts (`start_debug` errors: `DebuggerBusy`, `DebugSessionAlreadyActive`, `DebugConfigurationNotFound`, `DebugAdapterNotFound`). `${workspaceFolder}` expands in string values. Empty tables under list-typed options (`args`, `argv`, and keys ending in `Args` or `Commands`, at any depth) are sent as `[]`; other empty tables stay `{}`. `zide.start_debug(name)` starts a configuration; `zide.stop_debug()` applies normal Stop behavior. `zide.stop_debug(true)` requests attached-target termination when supported. Registrations and start return true or nil plus an error. See [examples/debug.lua](../examples/debug.lua) for LLDB configurations and optional bindings.
 
 The `debug` command opens a 12-item overview — configurations, threads, stack, variables, breakpoints, output, and the continue/pause/step/stop controls; Enter activates (a thread shows its stack, a frame jumps to its source, a variable expands, a breakpoint opens its location), R returns to the overview, S stops, O shows output. Build the executable with debug information before starting. Source breakpoints persist per workspace in `debug/` under the configuration directory (paths that are not UTF-8 are stored as `path_hex`) and follow the file tree root — re-checked every 1.5 s while no session runs, unlike recovery; limits are 256 files, 1024 breakpoints per file and a 2 MiB file read, and a file must be saved before a breakpoint can be set in it. The gutter shows `●` verified, `○` unverified and `>` on the execution line (in the TUI's single gutter column the debugger marker beats a diagnostic `!`, which beats a Git mark); the adapter reports verification, relocated lines and failures. An unusable breakpoint file is reported once and never overwritten; invalid entries are skipped with a count. Breakpoint markers also show in files opened through quick open. Save and rebuild after source changes so executable locations correspond to the source. Resume discards stale stack/variable handles. Stop terminates a launched target and detaches from an attached target; explicit `debug_terminate` requires adapter support. Closing ZIDE also disconnects the session. A stop whose source cannot be opened (libc frames, a moved toolchain) keeps the session running: the frame shows `Source unavailable`, with no execution marker and no encoding picker. Replies are capped at 4096 threads, 4096 stack frames and 256 scopes, and variables expand at most 32 levels deep; a note says what was cut. Adapter errors (with the adapter's formatted message), timeouts and stderr are reported in debug output; telemetry output is hidden. Interactive terminal input/launch, watches, conditional/log breakpoints, memory/disassembly and multiple sessions are deferred.
 
-Reloading extensions cancels their tasks, disconnects their active debug session and replaces their registrations. Core tests use deterministic fixtures; `zig build test -Dtest-tools=true` additionally requires working ZLS, Git and LLDB installations on PATH. See [ImplementationProgress.md](ImplementationProgress.md) for validation results and outstanding hardware checks.
+Reloading extensions cancels their tasks, disconnects their active debug session and replaces their registrations. Core tests use deterministic fixtures; `zig build test -Dtest-tools=true` additionally requires working ZLS, Git and LLDB installations on PATH. The release checklist — the validation runs completed so far and the display and hardware checks still outstanding — is [tests/VALIDATION.md](../tests/VALIDATION.md).
 
 ## TUI Frontend
 
@@ -248,7 +248,7 @@ Windows terminals commonly intercept Alt combos (Windows Terminal binds Alt+arro
 - Bracketed paste on Windows: vaxis's Windows reader forwards no paste markers, so a paste made by the terminal arrives as typed keys
 - Terminal scrollback (the emulator keeps no scrolled-off rows — the GUI shares this gap)
 
-Cross-frontend gaps are tracked in [Suggestions-2026-09-30.md](Suggestions-2026-09-30.md) (verified backlog: navigation back/forward, code folding, matching-bracket highlight, LSP references/signature help/symbols, regex search, Open Folder dialog and recent projects, dockable/multiple terminals, and more).
+Cross-frontend gaps are tracked in [Suggestions-2026-09-30.md](../references/Suggestions-2026-09-30.md) (verified backlog: navigation back/forward, code folding, matching-bracket highlight, LSP references/signature help/symbols, regex search, Open Folder dialog and recent projects, dockable/multiple terminals, and more).
 
 ---
 
@@ -330,7 +330,7 @@ Cross-frontend gaps are tracked in [Suggestions-2026-09-30.md](Suggestions-2026-
 - Theme setting in Settings dialog: dropdown (dark/light/high_contrast)
 - Open Theme File: opens `~/.config/zide/themes/gui-theme.lua` in the editor (the commented template with per-field descriptions is created at startup when missing — the menu action itself only opens the file)
 - Open Theme Folder: opens `~/.config/zide/themes/` in OS file explorer
-- Help > Documentation: opens Documentation.md in the editor (searches the exe's directory and its ancestors — works from `zig-out/bin` and desktop launches; also available as the `open_documentation` palette command in both frontends)
+- Help > Documentation: opens `docs/Documentation.md` in the editor (looks for `docs/Documentation.md`, then a root-level `Documentation.md` from older checkouts, in the exe's directory and its ancestors — works from `zig-out/bin` and desktop launches — and finally in the current directory; also available as the `open_documentation` palette command in both frontends)
 - Editor pane scrollbar: slim pill overlay on the right edge (same style as the file tree) — drag the thumb, click the band to page up/down, hover brightens; per split pane
 - Mouse wheel scrolls 3 lines per notch (editor panes, the quick-open preview and the search panel; the TUI scrolls 5)
 - Tab bar styling: inactive tabs have visible borders and control-style background
@@ -341,7 +341,7 @@ Cross-frontend gaps are tracked in [Suggestions-2026-09-30.md](Suggestions-2026-
 - Terminal scrollback (the emulator keeps no scrolled-off rows; the TUI shares this)
 - Terminal selection and copy/paste (Ctrl+Shift+C / Ctrl+Shift+V currently reach the shell as ^C/^V)
 
-Cross-frontend gaps are tracked in [Suggestions-2026-09-30.md](Suggestions-2026-09-30.md).
+Cross-frontend gaps are tracked in [Suggestions-2026-09-30.md](../references/Suggestions-2026-09-30.md).
 
 ---
 
@@ -974,7 +974,150 @@ Key combos for `zide.bind` / `zide.unbind` accept any case and modifier order (`
 
 **Keyboard focus.** In normal mode exactly one of the focused editor pane, the focused terminal pane, the file tree and the search panel owns the keyboard. The side panels live in the main window and can own the keyboard only while that window is focused. Clicking any pane, clicking a tab, splitting, F6 / Shift+F6, switching windows and `toggle_terminal` (Ctrl+backtick) give the keyboard back to the pane; `toggle_terminal` with a panel focused over a terminal pane focuses that terminal instead of opening another. While a panel owns the keyboard, clipboard, select-all and word-delete chords never touch the document behind it: in the search panel the keys bound to copy and cut take the whole focused field, paste appends the clipboard's first line and Ctrl+Backspace deletes the previous word, while Ctrl+A and Ctrl+Delete do nothing; in the file tree the keys bound to copy, cut and paste drive the file clipboard. The Edit menu's Cut/Copy/Paste/Select All follow the same rule.
 
-120+ registered commands covering cursor movement, editing, selection, clipboard, line operations, and theme switching. Theme commands: `theme_dark`, `theme_light`, `theme_high_contrast`, `theme_terminal` (set both frontends); `gui_theme_dark/light/high_contrast` (GUI only); `tui_theme_dark/light/high_contrast` (TUI only). `theme_*`, `gui_theme_*` and `tui_theme_*` re-apply `themes/syntax-theme.lua` and the `syn_theme_<lang>.lua` files on top of the new palette (the editor-color override files `gui-theme.lua` / `tui-theme.lua` are not re-run until the next launch). The editor-level actions `save`, `save_as`, `new_document`, `file_open`, `close_tab`, `next_doc`, `prev_doc`, `quit`, `find`, `find_replace`, `goto_line`, `command_palette`, `settings`, `toggle_terminal`, `open_terminal_right`, `close_terminal`, `lsp_completion`, `lsp_goto_definition`, `navigate_back`, `navigate_forward`, `reopen_closed_tab`, `open_folder` and `recent_projects` are registered commands too: listed in the command palette and bindable.
+About 150 registered commands; every one is listed in the command palette and bindable with `zide.bind`. The tables below are the complete set (names as the code registers them, 2026-10-08). "Default key" is the shipped binding; **hard-wired** means the frontends dispatch that plain key themselves, so it is not in the keybind map — the command can still be bound to a chord of your own. `theme_*`, `gui_theme_*` and `tui_theme_*` re-apply `themes/syntax-theme.lua` and the `syn_theme_<lang>.lua` files on top of the new palette (the editor-color override files `gui-theme.lua` / `tui-theme.lua` are not re-run until the next launch).
+
+**Files, tabs and projects**
+
+| Command | Default key | What it does |
+| --- | --- | --- |
+| `new_document` | Ctrl+N | Open a new untitled document |
+| `file_open` | Ctrl+O | Open a file by path |
+| `save` | Ctrl+S | Save the current document |
+| `save_as` | Ctrl+Shift+S | Save the current document under a new name |
+| `save_with_encoding` / `reopen_with_encoding` / `file_encoding` | — | Save or reopen with a chosen encoding; choose the file encoding |
+| `close_tab` | Ctrl+W | Close the current tab (asks about unsaved changes) |
+| `reopen_closed_tab` | Ctrl+Shift+T | Reopen the most recently closed file |
+| `next_doc` / `prev_doc` | Ctrl+Tab / Ctrl+Shift+Tab, also Ctrl+PgDn / Ctrl+PgUp | Switch to the next / previous tab |
+| `quick_open` | Ctrl+E | Fuzzy-find a file in the workspace (live preview) |
+| `open_folder` | Ctrl+Shift+O | Open a folder as the project (file tree root and language-server workspace) |
+| `recent_projects` | — | Pick a recently opened project folder |
+| `recover_documents` | — | Recover unsaved documents from a previous instance |
+| `quit` | Ctrl+Q | Quit ZIDE (asks about unsaved changes) |
+| `close_window` | — | Close this window (main window: quit) |
+| `open_in_new_window` | Ctrl+Shift+N, also Ctrl+Alt+N | Show the current document in a new window (TUI: split) |
+| `move_pane_to_new_window` | — | Move the focused pane into a new window (TUI: split) |
+| `settings` | — | Open the settings dialog (GUI) |
+| `command_palette` | Ctrl+P | Open the command palette |
+| `open_documentation` | — | Open `docs/Documentation.md` |
+| `open_log` | — | Open `zide.log` (reloads as it grows) |
+
+**Cursor, selection and navigation**
+
+| Command | Default key | What it does |
+| --- | --- | --- |
+| `cursor_left` / `cursor_right` / `cursor_up` / `cursor_down` | arrows (hard-wired) | Move the caret |
+| `cursor_left_select` / `cursor_right_select` / `cursor_up_select` / `cursor_down_select` | Shift+arrows (hard-wired) | Extend the selection |
+| `cursor_word_left` / `cursor_word_right` | Ctrl+Left / Ctrl+Right | Move by word |
+| `cursor_word_left_select` / `cursor_word_right_select` | Ctrl+Shift+Left / Ctrl+Shift+Right | Select by word |
+| `smart_home` / `smart_home_select` | Home / Shift+Home (hard-wired) | First non-whitespace column, then column 0 |
+| `cursor_home` / `cursor_home_select` | — (Home runs `smart_home`) | Column 0 / select to column 0 |
+| `cursor_end` / `cursor_end_select` | End / Shift+End (hard-wired) | End of line / select to end of line |
+| `cursor_file_start` / `cursor_file_end` | Ctrl+Home / Ctrl+End | Jump to the start / end of the file |
+| `cursor_file_start_select` / `cursor_file_end_select` | Ctrl+Shift+Home / Ctrl+Shift+End | Select to the start / end of the file |
+| `page_up` / `page_down` | PgUp / PgDn (hard-wired) | Move one page |
+| `select_all` | Ctrl+A | Select all text |
+| `add_cursor_above` / `add_cursor_below` | Ctrl+Shift+Up / Down, also Ctrl+Alt+Up / Down | Add a cursor on the line above / below |
+| `add_next_occurrence` | Ctrl+D | Add a cursor at the next occurrence (selects the word first) |
+| `escape_multicursor` | Escape (hard-wired) | Remove secondary cursors |
+| `goto_line` | Ctrl+G | Go to a line number |
+| `goto_matching_bracket` | Alt+M | Jump to the bracket matching the one at the caret |
+| `navigate_back` / `navigate_forward` | Ctrl+Alt+Left / Right, also F7 / Shift+F7 | Move through the jump history |
+| `next_todo` | — | Jump to the next TODO/FIXME/XXX/HACK/BUG/NOTE marker |
+
+**Editing**
+
+| Command | Default key | What it does |
+| --- | --- | --- |
+| `undo` / `redo` | Ctrl+Z / Ctrl+Y (also Ctrl+Shift+Z) | Undo / redo |
+| `copy` / `cut` / `paste` | Ctrl+C / Ctrl+X / Ctrl+V | Clipboard |
+| `insert_char` / `insert_newline` / `insert_newline_auto` | typing / Enter (hard-wired) | Insert text; Enter inserts a newline with auto-indent |
+| `delete_backward` / `delete_forward` | Backspace / Delete (hard-wired) | Delete one character |
+| `delete_word_backward` / `delete_word_forward` | Ctrl+Backspace / Ctrl+Delete | Delete one word |
+| `delete_line` | Ctrl+K | Delete the current line |
+| `duplicate_line` | Ctrl+Shift+D | Duplicate the current line |
+| `move_line_up` / `move_line_down` | Alt+Up / Alt+Down, also Ctrl+Shift+PgUp / PgDn | Move the line |
+| `indent` / `dedent` | Tab / Shift+Tab (hard-wired, after snippets and completion) | Indent / dedent the caret line or every selected line |
+| `toggle_comment` | Ctrl+/ | Toggle comments on the selected lines |
+
+**Find**
+
+| Command | Default key | What it does |
+| --- | --- | --- |
+| `find` | Ctrl+F | Find in the current document |
+| `find_replace` | Ctrl+H | Find and replace in the current document |
+| `find_in_files` | Ctrl+Shift+F | Search and replace across the workspace (results panel) |
+| `next_result` / `prev_result` | F4 / Shift+F4 | Step through the workspace search results |
+
+**Panes, windows and terminals**
+
+| Command | Default key | What it does |
+| --- | --- | --- |
+| `split_vertical` / `split_horizontal` | Alt+\ / Alt+Shift+\, also Ctrl+\ / Ctrl+Shift+\ | Split the pane side by side / top-bottom |
+| `close_pane` | Ctrl+Alt+Q, also Ctrl+F4 | Close the current pane (also a terminal pane) |
+| `focus_next_pane` / `focus_prev_pane` | Alt+Right / Alt+Left, also F6 / Shift+F6 | Move focus between panes |
+| `toggle_terminal` | Ctrl+` | Open a terminal below, or go back from a terminal to the editor |
+| `open_terminal_right` | Ctrl+Shift+` | Open a terminal in a split to the right |
+| `close_terminal` | — | Close the focused terminal pane |
+| `detach_terminal` | Ctrl+Alt+` | Move the focused terminal into its own window (TUI: side split) |
+
+**File tree**
+
+| Command | Default key | What it does |
+| --- | --- | --- |
+| `toggle_filetree` | Ctrl+B | Toggle the file tree side panel |
+| `filetree_reveal` | — | Reveal the current file in the tree |
+| `filetree_refresh` | — | Refresh the tree from disk |
+| `filetree_collapse_all` | — | Collapse every folder |
+| `filetree_root_up` | — | Re-root the tree at the parent directory |
+| `filetree_set_root` | `o` in the tree | Open the selected folder as the project root |
+| `filetree_copy` / `filetree_cut` / `filetree_paste` | — | The file clipboard for the selected entries |
+| `filetree_copy_path` / `filetree_copy_relative_path` | — | Copy the selected entry's absolute / root-relative path |
+| `filetree_reveal_explorer` | — | Show the selected entry in the system file manager |
+| `toggle_tui_icons` | — | Toggle nerdfont icons in the TUI tree (persists to init.lua) |
+
+**Language servers**
+
+| Command | Default key | What it does |
+| --- | --- | --- |
+| `lsp_completion` | Ctrl+Space | Show completions at the caret |
+| `lsp_goto_definition` | F12 | Go to the definition of the symbol at the caret |
+| `hover` | — | Show documentation for the symbol at the caret |
+| `rename_symbol` | — | Rename a symbol with a workspace-edit preview |
+| `format_document` / `format_selection` | — | Format the document / the selection |
+| `lsp_references` / `references` | Shift+F12 / — | Find every reference (References view) / reopen the last list |
+| `lsp_document_symbols` | Ctrl+F12 | Go to a symbol in this file (picker) |
+| `lsp_workspace_symbols` | Ctrl+T | Search symbols across the workspace (picker) |
+| `lsp_signature_help` | Ctrl+Shift+Space | Show the signature of the call at the caret |
+| `lsp_restart` | — | Restart language servers (re-reads registrations, clears failures) |
+| `lsp_stderr` | — | Show what the servers wrote to stderr (read-only tab) |
+
+**Snippets**
+
+| Command | Default key | What it does |
+| --- | --- | --- |
+| `snippet_expand` | Tab (hard-wired) | Expand the exact trigger before the caret |
+| `snippet_next` / `snippet_previous` | Tab / Shift+Tab (hard-wired) | Visit the next / previous placeholder |
+| `snippet_cancel` | Escape (hard-wired) | End snippet navigation |
+
+**Tasks, problems, Git and debugging**
+
+| Command | Default key | What it does |
+| --- | --- | --- |
+| `run_task` / `rerun_task` / `stop_task` / `task_output` | — | Run, rerun or cancel a task; show the latest output |
+| `problems` / `next_problem` / `previous_problem` | — | The Problems view and stepping through it |
+| `git_changes` / `git_refresh` / `git_stage` / `git_unstage` | — | The Changes panel and its actions |
+| `debug` / `debug_start` / `debug_stop` / `debug_terminate` | — | Debugger views; start a configuration; stop or detach; terminate an attached target |
+| `debug_continue` / `debug_pause` / `debug_step_in` / `debug_step_over` / `debug_step_out` | — | Execution control |
+| `toggle_breakpoint` | — | Toggle a source breakpoint at the caret |
+
+**Themes and extensions**
+
+| Command | Default key | What it does |
+| --- | --- | --- |
+| `theme_dark` / `theme_light` / `theme_high_contrast` / `theme_terminal` | — | Switch the theme in both frontends (`theme_terminal`: TUI only, ANSI colors) |
+| `gui_theme_dark` / `gui_theme_light` / `gui_theme_high_contrast` | — | GUI only |
+| `tui_theme_dark` / `tui_theme_light` / `tui_theme_high_contrast` | — | TUI only |
+| `reload_extensions` | — | Reload Lua extensions (re-runs `extensions/*.lua`) |
 
 ## Snippets
 

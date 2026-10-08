@@ -1,6 +1,6 @@
 # Release validation
 
-The implemented features and completed checks are tracked in [ImplementationProgress.md](../ImplementationProgress.md). This checklist distinguishes automated coverage from the display and hardware checks still required before declaring the complete release gate passed.
+The implemented features are described in [docs/Documentation.md](../docs/Documentation.md); the validation runs completed so far are recorded below. This checklist distinguishes automated coverage from the display and hardware checks still required before declaring the complete release gate passed.
 
 ## Automated checks
 

@@ -6897,7 +6897,7 @@ fn openSettingsFile(editor: *Editor) void {
     // Create file if it doesn't exist
     if (std.Io.Dir.cwd().access(editor.io, config_path, .{})) |_| {} else |_| {
         if (std.Io.Dir.cwd().createFile(editor.io, config_path, .{})) |f| {
-            f.writeStreamingAll(editor.io, "-- ZIDE settings\n-- See Documentation.md for available settings\n") catch {};
+            f.writeStreamingAll(editor.io, "-- ZIDE settings\n-- See docs/Documentation.md for available settings\n") catch {};
             f.close(editor.io);
         } else |_| {}
     }

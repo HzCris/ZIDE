@@ -2,7 +2,7 @@
 
 Zimplified Integrated Development Environment — a lightweight hybrid GUI/TUI
 editor written in Zig that you turn into an IDE with Lua (languages, language
-servers, settings, keys, extensions). See `Documentation.md` for everything
+servers, settings, keys, extensions). See [docs/Documentation.md](docs/Documentation.md) for everything
 the editor does; this file is about building and installing it.
 
 ZIDE pairs familiar, non-modal editing with the extension capability of a
@@ -185,8 +185,7 @@ The optional tool integration suite is `zig build test -Dtest-tools=true`. It re
 ZLS, Git and a working `lldb-dap` on PATH. Validate `lldb-dap --version` first; some
 Windows LLVM packages require a matching Python runtime DLL. The validated LLVM
 22.1.8 package required `python311.dll`. Normal builds and core unit tests do not need
-an installed debug adapter. See [ImplementationProgress.md](ImplementationProgress.md)
-for the environments and checks completed so far.
+an installed debug adapter.
 
 The remaining physical Linux display and renderer comparison checks are listed in
 [tests/VALIDATION.md](tests/VALIDATION.md). Software rendering is an explicit option;

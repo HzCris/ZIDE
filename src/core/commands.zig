@@ -378,7 +378,7 @@ pub fn registerBuiltins(registry: *CommandRegistry) !void {
     try registry.register("toggle_comment", "Toggle comment on selected lines", cmdToggleComment);
     try registry.register("next_todo", "Jump to next TODO/FIXME/XXX/HACK/BUG/NOTE marker", cmdNextTodo);
     try registry.register("goto_matching_bracket", "Jump to the bracket matching the one at the cursor", cmdGotoMatchingBracket);
-    try registry.register("open_documentation", "Open ZIDE documentation (Documentation.md)", cmdOpenDocumentation);
+    try registry.register("open_documentation", "Open ZIDE documentation (docs/Documentation.md)", cmdOpenDocumentation);
     try registry.register("file_encoding", "Choose file encoding", cmdFileEncoding);
     try registry.register("reopen_with_encoding", "Reopen with Encoding", cmdReopenEncoding);
     try registry.register("save_with_encoding", "Save with Encoding", cmdSaveEncoding);
@@ -1125,6 +1125,28 @@ test "open_log opens the log file from the config directory" {
     try t.expectEqualStrings("No language server is running", editor.status_message);
 }
 
+test "open_documentation prefers docs/Documentation.md and still finds a root-level copy" {
+    const t = std.testing;
+    var tmp = t.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(t.io, ".", t.allocator);
+    defer t.allocator.free(root);
+    var buf: [600]u8 = undefined;
+    try t.expect(documentationIn(t.io, root, &buf) == null);
+    // An older checkout keeps the file at the root.
+    try tmp.dir.writeFile(t.io, .{ .sub_path = "Documentation.md", .data = "# old home\n" });
+    const at_root = documentationIn(t.io, root, &buf).?;
+    try t.expect(std.mem.startsWith(u8, at_root, root));
+    try t.expect(std.mem.endsWith(u8, at_root, "/Documentation.md"));
+    try t.expect(!std.mem.endsWith(u8, at_root, "docs/Documentation.md"));
+    // docs/ wins once it exists.
+    try tmp.dir.createDirPath(t.io, "docs");
+    try tmp.dir.writeFile(t.io, .{ .sub_path = "docs/Documentation.md", .data = "# ZIDE Feature Documentation\n" });
+    const in_docs = documentationIn(t.io, root, &buf).?;
+    try t.expect(std.mem.startsWith(u8, in_docs, root));
+    try t.expect(std.mem.endsWith(u8, in_docs, "/docs/Documentation.md"));
+}
+
 fn cmdReferences(editor: *Editor, _: ?[]const u8) void {
     if (editor.lsp_tools.references.items.len == 0) {
         editor.status_message = "No references yet: run lsp_references on a symbol";
@@ -1667,31 +1689,48 @@ fn cmdPrevResult(editor: *Editor, _: ?[]const u8) void {
 
 // --- Documentation ---
 
-/// Open Documentation.md: search the exe's directory and its ancestors
+/// Where the documentation file may sit, relative to a checkout or install
+/// directory: `docs/` since 2026-10-08, the root in older checkouts.
+const documentation_names = [_][]const u8{ "docs/Documentation.md", "Documentation.md" };
+
+/// The documentation file under `dir` (`""` = the current working
+/// directory), as a NUL-terminated slice of `buf`, or null when neither
+/// location has it.
+fn documentationIn(io: std.Io, dir: []const u8, buf: *[600]u8) ?[:0]const u8 {
+    const sep: []const u8 = if (dir.len == 0) "" else "/";
+    for (documentation_names) |name| {
+        const path = std.fmt.bufPrint(buf, "{s}{s}{s}", .{ dir, sep, name }) catch continue;
+        if (path.len + 1 >= buf.len) continue;
+        buf[path.len] = 0;
+        const z_path: [:0]const u8 = buf[0..path.len :0];
+        if (std.Io.Dir.cwd().access(io, z_path, .{})) |_| {
+            return z_path;
+        } else |_| {}
+    }
+    return null;
+}
+
+/// Open docs/Documentation.md: search the exe's directory and its ancestors
 /// (zig-out/bin/zide.exe → repo root), then the current working directory.
 fn cmdOpenDocumentation(editor: *Editor, _: ?[]const u8) void {
+    var doc_buf: [600]u8 = undefined;
     var exe_dir_buf: [512]u8 = undefined;
     if (std.process.executableDirPath(editor.io, &exe_dir_buf)) |exe_dir_len| {
         var dir: []const u8 = exe_dir_buf[0..exe_dir_len];
         var level: usize = 0;
         while (level < 4) : (level += 1) {
-            var doc_buf: [600]u8 = undefined;
-            const doc_path = std.fmt.bufPrint(&doc_buf, "{s}/Documentation.md", .{dir}) catch break;
-            if (doc_path.len + 1 >= doc_buf.len) break;
-            doc_buf[doc_path.len] = 0;
-            const z_path: [:0]const u8 = doc_buf[0..doc_path.len :0];
-            if (std.Io.Dir.cwd().access(editor.io, z_path, .{})) |_| {
-                _ = editor.openFile(z_path) catch {};
+            if (documentationIn(editor.io, dir, &doc_buf)) |path| {
+                _ = editor.openFile(path) catch {};
                 return;
-            } else |_| {}
+            }
             dir = std.fs.path.dirname(dir) orelse break;
         }
     } else |_| {}
     // Fallback: current working directory
-    if (std.Io.Dir.cwd().access(editor.io, "Documentation.md", .{})) |_| {
-        _ = editor.openFile("Documentation.md") catch {};
+    if (documentationIn(editor.io, "", &doc_buf)) |path| {
+        _ = editor.openFile(path) catch {};
         return;
-    } else |_| {}
+    }
     editor.status_message = "Documentation.md not found";
 }
 
