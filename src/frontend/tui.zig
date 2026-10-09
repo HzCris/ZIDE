@@ -3267,7 +3267,7 @@ fn drawCommandPalette(win: Window, editor: *Editor, width: u16, height: u16) voi
     var shown: usize = 0;
     for (names) |name| {
         if (item_y > max_items) break;
-        if (filter.len > 0 and !fuzzyMatch(name, filter)) continue;
+        if (filter.len > 0 and !Editor.paletteMatch(name, filter)) continue;
         defer shown += 1;
         if (shown < first) continue;
 
@@ -3367,19 +3367,6 @@ fn handlePickerKey(editor: *Editor, key: Key) void {
 }
 
 /// Simple fuzzy match: all chars in needle appear in haystack in order.
-fn fuzzyMatch(haystack: []const u8, needle: []const u8) bool {
-    var hi: usize = 0;
-    for (needle) |ch| {
-        while (hi < haystack.len) : (hi += 1) {
-            if (haystack[hi] == ch) {
-                hi += 1;
-                break;
-            }
-        } else return false;
-    }
-    return true;
-}
-
 /// Signature help: the call's signature on the row above the caret with
 /// the active parameter in bold reverse, and a documentation row under it
 /// when there is one.
@@ -3921,7 +3908,7 @@ fn paletteMatchCount(editor: *Editor) usize {
     const names = editor.commands.allNames() catch return 0;
     var count: usize = 0;
     for (names) |name| {
-        if (filter.len > 0 and !fuzzyMatch(name, filter)) continue;
+        if (filter.len > 0 and !Editor.paletteMatch(name, filter)) continue;
         count += 1;
     }
     return count;
@@ -3936,31 +3923,19 @@ fn handlePaletteKey(editor: *Editor, key: Key) void {
         return;
     }
     if (key.codepoint == Key.enter) {
-        // Execute the selected matching command (the drawn selection: the
-        // index is clamped the same way drawCommandPalette clamps it)
-        const filter = editor.palette_buf[0..editor.palette_buf_len];
-        const names = editor.commands.allNames() catch {
-            editor.setMode(.normal);
-            editor.palette_selected = 0;
-            return;
-        };
-        const selected = @min(editor.palette_selected, paletteMatchCount(editor) -| 1);
-        var idx: usize = 0;
-        for (names) |name| {
-            if (filter.len > 0 and !fuzzyMatch(name, filter)) continue;
-            if (idx == selected) {
-                editor.setMode(.normal);
-                editor.palette_selected = 0;
-                _ = editor.execCommand(name, null);
-                return;
-            }
-            idx += 1;
-        }
+        // Execute the highlighted command (the drawn selection: a selection
+        // past the last match means the last match, as drawn).
+        const name = editor.paletteSelectedName();
         editor.setMode(.normal);
         editor.palette_selected = 0;
+        if (name) |n| _ = editor.execCommand(n, null);
         return;
     }
-    if (key.codepoint == Key.tab or key.codepoint == Key.down) {
+    if (key.codepoint == Key.tab) {
+        editor.paletteComplete();
+        return;
+    }
+    if (key.codepoint == Key.down) {
         // Every match is reachable: the list scrolls (it used to stop at
         // the 10 visible rows)
         if (editor.palette_selected + 1 < paletteMatchCount(editor)) editor.palette_selected += 1;
@@ -4150,7 +4125,8 @@ fn handleToolKey(editor: *Editor, key: Key) void {
     if (key.isModifier() or hasCommandMod(key)) return;
     switch (key.codepoint) {
         Key.escape => editor.setMode(.normal),
-        Key.enter => editor.tool_panel.activate(editor),
+        // Space too, so the left hand reaches it next to A / W / D / R.
+        Key.enter, ' ' => editor.tool_panel.activate(editor),
         Key.up => editor.tool_panel.move(editor, false),
         Key.down => editor.tool_panel.move(editor, true),
         Key.page_up => editor.tool_panel.page(editor, false, 20),
@@ -4163,6 +4139,7 @@ fn handleToolKey(editor: *Editor, key: Key) void {
         'o', 'O' => editor.tool_panel.action(editor, 'o'),
         'a', 'A' => editor.tool_panel.action(editor, 'a'),
         'w', 'W' => editor.tool_panel.action(editor, 'w'),
+        'p', 'P' => editor.tool_panel.action(editor, 'p'),
         else => {},
     }
 }
@@ -4186,7 +4163,7 @@ fn drawToolPanel(win: Window, editor: *Editor, width: u16, height: u16) void {
         row_style.reverse = index == state.selected;
         _ = writeStr(panel, 0, @intCast(i + 1), state.row(editor, index, &buf), row_style);
     }
-    _ = writeStr(panel, 0, rows -| 1, "Up/Down select • PgUp/PgDn scroll • Enter activates • Esc closes", style);
+    _ = writeStr(panel, 0, rows -| 1, "Up/Down select • PgUp/PgDn scroll • Enter/Space activates • Esc closes", style);
 }
 
 fn drawRecoveryPicker(win: Window, editor: *Editor, width: u16, height: u16) void {

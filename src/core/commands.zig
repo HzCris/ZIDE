@@ -1153,9 +1153,18 @@ fn cmdReviewCollapseAll(editor: *Editor, _: ?[]const u8) void {
     }
     review_reader.setAllExpanded(editor, editor.activeDoc(), false);
 }
+/// Reader → classic diff tab; classic diff → reader (caret on the same
+/// real line); a listed real file → its reader.
 fn cmdReviewToggleView(editor: *Editor, _: ?[]const u8) void {
-    if (editor.activeDoc().reader) |info| {
-        editor.git.previewAgainst(editor, info.rel_path, info.old_path, info.change == '?', if (info.change == '?') null else editor.review.baseRef());
+    const doc = editor.activeDoc();
+    if (doc.reader) |info| {
+        if (info.classic) {
+            const index = editor.review.fileIndexFor(info.rel_path) orelse {
+                editor.status_message = "Review: that file is no longer listed";
+                return;
+            };
+            editor.review.openReader(editor, index, review_reader.realLineAt(info.real_line, doc.cursorPos().line));
+        } else editor.review.openClassic(editor, info.rel_path, info.old_path, info.change);
         return;
     }
     cmdReviewOpenReader(editor, null);

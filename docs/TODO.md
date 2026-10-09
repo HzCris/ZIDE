@@ -233,9 +233,18 @@ Legend: **N** = native Zig, **L** = buildable as a Lua extension on the public A
 - **QoL asked for on 2026-10-08 (phase 1 smoke test):** GUI icons (SVG / TinyVG, like the
   panel chrome) for the `[x]` / `[!]` / `[ ]` verdict glyphs; a side-by-side comparison window
   (old and new as two read-only documents in a split with locked scrolling) as an alternative
-  to the inline reader; and the classic `git_diff` preview itself — today each diff line is a
-  button in a modal dialog — rendered as colored monospace text (`+` green, `-` red, `@@` dim)
-  in a wider window. Phase 2's reader is the planned answer for reading; these are the extras.
+  to the inline reader; and the Changes panel's own `git_diff` preview — plain uncolored rows
+  in the modal dialog's table — rendered as colored text in a wider window (the review's D /
+  Ctrl+F9 already open a tinted read-only `Diff:` tab instead, 2026-10-09; the Changes panel
+  could reuse it). The GUI tool dialogs became DVUI grid tables on 2026-10-09 (columns for
+  Changes and Review, click anywhere on a row to select, selection follows the keyboard);
+  sortable headers and resizable columns are available in the widget if wanted; the last
+  column takes the remaining width, so a path wider than it is cut at the table's edge (a
+  horizontal scrollbar would need the column sized to the longest path). The table has
+  a fixed height (360 px) so the dialog never outgrows its window; a height that follows the
+  row count would need the dialog to re-fit itself each time the list changes (it does so
+  today only when the content outgrows the window). Phase 2's reader is the answer for
+  reading; these are the extras.
 
 ## Appearance and accessibility
 

@@ -29,6 +29,12 @@ const reader_output_limit = 12 * 1024 * 1024;
 /// issued, so the next tick simply drops it).
 pub var test_no_spawn: bool = false;
 
+/// Why a diff runs: the user asked to read the file (switch to the tab,
+/// leave any panel, say so), the open reader is being rebuilt in the
+/// background (change nothing but its text, and keep quiet), or the user
+/// asked for the classic diff tab.
+const FetchReason = enum { open, refresh, classic };
+
 /// The diff job feeding the reader, and what it is for.
 const Fetch = struct {
     job: u64,
@@ -36,6 +42,7 @@ const Fetch = struct {
     old_path: ?[]u8,
     change: u8,
     target_line: ?u32,
+    reason: FetchReason,
     fn deinit(self: Fetch, a: Allocator) void {
         a.free(self.path);
         if (self.old_path) |p| a.free(p);
@@ -94,6 +101,7 @@ pub const State = struct {
     files_revision: u64 = 0,
     seen_git_revision: ?u64 = null,
     refresh_wanted: bool = true,
+    announce_refresh: bool = false,
     /// Set by pinning: entries for files the new list no longer shows are
     /// dropped once, so a finished review does not haunt the next one.
     prune_on_next_list: bool = false,
@@ -104,6 +112,8 @@ pub const State = struct {
     reported_error: ?anyerror = null,
     /// The one reader tab, reused in place; stale once the user closes it.
     reader_doc_id: ?u64 = null,
+    /// The one classic `Diff:` tab, likewise.
+    classic_doc_id: ?u64 = null,
     fetch: ?Fetch = null,
     next_reader_check: i128 = 0,
     /// The reader's old side moved (baseline pinned/followed, HEAD moved):
@@ -160,6 +170,11 @@ pub const State = struct {
     pub fn requestRefresh(self: *State) void {
         self.refresh_wanted = true;
     }
+    /// The user pressed R: say what the refreshed list holds once it lands.
+    pub fn requestRefreshAnnounced(self: *State) void {
+        self.refresh_wanted = true;
+        self.announce_refresh = true;
+    }
 
     pub fn tick(self: *State, editor: *Editor, now: i128) void {
         self.service(editor, now) catch |err| self.reportOnce(editor, err);
@@ -176,8 +191,10 @@ pub const State = struct {
         const revision = editor.git.revision;
         const stale = self.refresh_wanted or self.seen_git_revision == null or self.seen_git_revision.? != revision;
         if (stale) {
-            // The status moved (an edit, a commit): the reader's two sides may have too.
-            if (self.seen_git_revision != null) self.reader_refetch = true;
+            // Git's status moved (a commit, an edit the list shows): the
+            // reader's old side may have too. A plain refresh request
+            // (opening the Review view, R) changes nothing in it.
+            if (self.seen_git_revision != null and self.seen_git_revision.? != revision) self.reader_refetch = true;
             if (self.mode == .checkpoint and !self.commit_missing and self.commit != null) {
                 if (self.list_job == null) {
                     try self.startList(editor);
@@ -212,12 +229,28 @@ pub const State = struct {
     pub fn openReader(self: *State, editor: *Editor, index: usize, target_line: ?u32) void {
         if (index >= self.files.items.len) return;
         const file = self.files.items[index];
-        self.startFetch(editor, file.path, file.old_path, file.change, target_line) catch |err| report(editor, "{s}: {s}", .{ std.fs.path.basename(file.path), @errorName(err) });
+        // The reader of this very file is open and current: just show it.
+        if (self.fetch == null and !self.reader_refetch) if (self.readerInfo(editor)) |info| if (!info.stale and std.mem.eql(u8, info.rel_path, file.path)) {
+            if (review_reader.focusDoc(editor, self.reader_doc_id.?, target_line)) return;
+        };
+        self.startFetch(editor, file.path, file.old_path, file.change, target_line, .open) catch |err| report(editor, "{s}: {s}", .{ std.fs.path.basename(file.path), @errorName(err) });
     }
-    /// Rebuild the open reader (a marker was expanded, the file changed).
+    /// The classic diff tab for row `index` of the list.
+    pub fn openClassicRow(self: *State, editor: *Editor, index: usize) void {
+        if (index >= self.files.items.len) return;
+        const file = self.files.items[index];
+        self.openClassic(editor, file.path, file.old_path, file.change);
+    }
+    /// The classic diff tab for a file (`git diff` with three context
+    /// lines, painted like the reader).
+    pub fn openClassic(self: *State, editor: *Editor, path: []const u8, old_path: ?[]const u8, change: u8) void {
+        self.startFetch(editor, path, old_path, change, null, .classic) catch |err| report(editor, "{s}: {s}", .{ std.fs.path.basename(path), @errorName(err) });
+    }
+    /// Rebuild the open reader in place (a marker was expanded, the file
+    /// or the baseline changed): the user stays where they are.
     pub fn refetchReader(self: *State, editor: *Editor, target_line: ?u32) void {
         const info = self.readerInfo(editor) orelse return;
-        self.startFetch(editor, info.rel_path, info.old_path, info.change, target_line) catch |err| report(editor, "{s}", .{@errorName(err)});
+        self.startFetch(editor, info.rel_path, info.old_path, info.change, target_line, .refresh) catch |err| report(editor, "{s}", .{@errorName(err)});
     }
     fn readerInfo(self: *State, editor: *Editor) ?*review_reader.Info {
         const id = self.reader_doc_id orelse return null;
@@ -227,12 +260,12 @@ pub const State = struct {
         };
         return editor.documents.items[idx].reader;
     }
-    fn startFetch(self: *State, editor: *Editor, path: []const u8, old_path: ?[]const u8, change: u8, target_line: ?u32) !void {
+    fn startFetch(self: *State, editor: *Editor, path: []const u8, old_path: ?[]const u8, change: u8, target_line: ?u32, reason: FetchReason) !void {
         const root = self.root orelse return error.NoRepository;
         const a = editor.allocator;
         var args: std.ArrayList([]const u8) = .empty;
         defer args.deinit(a);
-        try args.appendSlice(a, &.{ "diff", "--no-ext-diff", "--no-textconv", "--no-color", "-U999999" });
+        try args.appendSlice(a, &.{ "diff", "--no-ext-diff", "--no-textconv", "--no-color", if (reason == .classic) "-U3" else "-U999999" });
         if (change == '?') {
             try args.appendSlice(a, &.{ "--no-index", "--", "/dev/null", path });
         } else {
@@ -247,8 +280,14 @@ pub const State = struct {
         errdefer if (owned_old) |p| a.free(p);
         const job: u64 = if (@import("builtin").is_test and test_no_spawn) 0 else try editor.jobs.start(.{ .argv = argv, .strict_output = true, .output_limit = reader_output_limit });
         self.clearFetch(editor);
-        self.fetch = .{ .job = job, .path = owned_path, .old_path = owned_old, .change = change, .target_line = target_line };
-        report(editor, "reading {s}…", .{std.fs.path.basename(path)});
+        self.fetch = .{ .job = job, .path = owned_path, .old_path = owned_old, .change = change, .target_line = target_line, .reason = reason };
+        if (reason != .refresh) report(editor, "reading {s}…", .{std.fs.path.basename(path)});
+    }
+    /// The open reader document, if any.
+    fn readerDoc(self: *State, editor: *Editor) ?*@import("document.zig").Document {
+        const id = self.reader_doc_id orelse return null;
+        const idx = editor.docIndexForId(id) orelse return null;
+        return &editor.documents.items[idx];
     }
     fn clearFetch(self: *State, editor: *Editor) void {
         const fetch = self.fetch orelse return;
@@ -268,26 +307,47 @@ pub const State = struct {
         defer result.deinit(a);
         defer self.clearFetch(editor);
         const name = std.fs.path.basename(fetch.path);
+        const open = fetch.reason != .refresh;
+        // A failed background rebuild keeps the old view, marked stale, and
+        // stops retrying; only a user-initiated read reports and falls back.
         if (result.failure) |err| {
-            if (err == error.StreamTooLong) {
+            if (!open) return self.staleReader(editor);
+            if (err == error.StreamTooLong and fetch.reason == .open) {
                 report(editor, "{s} is too large to read here; showing the classic diff", .{name});
-                editor.git.previewAgainst(editor, fetch.path, fetch.old_path, fetch.change == '?', if (fetch.change == '?') null else self.baseRef());
+                self.openClassic(editor, fetch.path, fetch.old_path, fetch.change);
             } else report(editor, "{s}: {s}", .{ name, @errorName(err) });
             return;
         }
         if (!(result.code == 0 or (fetch.change == '?' and result.code == 1))) {
+            if (!open) return self.staleReader(editor);
             const line = std.mem.trim(u8, firstLine(result.stderr), " \r\n\t");
             return report(editor, "{s}: {s}", .{ name, if (line.len > 0) line[0..@min(line.len, 200)] else "git diff failed" });
         }
-        var parsed = unidiff.parse(a, result.stdout) catch |err| return report(editor, "{s}: {s}", .{ name, @errorName(err) });
+        if (fetch.reason == .classic) {
+            try review_reader.showClassic(editor, .{ .root = self.root.?, .path = fetch.path, .old_path = fetch.old_path, .change = fetch.change }, result.stdout, true);
+            report(editor, "Diff: {s} — Enter opens the file at that line, Ctrl+F9 back to the reader", .{name});
+            return;
+        }
+        var parsed = unidiff.parse(a, result.stdout) catch |err| {
+            if (!open) return self.staleReader(editor);
+            return report(editor, "{s}: {s}", .{ name, @errorName(err) });
+        };
         defer parsed.deinit(a);
-        if (parsed.binary) return report(editor, "{s} is binary; listed only", .{name});
+        if (parsed.binary) {
+            if (!open) return self.staleReader(editor);
+            return report(editor, "{s} is binary; listed only", .{name});
+        }
         if (parsed.lines.len == 0) {
+            if (!open) return self.staleReader(editor);
             report(editor, "{s} has no text changes against {s}", .{ name, self.baseRef()[0..@min(self.baseRef().len, 7)] });
             return;
         }
-        try review_reader.show(editor, .{ .root = self.root.?, .path = fetch.path, .old_path = fetch.old_path, .change = fetch.change }, parsed, fetch.target_line);
-        report(editor, "{s}: F9 / Shift+F9 walk the changes, Enter opens the real file, Ctrl+F9 the classic diff", .{name});
+        try review_reader.show(editor, .{ .root = self.root.?, .path = fetch.path, .old_path = fetch.old_path, .change = fetch.change }, parsed, fetch.target_line, open);
+        if (open) report(editor, "{s} — F9 next change, Enter opens the file, Ctrl+F9 classic diff", .{name});
+    }
+    fn staleReader(self: *State, editor: *Editor) void {
+        const doc = self.readerDoc(editor) orelse return;
+        review_reader.markStale(editor, doc);
     }
     /// Rebuild the open reader when its file changed on disk or its old
     /// side moved; one check every 1.5 s, never while a fetch runs.
@@ -304,7 +364,7 @@ pub const State = struct {
         if (!self.reader_refetch and std.meta.eql(stamp, info.disk_stamp)) return;
         self.reader_refetch = false;
         const target = review_reader.realLineAt(info.real_line, doc.cursorPos().line);
-        self.startFetch(editor, info.rel_path, info.old_path, info.change, target) catch {};
+        self.startFetch(editor, info.rel_path, info.old_path, info.change, target, .refresh) catch {};
     }
 
     // --- The record file ---
@@ -446,6 +506,10 @@ pub const State = struct {
         self.files = list.*;
         list.* = .empty;
         self.files_revision +%= 1;
+        if (self.announce_refresh) {
+            self.announce_refresh = false;
+            report(editor, "list refreshed: {d} changed file{s}", .{ self.files.items.len, if (self.files.items.len == 1) "" else "s" });
+        }
         if (self.prune_on_next_list) {
             self.prune_on_next_list = false;
             var i: usize = 0;

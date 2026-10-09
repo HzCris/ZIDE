@@ -196,6 +196,9 @@ pub const Info = struct {
     disk_stamp: ?text_file.Stamp = null,
     /// The last rebuild failed (binary, too large): the view is old.
     stale: bool = false,
+    /// A `Diff: <file>` tab (git's own unified diff, a snapshot) rather
+    /// than the reader; never rebuilt in the background.
+    classic: bool = false,
 
     pub fn destroy(self: *Info, a: Allocator) void {
         a.free(self.source_path);
@@ -218,10 +221,14 @@ pub const Source = struct { root: []const u8, path: []const u8, old_path: ?[]con
 /// Show `parsed` as the reader tab for `source`: the one reader document
 /// is reused in place (its caret and scroll stay on the same real lines
 /// when it is the same file), else a new tab opens. `target_line` is a
-/// new-file line to put the caret on.
-pub fn show(editor: *Editor, source: Source, parsed: unidiff.Parsed, target_line: ?u32) !void {
+/// new-file line to put the caret on. `focus` = the user asked for it:
+/// switch to the tab and leave any panel. A background rebuild passes
+/// false and changes nothing but the reader's own text — never the active
+/// tab, the mode or the focus — and does nothing when the tab is gone.
+pub fn show(editor: *Editor, source: Source, parsed: unidiff.Parsed, target_line: ?u32, focus: bool) !void {
     const a = editor.allocator;
     const existing: ?usize = if (editor.review.reader_doc_id) |id| editor.docIndexForId(id) else null;
+    if (!focus and existing == null) return;
     var caret_anchor: ?u32 = null;
     var scroll_anchor: ?u32 = null;
     var expanded: std.ArrayList(u32) = .empty;
@@ -248,7 +255,7 @@ pub fn show(editor: *Editor, source: Source, parsed: unidiff.Parsed, target_line
     errdefer a.free(name);
 
     const doc: *Document = if (existing) |idx| blk: {
-        editor.switchToDoc(idx);
+        if (focus) editor.switchToDoc(idx);
         break :blk &editor.documents.items[idx];
     } else try editor.newDocument();
     try doc.loadText(synth.text);
@@ -283,7 +290,145 @@ pub fn show(editor: *Editor, source: Source, parsed: unidiff.Parsed, target_line
     doc.gotoLine(row + 1);
     if (scroll_anchor) |line| doc.scroll_top = rowForReal(info.real_line, info.runs, line);
     editor.review.reader_doc_id = doc.id;
+    if (focus) editor.setMode(.normal);
+}
+
+/// Switch to an existing reader or diff tab without rebuilding it; the
+/// caret goes to `target_line` (a new-file line) when given.
+pub fn focusDoc(editor: *Editor, doc_id: u64, target_line: ?u32) bool {
+    const idx = editor.docIndexForId(doc_id) orelse return false;
+    editor.switchToDoc(idx);
+    const doc = &editor.documents.items[idx];
+    if (target_line) |line| if (doc.reader) |info| doc.gotoLine(rowForReal(info.real_line, info.runs, line) + 1);
     editor.setMode(.normal);
+    return true;
+}
+
+/// The classic view: git's own unified diff (a few lines of context per
+/// hunk) as a read-only `Diff: <file>` tab painted like the reader — `+`
+/// rows tinted as added, `-` rows as ghosts, hunk headers dim, the new
+/// file's line numbers in the gutter. A snapshot: never rebuilt by itself.
+pub fn showClassic(editor: *Editor, source: Source, diff_text: []const u8, focus: bool) !void {
+    const a = editor.allocator;
+    var text: std.ArrayList(u8) = .empty;
+    errdefer text.deinit(a);
+    var kinds: std.ArrayList(LineKind) = .empty;
+    errdefer kinds.deinit(a);
+    var real: std.ArrayList(?u32) = .empty;
+    errdefer real.deinit(a);
+    var hunks: std.ArrayList(Hunk) = .empty;
+    errdefer hunks.deinit(a);
+    var in_hunk = false;
+    var new_line: u32 = 0;
+    var change_start: ?u32 = null;
+    var it = std.mem.splitScalar(u8, diff_text, '\n');
+    while (it.next()) |raw| {
+        const line = if (raw.len > 0 and raw[raw.len - 1] == '\r') raw[0 .. raw.len - 1] else raw;
+        if (std.mem.startsWith(u8, line, "@@")) {
+            in_hunk = true;
+            new_line = hunkNewStart(line);
+            try closeChange(a, &hunks, &change_start, kinds.items.len);
+            try appendRow(a, &text, &kinds, &real, line, .marker, null);
+            continue;
+        }
+        if (!in_hunk) {
+            // File headers are noise here; git's binary notice is the whole story.
+            if (std.mem.startsWith(u8, line, "Binary files ")) try appendRow(a, &text, &kinds, &real, line, .marker, null);
+            continue;
+        }
+        if (line.len == 0) continue;
+        switch (line[0]) {
+            '+' => {
+                if (change_start == null) change_start = @intCast(kinds.items.len);
+                try appendRow(a, &text, &kinds, &real, line, .added, new_line);
+                new_line += 1;
+            },
+            '-' => {
+                if (change_start == null) change_start = @intCast(kinds.items.len);
+                try appendRow(a, &text, &kinds, &real, line, .ghost, null);
+            },
+            ' ' => {
+                try closeChange(a, &hunks, &change_start, kinds.items.len);
+                try appendRow(a, &text, &kinds, &real, line, .context, new_line);
+                new_line += 1;
+            },
+            else => try appendRow(a, &text, &kinds, &real, line, .marker, null),
+        }
+    }
+    try closeChange(a, &hunks, &change_start, kinds.items.len);
+    if (kinds.items.len == 0) try appendRow(a, &text, &kinds, &real, "(no differences)", .marker, null);
+
+    const existing: ?usize = if (editor.review.classic_doc_id) |id| editor.docIndexForId(id) else null;
+    if (!focus and existing == null) return;
+    const info = try a.create(Info);
+    errdefer a.destroy(info);
+    const source_path = try std.fs.path.join(a, &.{ source.root, source.path });
+    errdefer a.free(source_path);
+    const rel_path = try a.dupe(u8, source.path);
+    errdefer a.free(rel_path);
+    const old_path = if (source.old_path) |p| try a.dupe(u8, p) else null;
+    errdefer if (old_path) |p| a.free(p);
+    const name = try std.fmt.allocPrint(a, "Diff: {s}", .{std.fs.path.basename(source.path)});
+    errdefer a.free(name);
+    const runs = try a.alloc(Run, 0);
+    errdefer a.free(runs);
+    const doc: *Document = if (existing) |idx| blk: {
+        if (focus) editor.switchToDoc(idx);
+        break :blk &editor.documents.items[idx];
+    } else try editor.newDocument();
+    try doc.loadText(text.items);
+    text.deinit(a);
+    info.* = .{
+        .source_path = source_path,
+        .rel_path = rel_path,
+        .old_path = old_path,
+        .change = source.change,
+        .kinds = try kinds.toOwnedSlice(a),
+        .real_line = try real.toOwnedSlice(a),
+        .hunks = try hunks.toOwnedSlice(a),
+        .runs = runs,
+        .classic = true,
+    };
+    if (doc.reader) |old| old.destroy(a);
+    doc.reader = info;
+    doc.readonly = true;
+    if (existing != null) a.free(doc.display_name);
+    doc.display_name = name;
+    const ext = std.fs.path.extension(source.path);
+    doc.language = if (ext.len > 1) editor.findLanguage(ext[1..]) else null;
+    doc.invalidateLineStates(0);
+    doc.gotoLine(if (info.hunks.len > 0) info.hunks[0].first_row + 1 else 1);
+    editor.review.classic_doc_id = doc.id;
+    if (focus) editor.setMode(.normal);
+}
+
+/// `@@ -a,b +c,d @@` → the new file's first line of the hunk, 0-based.
+fn hunkNewStart(hunk_line: []const u8) u32 {
+    const plus = std.mem.indexOfScalar(u8, hunk_line, '+') orelse return 0;
+    var end = plus + 1;
+    while (end < hunk_line.len and std.ascii.isDigit(hunk_line[end])) end += 1;
+    const start = std.fmt.parseInt(u32, hunk_line[plus + 1 .. end], 10) catch return 0;
+    return start -| 1;
+}
+
+fn closeChange(a: Allocator, hunks: *std.ArrayList(Hunk), start: *?u32, rows: usize) !void {
+    const first = start.* orelse return;
+    start.* = null;
+    if (rows == 0) return;
+    try hunks.append(a, .{ .first_row = first, .last_row = @intCast(rows - 1) });
+}
+
+/// A rebuild failed (binary now, too large, git error): keep the old
+/// text, say so in the tab name, and remember the file's current stamp
+/// so the next check does not start the same failing job again.
+pub fn markStale(editor: *Editor, doc: *Document) void {
+    const info = doc.reader orelse return;
+    info.disk_stamp = text_file.Stamp.read(editor.io, info.source_path) catch null;
+    if (info.stale) return;
+    info.stale = true;
+    const name = std.fmt.allocPrint(editor.allocator, "{s} (stale)", .{doc.display_name}) catch return;
+    editor.allocator.free(doc.display_name);
+    doc.display_name = name;
 }
 
 /// Enter inside the reader: a marker row expands its stretch; any other
@@ -454,7 +599,7 @@ test "the reader tab is read-only, pathless, named and reused in place" {
     editor.lsp_enabled = false;
     var parsed = try parsedFrom(t.allocator, header ++ " a\n+x\n b\n");
     defer parsed.deinit(t.allocator);
-    try show(&editor, .{ .root = root, .path = "x.zig", .change = 'M' }, parsed, null);
+    try show(&editor, .{ .root = root, .path = "x.zig", .change = 'M' }, parsed, null, true);
     const doc = editor.activeDoc();
     try t.expect(doc.readonly);
     try t.expect(doc.file_path == null);
@@ -485,7 +630,7 @@ test "the reader tab is read-only, pathless, named and reused in place" {
     // The same file again rebuilds in place: no second tab.
     var again = try parsedFrom(t.allocator, header ++ " a\n+x\n+y\n b\n");
     defer again.deinit(t.allocator);
-    try show(&editor, .{ .root = root, .path = "x.zig", .change = 'M' }, again, 2);
+    try show(&editor, .{ .root = root, .path = "x.zig", .change = 'M' }, again, 2, true);
     try t.expectEqual(count, editor.documents.items.len);
     try t.expectEqual(reader_id, editor.activeDoc().id);
     try t.expectEqual(@as(usize, 2), editor.activeDoc().cursorPos().line);
@@ -501,6 +646,86 @@ test "the reader tab is read-only, pathless, named and reused in place" {
     const idx = editor.docIndexForId(reader_id).?;
     _ = editor.closeDocAt(idx);
     try t.expect(editor.docIndexForId(reader_id) == null);
+}
+
+test "a background rebuild changes the reader's text only, never the active tab or the mode" {
+    const t = std.testing;
+    var tmp = t.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(t.io, ".", t.allocator);
+    defer t.allocator.free(root);
+    var editor = try Editor.init(t.allocator, t.io);
+    defer editor.deinit();
+    editor.lsp_enabled = false;
+    editor.git.root = try t.allocator.dupe(u8, root);
+    editor.review.tick(&editor, 0);
+    var parsed = try parsedFrom(t.allocator, header ++ " a\n+x\n b\n");
+    defer parsed.deinit(t.allocator);
+    try show(&editor, .{ .root = root, .path = "x.zig", .change = 'M' }, parsed, null, true);
+    const reader_id = editor.activeDoc().id;
+    // The user moves on: another tab, and the Review view open over it.
+    const other = try editor.newDocument();
+    const other_id = other.id;
+    editor.tool_panel.show(&editor, .review);
+    try t.expectEqual(Editor.Mode.tool_panel, editor.mode);
+    var again = try parsedFrom(t.allocator, header ++ " a\n+x\n+y\n b\n");
+    defer again.deinit(t.allocator);
+    try show(&editor, .{ .root = root, .path = "x.zig", .change = 'M' }, again, null, false);
+    try t.expectEqual(Editor.Mode.tool_panel, editor.mode);
+    try t.expectEqual(other_id, editor.activeDoc().id);
+    const reader = &editor.documents.items[editor.docIndexForId(reader_id).?];
+    try t.expectEqualStrings("a\nx\ny\nb\n", reader.buffer.slice(0, reader.buffer.byteLen()));
+    // A rebuild for a closed reader is a no-op.
+    editor.setMode(.normal);
+    _ = editor.closeDocAt(editor.docIndexForId(reader_id).?);
+    const count = editor.documents.items.len;
+    try show(&editor, .{ .root = root, .path = "x.zig", .change = 'M' }, again, null, false);
+    try t.expectEqual(count, editor.documents.items.len);
+}
+
+test "the classic diff tab keeps git's hunks with tints, new-file numbers and change blocks" {
+    const t = std.testing;
+    var tmp = t.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(t.io, ".", t.allocator);
+    defer t.allocator.free(root);
+    var editor = try Editor.init(t.allocator, t.io);
+    defer editor.deinit();
+    editor.lsp_enabled = false;
+    const diff =
+        "diff --git a/x.zig b/x.zig\n" ++
+        "index 1111111..2222222 100644\n" ++
+        "--- a/x.zig\n" ++
+        "+++ b/x.zig\n" ++
+        "@@ -1,3 +1,3 @@\n" ++
+        " a\n" ++
+        "-b\n" ++
+        "+B\n" ++
+        " c\n" ++
+        "@@ -10,2 +10,3 @@\n" ++
+        " j\n" ++
+        "+k\n" ++
+        " l\n";
+    try showClassic(&editor, .{ .root = root, .path = "x.zig", .change = 'M' }, diff, true);
+    const doc = editor.activeDoc();
+    const info = doc.reader.?;
+    try t.expect(info.classic and doc.readonly);
+    try t.expectEqualStrings("Diff: x.zig", doc.display_name);
+    try t.expectEqualSlices(LineKind, &.{ .marker, .context, .ghost, .added, .context, .marker, .context, .added, .context }, info.kinds);
+    try t.expectEqualSlices(?u32, &.{ null, 0, null, 1, 2, null, 9, 10, 11 }, info.real_line);
+    try t.expectEqual(@as(usize, 2), info.hunks.len);
+    try t.expectEqual(@as(u32, 2), info.hunks[0].first_row);
+    try t.expectEqual(@as(u32, 7), info.hunks[1].first_row);
+    try t.expectEqual(@as(usize, 2), doc.cursorPos().line); // the first change
+    try t.expect(std.mem.startsWith(u8, doc.buffer.lineContent(3), "+B"));
+    try t.expect(stepChange(doc, true));
+    try t.expectEqual(@as(usize, 7), doc.cursorPos().line);
+    // The same tab is reused for the next file.
+    const count = editor.documents.items.len;
+    try showClassic(&editor, .{ .root = root, .path = "y.zig", .change = 'A' }, "Binary files /dev/null and b/y.zig differ\n", true);
+    try t.expectEqual(count, editor.documents.items.len);
+    try t.expectEqualStrings("Diff: y.zig", editor.activeDoc().display_name);
+    try t.expectEqual(LineKind.marker, editor.activeDoc().reader.?.kindAt(0));
 }
 
 test "Enter on a marker row expands that stretch and the rebuild keeps it open" {
@@ -524,7 +749,7 @@ test "Enter on a marker row expands that stretch and the rebuild keeps it open" 
     try diff.appendSlice(t.allocator, "-last\n+LAST\n");
     var parsed = try parsedFrom(t.allocator, diff.items);
     defer parsed.deinit(t.allocator);
-    try show(&editor, .{ .root = root, .path = "x.zig", .change = 'M' }, parsed, null);
+    try show(&editor, .{ .root = root, .path = "x.zig", .change = 'M' }, parsed, null, true);
     const doc = editor.activeDoc();
     const info = doc.reader.?;
     try t.expectEqual(@as(usize, 1), info.runs.len);
@@ -540,14 +765,14 @@ test "Enter on a marker row expands that stretch and the rebuild keeps it open" 
     try t.expectEqual(@as(usize, 1), editor.activeDoc().reader.?.expanded.items.len);
     try t.expectEqual(editor.activeDoc().id, doc.id);
     // The rebuild (the fetch's result) keeps the stretch open: no marker left.
-    try show(&editor, .{ .root = root, .path = "x.zig", .change = 'M' }, parsed, null);
+    try show(&editor, .{ .root = root, .path = "x.zig", .change = 'M' }, parsed, null, true);
     try t.expectEqual(@as(usize, 0), editor.activeDoc().reader.?.runs.len);
     try t.expectEqual(@as(usize, 2 + 20 + 2 + 1), editor.activeDoc().reader.?.kinds.len);
     // Collapse all folds it again; expand all opens it.
     setAllExpanded(&editor, editor.activeDoc(), false);
-    try show(&editor, .{ .root = root, .path = "x.zig", .change = 'M' }, parsed, null);
+    try show(&editor, .{ .root = root, .path = "x.zig", .change = 'M' }, parsed, null, true);
     try t.expectEqual(@as(usize, 1), editor.activeDoc().reader.?.runs.len);
     setAllExpanded(&editor, editor.activeDoc(), true);
-    try show(&editor, .{ .root = root, .path = "x.zig", .change = 'M' }, parsed, null);
+    try show(&editor, .{ .root = root, .path = "x.zig", .change = 'M' }, parsed, null, true);
     try t.expectEqual(@as(usize, 0), editor.activeDoc().reader.?.runs.len);
 }

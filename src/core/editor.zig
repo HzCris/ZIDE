@@ -1086,6 +1086,63 @@ pub const Editor = struct {
         }
     }
 
+    /// Command palette: does `name` match what was typed? The typed letters
+    /// must appear in the name in that order; case does not matter, and a
+    /// space or dash stands for a name's underscore, so "set baseline"
+    /// finds review_set_baseline.
+    pub fn paletteMatch(name: []const u8, filter: []const u8) bool {
+        var ni: usize = 0;
+        for (filter) |raw| {
+            const want = std.ascii.toLower(raw);
+            const separator = want == ' ' or want == '-' or want == '_';
+            while (ni < name.len) : (ni += 1) {
+                const have = std.ascii.toLower(name[ni]);
+                if (have == want or (separator and (have == '_' or have == '-' or have == ' '))) {
+                    ni += 1;
+                    break;
+                }
+            } else return false;
+        }
+        return true;
+    }
+
+    /// The palette's highlighted command: the selected match of the typed
+    /// text, or the last match when the selection sits past the end (the
+    /// list shrank under it). Null when nothing matches.
+    pub fn paletteSelectedName(self: *Editor) ?[]const u8 {
+        const filter = self.palette_buf[0..self.palette_buf_len];
+        const names = self.commands.allNames() catch return null;
+        var matches: usize = 0;
+        var last: ?[]const u8 = null;
+        for (names) |name| {
+            if (!paletteMatch(name, filter)) continue;
+            if (matches == self.palette_selected) return name;
+            last = name;
+            matches += 1;
+        }
+        return last;
+    }
+
+    /// Tab in the palette: spell the highlighted command out in the input,
+    /// so what Enter will run is in plain view; the highlight stays on it.
+    pub fn paletteComplete(self: *Editor) void {
+        const name = self.paletteSelectedName() orelse return;
+        const len = @min(name.len, self.palette_buf.len);
+        @memcpy(self.palette_buf[0..len], name[0..len]);
+        self.palette_buf_len = len;
+        self.palette_selected = 0;
+        const names = self.commands.allNames() catch return;
+        var index: usize = 0;
+        for (names) |candidate| {
+            if (!paletteMatch(candidate, name[0..len])) continue;
+            if (candidate.ptr == name.ptr) {
+                self.palette_selected = index;
+                return;
+            }
+            index += 1;
+        }
+    }
+
     /// Case-insensitive subsequence match.
     fn fuzzySubseq(haystack: []const u8, needle: []const u8) bool {
         if (needle.len == 0) return true;
@@ -7931,4 +7988,39 @@ test "completion: the typed prefix filters the list and typing keeps the popup o
     try t.expect(editor.execCommand("insert_char", " "));
     try t.expect(!editor.completion_active);
     try t.expectEqual(@as(usize, 0), editor.completion_all.items.len);
+}
+
+test "command palette: matching ignores case, a space reads as an underscore, Tab completes the highlighted name" {
+    const t = std.testing;
+    try t.expect(Editor.paletteMatch("review_set_baseline", "Set Baseline"));
+    try t.expect(Editor.paletteMatch("review_set_baseline", "rsb"));
+    try t.expect(Editor.paletteMatch("review_set_baseline", "set-baseline"));
+    try t.expect(!Editor.paletteMatch("review_set_baseline", "baseline set"));
+    try t.expect(Editor.paletteMatch("anything", ""));
+    var editor = try Editor.init(t.allocator, t.io);
+    defer editor.deinit();
+    editor.lsp_enabled = false;
+    try t.expect(editor.execAction("command_palette"));
+    const typed = "set baseline";
+    @memcpy(editor.palette_buf[0..typed.len], typed);
+    editor.palette_buf_len = typed.len;
+    try t.expectEqualStrings("review_set_baseline", editor.paletteSelectedName().?);
+    editor.paletteComplete();
+    try t.expectEqualStrings("review_set_baseline", editor.palette_buf[0..editor.palette_buf_len]);
+    try t.expectEqualStrings("review_set_baseline", editor.paletteSelectedName().?);
+    // A selection past the last match means the last match.
+    editor.palette_selected = 999;
+    try t.expectEqualStrings("review_set_baseline", editor.paletteSelectedName().?);
+    // Nothing typed: the first command, alphabetically.
+    editor.palette_buf_len = 0;
+    editor.palette_selected = 0;
+    const names = try editor.commands.allNames();
+    try t.expectEqualStrings(names[0], editor.paletteSelectedName().?);
+    // Nothing matches: nothing to run or complete.
+    const junk = "zzzzqqqq";
+    @memcpy(editor.palette_buf[0..junk.len], junk);
+    editor.palette_buf_len = junk.len;
+    try t.expect(editor.paletteSelectedName() == null);
+    editor.paletteComplete();
+    try t.expectEqualStrings(junk, editor.palette_buf[0..editor.palette_buf_len]);
 }

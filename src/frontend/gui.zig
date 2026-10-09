@@ -13,6 +13,7 @@ const syntax = @import("../core/syntax.zig");
 const search_mod = @import("../core/search.zig");
 const brackets = @import("../core/brackets.zig");
 const review_reader = @import("../core/review_reader.zig");
+const review = @import("../core/review.zig");
 const lsp = @import("../core/lsp.zig");
 const terminal_mod = @import("../core/terminal.zig");
 const filetree_mod = @import("../core/filetree.zig");
@@ -298,6 +299,11 @@ pub const WinUi = struct {
     editor_sb_pane: u8 = 0,
     editor_sb_grab_dy: f32 = 0,
     editor_sb_hover_pane: ?u8 = null,
+    /// The tool dialog's table: its scroll state, which view it was built
+    /// for (a new view starts at the top) and the row it last followed.
+    tool_grid_si: dvui.ScrollInfo = .{},
+    tool_grid_kind: ?@import("../core/tool_panel.zig").Kind = null,
+    tool_grid_followed: ?usize = null,
     /// Multi-click detection (double-click = word, triple-click = line).
     last_click_time_ns: i128 = 0,
     last_click_offset: usize = 0,
@@ -1354,17 +1360,31 @@ fn statusBar(editor: *Editor) void {
             .color = status_text_color,
         }) catch {};
 
+        // Right block geometry first: the center text is clipped to the
+        // room before it, so a long message never runs under the file name.
+        const enc = doc.format.label();
+        const enc_w = status_font.textSize(enc).w * sscale;
+        const dirty_str: []const u8 = if (doc.dirty) " [Modified]" else "";
+        var name_buf: [256]u8 = undefined;
+        const name_str = std.fmt.bufPrint(&name_buf, "{s}{s}", .{ doc.display_name, dirty_str }) catch doc.display_name;
+        const name_w = status_font.textSize(name_str).w * sscale;
+        const name_x = sarea.x + sarea.w - enc_w - 16 * sscale - name_w;
+        const center_x = sarea.x + status_font.textSize(pos_str).w * sscale + 20 * sscale;
+        const center_limit = if (term_active) sarea.x + sarea.w else name_x - 12 * sscale;
+        const center_clip: dvui.Rect.Physical = .{ .x = center_x, .y = sarea.y, .w = @max(0, center_limit - center_x), .h = sarea.h };
+
         // Center: transient status message ("Saved", "Cannot open: ...",
         // file-tree results) takes priority over the line diagnostic —
         // previously these were never rendered in normal mode at all.
         const line_diag = if (term_active) null else worstDiagnosticOnLine(doc, pos.line);
         if (editor.status_message.len > 0) {
-            const pos_w = status_font.textSize(pos_str).w * sscale;
+            const prev_clip = dvui.clip(center_clip);
+            defer dvui.clipSet(prev_clip);
             dvui.renderText(.{
                 .font = status_font,
                 .text = editor.status_message,
                 .rs = srs,
-                .p = .{ .x = sarea.x + pos_w + 20 * sscale, .y = sarea.y },
+                .p = .{ .x = center_x, .y = sarea.y },
                 .color = status_text_color,
             }) catch {};
         } else if (line_diag) |diag| {
@@ -1381,20 +1401,19 @@ fn statusBar(editor: *Editor) void {
             @memcpy(diag_buf[prefix.len..][0..max_msg], diag.message[0..max_msg]);
             const diag_str = diag_buf[0 .. prefix.len + max_msg];
             // Position after cursor info with some padding
-            const pos_w = status_font.textSize(pos_str).w * sscale;
+            const prev_clip = dvui.clip(center_clip);
+            defer dvui.clipSet(prev_clip);
             dvui.renderText(.{
                 .font = status_font,
                 .text = diag_str,
                 .rs = srs,
-                .p = .{ .x = sarea.x + pos_w + 20 * sscale, .y = sarea.y },
+                .p = .{ .x = center_x, .y = sarea.y },
                 .color = diag_color,
             }) catch {};
         }
 
         // Right: filename + dirty marker (nothing for a terminal pane)
         if (!term_active) {
-            const enc = doc.format.label();
-            const enc_w = status_font.textSize(enc).w * sscale;
             const enc_rect: dvui.Rect.Physical = .{ .x = sarea.x + sarea.w - enc_w, .y = sarea.y, .w = enc_w, .h = sarea.h };
             enc_rect.fill(.{}, .{ .color = toDvui(editor.theme.status_bg), .fade = 1.0 });
             renderOverlayText(status_font, enc, enc_rect.x, enc_rect.y, srs, status_text_color);
@@ -1409,15 +1428,11 @@ fn statusBar(editor: *Editor) void {
                     editor.startEncoding(.choose);
                 }
             }
-            const dirty_str: []const u8 = if (doc.dirty) " [Modified]" else "";
-            var name_buf: [256]u8 = undefined;
-            const name_str = std.fmt.bufPrint(&name_buf, "{s}{s}", .{ doc.display_name, dirty_str }) catch doc.display_name;
-            const name_w = status_font.textSize(name_str).w * sscale;
             dvui.renderText(.{
                 .font = status_font,
                 .text = name_str,
                 .rs = srs,
-                .p = .{ .x = sarea.x + sarea.w - enc_w - 16 * sscale - name_w, .y = sarea.y },
+                .p = .{ .x = name_x, .y = sarea.y },
                 .color = status_text_color,
             }) catch {};
         }
@@ -6458,35 +6473,23 @@ fn handlePaletteKeyGui(editor: *Editor, key: dvui.Event.Key) void {
             editor.palette_selected = 0;
         },
         .enter => {
-            const filter = editor.palette_buf[0..editor.palette_buf_len];
-            const names = editor.commands.allNames() catch {
-                editor.setMode(.normal);
-                return;
-            };
-            // Find the Nth matching item (palette_selected)
-            var idx: usize = 0;
-            for (names) |name| {
-                if (filter.len > 0 and !guiFuzzyMatch(name, filter)) continue;
-                if (idx == editor.palette_selected) {
-                    editor.setMode(.normal);
-                    editor.palette_selected = 0;
-                    // Inside the focused pane EVERY command waits until
-                    // the panes finished rendering: any of them — a Lua
-                    // one through zide.exec — can split or close panes.
-                    // Theme commands bump editor.theme_revision themselves.
-                    if (rendering_panes) {
-                        deferRun(editor, .command, name);
-                    } else {
-                        _ = editor.execCommand(name, null);
-                    }
-                    return;
-                }
-                idx += 1;
-            }
+            const name = editor.paletteSelectedName();
             editor.setMode(.normal);
             editor.palette_selected = 0;
+            // Inside the focused pane EVERY command waits until the panes
+            // finished rendering: any of them — a Lua one through zide.exec
+            // — can split or close panes. Theme commands bump
+            // editor.theme_revision themselves.
+            if (name) |n| {
+                if (rendering_panes) {
+                    deferRun(editor, .command, n);
+                } else {
+                    _ = editor.execCommand(n, null);
+                }
+            }
         },
-        .tab, .down => {
+        .tab => editor.paletteComplete(),
+        .down => {
             editor.palette_selected += 1;
         },
         .up => {
@@ -7064,19 +7067,6 @@ fn guiCountMatches(editor: *Editor, needle: []const u8) usize {
     return count;
 }
 
-fn guiFuzzyMatch(haystack: []const u8, needle: []const u8) bool {
-    var hi: usize = 0;
-    for (needle) |ch| {
-        while (hi < haystack.len) : (hi += 1) {
-            if (haystack[hi] == ch) {
-                hi += 1;
-                break;
-            }
-        } else return false;
-    }
-    return true;
-}
-
 // ===========================================================================
 // Overlay rendering for modal modes
 // ===========================================================================
@@ -7311,7 +7301,7 @@ fn drawModalOverlay(editor: *Editor, render_area: dvui.Rect.Physical, render_rs:
             var match_count: usize = 0;
             const names = editor.commands.allNames() catch &[_][]const u8{};
             for (names) |name| {
-                if (filter.len == 0 or guiFuzzyMatch(name, filter)) {
+                if (filter.len == 0 or Editor.paletteMatch(name, filter)) {
                     match_count += 1;
                     if (match_count >= max_items) break;
                 }
@@ -7335,7 +7325,7 @@ fn drawModalOverlay(editor: *Editor, render_area: dvui.Rect.Physical, render_rs:
             var shown: usize = 0;
             for (names) |name| {
                 if (shown >= max_items) break;
-                if (filter.len > 0 and !guiFuzzyMatch(name, filter)) continue;
+                if (filter.len > 0 and !Editor.paletteMatch(name, filter)) continue;
                 if (shown == editor.palette_selected) {
                     // Highlight bar behind selected item
                     const bar: dvui.Rect.Physical = .{ .x = render_area.x, .y = item_y, .w = render_area.w, .h = lh + pad };
@@ -7539,7 +7529,8 @@ fn handleToolKeyGui(editor: *Editor, key: dvui.Event.Key) void {
     }
     switch (key.code) {
         .escape => editor.setMode(.normal),
-        .enter => editor.tool_panel.activate(editor),
+        // Space too, so the left hand reaches it next to A / W / D / R.
+        .enter, .space => editor.tool_panel.activate(editor),
         .up => editor.tool_panel.move(editor, false),
         .down => editor.tool_panel.move(editor, true),
         .page_up => editor.tool_panel.page(editor, false, 40),
@@ -7552,8 +7543,199 @@ fn handleToolKeyGui(editor: *Editor, key: dvui.Event.Key) void {
         .o => editor.tool_panel.action(editor, 'o'),
         .a => editor.tool_panel.action(editor, 'a'),
         .w => editor.tool_panel.action(editor, 'w'),
+        .p => editor.tool_panel.action(editor, 'p'),
         else => {},
     }
+}
+
+/// Rows the tool dialog's table renders at once (a window around the
+/// selection when the list is longer).
+const tool_grid_max_rows: usize = 400;
+/// The table's fixed height. The dialog sizes itself to its content once and
+/// then keeps that size, so the table must not grow with the list (its
+/// scroll area would otherwise ask for every row's height): extra rows
+/// scroll inside it.
+const tool_grid_height: f32 = 360;
+
+/// Padding inside a table cell.
+const tool_cell_pad: dvui.Rect = .{ .x = 6, .y = 2, .w = 6, .h = 2 };
+
+/// A fixed table column: wide enough for its heading plus the cell padding.
+fn toolColumnWidth(heading: []const u8) f32 {
+    return dvui.themeGet().font_body.textSize(heading).w + tool_cell_pad.x + tool_cell_pad.w + 10;
+}
+
+/// The tool dialog's rows as a table. The Review view has two checkbox
+/// columns (Approved, Needs work — ticking one gives that verdict, ticking
+/// it again takes it back), the change letter and the file; the Changes
+/// view has its status letters and the file; every other view one text
+/// column. The last column takes the rest of the table's width, odd rows
+/// are banded and every cell has a border. A left click anywhere on a row
+/// selects it (the path-tracking views remember its path, so a refresh
+/// cannot retarget A / W / S / U; the other views open it at once); the
+/// click is hit-tested against full-width bands taken from the laid-out
+/// cells rather than the grid's remembered row height. The table scrolls to
+/// keep the keyboard's row in view.
+fn toolGrid(editor: *Editor, state: *@import("../core/tool_panel.zig").State, total: usize) void {
+    const cols: usize = switch (state.kind) {
+        .review => 4,
+        .changes => 2,
+        else => 1,
+    };
+    if (win_ui.tool_grid_kind != state.kind) {
+        win_ui.tool_grid_kind = state.kind;
+        win_ui.tool_grid_si = .{};
+        win_ui.tool_grid_followed = null;
+    }
+    // Column widths: fixed ones sized by their heading, a negative ratio for
+    // the column that takes the remaining width.
+    const ratios: [4]f32 = switch (state.kind) {
+        .review => .{ toolColumnWidth("Approved"), toolColumnWidth("Needs work"), toolColumnWidth("Change"), -1 },
+        .changes => .{ toolColumnWidth("Index / tree"), -1, 0, 0 },
+        else => .{ -1, 0, 0, 0 },
+    };
+    var widths: [4]f32 = @splat(0);
+    var grid = dvui.grid(@src(), .colWidths(widths[0..cols]), .{ .scroll_opts = .{ .scroll_info = &win_ui.tool_grid_si, .horizontal_bar = .auto } }, .{ .expand = .horizontal, .background = true, .border = dvui.Rect.all(1), .min_size_content = .{ .h = tool_grid_height }, .max_size_content = .{ .w = 1100, .h = tool_grid_height }, .tag = "tool_grid" });
+    defer grid.deinit();
+    dvui.columnLayoutProportional(ratios[0..cols], widths[0..cols], grid.data().contentRect().w);
+    // The window's first, hidden frame has no width yet.
+    for (widths[0..cols]) |*w| w.* = @max(w.*, 0);
+    // The frame's unhandled left press inside the table and the pointer's
+    // position inside it, if any; the rows they fall in are found while the
+    // rows are laid out below. Found before the headings: a mouse event only
+    // matches inside the current clip, and the header row's scroll clip
+    // stays active until the first body cell.
+    var press: ?*dvui.Event = null;
+    var pointer: ?dvui.Point.Physical = null;
+    for (dvui.events()) |*e| {
+        if (e.evt != .mouse or !dvui.eventMatchSimple(e, grid.data())) continue;
+        const me = e.evt.mouse;
+        if (me.action == .press and me.button == .left) {
+            if (press == null) press = e;
+        } else if (me.action == .position) pointer = me.p;
+    }
+    const head_borders: dvui.GridWidget.CellStyle.Borders = .initBox(cols, 1, 1, 1);
+    switch (state.kind) {
+        .review => {
+            dvui.gridHeading(@src(), grid, 0, "Approved", .fixed, head_borders);
+            dvui.gridHeading(@src(), grid, 1, "Needs work", .fixed, head_borders);
+            dvui.gridHeading(@src(), grid, 2, "Change", .fixed, head_borders);
+            dvui.gridHeading(@src(), grid, 3, "File", .fixed, head_borders);
+        },
+        .changes => {
+            dvui.gridHeading(@src(), grid, 0, "Index / tree", .fixed, head_borders);
+            dvui.gridHeading(@src(), grid, 1, "File", .fixed, head_borders);
+        },
+        else => {},
+    }
+    // The window of rows drawn: everything when it fits, else rows around
+    // the selection. `first` maps table rows back to list indices.
+    const first: usize = if (total <= tool_grid_max_rows) 0 else @min(state.selected -| tool_grid_max_rows / 2, total - tool_grid_max_rows);
+    const shown = @min(total - first, tool_grid_max_rows);
+    var clicked: ?usize = null;
+    var clicked_widget = false; // the cell's own widget (a checkbox) took the click
+    // The chosen row wears the editor's selection color; the hovered row
+    // and the bands are the table's background nudged toward the text
+    // color (mixed here, so no translucency is involved), so the three read
+    // apart on any theme.
+    const sel_color = toDvui(editor.theme.selection);
+    const table_bg = dvui.themeGet().color(.content, .fill);
+    const text_color = toDvui(editor.theme.text);
+    const hover_color = table_bg.lerp(text_color, 0.16);
+    const band_color = table_bg.lerp(text_color, 0.07);
+    // The hovered table row: the grid maps the pointer through last frame's
+    // row height, and the columns span the width, so it covers whole rows.
+    const hovered_row: ?usize = blk: {
+        const p = pointer orelse break :blk null;
+        const cell = grid.pointToCell(p) orelse break :blk null;
+        break :blk cell.row_num;
+    };
+    const borders: dvui.GridWidget.CellStyle.Borders = .initBox(cols, @max(shown, 1), 1, 1);
+    // The click bands span the table's width.
+    const body = grid.data().contentRectScale().r;
+    const pad = tool_cell_pad;
+    for (0..shown) |row| {
+        const index = first + row;
+        // Selected beats hovered beats the banding of odd rows; even rows
+        // keep the table's own background.
+        const fill: ?dvui.Color = if (index == state.selected) sel_color else if (hovered_row == row) hover_color else if (row % 2 == 1) band_color else null;
+        var buf: [4096]u8 = undefined;
+        var letters: [2]u8 = .{ ' ', ' ' };
+        var texts: [4][]const u8 = .{ "", "", "", "" };
+        var count: usize = 1;
+        var checkbox_cols: usize = 0;
+        var status: review.Status = .unreviewed;
+        switch (state.kind) {
+            .review => {
+                const file = editor.review.files.items[index];
+                status = editor.review.statusOf(file.path);
+                letters[0] = file.change;
+                texts[2] = letters[0..1];
+                texts[3] = std.fmt.bufPrint(&buf, "{s}{s}{s}{s}", .{ file.path, if (file.old_path != null) " <- " else "", file.old_path orelse "", if (file.change == 'U') " (conflict)" else "" }) catch file.path;
+                count = 4;
+                checkbox_cols = 2;
+            },
+            .changes => {
+                const change = editor.git.changes.items[index];
+                letters = .{ change.x, change.y };
+                texts[0] = &letters;
+                texts[1] = std.fmt.bufPrint(&buf, "{s}{s}{s}{s}", .{ change.path, if (change.old_path != null) " <- " else "", change.old_path orelse "", if (change.conflict()) " (conflict)" else "" }) catch change.path;
+                count = 2;
+            },
+            else => texts[0] = state.row(editor, index, &buf),
+        }
+        for (0..count) |col| {
+            const cell: dvui.GridWidget.Cell = .colRow(col, row);
+            var cell_opts = borders.cellOptions(cell);
+            cell_opts.color_fill = fill;
+            var box = grid.bodyCell(@src(), cell, cell_opts);
+            defer box.deinit();
+            const cell_rect = box.data().borderRectScale().r;
+            if (col == 0) {
+                // The row's click target: one band across the table.
+                const band: dvui.Rect.Physical = .{ .x = body.x, .y = cell_rect.y, .w = body.w, .h = cell_rect.h };
+                if (press) |e| if (band.contains(e.evt.mouse.p)) {
+                    clicked = index;
+                };
+            }
+            if (col < checkbox_cols) {
+                // A press inside a checkbox cell is the checkbox's: it selects
+                // the row itself when it toggles.
+                if (press) |e| if (cell_rect.contains(e.evt.mouse.p)) {
+                    clicked_widget = true;
+                };
+                const verdict: review.Status = if (col == 0) .approved else .needs_work;
+                var ticked = status == verdict;
+                if (dvui.checkbox(@src(), &ticked, null, .{ .gravity_x = 0.5, .padding = pad })) {
+                    state.select(editor, index);
+                    editor.review.verdict(editor, index, verdict);
+                }
+            } else {
+                dvui.labelNoFmt(@src(), texts[col], .{}, .{ .padding = pad });
+            }
+        }
+    }
+    if (total == 0) {
+        var box = grid.bodyCell(@src(), .colRow(0, 0), .{});
+        defer box.deinit();
+        dvui.labelNoFmt(@src(), "No entries.", .{}, .{ .padding = pad });
+    }
+    // Keep the keyboard's row in view.
+    if (total > 0 and grid.row_height > 0 and win_ui.tool_grid_followed != state.selected) {
+        win_ui.tool_grid_followed = state.selected;
+        const row_y = @as(f32, @floatFromInt(state.selected - first)) * grid.row_height;
+        const vp = win_ui.tool_grid_si.viewport;
+        if (row_y < vp.y) {
+            win_ui.tool_grid_si.scrollToOffset(.vertical, row_y);
+        } else if (vp.h > 0 and row_y + grid.row_height > vp.y + vp.h) {
+            win_ui.tool_grid_si.scrollToOffset(.vertical, row_y + grid.row_height - vp.h);
+        }
+    }
+    if (clicked) |index| if (index < total and !clicked_widget) {
+        if (press) |e| if (!e.handled) e.handle(@src(), grid.data());
+        state.select(editor, index);
+        if (!state.tracksPath()) state.activate(editor);
+    };
 }
 
 fn toolDialog(editor: *Editor) void {
@@ -7565,6 +7747,20 @@ fn toolDialog(editor: *Editor) void {
         if (!open and editor.mode == mode) {
             if (mode == .task_save_prompt) editor.tasks.resolveSave(editor, .cancel) else if (mode == .git_stage_prompt) editor.git.resolveStage(editor, false) else editor.setMode(.normal);
             dvui.focusSubwindow(null, null);
+        }
+    }
+    // The window sizes itself to its content once, then keeps that size.
+    // Content that has outgrown it since (another view's wider button row
+    // took over while it was open) is fitted again on the next frame, so
+    // the bottom row of buttons never leaves the window.
+    if (dvui.minSizeGet(dialog.data().id)) |needed| {
+        const have = dialog.data().rect;
+        // A window never grows past the screen, so content wider than the
+        // screen must not ask for a refit every frame.
+        const screen = dvui.windowRect().size();
+        if (@min(needed.w, screen.w) > have.w + 0.5 or @min(needed.h, screen.h) > have.h + 0.5) {
+            dialog.autoSize();
+            dvui.refresh(null, @src(), dialog.data().id);
         }
     }
     var title: [1024]u8 = undefined;
@@ -7583,60 +7779,60 @@ fn toolDialog(editor: *Editor) void {
     } else {
         const state = &editor.tool_panel;
         const total = state.count(editor);
-        switch (state.kind) {
-            .problems => {
-                if (dvui.button(@src(), "Severity (F)", .{}, .{})) state.filterSeverity();
-                if (dvui.button(@src(), "Source (S)", .{}, .{})) state.filterSource(editor);
-            },
-            .task_output => {
-                if (dvui.button(@src(), "Rerun (R)", .{}, .{})) state.action(editor, 'r');
-                if (dvui.button(@src(), "Stop (S)", .{}, .{})) state.action(editor, 's');
-            },
-            .tasks, .references => {},
-            .changes => {
-                if (dvui.button(@src(), "Working tree diff (Enter)", .{}, .{})) state.activate(editor);
-                if (dvui.button(@src(), "Staged diff (D)", .{}, .{})) state.action(editor, 'd');
-                if (dvui.button(@src(), "Stage (S)", .{}, .{})) state.action(editor, 's');
-                if (dvui.button(@src(), "Unstage (U)", .{}, .{})) state.action(editor, 'u');
-                if (dvui.button(@src(), "Open file (O)", .{}, .{})) state.action(editor, 'o');
-                if (dvui.button(@src(), "Refresh (R)", .{}, .{})) state.action(editor, 'r');
-            },
-            .review => {
-                if (dvui.button(@src(), "Open file (Enter)", .{}, .{})) state.activate(editor);
-                if (dvui.button(@src(), "Approve (A)", .{}, .{})) state.action(editor, 'a');
-                if (dvui.button(@src(), "Needs work (W)", .{}, .{})) state.action(editor, 'w');
-                if (dvui.button(@src(), "Classic diff (D)", .{}, .{})) state.action(editor, 'd');
-                if (dvui.button(@src(), "Refresh (R)", .{}, .{})) state.action(editor, 'r');
-            },
-            .git_diff => {},
-            .debug => {
-                if (dvui.button(@src(), "Debug controls (R)", .{}, .{})) editor.dap.show(editor, .overview);
-                if (dvui.button(@src(), "Stop / detach (S)", .{}, .{})) editor.dap.stop(editor, false);
-            },
-        }
-        if (editor.mode != mode) return;
-        if (dvui.button(@src(), "Previous page (PgUp)", .{}, .{})) state.page(editor, false, 40);
-        if (dvui.button(@src(), "Next page (PgDn)", .{}, .{})) state.page(editor, true, 40);
+        // The status bar is behind this modal window: show its message here
+        // too, so a refused verdict or a refresh is not silent. The line is
+        // always there (empty text keeps its height), so a message arriving
+        // does not change the window's size.
+        dvui.labelNoFmt(@src(), editor.status_message, .{}, .{ .expand = .horizontal });
         {
-            var scroll = dvui.scrollArea(@src(), .{}, .{ .expand = .horizontal, .max_size_content = .{ .w = 1100, .h = 480 } });
-            defer scroll.deinit();
-            const first = state.selected / 40 * 40;
-            if (total == 0) dvui.labelNoFmt(@src(), "No entries. Register tasks in init.lua.", .{}, .{});
-            for (first..@min(total, first + 40)) |index| {
-                var buf: [4096]u8 = undefined;
-                const label = state.row(editor, index, &buf);
-                var selected_buf: [4120]u8 = undefined;
-                const display = std.fmt.bufPrint(&selected_buf, "{s}{s}", .{ if (index == state.selected) "> " else "  ", label }) catch label;
-                if (dvui.button(@src(), display, .{}, .{ .id_extra = index, .expand = .horizontal })) {
-                    // select() also records the Changes row's path, so a
-                    // refresh can't retarget S/U to another file.
-                    state.select(editor, index);
-                    if (!state.tracksPath()) state.activate(editor);
-                    break;
-                }
+            // The view's actions in one row, so the table below keeps its room.
+            var actions = dvui.box(@src(), .{ .dir = .horizontal }, .{ .expand = .horizontal });
+            defer actions.deinit();
+            switch (state.kind) {
+                .problems => {
+                    if (dvui.button(@src(), "Severity (F)", .{}, .{})) state.filterSeverity();
+                    if (dvui.button(@src(), "Source (S)", .{}, .{})) state.filterSource(editor);
+                },
+                .task_output => {
+                    if (dvui.button(@src(), "Rerun (R)", .{}, .{})) state.action(editor, 'r');
+                    if (dvui.button(@src(), "Stop (S)", .{}, .{})) state.action(editor, 's');
+                },
+                .tasks, .references => {},
+                .changes => {
+                    if (dvui.button(@src(), "Working tree diff (Enter / Space)", .{}, .{})) state.activate(editor);
+                    if (dvui.button(@src(), "Staged diff (D)", .{}, .{})) state.action(editor, 'd');
+                    if (dvui.button(@src(), "Stage (S)", .{}, .{})) state.action(editor, 's');
+                    if (dvui.button(@src(), "Unstage (U)", .{}, .{})) state.action(editor, 'u');
+                    if (dvui.button(@src(), "Open file (O)", .{}, .{})) state.action(editor, 'o');
+                    if (dvui.button(@src(), "Refresh (R)", .{}, .{})) state.action(editor, 'r');
+                },
+                .review => {
+                    if (dvui.button(@src(), "Read (Enter / Space)", .{}, .{})) state.activate(editor);
+                    if (dvui.button(@src(), "Approve (A)", .{}, .{})) state.action(editor, 'a');
+                    if (dvui.button(@src(), "Needs work (W)", .{}, .{})) state.action(editor, 'w');
+                    if (dvui.button(@src(), "Classic diff (D)", .{}, .{})) state.action(editor, 'd');
+                    if (dvui.button(@src(), "Open file (O)", .{}, .{})) state.action(editor, 'o');
+                    if (dvui.button(@src(), "Refresh (R)", .{}, .{})) state.action(editor, 'r');
+                    if (dvui.button(@src(), "Pin baseline (P)", .{}, .{})) state.action(editor, 'p');
+                    if (dvui.button(@src(), "Unpin (U)", .{}, .{})) state.action(editor, 'u');
+                },
+                .git_diff => {},
+                .debug => {
+                    if (dvui.button(@src(), "Debug controls (R)", .{}, .{})) editor.dap.show(editor, .overview);
+                    if (dvui.button(@src(), "Stop / detach (S)", .{}, .{})) editor.dap.stop(editor, false);
+                },
             }
         }
-        if (dvui.button(@src(), "Close (Esc)", .{}, .{})) open = false;
+        if (editor.mode != mode) return;
+        toolGrid(editor, state, total);
+        if (editor.mode != mode) return;
+        {
+            var nav = dvui.box(@src(), .{ .dir = .horizontal }, .{ .expand = .horizontal });
+            defer nav.deinit();
+            if (dvui.button(@src(), "Previous page (PgUp)", .{}, .{})) state.page(editor, false, 40);
+            if (dvui.button(@src(), "Next page (PgDn)", .{}, .{})) state.page(editor, true, 40);
+            if (dvui.button(@src(), "Close (Esc)", .{}, .{})) open = false;
+        }
     }
     for (dvui.events()) |*event| {
         if (event.handled or event.evt != .key) continue;
@@ -7870,6 +8066,9 @@ test "GUI tools smoke: hover, rename, workspace preview and recovery dialogs" {
     defer ui.deinit();
     var editor = try Editor.init(t.allocator, t.io);
     defer editor.deinit();
+    var window_state: WinUi = .{ .win_id = 0 };
+    win_ui = &window_state;
+    defer win_ui = undefined;
     cur_win = 0;
     editor.lsp_tools.hover = try t.allocator.dupe(u8, "café: i32\nUnicode documentation 😀");
     editor.setMode(.lsp_panel);
@@ -7902,6 +8101,87 @@ test "GUI tools smoke: hover, rename, workspace preview and recovery dialogs" {
         handleToolKeyGui(&editor, .{ .code = .escape, .action = .down, .mod = .none });
         try t.expectEqual(Editor.Mode.normal, editor.mode);
     }
+}
+
+test "GUI tool table: a click selects the row under the pointer" {
+    if (!build_options.has_gui) return error.SkipZigTest;
+    const t = std.testing;
+    var tmp = t.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(t.io, ".", t.allocator);
+    defer t.allocator.free(root);
+    var ui = try dvui.testing.init(.{ .window_size = .{ .w = 1000, .h = 700 } });
+    defer ui.deinit();
+    var editor = try Editor.init(t.allocator, t.io);
+    defer editor.deinit();
+    var window_state: WinUi = .{ .win_id = 0 };
+    win_ui = &window_state;
+    defer win_ui = undefined;
+    cur_win = 0;
+    editor.lsp_enabled = false;
+    editor.review.stage_on_approve = false;
+    editor.git.root = try t.allocator.dupe(u8, root);
+    const names = [_][]const u8{ "a.txt", "b.txt", "src/core/c.zig", "d.txt", "e.txt", "src/frontend/f.zig", "g.txt", "h.txt" };
+    for (names, 0..) |name, index| {
+        try editor.git.changes.insert(editor.allocator, index, .{ .path = try editor.allocator.dupe(u8, name), .x = ' ', .y = 'M' });
+    }
+    editor.review.tick(&editor, 0);
+    editor.tool_panel.show(&editor, .review);
+    try t.expectEqual(names.len, editor.review.files.items.len);
+    // Frames until the table's row height and the window's size settle.
+    var frame_ms: u64 = 100;
+    for (0..4) |_| {
+        toolDialog(&editor);
+        _ = try ui.window.end(.{});
+        frame_ms += 100;
+        try ui.window.begin(@intCast(frame_ms * std.time.ns_per_ms));
+    }
+    const grid_rect = (dvui.tagGet("tool_grid") orelse return error.TagNotFound).rect;
+    // Press down the table, a few pixels at a time, to the right of the
+    // columns' text: every row must come up, top to bottom.
+    var seen = [_]bool{false} ** names.len;
+    var last: usize = 0;
+    var y = grid_rect.y + 1;
+    while (y < grid_rect.y + grid_rect.h) : (y += 5) {
+        _ = try ui.window.addEventMouseMotion(.{ .pt = .{ .x = grid_rect.x + grid_rect.w * 0.8, .y = y } });
+        _ = try ui.window.addEventMouseButton(.left, .press);
+        _ = try ui.window.addEventMouseButton(.left, .release);
+        toolDialog(&editor);
+        _ = try ui.window.end(.{});
+        frame_ms += 100;
+        try ui.window.begin(@intCast(frame_ms * std.time.ns_per_ms));
+        const selected = editor.tool_panel.selected;
+        try t.expect(selected >= last);
+        last = selected;
+        seen[selected] = true;
+    }
+    for (seen) |row_seen| try t.expect(row_seen);
+    try t.expectEqual(Editor.Mode.tool_panel, editor.mode);
+    // ZIDE_CAPTURE_DIR=<dir>: also save a picture of the dialog there
+    // (tool_table.png), to look at the table without launching ZIDE.
+    const Backend = @import("sdl-backend");
+    const capture_dir = Backend.c.SDL_getenv("ZIDE_CAPTURE_DIR");
+    if (capture_dir != null) {
+        const path = try std.fs.path.join(t.allocator, &.{ std.mem.span(@as([*:0]const u8, capture_dir)), "tool_table.png" });
+        defer t.allocator.free(path);
+        // Row 1 selected, the pointer over row 3: both highlights in view.
+        editor.tool_panel.select(&editor, 1);
+        _ = try ui.window.addEventMouseMotion(.{ .pt = .{ .x = grid_rect.x + grid_rect.w * 0.5, .y = grid_rect.y + 32 + 3.5 * 26 } });
+        capture_editor = &editor;
+        const file = try std.Io.Dir.cwd().createFile(dvui.io, path, .{});
+        defer file.close(dvui.io);
+        var wbuf: [4096]u8 = undefined;
+        var writer = file.writer(dvui.io, &wbuf);
+        try dvui.testing.capturePng(captureDialogFrame, null, &writer.interface);
+        try writer.end();
+    }
+}
+
+/// The editor whose tool dialog `captureDialogFrame` renders (tests only).
+var capture_editor: *Editor = undefined;
+fn captureDialogFrame() anyerror!dvui.App.Result {
+    toolDialog(capture_editor);
+    return .ok;
 }
 
 comptime {

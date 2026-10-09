@@ -129,7 +129,7 @@ pub const State = struct {
                 if (editor.git.root == null) break :blk "Review: not a Git repository";
                 const counts = editor.review.counts();
                 var base_buf: [96]u8 = undefined;
-                break :blk std.fmt.bufPrint(buf, "Review: {d}/{d} reviewed, {d} needs work | {s}{s} | A approve / W needs work / D classic diff / O open / R refresh", .{
+                break :blk std.fmt.bufPrint(buf, "Review: {d}/{d} reviewed, {d} needs work | {s}{s} | A approve / W needs work / D diff / O open / R refresh / P pin baseline / U unpin", .{
                     counts.approved + counts.needs_work,   counts.total,                                             counts.needs_work,
                     editor.review.baselineText(&base_buf), if (editor.review.list_job != null) " (loading)" else "",
                 }) catch "Review";
@@ -310,12 +310,6 @@ pub const State = struct {
         defer editor.allocator.free(path);
         self.openLocation(editor, path, 0, 0, .bytes);
     }
-    /// Review view: the classic diff of the selected row, working tree
-    /// against the review baseline.
-    fn reviewClassicDiff(editor: *Editor, index: usize) void {
-        const file = editor.review.files.items[index];
-        editor.git.previewAgainst(editor, file.path, file.old_path, file.change == '?', if (file.change == '?') null else editor.review.baseRef());
-    }
 
     pub fn activate(self: *State, editor: *Editor) void {
         if (self.selected >= self.count(editor)) return;
@@ -412,14 +406,16 @@ pub const State = struct {
                     switch (key) {
                         'a' => editor.review.verdict(editor, index, .approved),
                         'w' => editor.review.verdict(editor, index, .needs_work),
-                        'd' => reviewClassicDiff(editor, index),
+                        'd' => editor.review.openClassicRow(editor, index),
                         else => self.openReviewFile(editor, index),
                     }
                 },
                 'r' => {
                     editor.git.requestRefresh();
-                    editor.review.requestRefresh();
+                    editor.review.requestRefreshAnnounced();
                 },
+                'p' => editor.review.pinHead(editor),
+                'u' => editor.review.followHead(editor),
                 else => {},
             },
             .git_diff => {},
@@ -549,6 +545,12 @@ test "Review rows show the verdict glyph and follow the selected file across ref
     try t.expect(std.mem.indexOf(u8, panel.title(&editor, &buf), "1/3 reviewed, 1 needs work") != null);
     panel.action(&editor, 'a');
     try t.expectEqualStrings("[x] M z.txt", panel.row(&editor, 2, &buf));
+    // U follows the last commit again (P needs git; pinning is tested in
+    // review.zig).
+    editor.review.mode = .checkpoint;
+    panel.action(&editor, 'u');
+    try t.expectEqual(review.BaselineMode.head, editor.review.mode);
+    try t.expect(std.mem.indexOf(u8, editor.status_message, "last commit") != null);
     // Enter asks for the row's reader (the diff job is only recorded here);
     // O opens the real file.
     review.test_no_spawn = true;
