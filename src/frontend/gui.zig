@@ -1329,18 +1329,22 @@ fn statusBar(editor: *Editor) void {
         const status_text_color = toDvui(editor.theme.status_fg);
 
         // Left: Ln/Col (+ cursor count if multi-cursor)
-        var pos_buf: [96]u8 = undefined;
+        var pos_buf: [160]u8 = undefined;
         const cursor_count = doc.cursors.count();
         // Show the detected language (and its server once up) so it's
         // obvious what syntax/LSP applies.
         var lang_buf: [64]u8 = undefined;
         const lang_name = editor.languageStatusText(doc, &lang_buf);
+        // Review progress and this file's verdict, while changed files are listed.
+        var review_buf: [48]u8 = undefined;
+        const review_segment = if (term_active) "" else editor.review.statusSegment(editor, &review_buf);
+        const review_sep: []const u8 = if (review_segment.len > 0) " | " else "";
         const pos_str: []const u8 = if (term_active)
             "Terminal"
         else if (cursor_count > 1)
-            std.fmt.bufPrint(&pos_buf, "{d} cursors | Ln {d}, Col {d} | {s}", .{ cursor_count, pos.line + 1, pos.col + 1, lang_name }) catch "?"
+            std.fmt.bufPrint(&pos_buf, "{d} cursors | Ln {d}, Col {d} | {s}{s}{s}", .{ cursor_count, pos.line + 1, pos.col + 1, lang_name, review_sep, review_segment }) catch "?"
         else
-            std.fmt.bufPrint(&pos_buf, "Ln {d}, Col {d} | {s}", .{ pos.line + 1, pos.col + 1, lang_name }) catch "?";
+            std.fmt.bufPrint(&pos_buf, "Ln {d}, Col {d} | {s}{s}{s}", .{ pos.line + 1, pos.col + 1, lang_name, review_sep, review_segment }) catch "?";
         dvui.renderText(.{
             .font = status_font,
             .text = pos_str,
@@ -6552,6 +6556,7 @@ const settings_defs = [_]SettingDef{
     .{ .key = "auto_close_brackets", .label = "Auto Close Brackets", .kind = .boolean, .desc = "Auto-close brackets and quotes" },
     .{ .key = "completion_auto", .label = "Auto Completion Popup", .kind = .boolean, .desc = "Open completions while typing (off = Ctrl+Space only)" },
     .{ .key = "signature_help_auto", .label = "Auto Signature Help", .kind = .boolean, .desc = "Show the call signature after ( and , (off = Ctrl+Shift+Space only)" },
+    .{ .key = "review_stage_on_approve", .label = "Review: Approve Stages", .kind = .boolean, .desc = "Approving a changed file in the Review view also stages it (git add)" },
     .{ .key = "auto_save", .label = "Auto Save", .kind = .boolean, .desc = "Auto-save dirty documents periodically" },
     .{ .key = "auto_save_interval_ms", .label = "Auto Save Interval (ms)", .kind = .number, .desc = "Delay before auto-save (500-300000)", .min = 500, .max = 300000 },
     .{ .key = "gutter_min_digits", .label = "Gutter Min Digits", .kind = .number, .desc = "Minimum width of line number gutter (1-10)", .min = 1, .max = 10 },
@@ -6785,6 +6790,7 @@ fn getSettingBool(editor: *const Editor, key: []const u8) bool {
     if (std.mem.eql(u8, key, "auto_close_brackets")) return editor.auto_close_brackets;
     if (std.mem.eql(u8, key, "completion_auto")) return editor.completion_auto;
     if (std.mem.eql(u8, key, "signature_help_auto")) return editor.signature_help_auto;
+    if (std.mem.eql(u8, key, "review_stage_on_approve")) return editor.review.stage_on_approve;
     if (std.mem.eql(u8, key, "auto_save")) return editor.auto_save;
     if (std.mem.eql(u8, key, "click_clears_cursors")) return editor.click_clears_cursors;
     if (std.mem.eql(u8, key, "session_persistence")) return editor.session_persistence;
@@ -6807,6 +6813,7 @@ fn applySettingBool(editor: *Editor, key: []const u8, val: bool) void {
     if (std.mem.eql(u8, key, "auto_close_brackets")) editor.auto_close_brackets = val;
     if (std.mem.eql(u8, key, "completion_auto")) editor.completion_auto = val;
     if (std.mem.eql(u8, key, "signature_help_auto")) editor.signature_help_auto = val;
+    if (std.mem.eql(u8, key, "review_stage_on_approve")) editor.review.stage_on_approve = val;
     if (std.mem.eql(u8, key, "auto_save")) editor.auto_save = val;
     if (std.mem.eql(u8, key, "click_clears_cursors")) editor.click_clears_cursors = val;
     if (std.mem.eql(u8, key, "session_persistence")) editor.session_persistence = val;
@@ -7488,6 +7495,8 @@ fn handleToolKeyGui(editor: *Editor, key: dvui.Event.Key) void {
         .d => editor.tool_panel.action(editor, 'd'),
         .u => editor.tool_panel.action(editor, 'u'),
         .o => editor.tool_panel.action(editor, 'o'),
+        .a => editor.tool_panel.action(editor, 'a'),
+        .w => editor.tool_panel.action(editor, 'w'),
         else => {},
     }
 }
@@ -7537,6 +7546,13 @@ fn toolDialog(editor: *Editor) void {
                 if (dvui.button(@src(), "Open file (O)", .{}, .{})) state.action(editor, 'o');
                 if (dvui.button(@src(), "Refresh (R)", .{}, .{})) state.action(editor, 'r');
             },
+            .review => {
+                if (dvui.button(@src(), "Open file (Enter)", .{}, .{})) state.activate(editor);
+                if (dvui.button(@src(), "Approve (A)", .{}, .{})) state.action(editor, 'a');
+                if (dvui.button(@src(), "Needs work (W)", .{}, .{})) state.action(editor, 'w');
+                if (dvui.button(@src(), "Classic diff (D)", .{}, .{})) state.action(editor, 'd');
+                if (dvui.button(@src(), "Refresh (R)", .{}, .{})) state.action(editor, 'r');
+            },
             .git_diff => {},
             .debug => {
                 if (dvui.button(@src(), "Debug controls (R)", .{}, .{})) editor.dap.show(editor, .overview);
@@ -7560,7 +7576,7 @@ fn toolDialog(editor: *Editor) void {
                     // select() also records the Changes row's path, so a
                     // refresh can't retarget S/U to another file.
                     state.select(editor, index);
-                    if (state.kind != .changes) state.activate(editor);
+                    if (!state.tracksPath()) state.activate(editor);
                     break;
                 }
             }
@@ -7821,7 +7837,7 @@ test "GUI tools smoke: hover, rename, workspace preview and recovery dialogs" {
     recoveryDialog(&editor);
     handleRecoveryKeyGui(&editor, .{ .code = .escape, .action = .down, .mod = .none });
     try t.expectEqual(Editor.Mode.normal, editor.mode);
-    for ([_]@import("../core/tool_panel.zig").Kind{ .tasks, .task_output, .problems, .changes, .git_diff, .debug }, 0..) |kind, index| {
+    for ([_]@import("../core/tool_panel.zig").Kind{ .tasks, .task_output, .problems, .changes, .git_diff, .debug, .references, .review }, 0..) |kind, index| {
         _ = try ui.window.end(.{});
         try ui.window.begin(@intCast((400 + index * 100) * std.time.ns_per_ms));
         editor.tool_panel.show(&editor, kind);

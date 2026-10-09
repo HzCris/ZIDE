@@ -49,7 +49,7 @@ pub fn parseStatus(a: Allocator, bytes: []const u8) !std.ArrayList(Change) {
     }
     return result;
 }
-fn validPath(path: []const u8) !void {
+pub fn validPath(path: []const u8) !void {
     if (path.len == 0 or std.fs.path.isAbsolute(path) or std.mem.indexOfScalar(u8, path, 0) != null) return error.InvalidGitPath;
     var parts = std.mem.splitScalar(u8, path, '/');
     while (parts.next()) |part| if (std.mem.eql(u8, part, "..")) return error.InvalidGitPath;
@@ -189,7 +189,8 @@ pub const State = struct {
         if (rendered.ptr != &self.message) @memcpy(self.message[0..rendered.len], rendered);
         editor.status_message = self.status();
     }
-    fn command(self: *State, editor: *Editor, cwd: []const u8, args: []const []const u8) !u64 {
+    /// Start a git job (strict output: over 4 MiB fails rather than truncates).
+    pub fn command(self: *State, editor: *Editor, cwd: []const u8, args: []const []const u8) !u64 {
         _ = self;
         const argv = try commandArgv(editor.allocator, cwd, args);
         defer editor.allocator.free(argv);
@@ -637,7 +638,7 @@ pub const State = struct {
 /// folder opens, and a repository's `.git/config` can name an fsmonitor
 /// hook that `git status` would execute (an extracted archive, a USB
 /// copy). Clean/smudge filters need a workspace-trust prompt instead.
-fn commandArgv(a: Allocator, cwd: []const u8, args: []const []const u8) ![]const []const u8 {
+pub fn commandArgv(a: Allocator, cwd: []const u8, args: []const []const u8) ![]const []const u8 {
     const base = [_][]const u8{ "git", "--no-pager", "--literal-pathspecs", "--no-optional-locks", "-c", "color.ui=false", "-c", "core.quotepath=false", "-c", "core.fsmonitor=false", "-C" };
     const argv = try a.alloc([]const u8, base.len + 1 + args.len);
     @memcpy(argv[0..base.len], &base);
@@ -646,7 +647,8 @@ fn commandArgv(a: Allocator, cwd: []const u8, args: []const []const u8) ![]const
     return argv;
 }
 
-fn relative(a: Allocator, io: std.Io, root: []const u8, path: []const u8, directory: bool) ![]u8 {
+/// `path` relative to the repository root, '/' separators, validated.
+pub fn relative(a: Allocator, io: std.Io, root: []const u8, path: []const u8, directory: bool) ![]u8 {
     const full = try identity.key(a, io, path);
     defer a.free(full);
     if (full.len < root.len or !identity.equalKeys(full[0..root.len], root)) return error.OutsideRepository;

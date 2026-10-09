@@ -5,7 +5,11 @@ const lsp = @import("lsp.zig");
 const diagnostics = @import("diagnostics.zig");
 const tasks = @import("tasks.zig");
 const git = @import("git.zig");
-pub const Kind = enum { tasks, task_output, problems, changes, git_diff, debug, references };
+const review = @import("review.zig");
+pub const Kind = enum { tasks, task_output, problems, changes, git_diff, debug, references, review };
+
+/// A row of one of the two path-tracked views (Changes, Review).
+const PathRow = struct { path: []const u8, old_path: ?[]const u8 };
 
 /// `path` relative to the file tree root when it lies inside it (servers
 /// spell the drive letter and separators their own way), else its last two
@@ -47,11 +51,11 @@ pub const State = struct {
     problem_indices: std.ArrayList(usize) = .empty,
     revision: ?u64 = null,
     problem_opened: bool = false,
-    /// Changes view: the change the user selected, by path (H5). A refresh
-    /// can insert or remove rows above it between selecting and pressing a
-    /// key, so the highlight follows the path and actions re-find it by path
-    /// instead of trusting `selected`. `change_row` is where it was last
-    /// seen; `selected` moving away from it means the user picked another row.
+    /// Changes and Review views: the row the user selected, by path (H5). A
+    /// refresh can insert or remove rows above it between selecting and
+    /// pressing a key, so the highlight follows the path and actions re-find
+    /// it by path instead of trusting `selected`. `change_row` is where it was
+    /// last seen; `selected` moving away from it means the user picked another row.
     change_path: ?[]u8 = null,
     change_old_path: ?[]u8 = null,
     change_row: usize = 0,
@@ -68,14 +72,43 @@ pub const State = struct {
         self.revision = null;
         self.problem_opened = false;
         self.forgetChange(editor.allocator);
-        if (kind == .changes) self.captureChange(editor);
+        if (self.tracksPath()) self.captureChange(editor);
         editor.setMode(.tool_panel);
     }
-    /// Select row `index` (frontend clicks): the Changes view remembers the
-    /// change under it right away.
+    /// Select row `index` (frontend clicks): the path-tracked views remember
+    /// the row under it right away.
     pub fn select(self: *State, editor: *Editor, index: usize) void {
         self.selected = index;
-        if (self.kind == .changes) self.captureChange(editor);
+        if (self.tracksPath()) self.captureChange(editor);
+    }
+    /// Whether the current view follows its selection by path (Changes, Review).
+    pub fn tracksPath(self: *const State) bool {
+        return self.kind == .changes or self.kind == .review;
+    }
+    fn rowCount(self: *const State, editor: *Editor) usize {
+        return switch (self.kind) {
+            .changes => editor.git.changes.items.len,
+            .review => editor.review.files.items.len,
+            else => 0,
+        };
+    }
+    fn pathAt(self: *const State, editor: *Editor, index: usize) ?PathRow {
+        switch (self.kind) {
+            .changes => {
+                const items = editor.git.changes.items;
+                if (index >= items.len) return null;
+                return .{ .path = items[index].path, .old_path = items[index].old_path };
+            },
+            .review => {
+                const items = editor.review.files.items;
+                if (index >= items.len) return null;
+                return .{ .path = items[index].path, .old_path = items[index].old_path };
+            },
+            else => return null,
+        }
+    }
+    fn viewName(self: *const State) []const u8 {
+        return if (self.kind == .review) "Review" else "Changes";
     }
     pub fn title(self: *State, editor: *Editor, buf: []u8) []const u8 {
         return switch (self.kind) {
@@ -89,6 +122,15 @@ pub const State = struct {
             },
             .problems => std.fmt.bufPrint(buf, "Problems: {s}, {s} | F severity / S source / Enter opens", .{ if (self.severity) |severity| @tagName(severity) else "all severities", self.source orelse "all sources" }) catch "Problems",
             .references => std.fmt.bufPrint(buf, "References to {s}: {d} | Enter opens / Esc closes", .{ editor.lsp_tools.referencesSymbol(), editor.lsp_tools.references.items.len }) catch "References",
+            .review => blk: {
+                if (editor.git.root == null) break :blk "Review: not a Git repository";
+                const counts = editor.review.counts();
+                var base_buf: [96]u8 = undefined;
+                break :blk std.fmt.bufPrint(buf, "Review: {d}/{d} reviewed, {d} needs work | {s}{s} | A approve / W needs work / D classic diff / O open / R refresh", .{
+                    counts.approved + counts.needs_work,   counts.total,                                             counts.needs_work,
+                    editor.review.baselineText(&base_buf), if (editor.review.list_job != null) " (loading)" else "",
+                }) catch "Review";
+            },
         };
     }
 
@@ -118,9 +160,9 @@ pub const State = struct {
         const total = switch (self.kind) {
             .tasks => editor.tasks.configs.items.len,
             .debug => editor.dap.count(editor),
-            .changes => blk: {
+            .changes, .review => blk: {
                 self.syncChange(editor);
-                break :blk editor.git.changes.items.len;
+                break :blk self.rowCount(editor);
             },
             .git_diff => editor.git.preview.count(),
             .references => editor.lsp_tools.references.items.len,
@@ -152,6 +194,10 @@ pub const State = struct {
                 const shown = displayPath(editor, r.path);
                 break :blk std.fmt.bufPrint(buf, "{s}{s}:{d}:{d}  {s}", .{ if (shown.elided) "…/" else "", shown.text, r.line + 1, r.col + 1, r.excerpt }) catch r.path;
             },
+            .review => blk: {
+                const file = editor.review.files.items[index];
+                break :blk std.fmt.bufPrint(buf, "{s} {c} {s}{s}{s}{s}", .{ review.glyph(editor.review.statusOf(file.path)), file.change, file.path, if (file.old_path != null) " <- " else "", file.old_path orelse "", if (file.change == 'U') " (conflict)" else "" }) catch file.path;
+            },
             .task_output => blk: {
                 const run = editor.tasks.get(editor.tasks.selected_run.?).?;
                 const line = run.output.line(index);
@@ -180,7 +226,7 @@ pub const State = struct {
         const total = self.count(editor);
         if (total == 0) return;
         self.selected = if (down) @min(total - 1, self.selected +| 1) else self.selected -| 1;
-        if (self.kind == .changes) self.captureChange(editor);
+        if (self.tracksPath()) self.captureChange(editor);
     }
 
     fn forgetChange(self: *State, allocator: std.mem.Allocator) void {
@@ -189,58 +235,89 @@ pub const State = struct {
         self.change_path = null;
         self.change_old_path = null;
     }
-    /// Remember the change now at `selected` as the user's choice.
+    /// Remember the row now at `selected` as the user's choice.
     fn captureChange(self: *State, editor: *Editor) void {
         self.forgetChange(editor.allocator);
         self.change_row = self.selected;
-        if (self.selected >= editor.git.changes.items.len) return;
-        const change = editor.git.changes.items[self.selected];
-        const path = editor.allocator.dupe(u8, change.path) catch return;
-        const old = if (change.old_path) |old| editor.allocator.dupe(u8, old) catch {
+        const pr = self.pathAt(editor, self.selected) orelse return;
+        const path = editor.allocator.dupe(u8, pr.path) catch return;
+        const old = if (pr.old_path) |old| editor.allocator.dupe(u8, old) catch {
             editor.allocator.free(path);
             return;
         } else null;
         self.change_path = path;
         self.change_old_path = old;
     }
-    fn sameChange(self: *const State, change: git.Change) bool {
+    fn sameChange(self: *const State, pr: PathRow) bool {
         const path = self.change_path orelse return false;
-        if (!std.mem.eql(u8, change.path, path)) return false;
-        const old = change.old_path orelse return self.change_old_path == null;
+        if (!std.mem.eql(u8, pr.path, path)) return false;
+        const old = pr.old_path orelse return self.change_old_path == null;
         return self.change_old_path != null and std.mem.eql(u8, old, self.change_old_path.?);
     }
-    /// Keep `selected` on the remembered change when the list changed under
-    /// it (exact match first, then the same path with another rename source).
-    /// A change that is gone stays remembered, so the next action reports it.
+    /// Keep `selected` on the remembered row when the list changed under it
+    /// (exact match first, then the same path with another rename source).
+    /// A row that is gone stays remembered, so the next action reports it.
     fn syncChange(self: *State, editor: *Editor) void {
-        const changes = editor.git.changes.items;
+        const total = self.rowCount(editor);
         if (self.change_path == null or self.selected != self.change_row) return self.captureChange(editor);
-        if (self.change_row < changes.len and self.sameChange(changes[self.change_row])) return;
+        if (self.change_row < total and self.sameChange(self.pathAt(editor, self.change_row).?)) return;
         var same_path: ?usize = null;
-        const found = for (changes, 0..) |change, index| {
-            if (self.sameChange(change)) break index;
-            if (same_path == null and std.mem.eql(u8, change.path, self.change_path.?)) same_path = index;
-        } else same_path;
-        if (found) |index| {
-            self.selected = index;
+        var found: ?usize = null;
+        var index: usize = 0;
+        while (index < total) : (index += 1) {
+            const pr = self.pathAt(editor, index).?;
+            if (self.sameChange(pr)) {
+                found = index;
+                break;
+            }
+            if (same_path == null and std.mem.eql(u8, pr.path, self.change_path.?)) same_path = index;
+        }
+        const pick = if (found) |f| f else same_path;
+        if (pick) |i| {
+            self.selected = i;
             self.captureChange(editor);
         } else {
             // Pin the clamped row so count()'s clamp is not taken for a user move.
-            self.selected = @min(self.selected, changes.len -| 1);
+            self.selected = @min(self.selected, total -| 1);
             self.change_row = self.selected;
         }
     }
-    /// The Changes row the user selected, re-found by path at keypress time
-    /// (H5); null, with a status message, when that file is no longer listed.
-    /// The row now highlighted is then remembered, so pressing again acts on it.
+    /// The Changes/Review row the user selected, re-found by path at keypress
+    /// time (H5); null, with a status message, when that file is no longer
+    /// listed. The row now highlighted is then remembered, so pressing again
+    /// acts on it.
     pub fn selectedChange(self: *State, editor: *Editor) ?usize {
         self.syncChange(editor);
-        const changes = editor.git.changes.items;
-        const path = self.change_path orelse return if (self.selected < changes.len) self.selected else null;
-        if (self.change_row < changes.len and self.sameChange(changes[self.change_row])) return self.change_row;
-        editor.status_message = std.fmt.bufPrint(&editor.status_buf, "Changes: {s} is no longer listed; nothing done", .{std.fs.path.basename(path)}) catch "Changes: the selected file is no longer listed; nothing done";
+        const total = self.rowCount(editor);
+        const path = self.change_path orelse return if (self.selected < total) self.selected else null;
+        if (self.change_row < total and self.sameChange(self.pathAt(editor, self.change_row).?)) return self.change_row;
+        editor.status_message = std.fmt.bufPrint(&editor.status_buf, "{s}: {s} is no longer listed; nothing done", .{ self.viewName(), std.fs.path.basename(path) }) catch "The selected file is no longer listed; nothing done";
         self.captureChange(editor);
         return null;
+    }
+    /// Review view: open the real file of the selected row.
+    fn openReviewFile(self: *State, editor: *Editor, index: usize) void {
+        const file = editor.review.files.items[index];
+        if (file.change == 'D') {
+            editor.status_message = "Review: deleted file — D shows the diff";
+            return;
+        }
+        const root = editor.review.root orelse return;
+        const path = std.fs.path.join(editor.allocator, &.{ root, file.path }) catch return;
+        defer editor.allocator.free(path);
+        self.openLocation(editor, path, 0, 0, .bytes);
+    }
+    /// Review view: the classic diff of the selected row — the Changes
+    /// panel's preview, so only files git lists in the working tree have
+    /// one (checkpoint-only rows are unchanged since the last commit).
+    fn reviewClassicDiff(editor: *Editor, index: usize) void {
+        const file = editor.review.files.items[index];
+        for (editor.git.changes.items, 0..) |change, i| {
+            if (!std.mem.eql(u8, change.path, file.path)) continue;
+            editor.git.previewChange(editor, i, !change.working());
+            return;
+        }
+        editor.status_message = std.fmt.bufPrint(&editor.status_buf, "Review: {s} is unchanged since the last commit; no working-tree diff", .{std.fs.path.basename(file.path)}) catch "Review: no working-tree diff";
     }
 
     pub fn activate(self: *State, editor: *Editor) void {
@@ -255,6 +332,10 @@ pub const State = struct {
             .references => {
                 const r = editor.lsp_tools.references.items[self.selected];
                 self.openLocation(editor, r.path, r.line, r.col, r.columns);
+            },
+            .review => {
+                const index = self.selectedChange(editor) orelse return;
+                self.openReviewFile(editor, index);
             },
             .tasks => {
                 editor.setMode(.normal);
@@ -301,7 +382,7 @@ pub const State = struct {
     pub fn page(self: *State, editor: *Editor, down: bool, amount: usize) void {
         const total = self.count(editor);
         self.selected = if (down) @min(total -| 1, self.selected +| amount) else self.selected -| amount;
-        if (self.kind == .changes) self.captureChange(editor);
+        if (self.tracksPath()) self.captureChange(editor);
     }
     pub fn action(self: *State, editor: *Editor, key: u8) void {
         switch (self.kind) {
@@ -326,6 +407,22 @@ pub const State = struct {
                     }
                 },
                 'r' => editor.git.requestRefresh(),
+                else => {},
+            },
+            .review => switch (key) {
+                'a', 'w', 'd', 'o' => {
+                    const index = self.selectedChange(editor) orelse return;
+                    switch (key) {
+                        'a' => editor.review.verdict(editor, index, .approved),
+                        'w' => editor.review.verdict(editor, index, .needs_work),
+                        'd' => reviewClassicDiff(editor, index),
+                        else => self.openReviewFile(editor, index),
+                    }
+                },
+                'r' => {
+                    editor.git.requestRefresh();
+                    editor.review.requestRefresh();
+                },
                 else => {},
             },
             .git_diff => {},
@@ -420,6 +517,44 @@ test "Changes actions follow the selected file when a refresh inserts or removes
     panel.action(&editor, 's');
     try t.expectEqualStrings("a.txt", editor.git.mutation.?.path);
     editor.git.resolveStage(&editor, false);
+}
+
+test "Review rows show the verdict glyph and follow the selected file across refreshes" {
+    const t = std.testing;
+    var tmp = t.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(t.io, ".", t.allocator);
+    defer t.allocator.free(root);
+    for ([_][]const u8{ "a.txt", "m.txt", "z.txt" }) |name| try tmp.dir.writeFile(t.io, .{ .sub_path = name, .data = "x\n" });
+    var editor = try Editor.init(t.allocator, t.io);
+    defer editor.deinit();
+    editor.lsp_enabled = false;
+    editor.review.stage_on_approve = false;
+    editor.git.root = try t.allocator.dupe(u8, root);
+    try testChange(&editor, 0, "a.txt");
+    try testChange(&editor, 1, "z.txt");
+    editor.review.tick(&editor, 0);
+    const panel = &editor.tool_panel;
+    panel.show(&editor, .review);
+    var buf: [512]u8 = undefined;
+    try t.expectEqualStrings("[ ] M a.txt", panel.row(&editor, 0, &buf));
+    try t.expect(std.mem.indexOf(u8, panel.title(&editor, &buf), "0/2 reviewed, 0 needs work | baseline: last commit") != null);
+    panel.move(&editor, true);
+    try t.expectEqual(@as(usize, 1), panel.selected); // z.txt
+    // A refresh lists m.txt above the selection before W is pressed.
+    try testChange(&editor, 1, "m.txt");
+    editor.git.revision += 1;
+    editor.review.tick(&editor, 0);
+    panel.action(&editor, 'w');
+    try t.expectEqual(@import("review.zig").Status.needs_work, editor.review.statusOf("z.txt"));
+    try t.expectEqual(@as(usize, 2), panel.selected); // the highlight followed it
+    try t.expectEqualStrings("[!] M z.txt", panel.row(&editor, 2, &buf));
+    try t.expect(std.mem.indexOf(u8, panel.title(&editor, &buf), "1/3 reviewed, 1 needs work") != null);
+    panel.action(&editor, 'a');
+    try t.expectEqualStrings("[x] M z.txt", panel.row(&editor, 2, &buf));
+    // Enter opens the real file; a missing root reports instead of crashing.
+    panel.activate(&editor);
+    try t.expect(std.mem.endsWith(u8, editor.activeDoc().file_path.?, "z.txt"));
 }
 
 test "Enter on a Task Output line uses the run's own Lua problem matcher" {

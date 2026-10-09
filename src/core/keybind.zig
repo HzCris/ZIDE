@@ -309,6 +309,11 @@ pub const KeybindMap = struct {
         try self.set("ctrl+f12", "lsp_document_symbols");
         try self.set("ctrl+t", "lsp_workspace_symbols");
         try self.set("ctrl+shift+space", "lsp_signature_help");
+        // Code review (temporary homes until the hotkey pass; Shift+F8 is
+        // explicit because an unbound Shift+F-key falls back to the plain one)
+        try self.set("f8", "review_next_file");
+        try self.set("shift+f8", "review_prev_file");
+        try self.set("ctrl+f8", "review");
         // Terminal
         try self.set("ctrl+`", "toggle_terminal");
         try self.set("ctrl+shift+`", "open_terminal_right");

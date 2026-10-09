@@ -44,7 +44,8 @@ Legend: **N** = native Zig, **L** = buildable as a Lua extension on the public A
   the twins pattern is) and decide what may break; then build a keybinding editor (Settings
   page or a `keybindings` palette view) with per-binding notes explaining the Windows
   shenanigans to end users. Until then new features get bindings "somewhere" and get sorted
-  in that pass — e.g. navigate_back/forward on Ctrl+Alt+Left/Right + F7/Shift+F7.
+  in that pass — e.g. navigate_back/forward on Ctrl+Alt+Left/Right + F7/Shift+F7, and the
+  review keys F8 / Shift+F8 / Ctrl+F8 (F9 family in phase 2 sits on the conventional debugger key).
 
 ## Top picks from the 2026-09-30 review
 
@@ -74,7 +75,13 @@ Legend: **N** = native Zig, **L** = buildable as a Lua extension on the public A
    focused), range get/replace/delete, one undo group per Lua batch, `cwd`/`env`/stdin and a
    cancel handle for run/spawn, events beyond `open`/`save` (change, close, cursor, focus,
    quit), and UI primitives (prompt, pick-list, panel). This is what turns the LLM and
-   extension-fetching wishlist items into pure Lua.
+   extension-fetching wishlist items into pure Lua. Design references (user, 2026-10-08): Lite XL's
+   plugin API (source kept locally in `references/lite-xl-master`) and Neovim's Lua API — its modal
+   editing is irrelevant, but the shape to borrow is there: `nvim_buf_*` buffer handles, the
+   autocmd event list (BufEnter / TextChanged / CursorMoved / BufWritePre / VimLeavePre map onto
+   our focus / change / cursor / save / quit), `vim.ui.select` / `vim.ui.input` as the pick-list
+   and prompt primitives, and lazy.nvim-style `github:user/repo` fetching. Read those at
+   neovim.io/doc (`lua-guide`, `api`, `vim.ui`); no Neovim checkout needed.
 4. **Open Folder + recent projects** (N, M) — **DONE 2026-10-08** except the session part:
    `open_folder` (Ctrl+Shift+O; GUI native dialog + File > Open Folder, TUI path prompt),
    `recent_projects` picker (last nine, persisted in `~/.config/zide/recent_projects`; GUI
@@ -195,6 +202,29 @@ Legend: **N** = native Zig, **L** = buildable as a Lua extension on the public A
   lazygit workflow; it would be for other users of ZIDE someday.
 - Make status handling survive huge untracked trees — today it gives up entirely past the size
   cap and retries every 10 s (N, S).
+
+## Code review reader (user, 2026-10-08; brief + plan notes in CodeDiffViewerIdea.md)
+
+- **Phase 1 — foundation: DONE 2026-10-08.** `review` view (Ctrl+F8) with verdict glyphs
+  `[x]` / `[!]` / `[ ]`, `n/N reviewed`, A / W toggles, D classic diff, O / Enter open,
+  F8 / Shift+F8 next / previous changed file from anywhere, a `Review 2/9 [x]` status-bar
+  segment. Verdicts live per repository in `~/.config/zide/review/<hash>.json`, keyed to git
+  blob ids, so any edit (yours or an AI's) resets them; approving also stages
+  (`review_stage_on_approve`). Baseline = last commit, or a checkpoint pinned with
+  `review_set_baseline` (`review_follow_head` goes back), remembered per repository.
+- **Phase 2 — the reader (next):** a read-only `Review: <file>` tab built from `git diff
+  -U999999`: soft tints on changed lines, deleted lines as dimmed ghost rows, real line numbers
+  in the gutter, Enter opens the real file at the line, F9 / Shift+F9 walk the changes, Ctrl+F9
+  shows the classic diff; collapsed unchanged stretches (2b) only if the session has room.
+  Needs the read-only guard in `Document.prepareRanges` + undo/redo (nothing enforces `readonly`
+  today — `lsp_stderr` tabs can be typed into).
+- **Deferred:** word-level highlights (`--word-diff=porcelain`), scrollbar change markers (GUI;
+  needs its own track geometry), `-w` / `--ignore-cr-at-eol` toggle, refresh on window focus (no
+  focus hook in either frontend), a `review_checkpoint_default` setting, `review_clear_all`,
+  hunk-level verdicts, AI intent notes (sidecar file, display-only, never affecting verdicts),
+  LSP hover / go-to-definition from the reader, several reader tabs, tokenizer skipping ghost
+  rows in block-comment languages, and the docs' wrong claim that TUI git gutter glyphs use the
+  git colors (they use the gutter separator color).
 
 ## Appearance and accessibility
 

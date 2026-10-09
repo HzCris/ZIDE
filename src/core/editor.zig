@@ -296,6 +296,7 @@ pub const Editor = struct {
     tool_panel: @import("tool_panel.zig").State = .{},
     git: @import("git.zig").State = .{},
     dap: @import("dap.zig").State = .{},
+    review: @import("review.zig").State = .{},
     editorconfig_enabled: bool = true,
     project_formatting: @import("editorconfig.zig").Cache,
     lua_jobs: std.ArrayList(lua_api.BackgroundJob) = .empty,
@@ -583,6 +584,7 @@ pub const Editor = struct {
         lua_api.deinitLua(self);
         self.tasks.deinit(self);
         self.git.deinit(self);
+        self.review.deinit(self);
         self.dap.deinit(self);
         self.tool_panel.deinit(self.allocator);
         self.jobs.deinit();
@@ -4240,6 +4242,12 @@ pub const Editor = struct {
         if (@import("lua_settings.zig").getConfigDir()) |base| self.dap.configureStorage(self, base, self.filetree_root orelse ".");
     }
 
+    /// Review verdicts persist under the config dir; the record itself is
+    /// picked per repository once Git has found the root (review.tick).
+    pub fn startReviewWorkspace(self: *Editor) void {
+        if (@import("lua_settings.zig").getConfigDir()) |base| self.review.configureStorage(self, base);
+    }
+
     pub fn startRecoveryAt(self: *Editor, base: []const u8, workspace: []const u8) !void {
         if (self.recovery != null) return;
         self.recovery = try @import("recovery.zig").Manager.init(self.allocator, self.io, base, workspace);
@@ -4271,6 +4279,7 @@ pub const Editor = struct {
         self.deadlines.tick(self, now);
         self.tasks.tick(self);
         self.git.tick(self, now);
+        self.review.tick(self, now);
         self.dap.tick(self, now);
         if (self.recovery) |*recovery| {
             recovery.tick(self.documents.items, now, self.recovery_enabled);

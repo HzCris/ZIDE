@@ -826,7 +826,7 @@ pub fn getFieldRaw(lua: *Lua, index: i32, key: [:0]const u8) zlua.LuaType {
 }
 
 /// zide.set(key, value)
-/// Supported keys: "tab_width", "use_tabs", "word_wrap", "auto_close_brackets", "completion_auto", "completion_min_chars", "signature_help_auto", "page_size"
+/// Supported keys: "tab_width", "use_tabs", "word_wrap", "auto_close_brackets", "completion_auto", "completion_min_chars", "signature_help_auto", "review_stage_on_approve", "page_size"
 fn luaSet(state: ?*zlua.LuaState) callconv(.c) c_int {
     var lua: *Lua = @ptrCast(@alignCast(state orelse return 0));
     const editor = getEditor(state) orelse return 0;
@@ -857,6 +857,8 @@ fn luaSet(state: ?*zlua.LuaState) callconv(.c) c_int {
         editor.completion_auto = lua.toBoolean(2);
     } else if (std.mem.eql(u8, key_str, "signature_help_auto")) {
         editor.signature_help_auto = lua.toBoolean(2);
+    } else if (std.mem.eql(u8, key_str, "review_stage_on_approve")) {
+        editor.review.stage_on_approve = lua.toBoolean(2);
     } else if (std.mem.eql(u8, key_str, "page_size")) {
         const val = lua.toInteger(2) catch return 0;
         if (val >= 5 and val <= 200) {
@@ -1119,6 +1121,9 @@ fn luaGet(state: ?*zlua.LuaState) callconv(.c) c_int {
         return 1;
     } else if (std.mem.eql(u8, key_str, "signature_help_auto")) {
         lua.pushBoolean(editor.signature_help_auto);
+        return 1;
+    } else if (std.mem.eql(u8, key_str, "review_stage_on_approve")) {
+        lua.pushBoolean(editor.review.stage_on_approve);
         return 1;
     } else if (std.mem.eql(u8, key_str, "page_size")) {
         lua.pushInteger(@intCast(editor.page_size));

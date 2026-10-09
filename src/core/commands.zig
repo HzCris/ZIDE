@@ -323,6 +323,13 @@ pub fn registerBuiltins(registry: *CommandRegistry) !void {
     try registry.register("git_refresh", "Refresh workspace Git status", cmdGitRefresh);
     try registry.register("git_stage", "Stage the selected file's saved contents", cmdGitStage);
     try registry.register("git_unstage", "Unstage the selected file", cmdGitUnstage);
+    try registry.register("review", "Review changed files: verdicts, progress and baseline (Review view)", cmdReview);
+    try registry.register("review_approve", "Approve the selected changed file (also stages it); press again to clear", cmdReviewApprove);
+    try registry.register("review_needs_work", "Mark the selected changed file as needing work; press again to clear", cmdReviewNeedsWork);
+    try registry.register("review_next_file", "Open the next changed file", cmdReviewNextFile);
+    try registry.register("review_prev_file", "Open the previous changed file", cmdReviewPrevFile);
+    try registry.register("review_set_baseline", "Pin the current commit as the review baseline (checkpoint)", cmdReviewSetBaseline);
+    try registry.register("review_follow_head", "Compare changed files with the last commit again", cmdReviewFollowHead);
     try registry.register("next_problem", "Open the next problem", cmdNextProblem);
     try registry.register("previous_problem", "Open the previous problem", cmdPreviousProblem);
     try registry.register("hover", "Show language-server information at the cursor", cmdHover);
@@ -1049,6 +1056,42 @@ fn cmdGitStage(editor: *Editor, _: ?[]const u8) void {
 fn cmdGitUnstage(editor: *Editor, _: ?[]const u8) void {
     if (editor.tool_panel.kind == .changes) editor.tool_panel.action(editor, 'u') else cmdGitChanges(editor, null);
 }
+fn cmdReview(editor: *Editor, _: ?[]const u8) void {
+    editor.git.requestRefresh();
+    editor.review.requestRefresh();
+    editor.tool_panel.show(editor, .review);
+}
+/// A verdict goes to the Review view's selected row while the view is open,
+/// else to the active document's row in the changed-file list.
+fn reviewVerdict(editor: *Editor, status: @import("review.zig").Status) void {
+    if (editor.mode == .tool_panel and editor.tool_panel.kind == .review) {
+        editor.tool_panel.action(editor, if (status == .approved) 'a' else 'w');
+        return;
+    }
+    const index = editor.review.activeFileIndex(editor) orelse {
+        editor.status_message = if (editor.activeDoc().file_path == null) "Review: save the file first" else "Review: not a changed file";
+        return;
+    };
+    editor.review.verdict(editor, index, status);
+}
+fn cmdReviewApprove(editor: *Editor, _: ?[]const u8) void {
+    reviewVerdict(editor, .approved);
+}
+fn cmdReviewNeedsWork(editor: *Editor, _: ?[]const u8) void {
+    reviewVerdict(editor, .needs_work);
+}
+fn cmdReviewNextFile(editor: *Editor, _: ?[]const u8) void {
+    editor.review.step(editor, true);
+}
+fn cmdReviewPrevFile(editor: *Editor, _: ?[]const u8) void {
+    editor.review.step(editor, false);
+}
+fn cmdReviewSetBaseline(editor: *Editor, _: ?[]const u8) void {
+    editor.review.pinHead(editor);
+}
+fn cmdReviewFollowHead(editor: *Editor, _: ?[]const u8) void {
+    editor.review.followHead(editor);
+}
 fn cmdNextProblem(editor: *Editor, _: ?[]const u8) void {
     editor.tool_panel.nextProblem(editor, true);
 }
@@ -1123,6 +1166,52 @@ test "open_log opens the log file from the config directory" {
     // Without a server, the stderr tab has nothing to show.
     try t.expect(editor.execCommand("lsp_stderr", null));
     try t.expectEqualStrings("No language server is running", editor.status_message);
+}
+
+test "review commands act on the Review view's selected row, else on the active document" {
+    const t = std.testing;
+    var tmp = t.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(t.io, ".", t.allocator);
+    defer t.allocator.free(root);
+    for ([_][]const u8{ "a.txt", "z.txt" }) |name| try tmp.dir.writeFile(t.io, .{ .sub_path = name, .data = "x\n" });
+    var editor = try Editor.init(t.allocator, t.io);
+    defer editor.deinit();
+    editor.lsp_enabled = false;
+    editor.review.stage_on_approve = false;
+    editor.git.root = try t.allocator.dupe(u8, root);
+    for ([_][]const u8{ "a.txt", "z.txt" }) |name| {
+        try editor.git.changes.append(t.allocator, .{ .path = try t.allocator.dupe(u8, name), .x = ' ', .y = 'M' });
+    }
+    editor.review.tick(&editor, 0);
+    const Status = @import("review.zig").Status;
+    // No file → nothing to judge.
+    try t.expect(editor.execCommand("review_approve", null));
+    try t.expectEqualStrings("Review: save the file first", editor.status_message);
+    // The active document is a listed file: the verdict lands on it.
+    const a_path = try std.fs.path.join(t.allocator, &.{ root, "a.txt" });
+    defer t.allocator.free(a_path);
+    const doc = try editor.newDocument();
+    try doc.setFilePath(a_path);
+    try t.expect(editor.execCommand("review_approve", null));
+    try t.expectEqual(Status.approved, editor.review.statusOf("a.txt"));
+    // With the Review view open, the selected row takes the verdict.
+    try t.expect(editor.execCommand("review", null));
+    try t.expectEqual(Editor.Mode.tool_panel, editor.mode);
+    editor.tool_panel.move(&editor, true); // z.txt
+    try t.expect(editor.execCommand("review_needs_work", null));
+    try t.expectEqual(Status.needs_work, editor.review.statusOf("z.txt"));
+    try t.expectEqual(Status.approved, editor.review.statusOf("a.txt"));
+    editor.setMode(.normal);
+    // Next / previous changed file wrap around the list.
+    try t.expect(editor.execCommand("review_next_file", null));
+    try t.expect(std.mem.endsWith(u8, editor.activeDoc().file_path.?, "z.txt"));
+    try t.expect(editor.execCommand("review_next_file", null));
+    try t.expect(std.mem.endsWith(u8, editor.activeDoc().file_path.?, "a.txt"));
+    try t.expect(editor.execCommand("review_prev_file", null));
+    try t.expect(std.mem.endsWith(u8, editor.activeDoc().file_path.?, "z.txt"));
+    var seg_buf: [48]u8 = undefined;
+    try t.expectEqualStrings("Review 2/2 [!]", editor.review.statusSegment(&editor, &seg_buf));
 }
 
 test "open_documentation prefers docs/Documentation.md and still finds a root-level copy" {

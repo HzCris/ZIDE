@@ -2205,8 +2205,13 @@ fn drawStatusBar(win: Window, editor: *Editor, width: u16) void {
     // display_name is heap-allocated and persistent, safe for printSegment
     _ = win.printSegment(.{ .text = doc.display_name, .style = style }, .{ .col_offset = x, .wrap = .none });
     x +|= @intCast(@min(doc.display_name.len, width -| x));
-    if (doc.dirty) {
-        _ = writeStr(win, x, 0, " [+]", style);
+    if (doc.dirty) x = writeStr(win, x, 0, " [+]", style);
+    // Review progress and this file's verdict, while changed files are listed.
+    var review_buf: [48]u8 = undefined;
+    const review_segment = editor.review.statusSegment(editor, &review_buf);
+    if (review_segment.len > 0) {
+        x = writeStr(win, x, 0, "  ", style);
+        _ = writeStr(win, x, 0, review_segment, style);
     }
 
     // Center: transient status message ("Saved", "Cannot open: ...",
@@ -4114,6 +4119,8 @@ fn handleToolKey(editor: *Editor, key: Key) void {
         'd', 'D' => editor.tool_panel.action(editor, 'd'),
         'u', 'U' => editor.tool_panel.action(editor, 'u'),
         'o', 'O' => editor.tool_panel.action(editor, 'o'),
+        'a', 'A' => editor.tool_panel.action(editor, 'a'),
+        'w', 'W' => editor.tool_panel.action(editor, 'w'),
         else => {},
     }
 }

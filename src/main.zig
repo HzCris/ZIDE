@@ -164,6 +164,11 @@ const welcome_text =
     \\//   F12               go to definition   Shift+F12        find references
     \\//   Ctrl+F12          symbols in file    Ctrl+T           workspace symbols
     \\//   Ctrl+Shift+Space  signature help (also after "(" and ",")
+    \\//
+    \\// Code review (what changed since the last commit, or since a pinned checkpoint)
+    \\//   Ctrl+F8           review changed files   F8 / Shift+F8   next / previous changed file
+    \\//   (in the Review view: A approve, W needs work, D classic diff, O open, R refresh;
+    \\//    palette: review_set_baseline pins a checkpoint, review_follow_head goes back)
     \\
 ;
 
@@ -442,6 +447,7 @@ fn runGui(allocator: std.mem.Allocator, io: std.Io, lua: *zlua.Lua, cli_files: [
 
     editor.startRecovery();
     editor.startDebugWorkspace();
+    editor.startReviewWorkspace();
     // A broken init.lua / extension outranks the startup chatter above.
     if (load_error.len > 0) lua_api.setStatusText(&editor, "", load_error);
 
@@ -569,6 +575,7 @@ fn runTui(allocator: std.mem.Allocator, io: std.Io, lua: *zlua.Lua, cli_files: [
 
     editor.startRecovery();
     editor.startDebugWorkspace();
+    editor.startReviewWorkspace();
     // A broken init.lua / extension outranks the startup chatter above.
     if (load_error.len > 0) lua_api.setStatusText(&editor, "", load_error);
     try tui.run(allocator, &editor);
@@ -706,6 +713,7 @@ comptime {
     _ = @import("core/tasks.zig");
     _ = @import("core/tool_output.zig");
     _ = @import("core/git.zig");
+    _ = @import("core/review.zig");
     _ = @import("core/line_diff.zig");
     _ = @import("core/breakpoints.zig");
     _ = @import("core/dap_session.zig");
