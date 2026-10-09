@@ -166,8 +166,10 @@ const welcome_text =
     \\//   Ctrl+Shift+Space  signature help (also after "(" and ",")
     \\//
     \\// Code review (what changed since the last commit, or since a pinned checkpoint)
-    \\//   Ctrl+F8           review changed files   F8 / Shift+F8   next / previous changed file
-    \\//   (in the Review view: A approve, W needs work, D classic diff, O open, R refresh;
+    \\//   Ctrl+F8           review changed files   F8 / Shift+F8   read next / previous changed file
+    \\//   F9 / Shift+F9     next / previous change in the reader   Ctrl+F9   classic diff
+    \\//   (reader: Enter opens the real file at that line, or expands a folded stretch;
+    \\//    Review view: A approve, W needs work, D classic diff, O open, R refresh;
     \\//    palette: review_set_baseline pins a checkpoint, review_follow_head goes back)
     \\
 ;
@@ -714,6 +716,8 @@ comptime {
     _ = @import("core/tool_output.zig");
     _ = @import("core/git.zig");
     _ = @import("core/review.zig");
+    _ = @import("core/review_reader.zig");
+    _ = @import("core/unidiff.zig");
     _ = @import("core/line_diff.zig");
     _ = @import("core/breakpoints.zig");
     _ = @import("core/dap_session.zig");

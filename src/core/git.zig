@@ -155,6 +155,9 @@ pub const State = struct {
     preview_untracked: bool = false,
     preview_epoch: u64 = 0,
     preview_stamp: ?text_file.Stamp = null,
+    /// The commit the preview compares the working tree with (the review
+    /// reader's classic view); null = the Changes panel's index/HEAD views.
+    preview_base: ?[]u8 = null,
     mutation: ?Mutation = null,
     mutation_job: ?u64 = null,
     caches: std.ArrayList(Cache) = .empty,
@@ -169,7 +172,7 @@ pub const State = struct {
         self.changes.deinit(editor.allocator);
         self.status_bytes.deinit(editor.allocator);
         self.preview.deinit(editor.allocator);
-        for ([_]?[]u8{ self.workspace_raw, self.workspace, self.root, self.index_path, self.preview_path }) |path| if (path) |p| editor.allocator.free(p);
+        for ([_]?[]u8{ self.workspace_raw, self.workspace, self.root, self.index_path, self.preview_path, self.preview_base }) |path| if (path) |p| editor.allocator.free(p);
         if (self.mutation) |mutation| mutation.deinit(editor.allocator);
     }
     pub fn setWake(self: *State, wake: ?*const fn () void) void {
@@ -326,33 +329,51 @@ pub const State = struct {
     fn startPreview(self: *State, editor: *Editor, selected: usize, staged: bool) !void {
         if (selected >= self.changes.items.len) return;
         const change = self.changes.items[selected];
-        const path = try editor.allocator.dupe(u8, change.path);
+        try self.startPreviewOf(editor, change.path, change.old_path, change.x == '?', staged, null, change.conflict());
+    }
+    /// The classic diff of `path` with the working tree against `base` (a
+    /// commit or `HEAD`), for the review reader; untracked files diff
+    /// against the null device.
+    pub fn previewAgainst(self: *State, editor: *Editor, path: []const u8, old_path: ?[]const u8, untracked: bool, base: ?[]const u8) void {
+        self.startPreviewOf(editor, path, old_path, untracked, false, base, false) catch |err| self.report(editor, @errorName(err));
+    }
+    fn startPreviewOf(self: *State, editor: *Editor, rel: []const u8, old_path: ?[]const u8, untracked: bool, staged: bool, base: ?[]const u8, conflict: bool) !void {
+        const path = try editor.allocator.dupe(u8, rel);
         errdefer editor.allocator.free(path);
+        const base_owned = if (base) |b| try editor.allocator.dupe(u8, b) else null;
+        errdefer if (base_owned) |b| editor.allocator.free(b);
         const absolute = try std.fs.path.join(editor.allocator, &.{ self.root orelse return error.NoRepository, path });
         defer editor.allocator.free(absolute);
         const stamp = text_file.Stamp.read(editor.io, absolute) catch null;
         var args: std.ArrayList([]const u8) = .empty;
         defer args.deinit(editor.allocator);
-        const untracked = change.x == '?';
         try args.appendSlice(editor.allocator, &.{ "diff", "--no-ext-diff", "--no-textconv", "--no-color" });
         if (staged) try args.append(editor.allocator, "--cached");
-        if (untracked and !staged) try args.appendSlice(editor.allocator, &.{ "--no-index", "--", "/dev/null", change.path }) else {
-            try args.appendSlice(editor.allocator, &.{ "--", change.path });
-            if (change.old_path) |old| try args.append(editor.allocator, old);
+        if (untracked and !staged) try args.appendSlice(editor.allocator, &.{ "--no-index", "--", "/dev/null", rel }) else {
+            if (base) |b| try args.appendSlice(editor.allocator, &.{ "-M", b });
+            try args.appendSlice(editor.allocator, &.{ "--", rel });
+            if (old_path) |old| try args.append(editor.allocator, old);
         }
         const job = try self.command(editor, self.root orelse return error.NoRepository, args.items);
         if (self.preview_job) |old| editor.jobs.remove(old);
         self.preview_job = job;
         if (self.preview_path) |old| editor.allocator.free(old);
         self.preview_path = path;
+        if (self.preview_base) |old| editor.allocator.free(old);
+        self.preview_base = base_owned;
         self.preview.deinit(editor.allocator);
         self.preview = .{};
         self.preview_staged = staged;
         self.preview_untracked = untracked;
-        self.preview_conflict = change.conflict();
+        self.preview_conflict = conflict;
         self.preview_epoch = self.index_epoch;
         self.preview_stamp = stamp;
         editor.tool_panel.show(editor, .git_diff);
+    }
+    /// What the open preview compares, for the panel title.
+    pub fn previewModeText(self: *const State, buf: []u8) []const u8 {
+        if (self.preview_base) |base| return std.fmt.bufPrint(buf, "working tree versus {s}", .{base[0..@min(base.len, 7)]}) catch "working tree versus the baseline";
+        return if (self.preview_staged) "index versus HEAD" else "saved working tree versus index";
     }
     fn pollPreview(self: *State, editor: *Editor) !void {
         const id = self.preview_job orelse return;

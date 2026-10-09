@@ -314,6 +314,9 @@ pub const KeybindMap = struct {
         try self.set("f8", "review_next_file");
         try self.set("shift+f8", "review_prev_file");
         try self.set("ctrl+f8", "review");
+        try self.set("f9", "review_next_change");
+        try self.set("shift+f9", "review_prev_change");
+        try self.set("ctrl+f9", "review_toggle_view");
         // Terminal
         try self.set("ctrl+`", "toggle_terminal");
         try self.set("ctrl+shift+`", "open_terminal_right");

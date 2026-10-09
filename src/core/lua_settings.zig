@@ -262,6 +262,13 @@ fn createGuiThemeTemplate(path: [:0]const u8) void {
         \\-- zide.set("color_bool_true", "#64dc64")       -- Boolean ON indicator
         \\-- zide.set("color_bool_false", "#b45050")      -- Boolean OFF indicator
         \\
+        \\-- === Review reader rows (alpha = how soft the tint is) ===
+        \\-- zide.set("color_review_added_bg", "#73bf6926")    -- Added lines
+        \\-- zide.set("color_review_modified_bg", "#e5c07b26") -- Replaced lines
+        \\-- zide.set("color_review_ghost_bg", "#e06c751a")    -- Deleted lines, kept as ghosts
+        \\-- zide.set("color_review_ghost_fg", "#e1e1e678")    -- Ghost line text (dimmed)
+        \\-- zide.set("color_review_marker_fg", "#828282c8")   -- "N unchanged lines" rows
+        \\
         \\-- === Status bar ===
         \\-- zide.set("color_status_bg", "#1e1e1e")       -- Status bar background
         \\-- zide.set("color_status_fg", "#e1e1e6")       -- Status bar text
@@ -306,6 +313,13 @@ fn createTuiThemeTemplate(path: [:0]const u8) void {
         \\-- zide.set("tui_color_tab_fg", "#b4b4b4")         -- Inactive tab text
         \\-- zide.set("tui_color_tab_active_bg", "#326098")  -- Active tab background
         \\-- zide.set("tui_color_tab_active_fg", "#ffffff")  -- Active tab text
+        \\
+        \\-- === Review reader rows ===
+        \\-- zide.set("tui_color_review_added_bg", "#005f00")    -- Added lines
+        \\-- zide.set("tui_color_review_modified_bg", "#5f5f00") -- Replaced lines
+        \\-- zide.set("tui_color_review_ghost_bg", "#5f0000")    -- Deleted lines, kept as ghosts
+        \\-- zide.set("tui_color_review_ghost_fg", "#8a8a8a")    -- Ghost line text (also dimmed)
+        \\-- zide.set("tui_color_review_marker_fg", "#767676")   -- "N unchanged lines" rows
         \\
         \\-- === Status bar ===
         \\-- zide.set("tui_color_status_bg", "#326098")      -- Status bar background

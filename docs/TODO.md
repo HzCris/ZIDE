@@ -212,19 +212,24 @@ Legend: **N** = native Zig, **L** = buildable as a Lua extension on the public A
   blob ids, so any edit (yours or an AI's) resets them; approving also stages
   (`review_stage_on_approve`). Baseline = last commit, or a checkpoint pinned with
   `review_set_baseline` (`review_follow_head` goes back), remembered per repository.
-- **Phase 2 — the reader (next):** a read-only `Review: <file>` tab built from `git diff
-  -U999999`: soft tints on changed lines, deleted lines as dimmed ghost rows, real line numbers
-  in the gutter, Enter opens the real file at the line, F9 / Shift+F9 walk the changes, Ctrl+F9
-  shows the classic diff; collapsed unchanged stretches (2b) only if the session has room.
-  Needs the read-only guard in `Document.prepareRanges` + undo/redo (nothing enforces `readonly`
-  today — `lsp_stderr` tabs can be typed into).
+- **Phase 2 — the reader: DONE 2026-10-08.** A read-only `Review: <file>` tab built from
+  `git diff -U999999` (`src/core/unidiff.zig` → `src/core/review_reader.zig`): soft tints on
+  added / replaced lines, deleted lines kept as dimmed ghost rows, real line numbers in the
+  gutter, unchanged stretches over six lines folded into a `··· N unchanged lines ···` row
+  (Enter unfolds; `review_expand_all` / `review_collapse_all`), Enter elsewhere opens the real
+  file at that line, F9 / Shift+F9 walk the changes, Ctrl+F9 the classic diff (now against the
+  baseline), rebuilt in place when the file or the baseline changes. `Document.readonly` is now
+  enforced (`prepareRanges` + undo/redo, one status message from the command dispatcher) — the
+  `lsp_stderr` tab got that for free. Five new theme colors per frontend.
 - **Deferred:** word-level highlights (`--word-diff=porcelain`), scrollbar change markers (GUI;
   needs its own track geometry), `-w` / `--ignore-cr-at-eol` toggle, refresh on window focus (no
   focus hook in either frontend), a `review_checkpoint_default` setting, `review_clear_all`,
   hunk-level verdicts, AI intent notes (sidecar file, display-only, never affecting verdicts),
-  LSP hover / go-to-definition from the reader, several reader tabs, tokenizer skipping ghost
-  rows in block-comment languages, and the docs' wrong claim that TUI git gutter glyphs use the
-  git colors (they use the gutter separator color).
+  LSP hover / go-to-definition from the reader, several reader tabs, GUI double-click on a
+  folded `··· N unchanged lines ···` row (Enter works), a setting for the number of context lines
+  kept around a change (3 today), tokenizer state across ghost rows in block-comment languages
+  (a folded stretch can hide a `/* … */` pair; harmless in Zig), and the docs' wrong claim that
+  TUI git gutter glyphs use the git colors (they use the gutter separator color).
 - **QoL asked for on 2026-10-08 (phase 1 smoke test):** GUI icons (SVG / TinyVG, like the
   panel chrome) for the `[x]` / `[!]` / `[ ]` verdict glyphs; a side-by-side comparison window
   (old and new as two read-only documents in a split with locked scrolling) as an alternative

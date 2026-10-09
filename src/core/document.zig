@@ -54,6 +54,12 @@ pub const Document = struct {
     /// Transient quick-open preview: hidden from tab bars, sessions, and
     /// LSP sync; promoted to a real document on finder commit.
     preview: bool = false,
+    /// The review reader's side data (row kinds, real-line map): the
+    /// document is then a synthesized read-only view of one changed file.
+    reader: ?*@import("review_reader.zig").Info = null,
+    /// A mutation was refused because the document is read-only; the
+    /// command dispatcher turns it into one status message.
+    edit_refused: bool = false,
 
     /// Scroll state: top visible line.
     scroll_top: usize = 0,
@@ -95,6 +101,8 @@ pub const Document = struct {
     }
 
     pub fn deinit(self: *Document) void {
+        if (self.reader) |info| info.destroy(self.allocator);
+        self.reader = null;
         self.cancelSnippet(false);
         self.history.deinit();
         self.cursors.deinit();
@@ -418,6 +426,12 @@ pub const Document = struct {
     }
 
     pub fn prepareRanges(self: *Document, ranges: []const RangeEdit) !PreparedEdit {
+        // Every mutation funnels through here (undo/redo aside); a read-only
+        // document refuses before anything is allocated or touched.
+        if (self.readonly) {
+            self.edit_refused = true;
+            return error.ReadOnlyDocument;
+        }
         var prepared: PreparedEdit = .{ .allocator = self.allocator, .id = self.id, .version = self.buffer.version, .depth = self.edit_depth };
         errdefer prepared.deinit();
         const ops = &prepared.ops;
@@ -540,6 +554,10 @@ pub const Document = struct {
         return if (self.crlf) "\r\n" else "\n";
     }
     pub fn undoAction(self: *Document) !bool {
+        if (self.readonly) {
+            self.edit_refused = true;
+            return false;
+        }
         self.cancelSnippet(false);
         if (!try self.history.undoCursors(&self.buffer, &self.cursors)) return false;
         self.markDirty();
@@ -549,6 +567,10 @@ pub const Document = struct {
         return true;
     }
     pub fn redoAction(self: *Document) !bool {
+        if (self.readonly) {
+            self.edit_refused = true;
+            return false;
+        }
         self.cancelSnippet(false);
         if (!try self.history.redoCursors(&self.buffer, &self.cursors)) return false;
         self.markDirty();

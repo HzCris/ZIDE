@@ -12,6 +12,7 @@ const theme_mod = @import("../core/theme.zig");
 const syntax = @import("../core/syntax.zig");
 const search_mod = @import("../core/search.zig");
 const brackets = @import("../core/brackets.zig");
+const review_reader = @import("../core/review_reader.zig");
 const lsp = @import("../core/lsp.zig");
 const terminal_mod = @import("../core/terminal.zig");
 const filetree_mod = @import("../core/filetree.zig");
@@ -2437,6 +2438,28 @@ fn editorMaxScrollTop(doc: *Document, font: dvui.Font, text_area_w_logical: f32,
     return @min(top, total -| 1);
 }
 
+/// The review reader's soft row tint for a row kind, if it has one.
+fn reviewRowTint(editor: *const Editor, kind: ?review_reader.LineKind) ?dvui.Color {
+    const k = kind orelse return null;
+    return switch (k) {
+        .added => toDvui(editor.theme.review_added_bg),
+        .modified => toDvui(editor.theme.review_modified_bg),
+        .ghost => toDvui(editor.theme.review_ghost_bg),
+        .marker, .context => null,
+    };
+}
+
+/// The gutter number of a row: in the review reader the real file's line
+/// (blank for ghost and marker rows), else the row's own.
+fn gutterNumber(doc: *const Document, line_idx: usize, buf: []u8) []const u8 {
+    if (doc.reader) |info| {
+        if (line_idx >= info.real_line.len) return "";
+        const real = info.real_line[line_idx] orelse return "";
+        return std.fmt.bufPrint(buf, "{d}", .{real + 1}) catch "";
+    }
+    return std.fmt.bufPrint(buf, "{d}", .{line_idx + 1}) catch "";
+}
+
 /// Editor-pane scrollbar thumb rect, or null when the whole buffer fits
 /// (`max_top` from `editorMaxScrollTop` is 0). The thumb's length is the
 /// logical-line approximation; its travel maps scroll_top onto 0..max_top.
@@ -4050,6 +4073,15 @@ fn editorPane(editor: *Editor, pane_id: u8) void {
         // Tokenizer state first: ensureLineState reads earlier lines, and a
         // lineContent slice may alias the buffer's one shared scratch.
         const line_state: syntax.LineState = if (lang_opt != null) doc.ensureLineState(line_idx) else .normal;
+        // Review reader rows: ghost and marker rows are old or synthetic
+        // text — drawn in their own color, never tokenized.
+        const row_kind: ?review_reader.LineKind = if (doc.reader) |info| info.kindAt(line_idx) else null;
+        const row_plain = if (row_kind) |k| (k == .ghost or k == .marker) else false;
+        const row_text_color: dvui.Color = if (row_kind) |k| switch (k) {
+            .ghost => toDvui(editor.theme.review_ghost_fg),
+            .marker => toDvui(editor.theme.review_marker_fg),
+            else => text_color,
+        } else text_color;
         const orig_line = doc.buffer.lineContent(line_idx);
         const line_start_offset = doc.buffer.line_starts.items[line_idx];
         var tab_exp_buf: [16384]u8 = undefined;
@@ -4105,7 +4137,7 @@ fn editorPane(editor: *Editor, pane_id: u8) void {
         var exp_ends: [syntax.MAX_SPANS]usize = undefined;
         const lang_name: ?[]const u8 = if (doc.language) |l| l.name else null;
         // syntax_highlighting=false: skip tokenizing → plain text render
-        if (lang_opt) |lang| {
+        if (if (row_plain) null else lang_opt) |lang| {
             const result = syntax.tokenizeLine(orig_line, lang, line_state, &span_buf);
             span_count = result.count;
             for (0..span_count) |si| {
@@ -4129,7 +4161,7 @@ fn editorPane(editor: *Editor, pane_id: u8) void {
             {
                 if (wrap_row == 0) {
                     var num_buf: [16]u8 = undefined;
-                    const num_str = std.fmt.bufPrint(&num_buf, "{d}", .{line_idx + 1}) catch "";
+                    const num_str = gutterNumber(doc, line_idx, &num_buf);
                     const num_text_w = @as(f32, @floatFromInt(num_str.len)) * digit_width;
                     const num_x = render_area.x + gutter_width - gutter_padding - num_text_w;
                     const num_color = if (cursor_pos.line == line_idx) gutter_active_color else gutter_text_color;
@@ -4196,6 +4228,11 @@ fn editorPane(editor: *Editor, pane_id: u8) void {
                 // For wrapped rows, x is always text_area_x (no scroll)
                 const row_x = if (needs_wrap) text_area_x else base_x;
 
+                // Review reader: the row's soft tint, under the selection.
+                if (reviewRowTint(editor, row_kind)) |tint| {
+                    (dvui.Rect.Physical{ .x = text_area_x, .y = y, .w = text_area_w, .h = line_height }).fill(.{}, .{ .color = tint, .fade = 1.0 });
+                }
+
                 // Selection highlights (every cursor's, pre-computed above).
                 // A selection that runs on past the line end also covers the
                 // end of its last row, up to the text area's edge — blank
@@ -4245,14 +4282,14 @@ fn editorPane(editor: *Editor, pane_id: u8) void {
                                     .text = gap,
                                     .rs = render_rs,
                                     .p = .{ .x = draw_x, .y = y },
-                                    .color = text_color,
+                                    .color = row_text_color,
                                 }) catch {};
                                 draw_x += font.textSize(gap).w * scale;
                             }
                             // Span → syntax color
                             if (vis_end > vis_start) {
                                 const span_text = segment[vis_start..vis_end];
-                                const token_color = if (syn_theme.colorForToken(span_buf[si].token)) |tc| toDvui(tc) else text_color;
+                                const token_color = if (syn_theme.colorForToken(span_buf[si].token)) |tc| toDvui(tc) else row_text_color;
                                 dvui.renderText(.{
                                     .font = font,
                                     .text = span_text,
@@ -4271,7 +4308,7 @@ fn editorPane(editor: *Editor, pane_id: u8) void {
                                 .text = segment[seg_pos..],
                                 .rs = render_rs,
                                 .p = .{ .x = draw_x, .y = y },
-                                .color = text_color,
+                                .color = row_text_color,
                             }) catch {};
                         }
                     } else {
@@ -4280,7 +4317,7 @@ fn editorPane(editor: *Editor, pane_id: u8) void {
                             .text = segment,
                             .rs = render_rs,
                             .p = .{ .x = row_x, .y = y },
-                            .color = text_color,
+                            .color = row_text_color,
                         }) catch {};
                     }
                 }

@@ -75,6 +75,13 @@ pub const EditorTheme = struct {
     git_deleted: ThemeColor,
     git_untracked: ThemeColor,
 
+    // Review reader rows: soft row tints (alpha matters), ghost/marker text
+    review_added_bg: ThemeColor,
+    review_modified_bg: ThemeColor,
+    review_ghost_bg: ThemeColor,
+    review_ghost_fg: ThemeColor,
+    review_marker_fg: ThemeColor,
+
     // Status bar
     status_bg: ThemeColor,
     status_fg: ThemeColor,
@@ -131,6 +138,13 @@ pub const TuiTheme = struct {
     git_deleted: TuiColor,
     git_untracked: TuiColor,
 
+    // Review reader rows: row backgrounds, ghost/marker text (ghosts also dim)
+    review_added_bg: TuiColor,
+    review_modified_bg: TuiColor,
+    review_ghost_bg: TuiColor,
+    review_ghost_fg: TuiColor,
+    review_marker_fg: TuiColor,
+
     // Status bar
     status_bg: TuiColor,
     status_fg: TuiColor,
@@ -179,6 +193,12 @@ pub const gui_dark = EditorTheme{
     .git_deleted = .{ .r = 224, .g = 108, .b = 117 },
     .git_untracked = .{ .r = 105, .g = 200, .b = 175 },
 
+    .review_added_bg = .{ .r = 115, .g = 191, .b = 105, .a = 38 },
+    .review_modified_bg = .{ .r = 229, .g = 192, .b = 123, .a = 38 },
+    .review_ghost_bg = .{ .r = 224, .g = 108, .b = 117, .a = 26 },
+    .review_ghost_fg = .{ .r = 225, .g = 225, .b = 230, .a = 120 },
+    .review_marker_fg = .{ .r = 130, .g = 130, .b = 130, .a = 200 },
+
     .status_bg = .{ .r = 30, .g = 30, .b = 30 },
     .status_fg = .{ .r = 225, .g = 225, .b = 230 },
 };
@@ -211,6 +231,12 @@ pub const gui_light = EditorTheme{
     .git_modified = .{ .r = 154, .g = 103, .b = 0 },
     .git_deleted = .{ .r = 200, .g = 40, .b = 40 },
     .git_untracked = .{ .r = 0, .g = 130, .b = 130 },
+
+    .review_added_bg = .{ .r = 30, .g = 130, .b = 30, .a = 40 },
+    .review_modified_bg = .{ .r = 154, .g = 103, .b = 0, .a = 40 },
+    .review_ghost_bg = .{ .r = 200, .g = 40, .b = 40, .a = 28 },
+    .review_ghost_fg = .{ .r = 30, .g = 30, .b = 30, .a = 115 },
+    .review_marker_fg = .{ .r = 140, .g = 140, .b = 140 },
 
     .status_bg = .{ .r = 230, .g = 230, .b = 230 },
     .status_fg = .{ .r = 30, .g = 30, .b = 30 },
@@ -245,6 +271,12 @@ pub const gui_high_contrast = EditorTheme{
     .git_deleted = .{ .r = 255, .g = 80, .b = 80 },
     .git_untracked = .{ .r = 0, .g = 255, .b = 255 },
 
+    .review_added_bg = .{ .r = 0, .g = 255, .b = 0, .a = 70 },
+    .review_modified_bg = .{ .r = 255, .g = 255, .b = 0, .a = 70 },
+    .review_ghost_bg = .{ .r = 255, .g = 80, .b = 80, .a = 60 },
+    .review_ghost_fg = .{ .r = 200, .g = 200, .b = 200 },
+    .review_marker_fg = .{ .r = 180, .g = 180, .b = 180 },
+
     .status_bg = .{ .r = 0, .g = 0, .b = 40 },
     .status_fg = .{ .r = 255, .g = 255, .b = 255 },
 };
@@ -278,6 +310,12 @@ pub const tui_terminal = TuiTheme{
     .git_modified = .{ .ansi = 3 }, // yellow
     .git_deleted = .{ .ansi = 1 }, // red
     .git_untracked = .{ .ansi = 6 }, // cyan
+
+    .review_added_bg = .{ .ansi = 22 }, // dark green
+    .review_modified_bg = .{ .ansi = 58 }, // dark olive
+    .review_ghost_bg = .{ .ansi = 52 }, // dark red
+    .review_ghost_fg = .{ .ansi = 8 }, // gray
+    .review_marker_fg = .{ .ansi = 8 }, // gray
 
     .status_bg = .{ .ansi = 4 }, // blue
     .status_fg = .{ .ansi = 15 }, // bright white
@@ -318,6 +356,12 @@ pub const tui_dark = TuiTheme{
     .git_deleted = .{ .rgb = .{ .r = 224, .g = 108, .b = 117 } },
     .git_untracked = .{ .rgb = .{ .r = 105, .g = 200, .b = 175 } },
 
+    .review_added_bg = .{ .ansi = 22 }, // #005f00
+    .review_modified_bg = .{ .ansi = 58 }, // #5f5f00
+    .review_ghost_bg = .{ .ansi = 52 }, // #5f0000
+    .review_ghost_fg = .{ .ansi = 245 }, // #8a8a8a
+    .review_marker_fg = .{ .ansi = 243 }, // #767676
+
     .status_bg = .{ .ansi = 24 }, // #005f87
     .status_fg = .{ .rgb = .{ .r = 255, .g = 255, .b = 255 } },
 
@@ -357,6 +401,12 @@ pub const tui_light = TuiTheme{
     .git_deleted = .{ .ansi = 160 }, // #d70000
     .git_untracked = .{ .ansi = 30 }, // #008787
 
+    .review_added_bg = .{ .ansi = 194 }, // #d7ffd7
+    .review_modified_bg = .{ .ansi = 230 }, // #ffffd7
+    .review_ghost_bg = .{ .ansi = 224 }, // #ffd7d7
+    .review_ghost_fg = .{ .ansi = 245 }, // #8a8a8a
+    .review_marker_fg = .{ .ansi = 246 }, // #949494
+
     .status_bg = .{ .ansi = 33 }, // #0087ff
     .status_fg = .{ .ansi = 231 }, // #ffffff
 
@@ -395,6 +445,12 @@ pub const tui_high_contrast = TuiTheme{
     .git_modified = .{ .rgb = .{ .r = 255, .g = 255, .b = 0 } },
     .git_deleted = .{ .rgb = .{ .r = 255, .g = 80, .b = 80 } },
     .git_untracked = .{ .rgb = .{ .r = 0, .g = 255, .b = 255 } },
+
+    .review_added_bg = .{ .ansi = 22 }, // #005f00
+    .review_modified_bg = .{ .ansi = 58 }, // #5f5f00
+    .review_ghost_bg = .{ .ansi = 88 }, // #870000
+    .review_ghost_fg = .{ .rgb = .{ .r = 200, .g = 200, .b = 200 } },
+    .review_marker_fg = .{ .rgb = .{ .r = 180, .g = 180, .b = 180 } },
 
     .status_bg = .{ .ansi = 17 }, // #00005f
     .status_fg = .{ .rgb = .{ .r = 255, .g = 255, .b = 255 } },

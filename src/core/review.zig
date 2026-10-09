@@ -8,6 +8,8 @@ const Editor = @import("editor.zig").Editor;
 const git = @import("git.zig");
 const identity = @import("file_identity.zig");
 const text_file = @import("text_file.zig");
+const unidiff = @import("unidiff.zig");
+const review_reader = @import("review_reader.zig");
 const Allocator = std.mem.Allocator;
 
 pub const Status = enum { unreviewed, approved, needs_work };
@@ -18,6 +20,27 @@ pub const max_entries = 50_000;
 /// Re-hashes per validation pass, so a mass change cannot stall a frame.
 const hash_budget = 16;
 const validate_interval = 1500 * std.time.ns_per_ms;
+/// A whole-file diff is about twice the file plus headers; files over
+/// `max_hash_bytes` are listed only, so this is the one git job that may
+/// exceed the 4 MiB default.
+const reader_output_limit = 12 * 1024 * 1024;
+
+/// Tests: record a reader fetch without starting git (job id 0 is never
+/// issued, so the next tick simply drops it).
+pub var test_no_spawn: bool = false;
+
+/// The diff job feeding the reader, and what it is for.
+const Fetch = struct {
+    job: u64,
+    path: []u8,
+    old_path: ?[]u8,
+    change: u8,
+    target_line: ?u32,
+    fn deinit(self: Fetch, a: Allocator) void {
+        a.free(self.path);
+        if (self.old_path) |p| a.free(p);
+    }
+};
 
 /// A remembered verdict; a path without one is unreviewed.
 pub const Entry = struct {
@@ -79,6 +102,13 @@ pub const State = struct {
     pin_job: ?u64 = null,
     next_validate: i128 = 0,
     reported_error: ?anyerror = null,
+    /// The one reader tab, reused in place; stale once the user closes it.
+    reader_doc_id: ?u64 = null,
+    fetch: ?Fetch = null,
+    next_reader_check: i128 = 0,
+    /// The reader's old side moved (baseline pinned/followed, HEAD moved):
+    /// rebuild it on the next check.
+    reader_refetch: bool = false,
     /// `activeFileIndex` cache: one realpath per document switch or list change.
     active_cached: bool = false,
     active_doc_id: u64 = 0,
@@ -99,6 +129,8 @@ pub const State = struct {
         self.list_job = null;
         self.pin_job = null;
         self.list_job_restart = false;
+        self.clearFetch(editor);
+        self.reader_refetch = false;
         for (self.entries.items) |entry| entry.deinit(a);
         self.entries.deinit(a);
         self.entries = .empty;
@@ -140,9 +172,12 @@ pub const State = struct {
         if (self.root == null or !identity.equalKeys(self.root.?, root)) try self.switchRoot(editor, root);
         try self.pollPin(editor);
         try self.pollList(editor);
+        try self.pollFetch(editor);
         const revision = editor.git.revision;
         const stale = self.refresh_wanted or self.seen_git_revision == null or self.seen_git_revision.? != revision;
         if (stale) {
+            // The status moved (an edit, a commit): the reader's two sides may have too.
+            if (self.seen_git_revision != null) self.reader_refetch = true;
             if (self.mode == .checkpoint and !self.commit_missing and self.commit != null) {
                 if (self.list_job == null) {
                     try self.startList(editor);
@@ -159,6 +194,117 @@ pub const State = struct {
             self.next_validate = now + validate_interval;
             self.validate(editor);
         }
+        if (now >= self.next_reader_check) {
+            self.next_reader_check = now + validate_interval;
+            self.checkReader(editor);
+        }
+    }
+
+    // --- The reader ---
+
+    /// The ref the reader's old side comes from.
+    pub fn baseRef(self: *const State) []const u8 {
+        if (self.mode == .checkpoint and !self.commit_missing) if (self.commit) |commit| return commit;
+        return "HEAD";
+    }
+    /// Open (or rebuild in place) the reader for row `index`; `target_line`
+    /// is a new-file line for the caret, else the first change.
+    pub fn openReader(self: *State, editor: *Editor, index: usize, target_line: ?u32) void {
+        if (index >= self.files.items.len) return;
+        const file = self.files.items[index];
+        self.startFetch(editor, file.path, file.old_path, file.change, target_line) catch |err| report(editor, "{s}: {s}", .{ std.fs.path.basename(file.path), @errorName(err) });
+    }
+    /// Rebuild the open reader (a marker was expanded, the file changed).
+    pub fn refetchReader(self: *State, editor: *Editor, target_line: ?u32) void {
+        const info = self.readerInfo(editor) orelse return;
+        self.startFetch(editor, info.rel_path, info.old_path, info.change, target_line) catch |err| report(editor, "{s}", .{@errorName(err)});
+    }
+    fn readerInfo(self: *State, editor: *Editor) ?*review_reader.Info {
+        const id = self.reader_doc_id orelse return null;
+        const idx = editor.docIndexForId(id) orelse {
+            self.reader_doc_id = null;
+            return null;
+        };
+        return editor.documents.items[idx].reader;
+    }
+    fn startFetch(self: *State, editor: *Editor, path: []const u8, old_path: ?[]const u8, change: u8, target_line: ?u32) !void {
+        const root = self.root orelse return error.NoRepository;
+        const a = editor.allocator;
+        var args: std.ArrayList([]const u8) = .empty;
+        defer args.deinit(a);
+        try args.appendSlice(a, &.{ "diff", "--no-ext-diff", "--no-textconv", "--no-color", "-U999999" });
+        if (change == '?') {
+            try args.appendSlice(a, &.{ "--no-index", "--", "/dev/null", path });
+        } else {
+            try args.appendSlice(a, &.{ "-M", self.baseRef(), "--", path });
+            if (old_path) |old| try args.append(a, old);
+        }
+        const argv = try git.commandArgv(a, root, args.items);
+        defer a.free(argv);
+        const owned_path = try a.dupe(u8, path);
+        errdefer a.free(owned_path);
+        const owned_old = if (old_path) |p| try a.dupe(u8, p) else null;
+        errdefer if (owned_old) |p| a.free(p);
+        const job: u64 = if (@import("builtin").is_test and test_no_spawn) 0 else try editor.jobs.start(.{ .argv = argv, .strict_output = true, .output_limit = reader_output_limit });
+        self.clearFetch(editor);
+        self.fetch = .{ .job = job, .path = owned_path, .old_path = owned_old, .change = change, .target_line = target_line };
+        report(editor, "reading {s}…", .{std.fs.path.basename(path)});
+    }
+    fn clearFetch(self: *State, editor: *Editor) void {
+        const fetch = self.fetch orelse return;
+        editor.jobs.remove(fetch.job);
+        fetch.deinit(editor.allocator);
+        self.fetch = null;
+    }
+    fn pollFetch(self: *State, editor: *Editor) !void {
+        const fetch = self.fetch orelse return;
+        const job = editor.jobs.get(fetch.job) orelse {
+            self.clearFetch(editor);
+            return;
+        };
+        if (!job.isDone()) return;
+        const a = editor.allocator;
+        const result = try job.snapshot(a, false);
+        defer result.deinit(a);
+        defer self.clearFetch(editor);
+        const name = std.fs.path.basename(fetch.path);
+        if (result.failure) |err| {
+            if (err == error.StreamTooLong) {
+                report(editor, "{s} is too large to read here; showing the classic diff", .{name});
+                editor.git.previewAgainst(editor, fetch.path, fetch.old_path, fetch.change == '?', if (fetch.change == '?') null else self.baseRef());
+            } else report(editor, "{s}: {s}", .{ name, @errorName(err) });
+            return;
+        }
+        if (!(result.code == 0 or (fetch.change == '?' and result.code == 1))) {
+            const line = std.mem.trim(u8, firstLine(result.stderr), " \r\n\t");
+            return report(editor, "{s}: {s}", .{ name, if (line.len > 0) line[0..@min(line.len, 200)] else "git diff failed" });
+        }
+        var parsed = unidiff.parse(a, result.stdout) catch |err| return report(editor, "{s}: {s}", .{ name, @errorName(err) });
+        defer parsed.deinit(a);
+        if (parsed.binary) return report(editor, "{s} is binary; listed only", .{name});
+        if (parsed.lines.len == 0) {
+            report(editor, "{s} has no text changes against {s}", .{ name, self.baseRef()[0..@min(self.baseRef().len, 7)] });
+            return;
+        }
+        try review_reader.show(editor, .{ .root = self.root.?, .path = fetch.path, .old_path = fetch.old_path, .change = fetch.change }, parsed, fetch.target_line);
+        report(editor, "{s}: F9 / Shift+F9 walk the changes, Enter opens the real file, Ctrl+F9 the classic diff", .{name});
+    }
+    /// Rebuild the open reader when its file changed on disk or its old
+    /// side moved; one check every 1.5 s, never while a fetch runs.
+    fn checkReader(self: *State, editor: *Editor) void {
+        const id = self.reader_doc_id orelse return;
+        const idx = editor.docIndexForId(id) orelse {
+            self.reader_doc_id = null;
+            return;
+        };
+        const doc = &editor.documents.items[idx];
+        const info = doc.reader orelse return;
+        if (self.fetch != null) return;
+        const stamp = text_file.Stamp.read(editor.io, info.source_path) catch null;
+        if (!self.reader_refetch and std.meta.eql(stamp, info.disk_stamp)) return;
+        self.reader_refetch = false;
+        const target = review_reader.realLineAt(info.real_line, doc.cursorPos().line);
+        self.startFetch(editor, info.rel_path, info.old_path, info.change, target) catch {};
     }
 
     // --- The record file ---
@@ -382,6 +528,7 @@ pub const State = struct {
         self.commit_missing = false;
         self.prune_on_next_list = true;
         self.refresh_wanted = true;
+        self.reader_refetch = true;
         self.save(editor);
         report(editor, "baseline pinned at {s}; the list shows what changed since then", .{self.shortCommit()});
     }
@@ -391,6 +538,7 @@ pub const State = struct {
         self.mode = .head;
         self.commit_missing = false;
         self.refresh_wanted = true;
+        self.reader_refetch = true;
         self.save(editor);
         report(editor, "comparing with the last commit", .{});
     }
@@ -523,24 +671,17 @@ pub const State = struct {
         }
         report(editor, "{s} approved; nothing to stage", .{name});
     }
-    /// `review_next_file` / `review_prev_file`: open the next listed file,
-    /// wrapping around, from the active document's row.
+    /// `review_next_file` / `review_prev_file`: open the reader of the next
+    /// listed file, wrapping around, from the row of the active document
+    /// (the reader's own file counts).
     pub fn step(self: *State, editor: *Editor, forward: bool) void {
-        const root = self.root orelse return report(editor, "not a Git repository", .{});
+        if (self.root == null) return report(editor, "not a Git repository", .{});
         const total = self.files.items.len;
         if (total == 0) return report(editor, "no changed files", .{});
-        var i: usize = self.activeFileIndex(editor) orelse (if (forward) total - 1 else 0);
-        var tries: usize = 0;
-        while (tries < total) : (tries += 1) {
-            i = if (forward) (i + 1) % total else (i + total - 1) % total;
-            const file = self.files.items[i];
-            if (file.change == 'D') continue;
-            const absolute = std.fs.path.join(editor.allocator, &.{ root, file.path }) catch return;
-            defer editor.allocator.free(absolute);
-            editor.jumpToLocation(absolute, 0, 0, .bytes);
-            return;
-        }
-        report(editor, "only deleted files are listed", .{});
+        const current: ?usize = if (editor.activeDoc().reader) |info| self.fileIndexFor(info.rel_path) else self.activeFileIndex(editor);
+        const start: usize = current orelse (if (forward) total - 1 else 0);
+        const next = if (forward) (start + 1) % total else (start + total - 1) % total;
+        self.openReader(editor, next, null);
     }
 
     // --- Keeping verdicts honest ---
@@ -611,6 +752,11 @@ pub fn glyph(status: Status) []const u8 {
 
 fn report(editor: *Editor, comptime fmt: []const u8, args: anytype) void {
     editor.status_message = std.fmt.bufPrint(&editor.status_buf, "Review: " ++ fmt, args) catch "Review: message too long";
+}
+
+fn firstLine(text: []const u8) []const u8 {
+    const end = std.mem.indexOfScalar(u8, text, '\n') orelse text.len;
+    return text[0..end];
 }
 
 fn validCommit(hash: []const u8) bool {

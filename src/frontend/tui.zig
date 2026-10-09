@@ -11,6 +11,7 @@ const Layout = @import("../core/layout.zig").Layout;
 const TuiColor = @import("../core/theme.zig").TuiColor;
 const syntax = @import("../core/syntax.zig");
 const brackets = @import("../core/brackets.zig");
+const review_reader = @import("../core/review_reader.zig");
 const lsp = @import("../core/lsp.zig");
 const terminal_mod = @import("../core/terminal.zig");
 const filetree_mod = @import("../core/filetree.zig");
@@ -1885,12 +1886,26 @@ fn drawContent(win: Window, doc: *Document, editor: *Editor, width: u16, height:
         const line = doc.lineContent(line_idx);
         const is_current = (line_idx == cursor_pos.line);
         const num_style = if (is_current) line_num_active_style else line_num_style;
+        // Review reader rows: a background per kind, ghost and marker rows
+        // in their own (dim) color and never tokenized.
+        const row_kind: ?review_reader.LineKind = if (doc.reader) |info| info.kindAt(line_idx) else null;
+        const row_plain = if (row_kind) |k| (k == .ghost or k == .marker) else false;
+        const row_bg: Color = reviewTuiBg(editor, row_kind) orelse bg;
+        const row_text_style: Style = .{
+            .fg = if (row_kind) |k| switch (k) {
+                .ghost => toVaxis(editor.tui_theme.review_ghost_fg),
+                .marker => toVaxis(editor.tui_theme.review_marker_fg),
+                else => text_style.fg,
+            } else text_style.fg,
+            .bg = row_bg,
+            .dim = if (row_kind) |k| k == .ghost else false,
+        };
 
         // Tokenize line for syntax highlighting
         var span_buf: [syntax.MAX_SPANS]syntax.HighlightSpan = undefined;
         var span_count: usize = 0;
         // syntax_highlighting=false: skip tokenizing → plain text render
-        if (if (editor.syntax_highlighting) doc.language else null) |lang| {
+        if (if (editor.syntax_highlighting and !row_plain) doc.language else null) |lang| {
             const state = doc.ensureLineState(line_idx);
             const result = syntax.tokenizeLine(line, lang, state, &span_buf);
             span_count = result.count;
@@ -1911,10 +1926,15 @@ fn drawContent(win: Window, doc: *Document, editor: *Editor, width: u16, height:
             // first cell: every piece below is measured from it.
             const seg = rowSegment(line, do_wrap, row_start, row_end, h_scroll, text_width, tab);
 
+            // Review reader: the row's background across the text area.
+            if (row_kind != null and text_start_x < width and reviewTuiBg(editor, row_kind) != null) {
+                win.child(.{ .x_off = @intCast(text_start_x), .y_off = @intCast(y), .width = text_width, .height = 1 }).fill(.{ .style = .{ .bg = row_bg } });
+            }
+
             // Line number: only on first row of a logical line
             if (wrap_row == 0) {
                 var num_buf: [16]u8 = undefined;
-                const num_str = std.fmt.bufPrint(&num_buf, "{d}", .{line_idx + 1}) catch "";
+                const num_str = tuiGutterNumber(doc, line_idx, &num_buf);
                 const num_len: u16 = @intCast(num_str.len);
                 const padding = gutter_width -| @min(num_len, gutter_width);
                 _ = writeStr(win, padding, y, num_str, num_style);
@@ -2007,7 +2027,7 @@ fn drawContent(win: Window, doc: *Document, editor: *Editor, width: u16, height:
                                 const gap_style = if (has_sel and seg_pos < sel_end_local and vis_start > sel_begin)
                                     sel_style
                                 else
-                                    text_style;
+                                    row_text_style;
                                 col = writeText(text_win, col, gap, gap_style, tab, seg.col0);
                             }
 
@@ -2021,12 +2041,12 @@ fn drawContent(win: Window, doc: *Document, editor: *Editor, width: u16, height:
                                     // Partial overlap — split into pre-sel, sel, post-sel
                                     const pre_end = @max(vis_start, sel_begin);
                                     const post_start = @min(vis_end, sel_end_local);
-                                    const syn_style = synTokenStyle(syn_theme, span_buf[si].token, text_style.fg, bg);
+                                    const syn_style = synTokenStyle(syn_theme, span_buf[si].token, row_text_style.fg, row_bg);
                                     if (pre_end > vis_start) col = writeText(text_win, col, span_text[0 .. pre_end - vis_start], syn_style, tab, seg.col0);
                                     if (post_start > pre_end) col = writeText(text_win, col, span_text[pre_end - vis_start .. post_start - vis_start], sel_style, tab, seg.col0);
                                     if (vis_end > post_start) col = writeText(text_win, col, span_text[post_start - vis_start ..], syn_style, tab, seg.col0);
                                 } else {
-                                    const syn_style = synTokenStyle(syn_theme, span_buf[si].token, text_style.fg, bg);
+                                    const syn_style = synTokenStyle(syn_theme, span_buf[si].token, row_text_style.fg, row_bg);
                                     col = writeText(text_win, col, span_text, syn_style, tab, seg.col0);
                                 }
                             }
@@ -2036,16 +2056,16 @@ fn drawContent(win: Window, doc: *Document, editor: *Editor, width: u16, height:
                         // Trailing text after last span
                         if (seg_pos < segment.len) {
                             const trail = segment[seg_pos..];
-                            const trail_style = if (has_sel and seg_pos < sel_end_local) sel_style else text_style;
+                            const trail_style = if (has_sel and seg_pos < sel_end_local) sel_style else row_text_style;
                             _ = writeText(text_win, col, trail, trail_style, tab, seg.col0);
                         }
                     } else if (has_sel) {
                         // No syntax highlighting, but has selection
-                        var col = writeText(text_win, 0, segment[0..sel_begin], text_style, tab, seg.col0);
+                        var col = writeText(text_win, 0, segment[0..sel_begin], row_text_style, tab, seg.col0);
                         col = writeText(text_win, col, segment[sel_begin..sel_end_local], sel_style, tab, seg.col0);
-                        _ = writeText(text_win, col, segment[sel_end_local..], text_style, tab, seg.col0);
+                        _ = writeText(text_win, col, segment[sel_end_local..], row_text_style, tab, seg.col0);
                     } else {
-                        _ = writeText(text_win, 0, segment, text_style, tab, seg.col0);
+                        _ = writeText(text_win, 0, segment, row_text_style, tab, seg.col0);
                     }
                 }
             }
@@ -4102,6 +4122,28 @@ fn drawLspPanel(win: Window, editor: *Editor, width: u16, height: u16) void {
             _ = writeStr(panel, 0, i, line, style);
         }
     }
+}
+
+/// The review reader's row background for a row kind, if it has one.
+fn reviewTuiBg(editor: *const Editor, kind: ?review_reader.LineKind) ?Color {
+    const k = kind orelse return null;
+    return switch (k) {
+        .added => toVaxis(editor.tui_theme.review_added_bg),
+        .modified => toVaxis(editor.tui_theme.review_modified_bg),
+        .ghost => toVaxis(editor.tui_theme.review_ghost_bg),
+        .marker, .context => null,
+    };
+}
+
+/// The gutter number of a row: in the review reader the real file's line
+/// (blank for ghost and marker rows), else the row's own.
+fn tuiGutterNumber(doc: *const Document, line_idx: usize, buf: []u8) []const u8 {
+    if (doc.reader) |info| {
+        if (line_idx >= info.real_line.len) return "";
+        const real = info.real_line[line_idx] orelse return "";
+        return std.fmt.bufPrint(buf, "{d}", .{real + 1}) catch "";
+    }
+    return std.fmt.bufPrint(buf, "{d}", .{line_idx + 1}) catch "";
 }
 
 fn handleToolKey(editor: *Editor, key: Key) void {

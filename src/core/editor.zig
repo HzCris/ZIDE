@@ -3126,7 +3126,9 @@ pub const Editor = struct {
                 self.status_message = "Save As destination exists; confirm overwrite";
             },
             .needs_path => self.status_message = "Use Save As for the untitled document, then quit again",
-            .failed => |err| self.status_message = std.fmt.bufPrint(&self.status_buf, "Save failed: {s}", .{@errorName(err)}) catch "Save failed",
+            .failed => |err| if (err != error.ReadOnlyDocument) {
+                self.status_message = std.fmt.bufPrint(&self.status_buf, "Save failed: {s}", .{@errorName(err)}) catch "Save failed";
+            },
             .unrepresentable => {
                 self.setMode(.confirm_encoding);
                 self.status_message = "Text cannot be represented in Windows-1252";
@@ -3141,6 +3143,12 @@ pub const Editor = struct {
         const doc = &self.documents.items[idx];
         // Invariant P: a quick-open preview is never written anywhere.
         if (doc.preview) return .{ .failed = error.PreviewDocument };
+        // A read-only document (the review reader, a server's stderr) has
+        // nothing of the user's to save; Save As would write synthesized text.
+        if (doc.readonly) {
+            self.status_message = if (doc.reader != null) "Read-only review view — Enter opens the real file" else "Read-only document";
+            return .{ .failed = error.ReadOnlyDocument };
+        }
         const same_path = options.path == null or (doc.file_path != null and self.pathsEqual(doc.file_path.?, options.path.?));
         if (options.path) |path| {
             const owner = self.findDocument(path) catch |err| return .{ .failed = err };

@@ -115,7 +115,10 @@ pub const State = struct {
             .tasks => "Tasks — Enter runs / Esc closes",
             .debug => editor.dap.title(buf),
             .changes => if (editor.git.status().len > 0) editor.git.status() else "Changes: index / working tree | Enter diff / D staged diff / S stage / U unstage / R refresh",
-            .git_diff => std.fmt.bufPrint(buf, "{s}: {s}{s}{s}", .{ editor.git.preview_path orelse "Diff", if (editor.git.preview_staged) "index versus HEAD" else "saved working tree versus index", if (editor.git.preview_job != null) " (loading)" else "", if (editor.git.preview.truncated) " (truncated)" else "" }) catch "Git diff",
+            .git_diff => blk: {
+                var mode_buf: [64]u8 = undefined;
+                break :blk std.fmt.bufPrint(buf, "{s}: {s}{s}{s}", .{ editor.git.preview_path orelse "Diff", editor.git.previewModeText(&mode_buf), if (editor.git.preview_job != null) " (loading)" else "", if (editor.git.preview.truncated) " (truncated)" else "" }) catch "Git diff";
+            },
             .task_output => blk: {
                 const run = editor.tasks.get(editor.tasks.selected_run orelse break :blk "Task output") orelse break :blk "Task output";
                 break :blk std.fmt.bufPrint(buf, "{s}: {s} (exit {any}){s} {s}{s}{s} | R reruns / S stops / Enter opens location", .{ run.config.options.name, @tagName(run.status), run.exit_code, if (run.truncated) " (output truncated)" else "", run.error_name orelse "", if (run.matcher_error != null) " problem matcher failed: " else "", run.matcher_error orelse "" }) catch run.config.options.name;
@@ -307,17 +310,11 @@ pub const State = struct {
         defer editor.allocator.free(path);
         self.openLocation(editor, path, 0, 0, .bytes);
     }
-    /// Review view: the classic diff of the selected row — the Changes
-    /// panel's preview, so only files git lists in the working tree have
-    /// one (checkpoint-only rows are unchanged since the last commit).
+    /// Review view: the classic diff of the selected row, working tree
+    /// against the review baseline.
     fn reviewClassicDiff(editor: *Editor, index: usize) void {
         const file = editor.review.files.items[index];
-        for (editor.git.changes.items, 0..) |change, i| {
-            if (!std.mem.eql(u8, change.path, file.path)) continue;
-            editor.git.previewChange(editor, i, !change.working());
-            return;
-        }
-        editor.status_message = std.fmt.bufPrint(&editor.status_buf, "Review: {s} is unchanged since the last commit; no working-tree diff", .{std.fs.path.basename(file.path)}) catch "Review: no working-tree diff";
+        editor.git.previewAgainst(editor, file.path, file.old_path, file.change == '?', if (file.change == '?') null else editor.review.baseRef());
     }
 
     pub fn activate(self: *State, editor: *Editor) void {
@@ -335,7 +332,7 @@ pub const State = struct {
             },
             .review => {
                 const index = self.selectedChange(editor) orelse return;
-                self.openReviewFile(editor, index);
+                editor.review.openReader(editor, index, null);
             },
             .tasks => {
                 editor.setMode(.normal);
@@ -552,8 +549,13 @@ test "Review rows show the verdict glyph and follow the selected file across ref
     try t.expect(std.mem.indexOf(u8, panel.title(&editor, &buf), "1/3 reviewed, 1 needs work") != null);
     panel.action(&editor, 'a');
     try t.expectEqualStrings("[x] M z.txt", panel.row(&editor, 2, &buf));
-    // Enter opens the real file; a missing root reports instead of crashing.
+    // Enter asks for the row's reader (the diff job is only recorded here);
+    // O opens the real file.
+    review.test_no_spawn = true;
+    defer review.test_no_spawn = false;
     panel.activate(&editor);
+    try t.expectEqualStrings("z.txt", editor.review.fetch.?.path);
+    panel.action(&editor, 'o');
     try t.expect(std.mem.endsWith(u8, editor.activeDoc().file_path.?, "z.txt"));
 }
 

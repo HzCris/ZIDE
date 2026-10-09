@@ -8,6 +8,7 @@ const syntax = @import("syntax.zig");
 const brackets = @import("brackets.zig");
 const filetree_mod = @import("filetree.zig");
 const cursor_mod = @import("cursor.zig");
+const review_reader = @import("review_reader.zig");
 const Document = @import("document.zig").Document;
 
 /// Forward declaration — Editor will be defined in editor.zig.
@@ -101,6 +102,7 @@ pub const CommandRegistry = struct {
     pub fn execute(self: *const CommandRegistry, editor: *Editor, name: []const u8, args: ?[]const u8) bool {
         editor.validateSnippetState();
         defer editor.validateSnippetState();
+        defer reportRefusedEdit(editor);
         const cmd = self.get(name) orelse return false;
         if (cmd.snippet) {
             editor.insertSnippetCommand(name);
@@ -112,6 +114,16 @@ pub const CommandRegistry = struct {
         }
         cmd.execute(editor, args);
         return true;
+    }
+
+    /// One status message for an edit the document refused (read-only),
+    /// whatever command tried it; the edit sites' own `catch` messages are
+    /// overwritten here, after the command ran.
+    fn reportRefusedEdit(editor: *Editor) void {
+        const doc = editor.activeDoc();
+        if (!doc.edit_refused) return;
+        doc.edit_refused = false;
+        editor.status_message = if (doc.reader != null) "Read-only review view — Enter opens the real file" else "Read-only document";
     }
 
     pub fn registerSnippet(self: *CommandRegistry, name: []const u8, description: []const u8) !void {
@@ -330,6 +342,12 @@ pub fn registerBuiltins(registry: *CommandRegistry) !void {
     try registry.register("review_prev_file", "Open the previous changed file", cmdReviewPrevFile);
     try registry.register("review_set_baseline", "Pin the current commit as the review baseline (checkpoint)", cmdReviewSetBaseline);
     try registry.register("review_follow_head", "Compare changed files with the last commit again", cmdReviewFollowHead);
+    try registry.register("review_open_reader", "Read the selected changed file: tints, ghost lines, real line numbers", cmdReviewOpenReader);
+    try registry.register("review_next_change", "Move to the next change in the review reader", cmdReviewNextChange);
+    try registry.register("review_prev_change", "Move to the previous change in the review reader", cmdReviewPrevChange);
+    try registry.register("review_toggle_view", "Switch between the review reader and the classic diff", cmdReviewToggleView);
+    try registry.register("review_expand_all", "Review reader: show every collapsed unchanged stretch", cmdReviewExpandAll);
+    try registry.register("review_collapse_all", "Review reader: fold the unchanged stretches again", cmdReviewCollapseAll);
     try registry.register("next_problem", "Open the next problem", cmdNextProblem);
     try registry.register("previous_problem", "Open the previous problem", cmdPreviousProblem);
     try registry.register("hover", "Show language-server information at the cursor", cmdHover);
@@ -592,6 +610,7 @@ fn cmdDeleteBackward(editor: *Editor, _: ?[]const u8) void {
 }
 
 fn cmdInsertNewline(editor: *Editor, _: ?[]const u8) void {
+    if (editor.activeDoc().reader != null) return review_reader.activateRow(editor, editor.activeDoc());
     editor.activeDoc().insertAtAllCursors(editor.activeDoc().lineEnding()) catch {
         editor.status_message = "Edit failed: out of memory";
     };
@@ -1092,6 +1111,55 @@ fn cmdReviewSetBaseline(editor: *Editor, _: ?[]const u8) void {
 fn cmdReviewFollowHead(editor: *Editor, _: ?[]const u8) void {
     editor.review.followHead(editor);
 }
+/// The row to read: the Review view's selection while it is open, else
+/// the active document (the reader's own file, or a listed real file).
+fn reviewRowForReader(editor: *Editor) ?usize {
+    if (editor.mode == .tool_panel and editor.tool_panel.kind == .review) return editor.tool_panel.selectedChange(editor);
+    if (editor.activeDoc().reader) |info| return editor.review.fileIndexFor(info.rel_path);
+    return editor.review.activeFileIndex(editor);
+}
+fn cmdReviewOpenReader(editor: *Editor, _: ?[]const u8) void {
+    const index = reviewRowForReader(editor) orelse {
+        editor.status_message = "Review: not a changed file — Ctrl+F8 lists them";
+        return;
+    };
+    editor.review.openReader(editor, index, null);
+}
+fn reviewStepChange(editor: *Editor, forward: bool) void {
+    const doc = editor.activeDoc();
+    if (doc.reader != null) {
+        if (!review_reader.stepChange(doc, forward)) editor.status_message = if (forward) "No more changes here — F8 opens the next file" else "No earlier changes here — Shift+F8 opens the previous file";
+        return;
+    }
+    cmdReviewOpenReader(editor, null);
+}
+fn cmdReviewNextChange(editor: *Editor, _: ?[]const u8) void {
+    reviewStepChange(editor, true);
+}
+fn cmdReviewPrevChange(editor: *Editor, _: ?[]const u8) void {
+    reviewStepChange(editor, false);
+}
+fn cmdReviewExpandAll(editor: *Editor, _: ?[]const u8) void {
+    if (editor.activeDoc().reader == null) {
+        editor.status_message = "Review: not a review reader tab";
+        return;
+    }
+    review_reader.setAllExpanded(editor, editor.activeDoc(), true);
+}
+fn cmdReviewCollapseAll(editor: *Editor, _: ?[]const u8) void {
+    if (editor.activeDoc().reader == null) {
+        editor.status_message = "Review: not a review reader tab";
+        return;
+    }
+    review_reader.setAllExpanded(editor, editor.activeDoc(), false);
+}
+fn cmdReviewToggleView(editor: *Editor, _: ?[]const u8) void {
+    if (editor.activeDoc().reader) |info| {
+        editor.git.previewAgainst(editor, info.rel_path, info.old_path, info.change == '?', if (info.change == '?') null else editor.review.baseRef());
+        return;
+    }
+    cmdReviewOpenReader(editor, null);
+}
 fn cmdNextProblem(editor: *Editor, _: ?[]const u8) void {
     editor.tool_panel.nextProblem(editor, true);
 }
@@ -1203,13 +1271,20 @@ test "review commands act on the Review view's selected row, else on the active 
     try t.expectEqual(Status.needs_work, editor.review.statusOf("z.txt"));
     try t.expectEqual(Status.approved, editor.review.statusOf("a.txt"));
     editor.setMode(.normal);
-    // Next / previous changed file wrap around the list.
+    // Next / previous changed file open the neighbouring row's reader (the
+    // diff job is only recorded here), wrapping around the list.
+    const review = @import("review.zig");
+    review.test_no_spawn = true;
+    defer review.test_no_spawn = false;
     try t.expect(editor.execCommand("review_next_file", null));
-    try t.expect(std.mem.endsWith(u8, editor.activeDoc().file_path.?, "z.txt"));
+    try t.expectEqualStrings("z.txt", editor.review.fetch.?.path);
+    const z_path = try std.fs.path.join(t.allocator, &.{ root, "z.txt" });
+    defer t.allocator.free(z_path);
+    _ = try editor.openFile(z_path);
     try t.expect(editor.execCommand("review_next_file", null));
-    try t.expect(std.mem.endsWith(u8, editor.activeDoc().file_path.?, "a.txt"));
+    try t.expectEqualStrings("a.txt", editor.review.fetch.?.path);
     try t.expect(editor.execCommand("review_prev_file", null));
-    try t.expect(std.mem.endsWith(u8, editor.activeDoc().file_path.?, "z.txt"));
+    try t.expectEqualStrings("a.txt", editor.review.fetch.?.path);
     var seg_buf: [48]u8 = undefined;
     try t.expectEqualStrings("Review 2/2 [!]", editor.review.statusSegment(&editor, &seg_buf));
 }
@@ -1827,6 +1902,8 @@ fn cmdOpenDocumentation(editor: *Editor, _: ?[]const u8) void {
 
 fn cmdInsertNewlineAuto(editor: *Editor, _: ?[]const u8) void {
     const doc = editor.activeDoc();
+    // In the review reader, Enter opens the real file at this row.
+    if (doc.reader != null) return review_reader.activateRow(editor, doc);
 
     // Multi-cursor: just insert plain newline (auto-indent per cursor is complex)
     if (doc.cursors.count() > 1) {
