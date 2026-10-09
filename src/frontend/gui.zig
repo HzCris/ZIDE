@@ -19,6 +19,7 @@ const terminal_mod = @import("../core/terminal.zig");
 const filetree_mod = @import("../core/filetree.zig");
 const FileTree = filetree_mod.FileTree;
 const fileicons = @import("../core/fileicons.zig");
+const icons = @import("icons.zig");
 const cursor_mod = @import("../core/cursor.zig");
 const keybind = @import("../core/keybind.zig");
 const lua_settings = @import("../core/lua_settings.zig");
@@ -2069,7 +2070,7 @@ fn filetreePanel(editor: *Editor) void {
     }
     const hdr_color = if (tree_focused) header_fg else dim;
     const up_sz = @min(header_h - 4 * scale, 13 * scale);
-    renderIconTinted("ft_up", dvui.entypo.level_up, .{
+    renderIconTinted("ft_up", icons.tvg(.arrow_up) orelse dvui.entypo.level_up, .{
         .x = area.x + 6 * scale,
         .y = area.y + (header_h - up_sz) / 2,
         .w = up_sz,
@@ -2079,13 +2080,13 @@ fn filetreePanel(editor: *Editor) void {
     const btn_y = area.y + (header_h - m.hdr_btn_sz) / 2;
     const b1_color = if (filetree_hdr_hover == 1) header_fg else dim;
     const b2_color = if (filetree_hdr_hover == 2) header_fg else dim;
-    renderIconTinted("ft_new", dvui.entypo.plus, .{
+    renderIconTinted("ft_new", icons.tvg(.new_file) orelse dvui.entypo.plus, .{
         .x = m.hdr_btn1_x,
         .y = btn_y,
         .w = m.hdr_btn_sz,
         .h = m.hdr_btn_sz,
     }, scale, b1_color);
-    renderIconTinted("ft_collapse", dvui.entypo.squared_minus, .{
+    renderIconTinted("ft_collapse", icons.tvg(.collapse_all) orelse dvui.entypo.squared_minus, .{
         .x = m.hdr_btn2_x,
         .y = btn_y,
         .w = m.hdr_btn_sz,
@@ -2178,7 +2179,7 @@ fn filetreePanel(editor: *Editor) void {
         }
         const icon_y = y + (line_height - m.icon_size) / 2;
         if (node.kind == .dir) {
-            const chev: []const u8 = if (node.expanded) dvui.entypo.chevron_small_down else dvui.entypo.chevron_small_right;
+            const chev: []const u8 = if (node.expanded) (icons.tvg(.chevron_down) orelse dvui.entypo.chevron_small_down) else (icons.tvg(.chevron_right) orelse dvui.entypo.chevron_small_right);
             const chev_name: []const u8 = if (node.expanded) "ft_chev_open" else "ft_chev";
             renderIconTinted(chev_name, chev, .{
                 .x = x + (m.chevron_w - m.icon_size) / 2,
@@ -3665,7 +3666,7 @@ fn drawSearchHeaderRow(editor: *Editor, font: dvui.Font, render_rs: dvui.RectSca
     const collapsed = search_collapsed.contains(h.path_idx);
     // Collapse chevron
     const chev_sz = @min(row_h - 4 * scale, 12 * scale);
-    const chev: []const u8 = if (collapsed) dvui.entypo.chevron_small_right else dvui.entypo.chevron_small_down;
+    const chev: []const u8 = if (collapsed) (icons.tvg(.chevron_right) orelse dvui.entypo.chevron_small_right) else (icons.tvg(.chevron_down) orelse dvui.entypo.chevron_small_down);
     renderIconTinted(if (collapsed) "srch_chev" else "srch_chev_open", chev, .{
         .x = area.x + pad,
         .y = ry + (row_h - chev_sz) / 2,
@@ -7564,6 +7565,29 @@ const tool_cell_pad: dvui.Rect = .{ .x = 6, .y = 2, .w = 6, .h = 2 };
 fn toolColumnWidth(heading: []const u8) f32 {
     return dvui.themeGet().font_body.textSize(heading).w + tool_cell_pad.x + tool_cell_pad.w + 10;
 }
+/// The width of a column that holds one icon.
+const tool_icon_col_w: f32 = 36;
+
+/// The Debug view's overview rows carry the debugger's icons; its other
+/// lists (threads, frames, ...) have none.
+fn debugRowIcon(editor: *const Editor, index: usize) ?icons.Icon {
+    if (editor.dap.view != .overview) return null;
+    return switch (index) {
+        0 => .gear,
+        1 => .list,
+        2 => .lines,
+        3 => .equal,
+        4 => .breakpoint,
+        5 => .terminal,
+        6 => .continue_run,
+        7 => .pause,
+        8 => .step_over,
+        9 => .step_into,
+        10 => .step_out,
+        11 => .stop,
+        else => null,
+    };
+}
 
 /// The tool dialog's rows as a table. The Review view has two checkbox
 /// columns (Approved, Needs work — ticking one gives that verdict, ticking
@@ -7578,8 +7602,8 @@ fn toolColumnWidth(heading: []const u8) f32 {
 /// keep the keyboard's row in view.
 fn toolGrid(editor: *Editor, state: *@import("../core/tool_panel.zig").State, total: usize) void {
     const cols: usize = switch (state.kind) {
-        .review => 4,
-        .changes => 2,
+        .review => 5,
+        .changes, .debug => 2,
         else => 1,
     };
     if (win_ui.tool_grid_kind != state.kind) {
@@ -7589,12 +7613,13 @@ fn toolGrid(editor: *Editor, state: *@import("../core/tool_panel.zig").State, to
     }
     // Column widths: fixed ones sized by their heading, a negative ratio for
     // the column that takes the remaining width.
-    const ratios: [4]f32 = switch (state.kind) {
-        .review => .{ toolColumnWidth("Approved"), toolColumnWidth("Needs work"), toolColumnWidth("Change"), -1 },
-        .changes => .{ toolColumnWidth("Index / tree"), -1, 0, 0 },
-        else => .{ -1, 0, 0, 0 },
+    const ratios: [5]f32 = switch (state.kind) {
+        .review => .{ toolColumnWidth("Verdict"), toolColumnWidth("Approved"), toolColumnWidth("Needs work"), toolColumnWidth("Change"), -1 },
+        .changes => .{ toolColumnWidth("Index / tree"), -1, 0, 0, 0 },
+        .debug => .{ tool_icon_col_w, -1, 0, 0, 0 },
+        else => .{ -1, 0, 0, 0, 0 },
     };
-    var widths: [4]f32 = @splat(0);
+    var widths: [5]f32 = @splat(0);
     var grid = dvui.grid(@src(), .colWidths(widths[0..cols]), .{ .scroll_opts = .{ .scroll_info = &win_ui.tool_grid_si, .horizontal_bar = .auto } }, .{ .expand = .horizontal, .background = true, .border = dvui.Rect.all(1), .min_size_content = .{ .h = tool_grid_height }, .max_size_content = .{ .w = 1100, .h = tool_grid_height }, .tag = "tool_grid" });
     defer grid.deinit();
     dvui.columnLayoutProportional(ratios[0..cols], widths[0..cols], grid.data().contentRect().w);
@@ -7617,14 +7642,19 @@ fn toolGrid(editor: *Editor, state: *@import("../core/tool_panel.zig").State, to
     const head_borders: dvui.GridWidget.CellStyle.Borders = .initBox(cols, 1, 1, 1);
     switch (state.kind) {
         .review => {
-            dvui.gridHeading(@src(), grid, 0, "Approved", .fixed, head_borders);
-            dvui.gridHeading(@src(), grid, 1, "Needs work", .fixed, head_borders);
-            dvui.gridHeading(@src(), grid, 2, "Change", .fixed, head_borders);
-            dvui.gridHeading(@src(), grid, 3, "File", .fixed, head_borders);
+            dvui.gridHeading(@src(), grid, 0, "Verdict", .fixed, head_borders);
+            dvui.gridHeading(@src(), grid, 1, "Approved", .fixed, head_borders);
+            dvui.gridHeading(@src(), grid, 2, "Needs work", .fixed, head_borders);
+            dvui.gridHeading(@src(), grid, 3, "Change", .fixed, head_borders);
+            dvui.gridHeading(@src(), grid, 4, "File", .fixed, head_borders);
         },
         .changes => {
             dvui.gridHeading(@src(), grid, 0, "Index / tree", .fixed, head_borders);
             dvui.gridHeading(@src(), grid, 1, "File", .fixed, head_borders);
+        },
+        .debug => {
+            dvui.gridHeading(@src(), grid, 0, "", .fixed, head_borders);
+            dvui.gridHeading(@src(), grid, 1, "Debugger", .fixed, head_borders);
         },
         else => {},
     }
@@ -7661,25 +7691,33 @@ fn toolGrid(editor: *Editor, state: *@import("../core/tool_panel.zig").State, to
         const fill: ?dvui.Color = if (index == state.selected) sel_color else if (hovered_row == row) hover_color else if (row % 2 == 1) band_color else null;
         var buf: [4096]u8 = undefined;
         var letters: [2]u8 = .{ ' ', ' ' };
-        var texts: [4][]const u8 = .{ "", "", "", "" };
+        var texts: [5][]const u8 = .{ "", "", "", "", "" };
+        const Col = enum { text, icon, verdict, approve, needs_work };
+        var kinds: [5]Col = .{ .text, .text, .text, .text, .text };
         var count: usize = 1;
-        var checkbox_cols: usize = 0;
         var status: review.Status = .unreviewed;
+        var row_icon: ?icons.Icon = null;
         switch (state.kind) {
             .review => {
                 const file = editor.review.files.items[index];
                 status = editor.review.statusOf(file.path);
                 letters[0] = file.change;
-                texts[2] = letters[0..1];
-                texts[3] = std.fmt.bufPrint(&buf, "{s}{s}{s}{s}", .{ file.path, if (file.old_path != null) " <- " else "", file.old_path orelse "", if (file.change == 'U') " (conflict)" else "" }) catch file.path;
-                count = 4;
-                checkbox_cols = 2;
+                kinds = .{ .verdict, .approve, .needs_work, .text, .text };
+                texts[3] = letters[0..1];
+                texts[4] = std.fmt.bufPrint(&buf, "{s}{s}{s}{s}", .{ file.path, if (file.old_path != null) " <- " else "", file.old_path orelse "", if (file.change == 'U') " (conflict)" else "" }) catch file.path;
+                count = 5;
             },
             .changes => {
                 const change = editor.git.changes.items[index];
                 letters = .{ change.x, change.y };
                 texts[0] = &letters;
                 texts[1] = std.fmt.bufPrint(&buf, "{s}{s}{s}{s}", .{ change.path, if (change.old_path != null) " <- " else "", change.old_path orelse "", if (change.conflict()) " (conflict)" else "" }) catch change.path;
+                count = 2;
+            },
+            .debug => {
+                kinds = .{ .icon, .text, .text, .text, .text };
+                row_icon = debugRowIcon(editor, index);
+                texts[1] = state.row(editor, index, &buf);
                 count = 2;
             },
             else => texts[0] = state.row(editor, index, &buf),
@@ -7698,20 +7736,35 @@ fn toolGrid(editor: *Editor, state: *@import("../core/tool_panel.zig").State, to
                     clicked = index;
                 };
             }
-            if (col < checkbox_cols) {
-                // A press inside a checkbox cell is the checkbox's: it selects
-                // the row itself when it toggles.
-                if (press) |e| if (cell_rect.contains(e.evt.mouse.p)) {
-                    clicked_widget = true;
-                };
-                const verdict: review.Status = if (col == 0) .approved else .needs_work;
-                var ticked = status == verdict;
-                if (dvui.checkbox(@src(), &ticked, null, .{ .gravity_x = 0.5, .padding = pad })) {
-                    state.select(editor, index);
-                    editor.review.verdict(editor, index, verdict);
-                }
-            } else {
-                dvui.labelNoFmt(@src(), texts[col], .{}, .{ .padding = pad });
+            switch (kinds[col]) {
+                .icon => if (row_icon) |row_ic| {
+                    icons.draw(@src(), row_ic, .{ .gravity_x = 0.5, .gravity_y = 0.5, .min_size_content = .{ .h = 15 }, .padding = pad });
+                },
+                .verdict => if (status != .unreviewed) {
+                    // The verdict as an icon: a check, or an exclamation mark.
+                    const approved = status == .approved;
+                    icons.draw(@src(), if (approved) .check else .warning, .{
+                        .gravity_x = 0.5,
+                        .gravity_y = 0.5,
+                        .min_size_content = .{ .h = 15 },
+                        .padding = pad,
+                        .color_text = toDvui(if (approved) editor.theme.git_added else editor.theme.overlay_warn),
+                    });
+                },
+                .approve, .needs_work => {
+                    // A press inside a checkbox cell is the checkbox's: it
+                    // selects the row itself when it toggles.
+                    if (press) |e| if (cell_rect.contains(e.evt.mouse.p)) {
+                        clicked_widget = true;
+                    };
+                    const verdict: review.Status = if (kinds[col] == .approve) .approved else .needs_work;
+                    var ticked = status == verdict;
+                    if (dvui.checkbox(@src(), &ticked, null, .{ .gravity_x = 0.5, .padding = pad })) {
+                        state.select(editor, index);
+                        editor.review.verdict(editor, index, verdict);
+                    }
+                },
+                .text => dvui.labelNoFmt(@src(), texts[col], .{}, .{ .padding = pad }),
             }
         }
     }
@@ -7741,7 +7794,7 @@ fn toolGrid(editor: *Editor, state: *@import("../core/tool_panel.zig").State, to
 fn toolDialog(editor: *Editor) void {
     const mode = editor.mode;
     var open = true;
-    var dialog = dvui.floatingWindow(@src(), .{ .modal = true, .open_flag = &open }, .{ .min_size_content = .{ .w = 650 } });
+    var dialog = dvui.floatingWindow(@src(), .{ .modal = true, .open_flag = &open }, .{ .min_size_content = .{ .w = 900 } });
     defer {
         dialog.deinit();
         if (!open and editor.mode == mode) {
@@ -7785,41 +7838,42 @@ fn toolDialog(editor: *Editor) void {
         // does not change the window's size.
         dvui.labelNoFmt(@src(), editor.status_message, .{}, .{ .expand = .horizontal });
         {
-            // The view's actions in one row, so the table below keeps its room.
-            var actions = dvui.box(@src(), .{ .dir = .horizontal }, .{ .expand = .horizontal });
+            // The view's actions: a row that wraps when the window is narrow,
+            // so no button leaves the window.
+            var actions = dvui.flexbox(@src(), .{ .justify_content = .start }, .{ .expand = .horizontal });
             defer actions.deinit();
             switch (state.kind) {
                 .problems => {
-                    if (dvui.button(@src(), "Severity (F)", .{}, .{})) state.filterSeverity();
-                    if (dvui.button(@src(), "Source (S)", .{}, .{})) state.filterSource(editor);
+                    if (icons.button(@src(), .filter, "Severity (F)", .{})) state.filterSeverity();
+                    if (icons.button(@src(), .filter, "Source (S)", .{})) state.filterSource(editor);
                 },
                 .task_output => {
-                    if (dvui.button(@src(), "Rerun (R)", .{}, .{})) state.action(editor, 'r');
-                    if (dvui.button(@src(), "Stop (S)", .{}, .{})) state.action(editor, 's');
+                    if (icons.button(@src(), .play, "Rerun (R)", .{})) state.action(editor, 'r');
+                    if (icons.button(@src(), .stop, "Stop (S)", .{})) state.action(editor, 's');
                 },
                 .tasks, .references => {},
                 .changes => {
-                    if (dvui.button(@src(), "Working tree diff (Enter / Space)", .{}, .{})) state.activate(editor);
-                    if (dvui.button(@src(), "Staged diff (D)", .{}, .{})) state.action(editor, 'd');
-                    if (dvui.button(@src(), "Stage (S)", .{}, .{})) state.action(editor, 's');
-                    if (dvui.button(@src(), "Unstage (U)", .{}, .{})) state.action(editor, 'u');
-                    if (dvui.button(@src(), "Open file (O)", .{}, .{})) state.action(editor, 'o');
-                    if (dvui.button(@src(), "Refresh (R)", .{}, .{})) state.action(editor, 'r');
+                    if (icons.button(@src(), .diff, "Working tree diff (Enter / Space)", .{})) state.activate(editor);
+                    if (icons.button(@src(), .diff, "Staged diff (D)", .{})) state.action(editor, 'd');
+                    if (icons.button(@src(), .add, "Stage (S)", .{})) state.action(editor, 's');
+                    if (icons.button(@src(), .remove, "Unstage (U)", .{})) state.action(editor, 'u');
+                    if (icons.button(@src(), .go_to_file, "Open file (O)", .{})) state.action(editor, 'o');
+                    if (icons.button(@src(), .refresh, "Refresh (R)", .{})) state.action(editor, 'r');
                 },
                 .review => {
-                    if (dvui.button(@src(), "Read (Enter / Space)", .{}, .{})) state.activate(editor);
-                    if (dvui.button(@src(), "Approve (A)", .{}, .{})) state.action(editor, 'a');
-                    if (dvui.button(@src(), "Needs work (W)", .{}, .{})) state.action(editor, 'w');
-                    if (dvui.button(@src(), "Classic diff (D)", .{}, .{})) state.action(editor, 'd');
-                    if (dvui.button(@src(), "Open file (O)", .{}, .{})) state.action(editor, 'o');
-                    if (dvui.button(@src(), "Refresh (R)", .{}, .{})) state.action(editor, 'r');
-                    if (dvui.button(@src(), "Pin baseline (P)", .{}, .{})) state.action(editor, 'p');
-                    if (dvui.button(@src(), "Unpin (U)", .{}, .{})) state.action(editor, 'u');
+                    if (icons.button(@src(), .book, "Read (Enter / Space)", .{})) state.activate(editor);
+                    if (icons.button(@src(), .check, "Approve (A)", .{})) state.action(editor, 'a');
+                    if (icons.button(@src(), .warning, "Needs work (W)", .{})) state.action(editor, 'w');
+                    if (icons.button(@src(), .diff, "Classic diff (D)", .{})) state.action(editor, 'd');
+                    if (icons.button(@src(), .go_to_file, "Open file (O)", .{})) state.action(editor, 'o');
+                    if (icons.button(@src(), .refresh, "Refresh (R)", .{})) state.action(editor, 'r');
+                    if (icons.button(@src(), .pin, "Pin baseline (P)", .{})) state.action(editor, 'p');
+                    if (icons.button(@src(), .pin_off, "Unpin (U)", .{})) state.action(editor, 'u');
                 },
                 .git_diff => {},
                 .debug => {
-                    if (dvui.button(@src(), "Debug controls (R)", .{}, .{})) editor.dap.show(editor, .overview);
-                    if (dvui.button(@src(), "Stop / detach (S)", .{}, .{})) editor.dap.stop(editor, false);
+                    if (icons.button(@src(), .list, "Debug controls (R)", .{})) editor.dap.show(editor, .overview);
+                    if (icons.button(@src(), .stop, "Stop / detach (S)", .{})) editor.dap.stop(editor, false);
                 },
             }
         }
@@ -7829,9 +7883,9 @@ fn toolDialog(editor: *Editor) void {
         {
             var nav = dvui.box(@src(), .{ .dir = .horizontal }, .{ .expand = .horizontal });
             defer nav.deinit();
-            if (dvui.button(@src(), "Previous page (PgUp)", .{}, .{})) state.page(editor, false, 40);
-            if (dvui.button(@src(), "Next page (PgDn)", .{}, .{})) state.page(editor, true, 40);
-            if (dvui.button(@src(), "Close (Esc)", .{}, .{})) open = false;
+            if (icons.button(@src(), .chevron_up, "Previous page (PgUp)", .{})) state.page(editor, false, 40);
+            if (icons.button(@src(), .chevron_down, "Next page (PgDn)", .{})) state.page(editor, true, 40);
+            if (icons.button(@src(), .close, "Close (Esc)", .{})) open = false;
         }
     }
     for (dvui.events()) |*event| {
@@ -8122,12 +8176,19 @@ test "GUI tool table: a click selects the row under the pointer" {
     editor.review.stage_on_approve = false;
     editor.git.root = try t.allocator.dupe(u8, root);
     const names = [_][]const u8{ "a.txt", "b.txt", "src/core/c.zig", "d.txt", "e.txt", "src/frontend/f.zig", "g.txt", "h.txt" };
+    try tmp.dir.createDirPath(t.io, "src/core");
+    try tmp.dir.createDirPath(t.io, "src/frontend");
     for (names, 0..) |name, index| {
+        try tmp.dir.writeFile(t.io, .{ .sub_path = name, .data = "x\n" });
         try editor.git.changes.insert(editor.allocator, index, .{ .path = try editor.allocator.dupe(u8, name), .x = ' ', .y = 'M' });
     }
     editor.review.tick(&editor, 0);
     editor.tool_panel.show(&editor, .review);
     try t.expectEqual(names.len, editor.review.files.items.len);
+    // Two verdicts, so the Verdict column has something to show.
+    editor.review.verdict(&editor, 0, .approved);
+    editor.review.verdict(&editor, 2, .needs_work);
+    try t.expectEqual(review.Status.approved, editor.review.statusOf("a.txt"));
     // Frames until the table's row height and the window's size settle.
     var frame_ms: u64 = 100;
     for (0..4) |_| {
@@ -8184,8 +8245,106 @@ fn captureDialogFrame() anyerror!dvui.App.Result {
     return .ok;
 }
 
+const SheetIcon = struct { name: []const u8, tvg: []const u8 };
+/// The icons `iconSheetFrame` lays out (tests only).
+var sheet_icons: []const SheetIcon = &.{};
+fn iconSheetFrame() anyerror!dvui.App.Result {
+    const cols: usize = 9;
+    const cell_w: f32 = 108;
+    const cell_h: f32 = 54;
+    const small = dvui.themeGet().font_body.withSize(10);
+    for (sheet_icons, 0..) |ic, i| {
+        const x = 8 + @as(f32, @floatFromInt(i % cols)) * cell_w;
+        const y = 8 + @as(f32, @floatFromInt(i / cols)) * cell_h;
+        dvui.icon(@src(), ic.name, ic.tvg, .{}, .{ .id_extra = i, .rect = .{ .x = x + 42, .y = y, .w = 24, .h = 24 }, .min_size_content = .{ .w = 24, .h = 24 }, .color_text = .{ .r = 0, .g = 0, .b = 0, .a = 255 } });
+        dvui.labelNoFmt(@src(), ic.name, .{}, .{ .id_extra = i, .rect = .{ .x = x, .y = y + 26, .w = cell_w, .h = 18 }, .font = small, .padding = .{}, .color_text = .{ .r = 0, .g = 0, .b = 0, .a = 255 } });
+    }
+    return .ok;
+}
+
+/// Converts every SVG in `folder` (tests only), skipping and reporting the
+/// ones that do not convert: a pack icon ZIDE never uses may not, and the
+/// icons ZIDE uses are checked by the icons module's own test.
+fn loadSheetIcons(io: std.Io, arena: std.mem.Allocator, folder: []const u8, out: *std.ArrayList(SheetIcon)) !void {
+    // A folder that is not there (a pack that was tried and removed) is
+    // simply an empty sheet.
+    var dir = std.Io.Dir.cwd().openDir(io, folder, .{ .iterate = true }) catch |err| switch (err) {
+        error.FileNotFound => return,
+        else => return err,
+    };
+    defer dir.close(io);
+    var it = dir.iterate();
+    while (try it.next(io)) |entry| {
+        if (entry.kind != .file or !std.mem.endsWith(u8, entry.name, ".svg")) continue;
+        const svg = try dir.readFileAlloc(io, entry.name, arena, .limited(64 * 1024));
+        const tvg = dvui.svgToTvg(arena, svg) catch |err| {
+            std.debug.print("icon {s}/{s} does not convert: {s}\n", .{ folder, entry.name, @errorName(err) });
+            continue;
+        };
+        const stem = entry.name[0 .. entry.name.len - ".svg".len];
+        try out.append(arena, .{ .name = try arena.dupe(u8, stem), .tvg = tvg });
+    }
+    std.mem.sort(SheetIcon, out.items, {}, struct {
+        fn lessThan(_: void, a: SheetIcon, b: SheetIcon) bool {
+            return std.mem.order(u8, a.name, b.name) == .lt;
+        }
+    }.lessThan);
+}
+
+/// Saves `list` as contact sheets `<prefix>_<page>.png` in `capture_dir`
+/// (tests only; one page holds what `iconSheetFrame` lays out).
+fn captureSheets(allocator: std.mem.Allocator, capture_dir: []const u8, list: []const SheetIcon, prefix: []const u8) !void {
+    const per_page: usize = 9 * 19;
+    var start: usize = 0;
+    var page: usize = 1;
+    while (start < list.len) : (page += 1) {
+        const end = @min(start + per_page, list.len);
+        sheet_icons = list[start..end];
+        var name_buf: [64]u8 = undefined;
+        const file_name = try std.fmt.bufPrint(&name_buf, "{s}_{d}.png", .{ prefix, page });
+        const path = try std.fs.path.join(allocator, &.{ capture_dir, file_name });
+        defer allocator.free(path);
+        const file = try std.Io.Dir.cwd().createFile(dvui.io, path, .{});
+        defer file.close(dvui.io);
+        var wbuf: [4096]u8 = undefined;
+        var writer = file.writer(dvui.io, &wbuf);
+        try dvui.testing.capturePng(iconSheetFrame, null, &writer.interface);
+        try writer.end();
+        start = end;
+    }
+    sheet_icons = &.{};
+}
+
+test "GUI icon sheet: every pack icon converts; ZIDE_CAPTURE_DIR saves contact sheets" {
+    if (!build_options.has_gui) return error.SkipZigTest;
+    const t = std.testing;
+    const Backend = @import("sdl-backend");
+    const capture_dir = Backend.c.SDL_getenv("ZIDE_CAPTURE_DIR");
+    if (capture_dir == null) return error.SkipZigTest;
+    var ui = try dvui.testing.init(.{ .window_size = .{ .w = 1000, .h = 1060 } });
+    defer ui.deinit();
+    var arena_state = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var cfpb: std.ArrayList(SheetIcon) = .empty;
+    try loadSheetIcons(t.io, arena, "src/icons/svg", &cfpb);
+    var own: std.ArrayList(SheetIcon) = .empty;
+    try loadSheetIcons(t.io, arena, "src/icons/svg/zide", &own);
+    var codicons: std.ArrayList(SheetIcon) = .empty;
+    try loadSheetIcons(t.io, arena, "src/icons/svg/codicons", &codicons);
+    try t.expect(cfpb.items.len > 0);
+    try t.expect(own.items.len > 0);
+    const dir = std.mem.span(@as([*:0]const u8, capture_dir));
+    try captureSheets(t.allocator, dir, cfpb.items, "icons_cfpb");
+    try captureSheets(t.allocator, dir, own.items, "icons_zide");
+    try captureSheets(t.allocator, dir, codicons.items, "icons_codicons");
+}
+
 comptime {
-    if (build_options.has_gui) _ = @import("software_render_tests.zig");
+    if (build_options.has_gui) {
+        _ = @import("software_render_tests.zig");
+        _ = @import("icons.zig");
+    }
 }
 
 test "GUI software profile: editor and settings at desktop resolution" {
