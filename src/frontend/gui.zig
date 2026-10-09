@@ -2415,19 +2415,40 @@ fn editorSbVisLines(area: dvui.Rect.Physical, line_height: f32) usize {
     return @intFromFloat(@floor(area.h / line_height));
 }
 
-/// Editor-pane scrollbar thumb rect, or null when the whole buffer fits.
-/// Logical-line approximation (wrapped rows are not counted), matching the
-/// wheel's scroll model. Works off the rect's right edge, so the events'
-/// gutter-trimmed rect and the render rect agree.
-fn editorSbThumb(doc: *const Document, area: dvui.Rect.Physical, line_height: f32, scale: f32) ?dvui.Rect.Physical {
-    if (area.h <= 0 or line_height <= 0) return null;
+/// The largest scroll_top that still fills the view, i.e. where the thumb's
+/// travel ends. With word wrap the last lines take more rows than lines, so
+/// the logical-line answer (`lineCount - vis`) left the bottom rows cut off
+/// and unreachable by the thumb: walk back from the end counting wrapped
+/// rows until the view is full. `text_area_w_logical` is in unscaled font
+/// units, as `guiWrapLineRows` expects.
+fn editorMaxScrollTop(doc: *Document, font: dvui.Font, text_area_w_logical: f32, vis: usize, tab_width: usize, do_wrap: bool) usize {
     const total = doc.buffer.lineCount();
+    if (!do_wrap) return total -| vis;
+    var rows: usize = 0;
+    var top: usize = total;
+    while (top > 0) {
+        var eb: [16384]u8 = undefined;
+        const shown = displayLine(doc.buffer.lineContent(top - 1), tab_width, &eb);
+        const line_rows = guiWrapLineRows(shown, font, text_area_w_logical);
+        if (rows + line_rows > vis) break;
+        rows += line_rows;
+        top -= 1;
+    }
+    return @min(top, total -| 1);
+}
+
+/// Editor-pane scrollbar thumb rect, or null when the whole buffer fits
+/// (`max_top` from `editorMaxScrollTop` is 0). The thumb's length is the
+/// logical-line approximation; its travel maps scroll_top onto 0..max_top.
+/// Works off the rect's right edge, so the events' gutter-trimmed rect and
+/// the render rect agree.
+fn editorSbThumb(doc: *const Document, area: dvui.Rect.Physical, line_height: f32, scale: f32, max_top: usize) ?dvui.Rect.Physical {
+    if (area.h <= 0 or line_height <= 0 or max_top == 0) return null;
     const vis = editorSbVisLines(area, line_height);
-    if (total <= vis) return null;
-    const total_f: f32 = @floatFromInt(total);
+    const total_f: f32 = @floatFromInt(@max(doc.buffer.lineCount(), vis + max_top));
     const vis_f: f32 = @floatFromInt(vis);
     const thumb_h = @min(area.h, @max(20 * scale, area.h * vis_f / total_f));
-    const denom: f32 = @floatFromInt(total - vis);
+    const denom: f32 = @floatFromInt(max_top);
     const frac = @min(1.0, @as(f32, @floatFromInt(doc.scroll_top)) / denom);
     const pill_w = 6 * scale;
     return .{
@@ -4399,7 +4420,8 @@ fn editorPane(editor: *Editor, pane_id: u8) void {
     }
 
     // --- Scrollbar: slim pill over the right edge (matches the file tree) ---
-    if (editorSbThumb(doc, render_area, line_height, scale)) |thumb| {
+    const sb_max_top = editorMaxScrollTop(doc, font, text_area_w_logical, editorSbVisLines(render_area, line_height), tab_width, do_wrap);
+    if (editorSbThumb(doc, render_area, line_height, scale, sb_max_top)) |thumb| {
         const active = (win_ui.editor_sb_drag and win_ui.editor_sb_pane == pane_id) or
             win_ui.editor_sb_hover_pane == pane_id;
         const sb_color = if (active)
@@ -4932,6 +4954,8 @@ fn handleMouseEvents(editor: *Editor, pane_id: u8, wd: *dvui.WidgetData, area: d
     const doc = &editor.documents.items[pane_doc_idx];
     const tab_width = editor.tabWidthFor(doc);
     const do_wrap = editor.wordWrapFor(doc);
+    // `area` is the text area (gutter trimmed), so its width is the wrap width.
+    const sb_max_top = editorMaxScrollTop(doc, font, area.w / scale, editorSbVisLines(area, line_height), tab_width, do_wrap);
     const double_click_threshold_ms: u64 = 400;
     const double_click_distance: f32 = 5; // pixels
 
@@ -4989,7 +5013,7 @@ fn handleMouseEvents(editor: *Editor, pane_id: u8, wd: *dvui.WidgetData, area: d
 
                 // Scrollbar band: drag the thumb, or page toward the click.
                 if (me.p.x >= area.x + area.w - editor_sb_band * scale) {
-                    if (editorSbThumb(doc, area, line_height, scale)) |thumb| {
+                    if (editorSbThumb(doc, area, line_height, scale, sb_max_top)) |thumb| {
                         win_ui.scroll_pinned = true;
                         if (me.p.y >= thumb.y and me.p.y < thumb.y + thumb.h) {
                             win_ui.editor_sb_drag = true;
@@ -5000,7 +5024,7 @@ fn handleMouseEvents(editor: *Editor, pane_id: u8, wd: *dvui.WidgetData, area: d
                             if (me.p.y < thumb.y) {
                                 doc.scroll_top -|= vis;
                             } else {
-                                doc.scroll_top = @min(doc.scroll_top + vis, doc.buffer.lineCount() -| vis);
+                                doc.scroll_top = @min(doc.scroll_top + vis, sb_max_top);
                             }
                         }
                         continue;
@@ -5111,12 +5135,10 @@ fn handleMouseEvents(editor: *Editor, pane_id: u8, wd: *dvui.WidgetData, area: d
             .motion => {
                 if (win_ui.editor_sb_drag and win_ui.editor_sb_pane == pane_id) {
                     e.handle(@src(), wd);
-                    if (editorSbThumb(doc, area, line_height, scale)) |thumb| {
+                    if (editorSbThumb(doc, area, line_height, scale, sb_max_top)) |thumb| {
                         const usable = area.h - thumb.h;
                         if (usable > 0) {
-                            const vis = editorSbVisLines(area, line_height);
-                            const total = doc.buffer.lineCount();
-                            const denom: f32 = @floatFromInt(total - vis);
+                            const denom: f32 = @floatFromInt(sb_max_top);
                             const frac = std.math.clamp((me.p.y - win_ui.editor_sb_grab_dy - area.y) / usable, 0.0, 1.0);
                             doc.scroll_top = @intFromFloat(@round(frac * denom));
                         }
@@ -5130,11 +5152,7 @@ fn handleMouseEvents(editor: *Editor, pane_id: u8, wd: *dvui.WidgetData, area: d
                     if (me.p.y < live_area.y and doc.scroll_top > 0) {
                         doc.scroll_top -|= 1;
                     } else if (me.p.y > live_area.y + live_area.h) {
-                        const visible = live_area.h / line_height;
-                        const vis_lines: usize = if (visible > 0) @intFromFloat(@floor(visible)) else 1;
-                        if (doc.scroll_top + vis_lines < doc.buffer.lineCount()) {
-                            doc.scroll_top += 1;
-                        }
+                        if (doc.scroll_top < sb_max_top) doc.scroll_top += 1;
                     }
                     const offset = screenToOffset(doc, area, font, line_height, scale, me.p, tab_width, do_wrap);
                     const c = doc.cursors.primary();
@@ -5207,7 +5225,7 @@ fn handleMouseEvents(editor: *Editor, pane_id: u8, wd: *dvui.WidgetData, area: d
                     me.p.y >= area.y and me.p.y <= area.y + area.h)
                 {
                     const in_band = me.p.x >= area.x + area.w - editor_sb_band * scale and
-                        editorSbThumb(doc, area, line_height, scale) != null;
+                        editorSbThumb(doc, area, line_height, scale, sb_max_top) != null;
                     win_ui.editor_sb_hover_pane = if (in_band) pane_id else null;
                     if (!in_band) dvui.cursorSet(.ibeam);
                 }

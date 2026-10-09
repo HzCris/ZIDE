@@ -225,6 +225,12 @@ Legend: **N** = native Zig, **L** = buildable as a Lua extension on the public A
   LSP hover / go-to-definition from the reader, several reader tabs, tokenizer skipping ghost
   rows in block-comment languages, and the docs' wrong claim that TUI git gutter glyphs use the
   git colors (they use the gutter separator color).
+- **QoL asked for on 2026-10-08 (phase 1 smoke test):** GUI icons (SVG / TinyVG, like the
+  panel chrome) for the `[x]` / `[!]` / `[ ]` verdict glyphs; a side-by-side comparison window
+  (old and new as two read-only documents in a split with locked scrolling) as an alternative
+  to the inline reader; and the classic `git_diff` preview itself — today each diff line is a
+  button in a modal dialog — rendered as colored monospace text (`+` green, `-` red, `@@` dim)
+  in a wider window. Phase 2's reader is the planned answer for reading; these are the extras.
 
 ## Appearance and accessibility
 
