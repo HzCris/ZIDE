@@ -19,6 +19,8 @@ const terminal_mod = @import("../core/terminal.zig");
 const filetree_mod = @import("../core/filetree.zig");
 const FileTree = filetree_mod.FileTree;
 const fileicons = @import("../core/fileicons.zig");
+const snippet_panel = @import("../core/snippet_panel.zig");
+const snippets_mod = @import("../core/snippets.zig");
 const icons = @import("icons.zig");
 const cursor_mod = @import("../core/cursor.zig");
 const keybind = @import("../core/keybind.zig");
@@ -499,12 +501,30 @@ pub fn frame(editor: *Editor, g: *GuiState) bool {
     // Check if quit was requested via keybind/command
     if (!editor.running) return false;
 
-    // File tree edge-drag resize (uses last frame's panel rect).
+    // Side band edge-drag resize (uses last frame's band rects). A drag
+    // well past a band's minimum hides it (Ctrl+B / Ctrl+Alt+B bring it
+    // back at its old width); the status bar says so before the release.
     if (editor.filetree_visible and editor.filetree != null) {
-        if (filetree_panel_rect) |prect| handleFiletreeResize(editor, prect, filetree_panel_scale);
+        if (handleBandResize(&filetree_band, editor.filetree_side, &editor.filetree_width, 120, 600, "filetree_width")) {
+            editor.filetree_visible = false;
+            editor.filetree_focused = false;
+            editor.status_message = "File tree hidden — Ctrl+B shows it again";
+        } else if (filetree_band.resizing) {
+            bandDragHint(editor, filetree_band.hide_pending, "Release to hide the file tree");
+        }
     } else {
-        filetree_resizing = false;
-        filetree_panel_rect = null;
+        filetree_band.reset();
+    }
+    if (editor.snippets_visible) {
+        if (handleBandResize(&snippets_band, editor.snippetsSide(), &editor.snippets_width, 120, 600, "snippets_width")) {
+            editor.snippets_visible = false;
+            editor.snippets_focused = false;
+            editor.status_message = "Snippets panel hidden — Ctrl+Alt+B shows it again";
+        } else if (snippets_band.resizing) {
+            bandDragHint(editor, snippets_band.hide_pending, "Release to hide the Snippets panel");
+        }
+    } else {
+        snippetsBandGone();
     }
 
     // OS file drops staged by the SDL backend between frames.
@@ -696,6 +716,11 @@ fn treeTakesKeys(editor: *const Editor) bool {
     return guiMode(editor) == .normal and editor.keyboardOwner() == .filetree;
 }
 
+/// Key events go to the Snippets panel (it takes no text).
+fn snippetsTakesKeys(editor: *const Editor) bool {
+    return guiMode(editor) == .normal and editor.keyboardOwner() == .snippets;
+}
+
 /// Key and text events go to the search panel.
 fn searchTakesKeys(editor: *const Editor) bool {
     return guiMode(editor) == .normal and editor.keyboardOwner() == .search;
@@ -840,6 +865,11 @@ fn menuBar(editor: *Editor) void {
             if (dvui.menuItemLabel(@src(), "File Tree        Ctrl+B", .{}, .{ .expand = .horizontal }) != null) {
                 // Like Ctrl+B: from a secondary window this raises the primary.
                 execGuiAction(editor, "toggle_filetree");
+                m.close();
+            }
+            if (dvui.menuItemLabel(@src(), "Snippets         Ctrl+Alt+B", .{}, .{ .expand = .horizontal }) != null) {
+                // Like Ctrl+Alt+B: the panel lives in the primary window.
+                execGuiAction(editor, "toggle_snippets");
                 m.close();
             }
             if (dvui.menuItemLabel(@src(), "Reveal in Tree", .{}, .{ .expand = .horizontal }) != null) {
@@ -1441,29 +1471,30 @@ fn statusBar(editor: *Editor) void {
 }
 
 /// Editor area of the current window: the split-pane tree, plus (primary
-/// window only, side_panels) the docked file tree and search panel.
+/// window only, side_panels) the docked file tree, Snippets panel and
+/// search panel.
 fn editorArea(editor: *Editor, side_panels: bool) void {
     // --- Editor area (expand=.both, LAST child) ---
-    // The file tree docks left or right of the split tree as a fixed-width
-    // sibling in an hbox; the splits expand into the rest. The docked
-    // search panel (when shown) sits below both as a fixed-height strip.
+    // The file tree and the Snippets panel dock left or right of the split
+    // tree as fixed-width siblings in an hbox; the splits expand into the
+    // rest. The docked search panel (when shown) sits below them all as a
+    // fixed-height strip.
     {
         var main_col = dvui.box(@src(), .{ .dir = .vertical }, .{ .expand = .both });
         defer main_col.deinit();
         {
             var content_row = dvui.box(@src(), .{ .dir = .horizontal }, .{ .expand = .both });
             defer content_row.deinit();
-            if (side_panels and editor.filetree_visible and editor.ensureFiletree() != null) {
-                if (editor.filetree_side == .left) {
-                    filetreePanel(editor);
-                    renderPanes(editor);
-                } else {
-                    renderPanes(editor);
-                    filetreePanel(editor);
-                }
-            } else {
-                renderPanes(editor);
-            }
+            const tree = side_panels and editor.filetree_visible and editor.ensureFiletree() != null;
+            const snippets_w: f32 = if (side_panels) snippetsBandWidth(editor, content_row.data().contentRect().w, tree) else 0;
+            const snippets_side = editor.snippetsSide();
+            // Call order is the left-to-right order: on a shared side the
+            // tree is the outermost band.
+            if (tree and editor.filetree_side == .left) filetreePanel(editor);
+            if (snippets_w > 0 and snippets_side == .left) snippetsPanel(editor, snippets_w);
+            renderPanes(editor);
+            if (snippets_w > 0 and snippets_side == .right) snippetsPanel(editor, snippets_w);
+            if (tree and editor.filetree_side == .right) filetreePanel(editor);
         }
         if (side_panels and editor.search_visible) searchPanelGui(editor);
         // Modal prompts normally live in the focused editor pane. With a
@@ -1597,6 +1628,7 @@ fn runDeferred(editor: *Editor) void {
 /// Actions whose UI lives in the primary window only.
 fn isPrimaryPanelAction(action: []const u8) bool {
     return std.mem.eql(u8, action, "toggle_filetree") or
+        std.mem.eql(u8, action, "toggle_snippets") or
         std.mem.eql(u8, action, "filetree_reveal") or
         std.mem.eql(u8, action, "find_in_files");
 }
@@ -1797,18 +1829,34 @@ var filetree_scroll: usize = 0;
 
 /// One-frame flag: the keyboard just came back to an editor pane (from the
 /// tree, the search panel, another pane or window — trackKeyboardOwner, or
-/// the tree's own Escape/Enter), so the active editor pane takes dvui focus
-/// back: its movement/typing handlers are gated on holding dvui widget
-/// focus, which a panel grabbed on click. Without this, Escape "worked" but
-/// the editor stayed deaf.
+/// the tree's own Escape/Enter, the Snippets panel's Escape and inserts),
+/// so the active editor pane takes dvui focus back: its movement/typing
+/// handlers are gated on holding dvui widget focus, which a panel grabbed
+/// on click. Without this, Escape "worked" but the editor stayed deaf.
 var filetree_release_focus: bool = false;
-/// Panel content rect + scale from the last draw — the resize drag runs
-/// at the top of frame() (before any pane consumes events), so it works
-/// the same whichever side the panel docks on.
-var filetree_panel_rect: ?dvui.Rect.Physical = null;
-var filetree_panel_scale: f32 = 1;
-/// True while the user is dragging the panel's editor-facing edge.
-var filetree_resizing: bool = false;
+/// A docked side band's edge-drag resize: its content rect + scale from
+/// the last draw — the drag runs at the top of frame() (before any pane
+/// consumes events), so it works the same whichever side the band docks
+/// on — and whether its editor-facing edge is being dragged.
+const BandResize = struct {
+    rect: ?dvui.Rect.Physical = null,
+    scale: f32 = 1,
+    resizing: bool = false,
+    /// The width the drag started from: put back when the drag ends by
+    /// hiding the band, so it comes back at its old width.
+    start_width: f32 = 0,
+    /// The pointer is past the hide threshold: the release hides the band.
+    hide_pending: bool = false,
+
+    /// No band this frame: nothing to grab, and a drag in flight ends.
+    fn reset(self: *BandResize) void {
+        self.rect = null;
+        self.resizing = false;
+        self.hide_pending = false;
+    }
+};
+/// The file tree's band (its rect also targets OS file drops).
+var filetree_band: BandResize = .{};
 /// Double-click state for tree rows: single click on a row NAME only
 /// selects; a second click on the same row within the threshold toggles
 /// a folder or opens a file. (The +/- glyph stays single-click.)
@@ -1904,7 +1952,7 @@ fn processFileDrops(editor: *Editor) void {
         const path = s.path[0..s.len];
         var handled = false;
         if (cur_win == 0 and editor.filetree_visible) {
-            if (filetree_panel_rect) |pr| {
+            if (filetree_band.rect) |pr| {
                 const px = s.x * scale;
                 const py = s.y * scale;
                 if (px >= pr.x and px <= pr.x + pr.w and py >= pr.y and py <= pr.y + pr.h) {
@@ -1993,8 +2041,8 @@ fn filetreePanel(editor: *Editor) void {
     const rs = wd.contentRectScale();
     const scale = rs.s;
     const area = rs.r;
-    filetree_panel_rect = area;
-    filetree_panel_scale = scale;
+    filetree_band.rect = area;
+    filetree_band.scale = scale;
 
     var font = dvui.Font.theme(.body);
     if (editor.filetree_font_size > 0) font = font.withSize(editor.filetree_font_size);
@@ -2120,7 +2168,7 @@ fn filetreePanel(editor: *Editor) void {
     // --- Rows ---
     const text_color = toDvui(editor.theme.text);
     const sel_bg = toDvui(editor.theme.selection);
-    const guide_color = toDvui(editor.theme.gutter_separator);
+    const guide_color = toDvui(editor.theme.panel_border);
     // Type icons render as text from the mono font (bundled Fira Code
     // Nerd Font — the devicon glyphs are guaranteed present), sized by
     // filetree_icon_scale relative to the row text, evened out per glyph
@@ -2254,20 +2302,29 @@ fn filetreePanel(editor: *Editor) void {
     const sep_w = @max(1.0, 1 * scale);
     const sep_x = if (editor.filetree_side == .left) area.x + area.w - sep_w else area.x;
     const sep_rect: dvui.Rect.Physical = .{ .x = sep_x, .y = area.y, .w = sep_w, .h = area.h };
-    sep_rect.fill(.{}, .{ .color = toDvui(editor.theme.gutter_separator), .fade = 1.0 });
+    sep_rect.fill(.{}, .{ .color = toDvui(editor.theme.panel_border), .fade = 1.0 });
 
     // Right-click context menu over the panel.
     filetreeContextMenu(editor, area);
 }
 
-/// Drag the panel's editor-facing edge to resize, VS Code style. The
-/// chosen width persists to init.lua on release. Runs from frame() with
-/// the previous frame's rect so it always sees events before the panes.
-fn handleFiletreeResize(editor: *Editor, prect: dvui.Rect.Physical, scale: f32) void {
-    if (!build_options.has_gui) return;
-    if (scale <= 0) return;
-    const edge_x = if (editor.filetree_side == .left) prect.x + prect.w else prect.x;
+/// Drag a side band's editor-facing edge to resize it, VS Code style:
+/// `width` (logical px) follows the pointer within `min`..`max`, and the
+/// chosen width persists to init.lua under `setting` on release. Dragged
+/// well past the minimum (under half of it) the band stays at its
+/// minimum until the release, which hides it instead: the width goes
+/// back to what the drag started from, nothing is persisted, and the
+/// call returns true so the caller hides its band and says so. Runs
+/// from frame() with the previous frame's rect so it always sees events
+/// before the panes.
+fn handleBandResize(band: *BandResize, side: Editor.FiletreeSide, width: *f32, min: f32, max: f32, setting: []const u8) bool {
+    if (!build_options.has_gui) return false;
+    const prect = band.rect orelse return false;
+    const scale = band.scale;
+    if (scale <= 0) return false;
+    const edge_x = if (side == .left) prect.x + prect.w else prect.x;
     const grab: f32 = 4 * scale;
+    var hide = false;
 
     for (dvui.events()) |*e| {
         if (e.handled) continue;
@@ -2281,36 +2338,59 @@ fn handleFiletreeResize(editor: *Editor, prect: dvui.Rect.Physical, scale: f32) 
 
         switch (me.action) {
             .position => {
-                if (near_edge or filetree_resizing) dvui.cursorSet(.arrow_w_e);
+                if (near_edge or band.resizing) dvui.cursorSet(.arrow_w_e);
             },
             .press => {
                 if (me.button == .left and near_edge) {
                     e.handled = true;
-                    filetree_resizing = true;
+                    band.resizing = true;
+                    band.start_width = width.*;
+                    band.hide_pending = false;
                 }
             },
             .motion => {
-                if (filetree_resizing) {
+                if (band.resizing) {
                     e.handled = true;
-                    const w_phys = if (editor.filetree_side == .left)
+                    const w_phys = if (side == .left)
                         me.p.x - prect.x
                     else
                         (prect.x + prect.w) - me.p.x;
-                    editor.filetree_width = std.math.clamp(w_phys / scale, 120, 600);
+                    const w = w_phys / scale;
+                    band.hide_pending = w < min / 2;
+                    width.* = std.math.clamp(w, min, max);
                 }
             },
             .release => {
-                if (filetree_resizing) {
+                if (band.resizing) {
                     e.handled = true;
-                    filetree_resizing = false;
+                    band.resizing = false;
+                    if (band.hide_pending) {
+                        band.hide_pending = false;
+                        width.* = band.start_width;
+                        hide = true;
+                        continue;
+                    }
                     // Persist the chosen width
                     var buf: [32]u8 = undefined;
-                    const num = std.fmt.bufPrint(&buf, "{d}", .{@as(i64, @intFromFloat(editor.filetree_width))}) catch "";
-                    if (num.len > 0) lua_settings.writeSettingToFile("filetree_width", num) catch {};
+                    const num = std.fmt.bufPrint(&buf, "{d}", .{@as(i64, @intFromFloat(width.*))}) catch "";
+                    if (num.len > 0) lua_settings.writeSettingToFile(setting, num) catch {};
                 }
             },
             else => {},
         }
+    }
+    return hide;
+}
+
+/// While a band is dragged: `hint` in the status bar past the hide
+/// threshold, and cleared again back inside it — only the hint, so a
+/// message that came up during the drag (a panel that ran out of room)
+/// stays.
+fn bandDragHint(editor: *Editor, past_threshold: bool, hint: []const u8) void {
+    if (past_threshold) {
+        editor.status_message = hint;
+    } else if (std.mem.eql(u8, editor.status_message, hint)) {
+        editor.status_message = "";
     }
 }
 
@@ -3238,6 +3318,871 @@ fn filetreeContextMenu(editor: *Editor, area: dvui.Rect.Physical) void {
         }
         if (dvui.menuItemLabel(@src(), "Reveal Current File", .{}, .{ .expand = .horizontal }) != null) {
             _ = editor.execCommand("filetree_reveal", null);
+            fw.close();
+        }
+    }
+}
+
+// ===========================================================================
+// Snippets side panel
+// ===========================================================================
+
+/// The Snippets band (see BandResize).
+var snippets_band: BandResize = .{};
+/// Row under the pointer: the hover bar, and the preview follows it. Null
+/// outside the rows, and after keyboard navigation until the pointer
+/// moves again, so the selection drives the preview.
+var snippets_hover_row: ?usize = null;
+/// Where the pointer was when the hover row was last set: every frame ends
+/// with a synthetic position event at the pointer, which must not undo a
+/// keyboard move.
+var snippets_hover_pt: ?dvui.Point.Physical = null;
+/// Scrollbar state, as the file tree's: thumb drag with the grab offset
+/// inside the thumb, plus hover over the band for the brighter thumb.
+var snippets_sb_drag: bool = false;
+var snippets_sb_grab_dy: f32 = 0;
+var snippets_sb_hover: bool = false;
+/// The row last clicked and its frame time: the second press of a
+/// double-click must not insert an item again, or close the group it
+/// just opened.
+var snippets_last_click_ns: i128 = 0;
+var snippets_last_click_row: usize = std.math.maxInt(usize);
+/// Registry index of the definition the preview showed last frame (null:
+/// none) — the tests read it.
+var snippets_preview_def: ?u32 = null;
+/// The preview's scroll offset (physical px; back to 0 when the previewed
+/// item changes) and how much of its content did not fit last frame: the
+/// wheel over the preview, or its scrollbar, scrolls long notes.
+var snippets_preview_scroll: f32 = 0;
+var snippets_preview_overflow: f32 = 0;
+var snippets_pv_sb_drag: bool = false;
+var snippets_pv_sb_grab_dy: f32 = 0;
+var snippets_pv_sb_hover: bool = false;
+/// Visual rows the preview's code block took last frame — the tests read it.
+var snippets_preview_code_rows: usize = 0;
+/// snippets_double_click: the last double-click already inserted its
+/// item, so a third press right after must not insert it again.
+var snippets_last_click_inserted: bool = false;
+
+/// The Snippets band's logical width this frame: its setting, narrowed so
+/// the panes keep 240 px beside the bands. 0 = no band: hidden, the row
+/// not laid out yet, or no room — the panel then hides itself and says so
+/// (a band that cannot appear must not keep the keyboard, and Ctrl+Alt+B
+/// must not be left cycling a panel nobody can see).
+fn snippetsBandWidth(editor: *Editor, row_w: f32, tree_shown: bool) f32 {
+    if (!editor.snippets_visible) return 0;
+    if (row_w <= 0) {
+        snippetsBandGone();
+        return 0;
+    }
+    const tree_w: f32 = if (tree_shown) std.math.clamp(editor.filetree_width, 120, 600) else 0;
+    const w = @min(std.math.clamp(editor.snippets_width, 120, 600), row_w - tree_w - 240);
+    if (w >= 120) return w;
+    snippetsBandGone();
+    if (editor.keyboardOwner() == .snippets) filetree_release_focus = true;
+    editor.snippets_visible = false;
+    editor.snippets_focused = false;
+    editor.status_message = "Snippets panel: no room beside the editor — widen the window, then Ctrl+Alt+B";
+    return 0;
+}
+
+/// No Snippets band this frame (hidden, or no room for it): nothing to
+/// grab, hover or drag until it is drawn again.
+fn snippetsBandGone() void {
+    snippets_band.reset();
+    snippets_hover_row = null;
+    snippets_hover_pt = null;
+    snippets_sb_drag = false;
+    snippets_sb_hover = false;
+    snippets_pv_sb_drag = false;
+    snippets_pv_sb_hover = false;
+}
+
+/// Per-frame Snippets panel layout (physical px) — one place for the
+/// geometry so the painter and the mouse handler can't drift.
+const SnippetsMetrics = struct {
+    area: dvui.Rect.Physical,
+    scale: f32,
+    line_height: f32,
+    rows_y: f32,
+    rows_h: f32,
+    visible_rows: usize,
+    /// The preview block under the rows; h = 0 when the panel is too short.
+    preview: dvui.Rect.Physical,
+    /// Left padding before a group's chevron.
+    pad_l: f32,
+    chevron_w: f32,
+    icon_size: f32,
+    /// Where group names start, and item names, indented under them.
+    group_x: f32,
+    item_x: f32,
+    /// Scrollbar band (left edge + width) over the rows' right edge.
+    sb_x: f32,
+    sb_w: f32,
+};
+
+/// `row_count` is the list as last built: a short list leaves the room it
+/// does not need to the preview.
+fn snippetsMetrics(area: dvui.Rect.Physical, scale: f32, line_height: f32, row_count: usize) SnippetsMetrics {
+    const header_h = line_height + 4 * scale;
+    // The preview keeps at least 40% of the panel — sized by its content,
+    // the list would grow and shrink under the pointer as the hover moved
+    // — and takes whatever a short list leaves free (an empty list shows
+    // a hint: keep it a few rows).
+    const rows_f: f32 = @floatFromInt(if (row_count == 0) 6 else row_count);
+    const list_h = header_h + rows_f * line_height + 4 * scale;
+    var preview_h = @max(@floor(area.h * 0.4), @floor(area.h - list_h));
+    const list_min = header_h + 3 * line_height;
+    if (area.h - preview_h < list_min) preview_h = @max(0, area.h - list_min);
+    if (preview_h < 3 * line_height) preview_h = 0;
+    const rows_h = @max(0, area.h - header_h - preview_h);
+    const sb_w = 6 * scale;
+    const pad_l = 6 * scale;
+    const chevron_w = 14 * scale;
+    const group_x = area.x + pad_l + chevron_w + 4 * scale;
+    return .{
+        .area = area,
+        .scale = scale,
+        .line_height = line_height,
+        .rows_y = area.y + header_h,
+        .rows_h = rows_h,
+        .visible_rows = if (rows_h > line_height) @intFromFloat(@floor(rows_h / line_height)) else 1,
+        .preview = .{ .x = area.x, .y = area.y + area.h - preview_h, .w = area.w, .h = preview_h },
+        .pad_l = pad_l,
+        .chevron_w = chevron_w,
+        .icon_size = @round(line_height * 0.72),
+        .group_x = group_x,
+        .item_x = group_x + 10 * scale,
+        .sb_x = area.x + area.w - sb_w - 1 * scale,
+        .sb_w = sb_w,
+    };
+}
+
+/// Row index under a physical y position, or null off the drawn rows.
+fn snippetsRowAt(panel: *const snippet_panel.State, m: SnippetsMetrics, y: f32) ?usize {
+    if (y < m.rows_y or y >= m.rows_y + m.rows_h or m.line_height <= 0) return null;
+    const rel: usize = @intFromFloat(@floor((y - m.rows_y) / m.line_height));
+    if (rel >= m.visible_rows) return null;
+    const row = panel.scroll + rel;
+    return if (row < panel.rows.items.len) row else null;
+}
+
+/// Scrollbar thumb rect, or null when every row fits (as filetreeSbThumb).
+fn snippetsSbThumb(panel: *const snippet_panel.State, m: SnippetsMetrics) ?dvui.Rect.Physical {
+    const count = panel.rows.items.len;
+    if (count <= m.visible_rows or m.rows_h <= 0) return null;
+    const count_f: f32 = @floatFromInt(count);
+    const vis_f: f32 = @floatFromInt(m.visible_rows);
+    const thumb_h = @min(m.rows_h, @max(20 * m.scale, m.rows_h * vis_f / count_f));
+    const denom: f32 = @floatFromInt(count - m.visible_rows);
+    const frac = @min(1.0, @as(f32, @floatFromInt(panel.scroll)) / denom);
+    return .{
+        .x = m.sb_x + 1 * m.scale,
+        .y = m.rows_y + (m.rows_h - thumb_h) * frac,
+        .w = m.sb_w - 2 * m.scale,
+        .h = thumb_h,
+    };
+}
+
+/// The Snippets side panel, modelled on Kate's Snippets tool view: the
+/// snippets for the main window's document, filed in collapsible groups
+/// (snippet_panel.zig owns the rows). A click or Enter inserts an item at
+/// the caret and hands the keyboard back so Tab walks its blanks; the
+/// preview at the bottom shows what the hovered (else the selected) item
+/// inserts. Custom rows in the file tree's style; `width` is the band's
+/// logical width this frame (snippetsBandWidth).
+fn snippetsPanel(editor: *Editor, width: f32) void {
+    if (!build_options.has_gui) return;
+    var pbox = dvui.box(@src(), .{ .dir = .vertical }, .{
+        .expand = .vertical,
+        .min_size_content = .{ .w = width },
+        .background = true,
+        .style = .window,
+        .name = "snippets_panel",
+        .tag = "snippets_panel",
+    });
+    defer pbox.deinit();
+
+    const wd = pbox.data();
+    const rs = wd.contentRectScale();
+    const scale = rs.s;
+    const area = rs.r;
+    snippets_band.rect = area;
+    snippets_band.scale = scale;
+
+    const font = dvui.Font.theme(.body);
+    const line_height = font.lineHeight() * scale;
+    if (line_height <= 0 or area.h <= 0 or area.w <= 0) return;
+    // The input is hit-tested against the layout drawn last frame: the
+    // rows as the list had them.
+    const rows_before = editor.snippet_panel.rows.items.len;
+    var m = snippetsMetrics(area, scale, line_height, rows_before);
+
+    // Input first, then the sync: a click or a key can open or close a
+    // group, or give an untitled file a language, and every count and
+    // clamp below must see the rows that left (a stale row count was an
+    // out-of-bounds panic in the file tree).
+    handleSnippetsMouse(editor, wd, m);
+    if (snippetsTakesKeys(editor)) handleSnippetsKeys(editor, wd, m.visible_rows);
+    const panel = editor.syncSnippetPanel();
+    const rows = panel.rows.items;
+    // Rows came or went: the list and the preview share the panel anew.
+    if (rows.len != rows_before) m = snippetsMetrics(area, scale, line_height, rows.len);
+    const defs = editor.snippets.items.items;
+    const focused = editor.keyboardOwner() == .snippets;
+
+    if (snippets_hover_row) |h| {
+        if (h >= rows.len) snippets_hover_row = null;
+    }
+    // Keyboard navigation flagged the selection for scroll-into-view.
+    if (panel.scroll_to_selected) {
+        panel.scroll_to_selected = false;
+        if (panel.selected < panel.scroll) {
+            panel.scroll = panel.selected;
+        } else if (panel.selected >= panel.scroll + m.visible_rows) {
+            panel.scroll = panel.selected + 1 - m.visible_rows;
+        }
+    }
+    // Clamp the scroll when rows disappeared (a group closed, a reload).
+    panel.scroll = @min(panel.scroll, rows.len -| m.visible_rows);
+
+    const header_fg = toDvui(editor.theme.overlay_fg);
+    const dim = toDvui(editor.theme.overlay_dim);
+    const text_color = toDvui(editor.theme.text);
+    const sel_bg = toDvui(editor.theme.selection);
+    // Edges, dividers and indent guides: the panel border color, lighter
+    // than the gutter line so the panel reads as a box.
+    const guide_color = toDvui(editor.theme.panel_border);
+    const line_w = @max(1.0, 1 * scale);
+    {
+        const prev_clip = dvui.clip(area);
+        defer dvui.clipSet(prev_clip);
+
+        // --- Header: "Snippets — <language>", bold while it has the keyboard ---
+        fillBar(area, 0, m.rows_y - area.y, toDvui(editor.theme.gutter_bg));
+        const header_line: dvui.Rect.Physical = .{ .x = area.x, .y = m.rows_y - line_w, .w = area.w, .h = line_w };
+        header_line.fill(.{}, .{ .color = guide_color, .fade = 1.0 });
+        var title_buf: [128]u8 = undefined;
+        const title: []const u8 = if (std.fmt.bufPrint(&title_buf, "Snippets — {s}", .{panel.languageLabel()})) |t| blk: {
+            // The label is cut at 64 bytes, maybe inside a character.
+            sanitizeUtf8(t);
+            break :blk t;
+        } else |_| "Snippets";
+        const title_font = if (focused) dvui.Font.theme(.heading) else font;
+        const title_fit = fitOverlayText(title_font, title, area.w - 16 * scale, scale);
+        renderOverlayText(title_font, title_fit, area.x + 8 * scale, area.y + 2 * scale, rs, if (focused) header_fg else dim);
+
+        // --- Rows: groups (chevron, name, count) and their items (name,
+        //     Tab trigger right-aligned) ---
+        if (rows.len == 0) {
+            _ = drawWrappedText(font, panel.emptyHint(), area.x + 8 * scale, m.rows_y + 4 * scale, area.w - 16 * scale, m.rows_y + m.rows_h, rs, dim);
+        }
+        // Any-language mode lists several languages' groups: each says whose.
+        const any_language = panel.anyLanguage();
+        // Counts and triggers end here, clear of the scrollbar.
+        const text_right = m.sb_x - 4 * scale;
+        var r = panel.scroll;
+        var y = m.rows_y;
+        while (r < rows.len and y + line_height <= m.rows_y + m.rows_h + 0.5) : ({
+            r += 1;
+            y += line_height;
+        }) {
+            const row = rows[r];
+            if (snippets_hover_row) |h| {
+                if (h == r and r != panel.selected) fillBar(area, y - area.y, line_height, sel_bg.opacity(0.3));
+            }
+            if (r == panel.selected) {
+                // Dimmed bar when the panel doesn't own the keyboard.
+                fillBar(area, y - area.y, line_height, if (focused) sel_bg else sel_bg.opacity(0.45));
+            }
+            switch (row.kind) {
+                .group => {
+                    const group = panel.groups.items[row.group];
+                    const chev: []const u8 = if (group.expanded) (icons.tvg(.chevron_down) orelse dvui.entypo.chevron_small_down) else (icons.tvg(.chevron_right) orelse dvui.entypo.chevron_small_right);
+                    renderIconTinted(if (group.expanded) "snip_chev_open" else "snip_chev", chev, .{
+                        .x = area.x + m.pad_l + (m.chevron_w - m.icon_size) / 2,
+                        .y = y + (line_height - m.icon_size) / 2,
+                        .w = m.icon_size,
+                        .h = m.icon_size,
+                    }, scale, dim);
+                    var count_buf: [16]u8 = undefined;
+                    const count = std.fmt.bufPrint(&count_buf, "{d}", .{group.count}) catch "";
+                    const count_x = text_right - font.textSize(count).w * scale;
+                    renderOverlayText(font, count, count_x, y, rs, dim);
+                    // Name (after the language in any-language mode),
+                    // clipped so it never runs under the count.
+                    const name_clip = dvui.clip(.{ .x = area.x, .y = y, .w = @max(0, count_x - 6 * scale - area.x), .h = line_height });
+                    defer dvui.clipSet(name_clip);
+                    var x = m.group_x;
+                    if (any_language) {
+                        renderOverlayText(font, group.language, x, y, rs, dim);
+                        x += font.textSize(group.language).w * scale + 6 * scale;
+                    }
+                    renderOverlayText(font, group.name, x, y, rs, text_color);
+                },
+                .item => {
+                    // Indent guide under the group's chevron, as the tree
+                    // draws for its folders.
+                    const guide: dvui.Rect.Physical = .{ .x = area.x + m.pad_l + m.chevron_w / 2, .y = y, .w = line_w, .h = line_height };
+                    guide.fill(.{}, .{ .color = guide_color, .fade = 1.0 });
+                    if (row.def >= defs.len) continue;
+                    const def = &defs[row.def];
+                    const x = m.item_x;
+                    var name_right = text_right;
+                    if (def.hasTrigger()) {
+                        const trigger_x = text_right - font.textSize(def.prefix).w * scale;
+                        // Only beside a name that keeps a few letters.
+                        if (trigger_x - 8 * scale > x + 4 * font.textSize("M").w * scale) {
+                            renderOverlayText(font, def.prefix, trigger_x, y, rs, dim);
+                            name_right = trigger_x - 8 * scale;
+                        }
+                    }
+                    const name_clip = dvui.clip(.{ .x = area.x, .y = y, .w = @max(0, name_right - area.x), .h = line_height });
+                    defer dvui.clipSet(name_clip);
+                    renderOverlayText(font, def.description, x, y, rs, text_color);
+                },
+            }
+        }
+
+        // --- Scrollbar: slim pill over the right edge of the rows ---
+        if (snippetsSbThumb(panel, m)) |thumb| {
+            const active = snippets_sb_drag or snippets_sb_hover;
+            const sb_color = if (active) header_fg.opacity(0.6) else dim.opacity(0.45);
+            const rad = thumb.w / 2;
+            thumb.fill(.{ .x = rad, .y = rad, .w = rad, .h = rad }, .{ .color = sb_color, .fade = 1.0 });
+        }
+
+        // --- Preview of the hovered, else the selected, item; a new one
+        //     starts at its top ---
+        const preview_def = panel.previewDef(snippets_hover_row);
+        if (!std.meta.eql(preview_def, snippets_preview_def)) {
+            snippets_preview_scroll = 0;
+            snippets_pv_sb_drag = false;
+        }
+        snippets_preview_def = preview_def;
+        if (m.preview.h > 0) {
+            const preview: ?*const snippets_mod.Definition = blk: {
+                const di = snippets_preview_def orelse break :blk null;
+                break :blk if (di < defs.len) &defs[di] else null;
+            };
+            drawSnippetPreview(editor, preview, m, rs, font);
+        } else {
+            snippets_preview_overflow = 0;
+        }
+
+        // Separator line on the editor-facing edge, as the file tree's.
+        const sep_w = line_w;
+        const sep_x = if (editor.snippetsSide() == .left) area.x + area.w - sep_w else area.x;
+        const sep_rect: dvui.Rect.Physical = .{ .x = sep_x, .y = area.y, .w = sep_w, .h = area.h };
+        sep_rect.fill(.{}, .{ .color = guide_color, .fade = 1.0 });
+    }
+
+    // Right-click context menu over the panel.
+    snippetsContextMenu(editor, area);
+}
+
+/// The preview block under the rows: the code `def` inserts (the editor's
+/// mono font, tabs at the document's indent width, the blanks tinted), how
+/// to fill it in, then its notes word-wrapped. What does not fit scrolls:
+/// the wheel over the block, or its scrollbar (snippets_preview_scroll).
+/// A null `def` (no item highlighted) says how to get one.
+fn drawSnippetPreview(editor: *Editor, def: ?*const snippets_mod.Definition, m: SnippetsMetrics, rs: dvui.RectScale, font: dvui.Font) void {
+    const scale = m.scale;
+    const pv = m.preview;
+    const dim = toDvui(editor.theme.overlay_dim);
+    const text_color = toDvui(editor.theme.text);
+    const line_w = @max(1.0, 1 * scale);
+    const top_line: dvui.Rect.Physical = .{ .x = pv.x, .y = pv.y, .w = pv.w, .h = line_w };
+    top_line.fill(.{}, .{ .color = toDvui(editor.theme.panel_border), .fade = 1.0 });
+    const x = pv.x + 8 * scale;
+    // Text ends clear of the scrollbar band.
+    const max_w = m.sb_x - 4 * scale - x;
+    const content_top = pv.y + line_w;
+    const bottom = pv.y + pv.h;
+    const d = def orelse {
+        snippets_preview_overflow = 0;
+        _ = drawWrappedText(font, "Point at a snippet, or select one, to see the code it inserts", x, content_top + 5 * scale, max_w, bottom - 4 * scale, rs, dim);
+        return;
+    };
+
+    // Everything below scrolls together, clipped to the block.
+    const prev_clip = dvui.clip(.{ .x = pv.x, .y = content_top, .w = pv.w, .h = @max(0, bottom - content_top) });
+    defer dvui.clipSet(prev_clip);
+    var y = content_top + 5 * scale - snippets_preview_scroll;
+    const no_limit = std.math.inf(f32);
+
+    // --- Code block: every line, soft-wrapped to the block as the notes
+    //     are (a continued row sits two columns in), the blanks tinted ---
+    const mono = dvui.Font.theme(.mono);
+    const mono_lh = mono.lineHeight() * scale;
+    const text = d.template.text;
+    const has_blanks = for (d.template.stops) |stop| {
+        if (stop.number != 0) break true;
+    } else false;
+    const doc = &editor.documents.items[editor.windowDocIdx(0)];
+    const tab_w = editor.indentWidthFor(doc);
+    const code_x = pv.x + 4 * scale;
+    const code_w = @max(0, m.sb_x - 2 * scale - code_x);
+    const cont_indent = mono.textSize("  ").w * scale;
+    const wrap: PreviewWrap = .{
+        .font = mono,
+        .first_w = @max(0, code_w - 8 * scale) / scale,
+        .cont_w = @max(0, code_w - 8 * scale - cont_indent) / scale,
+    };
+    const code_rows = previewCodeRows(text, tab_w, wrap);
+    snippets_preview_code_rows = code_rows;
+    if (mono_lh > 0 and code_rows > 0) {
+        const code_rect: dvui.Rect.Physical = .{
+            .x = code_x,
+            .y = y,
+            .w = code_w,
+            .h = @as(f32, @floatFromInt(code_rows)) * mono_lh + 8 * scale,
+        };
+        const rad = 3 * scale;
+        code_rect.fill(.{ .x = rad, .y = rad, .w = rad, .h = rad }, .{ .color = toDvui(editor.theme.gutter_bg), .fade = 1.0 });
+        strokeRect(code_rect, line_w, toDvui(editor.theme.panel_border));
+        const code_clip = dvui.clip(code_rect);
+        defer dvui.clipSet(code_clip);
+        const blank_bg = toDvui(editor.theme.selection).opacity(0.6);
+        var ly = y + 4 * scale;
+        var start: usize = 0;
+        while (start <= text.len) {
+            const end = std.mem.indexOfScalarPos(u8, text, start, '\n') orelse text.len;
+            const line = std.mem.trimEnd(u8, text[start..end], "\r");
+            var buf: [512]u8 = undefined;
+            const shown = displayLine(line, tab_w, &buf);
+            var pos: usize = 0;
+            var first = true;
+            while (true) {
+                const row_end = wrap.rowEnd(shown, pos, first);
+                const rx = x + (if (first) @as(f32, 0) else cont_indent);
+                // The blanks on this row, tinted under the text; an empty
+                // one is a thin bar where the caret will stand.
+                for (d.template.stops) |stop| {
+                    if (stop.number == 0) continue;
+                    if (stop.start == stop.end) {
+                        // On the row holding its column — the row's end
+                        // only on the line's last row.
+                        if (stop.start < start or stop.start > start + line.len) continue;
+                        const col = displayCol(line, shown, stop.start - start, tab_w);
+                        if (col < pos or col > row_end or (col == row_end and row_end < shown.len)) continue;
+                        const cx = rx + mono.textSize(shown[pos..col]).w * scale;
+                        const bar: dvui.Rect.Physical = .{ .x = cx - 1 * scale, .y = ly, .w = 2 * scale, .h = mono_lh };
+                        bar.fill(.{ .x = 2 * scale, .y = 2 * scale, .w = 2 * scale, .h = 2 * scale }, .{ .color = blank_bg, .fade = 1.0 });
+                        continue;
+                    }
+                    const lo = @max(stop.start, start);
+                    const hi = @min(stop.end, start + line.len);
+                    if (lo >= hi) continue;
+                    const lo_col = @max(displayCol(line, shown, lo - start, tab_w), pos);
+                    const hi_col = @min(displayCol(line, shown, hi - start, tab_w), row_end);
+                    if (lo_col >= hi_col) continue;
+                    const lo_x = rx + mono.textSize(shown[pos..lo_col]).w * scale;
+                    const hi_x = rx + mono.textSize(shown[pos..hi_col]).w * scale;
+                    const tint: dvui.Rect.Physical = .{ .x = lo_x - 1 * scale, .y = ly, .w = @max(2 * scale, hi_x - lo_x + 2 * scale), .h = mono_lh };
+                    tint.fill(.{ .x = 2 * scale, .y = 2 * scale, .w = 2 * scale, .h = 2 * scale }, .{ .color = blank_bg, .fade = 1.0 });
+                }
+                renderOverlayText(mono, shown[pos..row_end], rx, ly, rs, text_color);
+                ly += mono_lh;
+                if (row_end >= shown.len) break;
+                pos = row_end;
+                first = false;
+            }
+            if (end >= text.len) break;
+            start = end + 1;
+        }
+        y = code_rect.y + code_rect.h + 6 * scale;
+    }
+
+    // --- How to fill it in, then the notes ---
+    if (has_blanks) y = drawWrappedText(font, "Tab jumps between the highlighted blanks", x, y, max_w, no_limit, rs, dim);
+    if (d.hasTrigger()) {
+        var trigger_buf: [256]u8 = undefined;
+        const trigger = std.fmt.bufPrint(&trigger_buf, "trigger: {s} + Tab", .{d.prefix}) catch "Type its trigger, then Tab";
+        y = drawWrappedText(font, trigger, x, y, max_w, no_limit, rs, dim);
+    }
+    if (d.notes.len > 0) y = drawWrappedText(font, d.notes, x, y + 4 * scale, max_w, no_limit, rs, text_color);
+
+    // --- What did not fit: the wheel scrolls that far. A block that grew
+    //     (fewer rows, a taller window) pulls the scroll back in ---
+    const content_h = y + 4 * scale + snippets_preview_scroll - content_top;
+    snippets_preview_overflow = @max(0, content_h - (bottom - content_top));
+    if (snippets_preview_scroll > snippets_preview_overflow) {
+        snippets_preview_scroll = snippets_preview_overflow;
+        dvui.refresh(null, @src(), null);
+    }
+    if (snippetsPreviewThumb(m)) |thumb| {
+        const active = snippets_pv_sb_drag or snippets_pv_sb_hover;
+        const sb_color = if (active) toDvui(editor.theme.overlay_fg).opacity(0.6) else dim.opacity(0.45);
+        const rad = thumb.w / 2;
+        thumb.fill(.{ .x = rad, .y = rad, .w = rad, .h = rad }, .{ .color = sb_color, .fade = 1.0 });
+    }
+}
+
+/// The preview's scrollbar thumb, or null when its content fits.
+fn snippetsPreviewThumb(m: SnippetsMetrics) ?dvui.Rect.Physical {
+    const pv = m.preview;
+    if (pv.h <= 0 or snippets_preview_overflow <= 0) return null;
+    const content_h = pv.h + snippets_preview_overflow;
+    const thumb_h = @min(pv.h, @max(20 * m.scale, pv.h * pv.h / content_h));
+    const frac = std.math.clamp(snippets_preview_scroll / snippets_preview_overflow, 0, 1);
+    return .{
+        .x = m.sb_x + 1 * m.scale,
+        .y = pv.y + (pv.h - thumb_h) * frac,
+        .w = m.sb_w - 2 * m.scale,
+        .h = thumb_h,
+    };
+}
+
+/// How the preview wraps its code to the block: the logical px a line's
+/// first row may take (`first_w`) and what the rows it continues on may
+/// (`cont_w`: two columns less, the continuation being indented).
+const PreviewWrap = struct {
+    font: dvui.Font,
+    first_w: f32,
+    cont_w: f32,
+
+    /// Where the row starting at `pos` of the drawn line `shown` ends.
+    fn rowEnd(w: PreviewWrap, shown: []const u8, pos: usize, first: bool) usize {
+        if (shown.len == 0) return 0;
+        return guiWrapAdvanceRow(shown, w.font, if (first) w.first_w else w.cont_w, pos);
+    }
+};
+
+/// The visual rows the preview's code block needs for `text`.
+fn previewCodeRows(text: []const u8, tab_w: usize, wrap: PreviewWrap) usize {
+    var rows: usize = 0;
+    var start: usize = 0;
+    while (start <= text.len) {
+        const end = std.mem.indexOfScalarPos(u8, text, start, '\n') orelse text.len;
+        const line = std.mem.trimEnd(u8, text[start..end], "\r");
+        var buf: [512]u8 = undefined;
+        const shown = displayLine(line, tab_w, &buf);
+        var pos: usize = 0;
+        var first = true;
+        while (true) {
+            rows += 1;
+            const row_end = wrap.rowEnd(shown, pos, first);
+            if (row_end >= shown.len) break;
+            pos = row_end;
+            first = false;
+        }
+        if (end >= text.len) break;
+        start = end + 1;
+    }
+    return rows;
+}
+
+/// Outline `r` with a `w`-thick line of `color` just inside its edges.
+fn strokeRect(r: dvui.Rect.Physical, w: f32, color: dvui.Color) void {
+    const edges = [_]dvui.Rect.Physical{
+        .{ .x = r.x, .y = r.y, .w = r.w, .h = w },
+        .{ .x = r.x, .y = r.y + r.h - w, .w = r.w, .h = w },
+        .{ .x = r.x, .y = r.y, .w = w, .h = r.h },
+        .{ .x = r.x + r.w - w, .y = r.y, .w = w, .h = r.h },
+    };
+    for (edges) |edge| edge.fill(.{}, .{ .color = color, .fade = 1.0 });
+}
+
+/// Draw `text` word-wrapped to `max_w` physical px from (x, top), breaking
+/// at its newlines too, while rows fit above `bottom`; text that does not
+/// fit ends in an ellipsis on the last row. Returns the y below the last
+/// row drawn.
+fn drawWrappedText(font: dvui.Font, text: []const u8, x: f32, top: f32, max_w: f32, bottom: f32, rs: dvui.RectScale, color: dvui.Color) f32 {
+    const scale = rs.s;
+    const lh = font.lineHeight() * scale;
+    if (lh <= 0 or max_w <= 0 or scale <= 0) return top;
+    var y = top;
+    var paragraphs = std.mem.splitScalar(u8, text, '\n');
+    while (paragraphs.next()) |par| {
+        var pos: usize = 0;
+        while (true) {
+            if (y + lh > bottom + 0.5) return y;
+            const end = if (par.len == 0) 0 else guiWrapAdvanceRow(par, font, max_w / scale, pos);
+            const row = std.mem.trimEnd(u8, par[pos..end], " ");
+            const more = end < par.len or paragraphs.peek() != null;
+            if (more and y + 2 * lh > bottom + 0.5) {
+                // The last row that fits: cut it to make room for the ellipsis.
+                const ellipsis = "\u{2026}";
+                const cut = fitOverlayText(font, row, max_w - font.textSize(ellipsis).w * scale, scale);
+                renderOverlayText(font, cut, x, y, rs, color);
+                renderOverlayText(font, ellipsis, x + font.textSize(cut).w * scale, y, rs, color);
+                return y + lh;
+            }
+            renderOverlayText(font, row, x, y, rs, color);
+            y += lh;
+            if (end >= par.len) break;
+            pos = end;
+        }
+    }
+    return y;
+}
+
+/// Clicks, the wheel and hover over the Snippets panel. Position and
+/// motion events are never marked handled: the file tree tracks its drags
+/// and hover outside its own rect, and a band drawn before it must not
+/// swallow them. Right presses stay unhandled for the context menu.
+fn handleSnippetsMouse(editor: *Editor, wd: *dvui.WidgetData, m: SnippetsMetrics) void {
+    const panel = &editor.snippet_panel;
+    for (dvui.events()) |*e| {
+        if (e.handled) continue;
+        if (e.evt != .mouse) continue;
+        const me = e.evt.mouse;
+        // Events over an open floating window (context menu, dialogs)
+        // belong to it (see handleFiletreeMouse).
+        if (me.floating_win != dvui.subwindowCurrentId()) continue;
+
+        // In-flight scrollbar-thumb drag: follows the pointer outside the
+        // panel too.
+        if (snippets_sb_drag) {
+            if (me.action == .motion) {
+                if (snippetsSbThumb(panel, m)) |thumb| {
+                    const usable = m.rows_h - thumb.h;
+                    if (usable > 0) {
+                        const frac = std.math.clamp((me.p.y - m.rows_y - snippets_sb_grab_dy) / usable, 0, 1);
+                        const denom: f32 = @floatFromInt(panel.rows.items.len - m.visible_rows);
+                        panel.scroll = @intFromFloat(@round(frac * denom));
+                    }
+                }
+                continue;
+            }
+            if (me.action == .release) {
+                snippets_sb_drag = false;
+                continue;
+            }
+        }
+        if (snippets_pv_sb_drag) {
+            if (me.action == .motion) {
+                if (snippetsPreviewThumb(m)) |thumb| {
+                    const usable = m.preview.h - thumb.h;
+                    if (usable > 0) {
+                        const frac = std.math.clamp((me.p.y - m.preview.y - snippets_pv_sb_grab_dy) / usable, 0, 1);
+                        snippets_preview_scroll = frac * snippets_preview_overflow;
+                    }
+                }
+                continue;
+            }
+            if (me.action == .release) {
+                snippets_pv_sb_drag = false;
+                continue;
+            }
+        }
+
+        const inside = m.area.contains(me.p);
+        const in_sb_band = me.p.x >= m.sb_x and me.p.y >= m.rows_y and me.p.y < m.rows_y + m.rows_h;
+        const in_preview = m.preview.h > 0 and m.preview.contains(me.p);
+        const in_pv_sb_band = in_preview and me.p.x >= m.sb_x;
+        switch (me.action) {
+            .position => {
+                if (!inside) {
+                    snippets_hover_row = null;
+                    snippets_hover_pt = null;
+                    snippets_sb_hover = false;
+                    snippets_pv_sb_hover = false;
+                    continue;
+                }
+                dvui.cursorSet(.arrow);
+                snippets_sb_hover = in_sb_band;
+                snippets_pv_sb_hover = in_pv_sb_band and snippetsPreviewThumb(m) != null;
+                // Only a pointer that moved sets the hover: a keyboard
+                // move cleared it, and the frame's closing position event
+                // at the same spot must not bring it back.
+                if (snippets_hover_pt) |pt| {
+                    if (pt.x == me.p.x and pt.y == me.p.y) continue;
+                }
+                snippets_hover_pt = me.p;
+                snippets_hover_row = if (in_sb_band) null else snippetsRowAt(panel, m, me.p.y);
+            },
+            // A left press's focus event, handled so dvui keeps its widget
+            // focus: unhandled, it clears it at the end of the frame, and
+            // the editor pane that just took it back for an insert would
+            // stay deaf (it only re-takes focus when the owner changes).
+            .focus => if (inside) e.handle(@src(), wd),
+            .press => {
+                if (!inside or me.button != .left) continue;
+                e.handle(@src(), wd);
+                // The rows can change under the pointer: hover anew.
+                snippets_hover_pt = null;
+                // Scrollbar band, when the rows overflow: drag the thumb,
+                // or page toward the click.
+                if (in_sb_band) {
+                    if (snippetsSbThumb(panel, m)) |thumb| {
+                        if (me.p.y >= thumb.y and me.p.y < thumb.y + thumb.h) {
+                            snippets_sb_drag = true;
+                            snippets_sb_grab_dy = me.p.y - thumb.y;
+                        } else if (me.p.y < thumb.y) {
+                            panel.scroll -|= m.visible_rows;
+                        } else {
+                            panel.scroll = @min(panel.scroll + m.visible_rows, panel.rows.items.len -| m.visible_rows);
+                        }
+                        continue;
+                    }
+                }
+                if (in_pv_sb_band) {
+                    if (snippetsPreviewThumb(m)) |thumb| {
+                        if (me.p.y >= thumb.y and me.p.y < thumb.y + thumb.h) {
+                            snippets_pv_sb_drag = true;
+                            snippets_pv_sb_grab_dy = me.p.y - thumb.y;
+                        } else {
+                            const page: f32 = if (me.p.y < thumb.y) -m.preview.h else m.preview.h;
+                            snippets_preview_scroll = std.math.clamp(snippets_preview_scroll + page, 0, snippets_preview_overflow);
+                        }
+                        continue;
+                    }
+                }
+                const row_idx = snippetsRowAt(panel, m, me.p.y);
+                const now_ns = dvui.frameTimeNS();
+                const repeat = row_idx != null and row_idx.? == snippets_last_click_row and
+                    now_ns - snippets_last_click_ns < filetree_double_click_ms * std.time.ns_per_ms;
+                snippets_last_click_row = row_idx orelse std.math.maxInt(usize);
+                snippets_last_click_ns = now_ns;
+                if (!repeat) snippets_last_click_inserted = false;
+                // A refused insert explains itself in the status bar: the
+                // second press must not wipe that.
+                if (!repeat) editor.status_message = "";
+                const is_item = if (row_idx) |r| (if (panel.rowAt(r)) |row| row.kind == .item else false) else false;
+                if (is_item and guiMode(editor) == .normal) {
+                    panel.selected = row_idx.?;
+                    if (editor.snippets_double_click) {
+                        // A click selects the item — its preview stays put
+                        // — and gives the panel the keyboard; the second
+                        // press of a double-click inserts it, once (a third
+                        // press right after inserts nothing more).
+                        if (!repeat) {
+                            _ = editor.takeKeyboardFocus(.snippets);
+                            dvui.focusWidget(wd.id, null, e.num);
+                        } else if (!snippets_last_click_inserted) {
+                            snippets_last_click_inserted = true;
+                            snippetsInsert(editor, row_idx.?);
+                        }
+                    } else if (!repeat) {
+                        // A click inserts; the second press of a
+                        // double-click must not insert it again.
+                        snippetsInsert(editor, row_idx.?);
+                    }
+                    continue;
+                }
+                // The header, a group, the preview or the empty space: the
+                // panel takes the keyboard, and a group opens or closes.
+                _ = editor.takeKeyboardFocus(.snippets);
+                dvui.focusWidget(wd.id, null, e.num);
+                if (guiMode(editor) != .normal or repeat) continue;
+                if (row_idx) |r| editor.activateSnippetRow(r);
+            },
+            .wheel_y => |delta| {
+                if (!inside) continue;
+                e.handle(@src(), wd);
+                const notches = -delta / dvui.scroll_speed;
+                if (in_preview) {
+                    // Over the preview: its notes scroll, three lines a notch.
+                    snippets_preview_scroll = std.math.clamp(snippets_preview_scroll + notches * 3 * m.line_height, 0, snippets_preview_overflow);
+                    continue;
+                }
+                const rows_per_notch: f32 = 3;
+                const scroll_rows: i64 = @intFromFloat(@round(notches * rows_per_notch));
+                const max_top: i64 = @intCast(panel.rows.items.len -| m.visible_rows);
+                panel.scroll = @intCast(std.math.clamp(@as(i64, @intCast(panel.scroll)) + scroll_rows, 0, max_top));
+                // Rows moved under the pointer — recompute the hover row.
+                snippets_hover_pt = me.p;
+                snippets_hover_row = if (in_sb_band) null else snippetsRowAt(panel, m, me.p.y);
+            },
+            else => {},
+        }
+    }
+}
+
+/// Insert the item on row `index` (a click or Enter). When that gave the
+/// editor the keyboard — a refusal (a terminal pane, a read-only file,
+/// several cursors) leaves it where it was — its pane takes dvui focus
+/// back and follows the caret, so Tab walks the blanks right away.
+fn snippetsInsert(editor: *Editor, index: usize) void {
+    editor.activateSnippetRow(index);
+    if (editor.keyboardOwner() == .editor) {
+        filetree_release_focus = true;
+        win_ui.scroll_pinned = false;
+    }
+    dvui.refresh(null, @src(), null);
+}
+
+/// Keys while the Snippets panel owns the keyboard (snippetsTakesKeys).
+/// Ctrl/Alt/Cmd chords are left for the global keybind map. The panel
+/// types nothing: Space does nothing (were it to insert, its text event
+/// would land in the first blank), and Tab is swallowed so dvui does not
+/// walk its widget focus to the menu bar.
+fn handleSnippetsKeys(editor: *Editor, wd: *dvui.WidgetData, visible_rows: usize) void {
+    const panel = &editor.snippet_panel;
+    const page: isize = @intCast(@max(1, visible_rows));
+    for (dvui.events()) |*e| {
+        if (e.handled) continue;
+        // Enter on an item and Escape hand the keyboard back: the rest of
+        // the input is the editor pane's.
+        if (!snippetsTakesKeys(editor)) break;
+        if (e.evt != .key) continue;
+        const key = e.evt.key;
+        if (key.action != .down and key.action != .repeat) continue;
+        if (hasCommandMod(key.mod)) continue;
+        switch (key.code) {
+            .up => panel.move(-1),
+            .down => panel.move(1),
+            .page_up => panel.move(-page),
+            .page_down => panel.move(page),
+            .home => panel.home(),
+            .end => panel.end(),
+            // Left and Right can close or open a group: the next key
+            // moves over the rebuilt rows.
+            .left => {
+                panel.left(editor.allocator);
+                _ = editor.syncSnippetPanel();
+            },
+            .right => {
+                panel.right(editor.allocator);
+                _ = editor.syncSnippetPanel();
+            },
+            .enter => {
+                // Handled before the insert: the pane that gets the
+                // keyboard must not see it too.
+                e.handle(@src(), wd);
+                snippets_hover_row = null;
+                const row = panel.rowAt(panel.selected) orelse continue;
+                if (row.kind == .item) {
+                    snippetsInsert(editor, panel.selected);
+                } else {
+                    editor.activateSnippetRow(panel.selected);
+                }
+                continue;
+            },
+            .escape => {
+                e.handle(@src(), wd);
+                _ = editor.takeKeyboardFocus(.pane);
+                filetree_release_focus = true;
+                // A pane drawn before the panel takes it on the next frame.
+                dvui.refresh(null, @src(), null);
+                continue;
+            },
+            .tab => {},
+            else => continue,
+        }
+        e.handle(@src(), wd);
+        // The selection drives the preview again.
+        snippets_hover_row = null;
+    }
+}
+
+/// Right-click context menu for the Snippets panel: dock it on the other
+/// side (persisted, like the tree's side).
+fn snippetsContextMenu(editor: *Editor, area: dvui.Rect.Physical) void {
+    const ctext = dvui.context(@src(), .{ .rect = area }, .{});
+    defer ctext.deinit();
+
+    if (ctext.activePoint()) |cp| {
+        var fw = dvui.floatingMenu(@src(), .{ .from = dvui.Rect.Natural.fromPoint(cp) }, .{});
+        defer fw.deinit();
+
+        const other: Editor.FiletreeSide = if (editor.snippetsSide() == .left) .right else .left;
+        const side_label: []const u8 = if (other == .left) "Move Snippets to Left" else "Move Snippets to Right";
+        if (dvui.menuItemLabel(@src(), side_label, .{}, .{ .expand = .horizontal }) != null) {
+            editor.snippets_side = other;
+            lua_settings.writeStringSettingToFile("snippets_side", @tagName(other)) catch {};
             fw.close();
         }
     }
@@ -5620,8 +6565,8 @@ fn completionKeepsOnKey(editor: *Editor, key: dvui.Event.Key) bool {
 fn execGuiAction(editor: *Editor, action: []const u8) void {
     // New action — drop the previous transient status message
     editor.status_message = "";
-    // The file tree and search panel live in the primary window: bring it
-    // forward when their actions run from a secondary window.
+    // The file tree, Snippets and search panels live in the primary
+    // window: bring it forward when their actions run from a secondary one.
     if (editor.active_window != 0 and isPrimaryPanelAction(action)) {
         editor.focusWindow(0);
         raisePrimaryWindow();
@@ -6637,6 +7582,11 @@ const settings_defs = [_]SettingDef{
     .{ .key = "tui_filetree_icons", .label = "File Tree Icons (TUI)", .kind = .boolean, .desc = "Nerdfont file icons in the TUI tree (terminal font must be a Nerd Font)" },
     .{ .key = "filetree_font_size", .label = "File Tree Font Size (GUI)", .kind = .number, .desc = "Row text size in points — rows and icons scale together; 0 = theme default (0-32)", .min = 0, .max = 32 },
     .{ .key = "filetree_icon_scale", .label = "File Tree Icon Scale (GUI)", .kind = .number, .desc = "Icon size as a percentage of the row font (50-200)", .min = 50, .max = 200 },
+    .{ .key = "snippets_visible", .label = "Snippets Panel Visible", .kind = .boolean, .desc = "Show the Snippets side panel (Ctrl+Alt+B)" },
+    .{ .key = "snippets_side", .label = "Snippets Panel Side", .kind = .enum_choice, .desc = "Dock the Snippets panel left or right; auto = opposite the file tree", .choices = &.{ "auto", "left", "right" } },
+    .{ .key = "snippets_width", .label = "Snippets Panel Width (GUI)", .kind = .number, .desc = "Panel width in pixels (120-600)", .min = 120, .max = 600 },
+    .{ .key = "tui_snippets_width", .label = "Snippets Panel Width (TUI)", .kind = .number, .desc = "Panel width in columns (16-80)", .min = 16, .max = 80 },
+    .{ .key = "snippets_double_click", .label = "Snippets Insert on Double-Click", .kind = .boolean, .desc = "A click only selects a snippet and keeps its preview; a double-click (or Enter) inserts it" },
     .{ .key = "filetree_root", .label = "File Tree Root", .kind = .text, .desc = "Starting directory — empty = current dir (Enter applies)" },
 };
 
@@ -6794,6 +7744,10 @@ fn settingsDialog(editor: *Editor) void {
                     } else if (std.mem.eql(u8, def.key, "filetree_side")) {
                         editor.filetree_side = if (std.mem.eql(u8, def.choices[choice], "right")) .right else .left;
                         lua_settings.writeStringSettingToFile(def.key, def.choices[choice]) catch {};
+                    } else if (std.mem.eql(u8, def.key, "snippets_side")) {
+                        const pick = def.choices[choice];
+                        editor.snippets_side = if (std.mem.eql(u8, pick, "auto")) null else if (std.mem.eql(u8, pick, "right")) Editor.FiletreeSide.right else Editor.FiletreeSide.left;
+                        lua_settings.writeStringSettingToFile(def.key, pick) catch {};
                     }
                 }
             },
@@ -6860,6 +7814,8 @@ fn getSettingBool(editor: *const Editor, key: []const u8) bool {
     if (std.mem.eql(u8, key, "filetree_auto_reveal")) return editor.filetree_auto_reveal;
     if (std.mem.eql(u8, key, "filetree_visible")) return editor.filetree_visible;
     if (std.mem.eql(u8, key, "tui_filetree_icons")) return editor.tui_filetree_icons;
+    if (std.mem.eql(u8, key, "snippets_visible")) return editor.snippets_visible;
+    if (std.mem.eql(u8, key, "snippets_double_click")) return editor.snippets_double_click;
     return false;
 }
 
@@ -6892,6 +7848,11 @@ fn applySettingBool(editor: *Editor, key: []const u8, val: bool) void {
         editor.filetree_visible = val;
         if (!val) editor.filetree_focused = false;
     }
+    if (std.mem.eql(u8, key, "snippets_visible")) {
+        editor.snippets_visible = val;
+        if (!val) editor.snippets_focused = false;
+    }
+    if (std.mem.eql(u8, key, "snippets_double_click")) editor.snippets_double_click = val;
 }
 
 fn getSettingNumber(editor: *const Editor, key: []const u8) i64 {
@@ -6905,6 +7866,8 @@ fn getSettingNumber(editor: *const Editor, key: []const u8) i64 {
     if (std.mem.eql(u8, key, "tui_filetree_width")) return @intCast(editor.tui_filetree_width);
     if (std.mem.eql(u8, key, "filetree_font_size")) return @intFromFloat(editor.filetree_font_size);
     if (std.mem.eql(u8, key, "filetree_icon_scale")) return @intCast(editor.filetree_icon_scale);
+    if (std.mem.eql(u8, key, "snippets_width")) return @intFromFloat(editor.snippets_width);
+    if (std.mem.eql(u8, key, "tui_snippets_width")) return @intCast(editor.tui_snippets_width);
     return 0;
 }
 
@@ -6944,11 +7907,18 @@ fn applySettingNumber(editor: *Editor, key: []const u8, val: i64) void {
     if (std.mem.eql(u8, key, "tui_filetree_width")) {
         if (val >= 16 and val <= 80) editor.tui_filetree_width = @intCast(val);
     }
+    if (std.mem.eql(u8, key, "snippets_width")) {
+        if (val >= 120 and val <= 600) editor.snippets_width = @floatFromInt(val);
+    }
+    if (std.mem.eql(u8, key, "tui_snippets_width")) {
+        if (val >= 16 and val <= 80) editor.tui_snippets_width = @intCast(val);
+    }
 }
 
 fn getSettingEnum(editor: *const Editor, key: []const u8) []const u8 {
     if (std.mem.eql(u8, key, "theme")) return editor.theme_name;
     if (std.mem.eql(u8, key, "filetree_side")) return @tagName(editor.filetree_side);
+    if (std.mem.eql(u8, key, "snippets_side")) return if (editor.snippets_side) |side| @tagName(side) else "auto";
     return "";
 }
 
@@ -8056,7 +9026,7 @@ test "GUI snippets: hidden window dispatches Tab text Shift-Tab and Escape in or
     var box = dvui.box(@src(), .{ .dir = .vertical }, .{ .expand = .both });
     defer box.deinit();
     dvui.focusWidget(box.data().id, null, null);
-    _ = try editor.registerSnippet("*", "demo", "Demo", "${1:first} ${2:tail}$0");
+    _ = try editor.registerSnippet(.{ .language = "*", .prefix = "demo", .description = "Demo", .body = "${1:first} ${2:tail}$0" });
     const doc = editor.activeDoc();
     try doc.loadText("demo");
     doc.cursors.primary().moveToEnd(&doc.buffer);
@@ -8243,6 +9213,534 @@ var capture_editor: *Editor = undefined;
 fn captureDialogFrame() anyerror!dvui.App.Result {
     toolDialog(capture_editor);
     return .ok;
+}
+
+/// The GUI state `captureWindowFrame` renders `capture_editor` with (tests only).
+var capture_gui: *GuiState = undefined;
+fn captureWindowFrame() anyerror!dvui.App.Result {
+    _ = frame(capture_editor, capture_gui);
+    return .ok;
+}
+
+/// Tests only: three Zig snippets in two groups — rows Start here, Print,
+/// Constant, Functions (closed) — the untitled document in Zig, LSP and
+/// the file tree off, and the per-process GUI state a test before left.
+fn snippetsTestSetup(editor: *Editor) !void {
+    editor.lsp_enabled = false;
+    editor.filetree_visible = false;
+    _ = try editor.registerSnippet(.{ .language = "zig", .description = "Print", .group = "Start here", .notes = "Writes text to the terminal. Each {} in the text is filled by one value from the .{} list, in order.", .body = "std.debug.print(\"${1:text}\n\", .{${2:values}});" });
+    _ = try editor.registerSnippet(.{ .language = "zig", .description = "Constant", .group = "Start here", .notes = "A value that never changes after it is set.\nThe type can be left out when Zig can tell it from the value.", .body = "const ${1:name}: ${2:i32} = ${3:0};" });
+    _ = try editor.registerSnippet(.{ .language = "zig", .prefix = "fn", .description = "Function", .group = "Functions", .notes = "A named block of code you call with name(). Parameters go in the parentheses as name: type; void means it gives nothing back.", .body = "fn ${1:name}($2) ${3:void} {\n\t$0\n}" });
+    editor.activeDoc().language = editor.findLanguage("zig");
+    owner_seen = null;
+    filetree_release_focus = false;
+    filetree_band = .{};
+    snippets_band = .{};
+    snippets_hover_row = null;
+    snippets_hover_pt = null;
+    snippets_sb_drag = false;
+    snippets_last_click_row = std.math.maxInt(usize);
+    snippets_last_click_inserted = false;
+    snippets_preview_def = null;
+    snippets_preview_scroll = 0;
+    snippets_preview_overflow = 0;
+    snippets_pv_sb_drag = false;
+}
+
+/// Tests only: draw one GUI frame, then begin the next (`ms` is the
+/// test clock, 100 ms a frame).
+fn snippetsTestFrame(window: *dvui.Window, editor: *Editor, g: *GuiState, ms: *u64) !void {
+    _ = frame(editor, g);
+    _ = try window.end(.{});
+    ms.* += 100;
+    try window.begin(@intCast(ms.* * std.time.ns_per_ms));
+}
+
+/// Tests only: the Snippets panel's geometry as last drawn.
+fn snippetsTestMetrics(editor: *const Editor) !SnippetsMetrics {
+    const area = snippets_band.rect orelse return error.TestUnexpectedResult;
+    const scale = snippets_band.scale;
+    return snippetsMetrics(area, scale, dvui.Font.theme(.body).lineHeight() * scale, editor.snippet_panel.rows.items.len);
+}
+
+/// Tests only: the middle of drawn row `row`, left of the scrollbar.
+fn snippetsTestRowPoint(m: SnippetsMetrics, row: usize) dvui.Point.Physical {
+    return .{ .x = m.area.x + m.area.w * 0.4, .y = m.rows_y + (@as(f32, @floatFromInt(row)) + 0.5) * m.line_height };
+}
+
+/// Tests only: a left click on drawn row `row`.
+fn snippetsTestClick(window: *dvui.Window, m: SnippetsMetrics, row: usize) !void {
+    _ = try window.addEventMouseMotion(.{ .pt = snippetsTestRowPoint(m, row) });
+    _ = try window.addEventMouseButton(.left, .press);
+    _ = try window.addEventMouseButton(.left, .release);
+}
+
+/// Tests only: the registry index of the snippet named `description`.
+fn snippetsTestDef(editor: *const Editor, description: []const u8) !u32 {
+    for (editor.snippets.items.items, 0..) |def, i| {
+        if (std.mem.eql(u8, def.description, description)) return @intCast(i);
+    }
+    return error.TestUnexpectedResult;
+}
+
+test "GUI snippets panel: a click on a group opens it and the keys drive the list" {
+    if (!build_options.has_gui) return error.SkipZigTest;
+    const t = std.testing;
+    var ui = try dvui.testing.init(.{ .window_size = .{ .w = 900, .h = 600 } });
+    defer ui.deinit();
+    var editor = try Editor.init(t.allocator, t.io);
+    defer editor.deinit();
+    var g = try GuiState.init(t.allocator);
+    defer g.deinit();
+    defer win_ui = undefined;
+    applyWindowFonts(ui.window, &g, &editor);
+    try snippetsTestSetup(&editor);
+    editor.snippets_visible = true;
+    var ms: u64 = 0;
+    for (0..3) |_| try snippetsTestFrame(ui.window, &editor, &g, &ms);
+    const panel = &editor.snippet_panel;
+    const doc = editor.activeDoc();
+    try t.expectEqual(@as(usize, 4), panel.rows.items.len);
+    try t.expectEqual(Editor.KeyboardOwner.editor, editor.keyboardOwner());
+    // A click on the closed group opens and selects it, and the panel
+    // takes the keyboard.
+    try snippetsTestClick(ui.window, try snippetsTestMetrics(&editor), 3);
+    try snippetsTestFrame(ui.window, &editor, &g, &ms);
+    try t.expectEqual(@as(usize, 5), panel.rows.items.len);
+    try t.expectEqual(@as(usize, 3), panel.selected);
+    try t.expectEqual(Editor.KeyboardOwner.snippets, editor.keyboardOwner());
+    // The second press of a double-click leaves it open.
+    try snippetsTestClick(ui.window, try snippetsTestMetrics(&editor), 3);
+    try snippetsTestFrame(ui.window, &editor, &g, &ms);
+    try t.expectEqual(@as(usize, 5), panel.rows.items.len);
+    // Down onto its item; Left back to the group, Left again closes it.
+    try dvui.testing.pressKey(.down, .none);
+    try snippetsTestFrame(ui.window, &editor, &g, &ms);
+    try t.expectEqual(@as(usize, 4), panel.selected);
+    try dvui.testing.pressKey(.left, .none);
+    try dvui.testing.pressKey(.left, .none);
+    try snippetsTestFrame(ui.window, &editor, &g, &ms);
+    try t.expectEqual(@as(usize, 4), panel.rows.items.len);
+    try t.expectEqual(@as(usize, 3), panel.selected);
+    // Space, text and Tab change nothing: the panel types nothing.
+    try dvui.testing.pressKey(.space, .none);
+    try dvui.testing.writeText(" ");
+    try dvui.testing.pressKey(.tab, .none);
+    try snippetsTestFrame(ui.window, &editor, &g, &ms);
+    try t.expectEqual(@as(usize, 0), doc.buffer.byteLen());
+    try t.expectEqual(Editor.KeyboardOwner.snippets, editor.keyboardOwner());
+    // Up, Up, Enter: Print goes in at the caret, its first blank selected,
+    // and the editor has the keyboard.
+    try dvui.testing.pressKey(.up, .none);
+    try dvui.testing.pressKey(.up, .none);
+    try dvui.testing.pressKey(.enter, .none);
+    try snippetsTestFrame(ui.window, &editor, &g, &ms);
+    try t.expectEqualStrings("std.debug.print(\"text\n\", .{values});", doc.buffer.slice(0, doc.buffer.byteLen()));
+    try t.expectEqualStrings("text", doc.selectedText().?);
+    try t.expectEqual(Editor.KeyboardOwner.editor, editor.keyboardOwner());
+    // Ctrl+Alt+B focuses the shown panel, Escape hands the keyboard back,
+    // and twice more hides it.
+    const ctrl_alt: dvui.enums.Mod = @enumFromInt(@intFromEnum(dvui.enums.Mod.lcontrol) | @intFromEnum(dvui.enums.Mod.lalt));
+    try dvui.testing.pressKey(.b, ctrl_alt);
+    try snippetsTestFrame(ui.window, &editor, &g, &ms);
+    try t.expectEqual(Editor.KeyboardOwner.snippets, editor.keyboardOwner());
+    try dvui.testing.pressKey(.escape, .none);
+    try snippetsTestFrame(ui.window, &editor, &g, &ms);
+    try t.expectEqual(Editor.KeyboardOwner.editor, editor.keyboardOwner());
+    try t.expect(editor.snippets_visible);
+    try dvui.testing.pressKey(.b, ctrl_alt);
+    try dvui.testing.pressKey(.b, ctrl_alt);
+    try snippetsTestFrame(ui.window, &editor, &g, &ms);
+    try t.expect(!editor.snippets_visible);
+    try t.expectEqual(Editor.KeyboardOwner.editor, editor.keyboardOwner());
+    try t.expect(snippets_band.rect == null);
+}
+
+test "GUI snippets panel: a click on an item inserts it and Tab walks its blanks" {
+    if (!build_options.has_gui) return error.SkipZigTest;
+    const t = std.testing;
+    var ui = try dvui.testing.init(.{ .window_size = .{ .w = 900, .h = 600 } });
+    defer ui.deinit();
+    var editor = try Editor.init(t.allocator, t.io);
+    defer editor.deinit();
+    var g = try GuiState.init(t.allocator);
+    defer g.deinit();
+    defer win_ui = undefined;
+    applyWindowFonts(ui.window, &g, &editor);
+    try snippetsTestSetup(&editor);
+    editor.snippets_visible = true;
+    var ms: u64 = 0;
+    for (0..3) |_| try snippetsTestFrame(ui.window, &editor, &g, &ms);
+    const doc = editor.activeDoc();
+    // Right of the panes (opposite the tree): the pane takes dvui focus
+    // back on the next frame.
+    try t.expectEqual(Editor.FiletreeSide.right, editor.snippetsSide());
+    try snippetsTestClick(ui.window, try snippetsTestMetrics(&editor), 1);
+    try snippetsTestFrame(ui.window, &editor, &g, &ms);
+    try t.expectEqualStrings("std.debug.print(\"text\n\", .{values});", doc.buffer.slice(0, doc.buffer.byteLen()));
+    try t.expectEqualStrings("text", doc.selectedText().?);
+    try t.expectEqual(Editor.KeyboardOwner.editor, editor.keyboardOwner());
+    try t.expect(filetree_release_focus);
+    try t.expectEqual(@as(usize, 1), editor.snippet_panel.selected);
+    // The second press of a double-click (a frame later) inserts nothing
+    // more, and the pane takes dvui focus back: Tab moves to the next blank.
+    const before = doc.buffer.byteLen();
+    try snippetsTestClick(ui.window, try snippetsTestMetrics(&editor), 1);
+    try snippetsTestFrame(ui.window, &editor, &g, &ms);
+    try t.expectEqual(before, doc.buffer.byteLen());
+    try t.expect(!filetree_release_focus);
+    try dvui.testing.pressKey(.tab, .none);
+    try snippetsTestFrame(ui.window, &editor, &g, &ms);
+    try t.expectEqualStrings("values", doc.selectedText().?);
+    // Left of the panes the pane takes focus back in the click's own
+    // frame, and must keep it past the end of that frame.
+    try dvui.testing.pressKey(.escape, .none);
+    editor.snippets_side = .left;
+    for (0..2) |_| try snippetsTestFrame(ui.window, &editor, &g, &ms);
+    try t.expect(doc.snippet_session == null);
+    try snippetsTestClick(ui.window, try snippetsTestMetrics(&editor), 2);
+    try snippetsTestFrame(ui.window, &editor, &g, &ms);
+    try t.expect(!filetree_release_focus);
+    try t.expectEqualStrings("name", doc.selectedText().?);
+    try dvui.testing.pressKey(.tab, .none);
+    try snippetsTestFrame(ui.window, &editor, &g, &ms);
+    try t.expectEqualStrings("i32", doc.selectedText().?);
+}
+
+test "GUI snippets panel: the preview follows the hovered item, then the keyboard" {
+    if (!build_options.has_gui) return error.SkipZigTest;
+    const t = std.testing;
+    var ui = try dvui.testing.init(.{ .window_size = .{ .w = 900, .h = 600 } });
+    defer ui.deinit();
+    var editor = try Editor.init(t.allocator, t.io);
+    defer editor.deinit();
+    var g = try GuiState.init(t.allocator);
+    defer g.deinit();
+    defer win_ui = undefined;
+    applyWindowFonts(ui.window, &g, &editor);
+    try snippetsTestSetup(&editor);
+    editor.snippets_visible = true;
+    var ms: u64 = 0;
+    for (0..3) |_| try snippetsTestFrame(ui.window, &editor, &g, &ms);
+    const print = try snippetsTestDef(&editor, "Print");
+    const constant = try snippetsTestDef(&editor, "Constant");
+    const m = try snippetsTestMetrics(&editor);
+    try t.expect(m.preview.h > 0);
+    // The selection is on a group and nothing is hovered: no preview.
+    try t.expectEqual(@as(?u32, null), snippets_preview_def);
+    _ = try ui.window.addEventMouseMotion(.{ .pt = snippetsTestRowPoint(m, 2) });
+    try snippetsTestFrame(ui.window, &editor, &g, &ms);
+    try t.expectEqual(@as(?usize, 2), snippets_hover_row);
+    try t.expectEqual(@as(?u32, constant), snippets_preview_def);
+    _ = try ui.window.addEventMouseMotion(.{ .pt = snippetsTestRowPoint(m, 1) });
+    try snippetsTestFrame(ui.window, &editor, &g, &ms);
+    try t.expectEqual(@as(?u32, print), snippets_preview_def);
+    // Keyboard navigation clears the hover: the pointer stays over Print,
+    // yet the selection (Constant) drives the preview.
+    _ = editor.takeKeyboardFocus(.snippets);
+    try dvui.testing.pressKey(.down, .none);
+    try dvui.testing.pressKey(.down, .none);
+    try snippetsTestFrame(ui.window, &editor, &g, &ms);
+    try snippetsTestFrame(ui.window, &editor, &g, &ms);
+    try t.expectEqual(@as(?usize, null), snippets_hover_row);
+    try t.expectEqual(@as(?u32, constant), snippets_preview_def);
+    // A pointer that moves hovers again; one that leaves the panel does not.
+    var p = snippetsTestRowPoint(m, 1);
+    p.y += 1;
+    _ = try ui.window.addEventMouseMotion(.{ .pt = p });
+    try snippetsTestFrame(ui.window, &editor, &g, &ms);
+    try t.expectEqual(@as(?u32, print), snippets_preview_def);
+    _ = try ui.window.addEventMouseMotion(.{ .pt = .{ .x = m.area.x - 50, .y = p.y } });
+    try snippetsTestFrame(ui.window, &editor, &g, &ms);
+    try t.expectEqual(@as(?usize, null), snippets_hover_row);
+    try t.expectEqual(@as(?u32, constant), snippets_preview_def);
+
+    // ZIDE_CAPTURE_DIR=<dir>: also save a picture of the window there
+    // (snippets_panel.png): the Functions group open, the pointer on its
+    // item, so the preview shows a multi-line skeleton and a trigger.
+    const Backend = @import("sdl-backend");
+    const capture_dir = Backend.c.SDL_getenv("ZIDE_CAPTURE_DIR");
+    if (capture_dir != null) {
+        try snippetsTestClick(ui.window, m, 3);
+        try snippetsTestFrame(ui.window, &editor, &g, &ms);
+        _ = try ui.window.addEventMouseMotion(.{ .pt = snippetsTestRowPoint(m, 4) });
+        try snippetsTestFrame(ui.window, &editor, &g, &ms);
+        try t.expectEqual(@as(?u32, try snippetsTestDef(&editor, "Function")), snippets_preview_def);
+        const path = try std.fs.path.join(t.allocator, &.{ std.mem.span(@as([*:0]const u8, capture_dir)), "snippets_panel.png" });
+        defer t.allocator.free(path);
+        capture_editor = &editor;
+        capture_gui = &g;
+        const file = try std.Io.Dir.cwd().createFile(dvui.io, path, .{});
+        defer file.close(dvui.io);
+        var wbuf: [4096]u8 = undefined;
+        var writer = file.writer(dvui.io, &wbuf);
+        try dvui.testing.capturePng(captureWindowFrame, null, &writer.interface);
+        try writer.end();
+    }
+}
+
+test "GUI snippets panel: dragging the band edge resizes it, and a shared side keeps the tree outermost" {
+    if (!build_options.has_gui) return error.SkipZigTest;
+    const t = std.testing;
+    var tmp = t.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(t.io, ".", t.allocator);
+    defer t.allocator.free(root);
+    var ui = try dvui.testing.init(.{ .window_size = .{ .w = 900, .h = 600 } });
+    defer ui.deinit();
+    var editor = try Editor.init(t.allocator, t.io);
+    defer editor.deinit();
+    var g = try GuiState.init(t.allocator);
+    defer g.deinit();
+    defer win_ui = undefined;
+    applyWindowFonts(ui.window, &g, &editor);
+    try snippetsTestSetup(&editor);
+    editor.snippets_visible = true;
+    var ms: u64 = 0;
+    for (0..3) |_| try snippetsTestFrame(ui.window, &editor, &g, &ms);
+    // Docked right, the editor-facing edge is the left one: drag it 60 px
+    // further left (the init.lua write fails harmlessly in tests).
+    var rect = snippets_band.rect orelse return error.TestUnexpectedResult;
+    const scale = snippets_band.scale;
+    const mid_y = rect.y + rect.h / 2;
+    try t.expectApproxEqAbs(@as(f32, 260), rect.w / scale, 1);
+    _ = try ui.window.addEventMouseMotion(.{ .pt = .{ .x = rect.x, .y = mid_y } });
+    _ = try ui.window.addEventMouseButton(.left, .press);
+    try snippetsTestFrame(ui.window, &editor, &g, &ms);
+    try t.expect(snippets_band.resizing);
+    _ = try ui.window.addEventMouseMotion(.{ .pt = .{ .x = rect.x - 60 * scale, .y = mid_y } });
+    _ = try ui.window.addEventMouseButton(.left, .release);
+    for (0..2) |_| try snippetsTestFrame(ui.window, &editor, &g, &ms);
+    try t.expect(!snippets_band.resizing);
+    try t.expectApproxEqAbs(@as(f32, 320), editor.snippets_width, 1);
+    rect = snippets_band.rect orelse return error.TestUnexpectedResult;
+    try t.expectApproxEqAbs(@as(f32, 320), rect.w / scale, 1);
+    // Docked left, it is the right edge: 40 px wider.
+    editor.snippets_side = .left;
+    for (0..2) |_| try snippetsTestFrame(ui.window, &editor, &g, &ms);
+    rect = snippets_band.rect orelse return error.TestUnexpectedResult;
+    _ = try ui.window.addEventMouseMotion(.{ .pt = .{ .x = rect.x + rect.w, .y = mid_y } });
+    _ = try ui.window.addEventMouseButton(.left, .press);
+    try snippetsTestFrame(ui.window, &editor, &g, &ms);
+    _ = try ui.window.addEventMouseMotion(.{ .pt = .{ .x = rect.x + rect.w + 40 * scale, .y = mid_y } });
+    _ = try ui.window.addEventMouseButton(.left, .release);
+    for (0..2) |_| try snippetsTestFrame(ui.window, &editor, &g, &ms);
+    try t.expectApproxEqAbs(@as(f32, 360), editor.snippets_width, 1);
+    // With the file tree on the same side, the tree is the outer band.
+    editor.filetree_git_colors = false;
+    try t.expect(editor.setFiletreeRoot(root));
+    editor.filetree_auto_reveal = false;
+    for (0..2) |_| try snippetsTestFrame(ui.window, &editor, &g, &ms);
+    var tree = filetree_band.rect orelse return error.TestUnexpectedResult;
+    rect = snippets_band.rect orelse return error.TestUnexpectedResult;
+    try t.expect(tree.x + tree.w <= rect.x + 1);
+    editor.filetree_side = .right;
+    editor.snippets_side = .right;
+    for (0..2) |_| try snippetsTestFrame(ui.window, &editor, &g, &ms);
+    tree = filetree_band.rect orelse return error.TestUnexpectedResult;
+    rect = snippets_band.rect orelse return error.TestUnexpectedResult;
+    try t.expect(rect.x + rect.w <= tree.x + 1);
+    // Too narrow for both bands and 240 px of editor: the Snippets panel
+    // hides itself, says so, and its keyboard goes back to the pane.
+    editor.filetree_width = 600;
+    _ = editor.takeKeyboardFocus(.snippets);
+    for (0..2) |_| try snippetsTestFrame(ui.window, &editor, &g, &ms);
+    try t.expect(snippets_band.rect == null);
+    try t.expect(!editor.snippets_visible and !editor.snippets_focused);
+    try t.expect(std.mem.indexOf(u8, editor.status_message, "no room") != null);
+    try t.expectEqual(Editor.KeyboardOwner.editor, editor.keyboardOwner());
+}
+
+test "GUI snippets panel: snippets_double_click — a click selects, a double-click inserts once" {
+    if (!build_options.has_gui) return error.SkipZigTest;
+    const t = std.testing;
+    var ui = try dvui.testing.init(.{ .window_size = .{ .w = 900, .h = 600 } });
+    defer ui.deinit();
+    var editor = try Editor.init(t.allocator, t.io);
+    defer editor.deinit();
+    var g = try GuiState.init(t.allocator);
+    defer g.deinit();
+    defer win_ui = undefined;
+    applyWindowFonts(ui.window, &g, &editor);
+    try snippetsTestSetup(&editor);
+    editor.snippets_visible = true;
+    editor.snippets_double_click = true;
+    var ms: u64 = 0;
+    for (0..3) |_| try snippetsTestFrame(ui.window, &editor, &g, &ms);
+    const doc = editor.activeDoc();
+    const print = try snippetsTestDef(&editor, "Print");
+    const inserted = "std.debug.print(\"text\n\", .{values});";
+    // One click: Print is selected and previewed, nothing is inserted,
+    // and the panel has the keyboard, so the arrows work right away.
+    try snippetsTestClick(ui.window, try snippetsTestMetrics(&editor), 1);
+    try snippetsTestFrame(ui.window, &editor, &g, &ms);
+    try t.expectEqual(@as(usize, 0), doc.buffer.byteLen());
+    try t.expectEqual(@as(usize, 1), editor.snippet_panel.selected);
+    try t.expectEqual(@as(?u32, print), snippets_preview_def);
+    try t.expectEqual(Editor.KeyboardOwner.snippets, editor.keyboardOwner());
+    // The second press of a double-click inserts it and the editor gets
+    // the keyboard; a third press right after inserts nothing more and
+    // leaves the keyboard there.
+    try snippetsTestClick(ui.window, try snippetsTestMetrics(&editor), 1);
+    try snippetsTestFrame(ui.window, &editor, &g, &ms);
+    try t.expectEqualStrings(inserted, doc.buffer.slice(0, doc.buffer.byteLen()));
+    try t.expectEqualStrings("text", doc.selectedText().?);
+    try t.expectEqual(Editor.KeyboardOwner.editor, editor.keyboardOwner());
+    try snippetsTestClick(ui.window, try snippetsTestMetrics(&editor), 1);
+    try snippetsTestFrame(ui.window, &editor, &g, &ms);
+    try t.expectEqualStrings(inserted, doc.buffer.slice(0, doc.buffer.byteLen()));
+    try t.expectEqual(Editor.KeyboardOwner.editor, editor.keyboardOwner());
+    // Well after the double-click a click is a plain select again (the
+    // frame after the clock jump is when the window sees the new time).
+    ms += 1000;
+    try snippetsTestFrame(ui.window, &editor, &g, &ms);
+    try snippetsTestClick(ui.window, try snippetsTestMetrics(&editor), 2);
+    try snippetsTestFrame(ui.window, &editor, &g, &ms);
+    try t.expectEqualStrings(inserted, doc.buffer.slice(0, doc.buffer.byteLen()));
+    try t.expectEqual(@as(usize, 2), editor.snippet_panel.selected);
+    try t.expectEqual(Editor.KeyboardOwner.snippets, editor.keyboardOwner());
+    // Enter still inserts from the keyboard.
+    try dvui.testing.pressKey(.enter, .none);
+    try snippetsTestFrame(ui.window, &editor, &g, &ms);
+    try t.expect(std.mem.indexOf(u8, doc.buffer.slice(0, doc.buffer.byteLen()), "const name: i32 = 0;") != null);
+    try t.expectEqual(Editor.KeyboardOwner.editor, editor.keyboardOwner());
+}
+
+test "GUI snippets panel: a short list leaves the preview its free space, and long notes scroll" {
+    if (!build_options.has_gui) return error.SkipZigTest;
+    const t = std.testing;
+    var ui = try dvui.testing.init(.{ .window_size = .{ .w = 900, .h = 600 } });
+    defer ui.deinit();
+    var editor = try Editor.init(t.allocator, t.io);
+    defer editor.deinit();
+    var g = try GuiState.init(t.allocator);
+    defer g.deinit();
+    defer win_ui = undefined;
+    applyWindowFonts(ui.window, &g, &editor);
+    try snippetsTestSetup(&editor);
+    // A fourth Start-here item whose notes run far past the block.
+    _ = try editor.registerSnippet(.{ .language = "zig", .description = "Long", .group = "Start here", .notes = "Long notes, longer than the preview block can show at once. " ** 40, .body = "const value = some_function(argument_one, argument_two, argument_three, argument_four, ${1:argument_five});\nx" });
+    editor.snippets_visible = true;
+    var ms: u64 = 0;
+    for (0..3) |_| try snippetsTestFrame(ui.window, &editor, &g, &ms);
+    const print = try snippetsTestDef(&editor, "Print");
+    const long = try snippetsTestDef(&editor, "Long");
+    const m = try snippetsTestMetrics(&editor);
+    // Five rows: every row fits, and the preview gets more than its 40%.
+    try t.expectEqual(@as(usize, 5), editor.snippet_panel.rows.items.len);
+    try t.expect(m.rows_h >= 5 * m.line_height);
+    try t.expect(m.preview.h > m.area.h * 0.5);
+    // Long selected from the keyboard, the pointer resting over the
+    // preview (nothing hovered): its notes do not fit.
+    _ = editor.takeKeyboardFocus(.snippets);
+    editor.snippet_panel.selected = 3;
+    _ = try ui.window.addEventMouseMotion(.{ .pt = .{ .x = m.preview.x + m.preview.w * 0.4, .y = m.preview.y + m.preview.h / 2 } });
+    for (0..2) |_| try snippetsTestFrame(ui.window, &editor, &g, &ms);
+    try t.expectEqual(@as(?usize, null), snippets_hover_row);
+    try t.expectEqual(@as(?u32, long), snippets_preview_def);
+    try t.expect(snippets_preview_overflow > 0);
+    try t.expectEqual(@as(f32, 0), snippets_preview_scroll);
+    // Its 100-column line soft-wraps to several rows, like the notes.
+    try t.expect(snippets_preview_code_rows >= 3);
+    // ZIDE_CAPTURE_DIR=<dir>: save a picture of the wrapped code in its
+    // box, the overflowing notes and the preview's scrollbar there
+    // (snippets_preview.png).
+    const Backend = @import("sdl-backend");
+    const capture_dir = Backend.c.SDL_getenv("ZIDE_CAPTURE_DIR");
+    if (capture_dir != null) {
+        const path = try std.fs.path.join(t.allocator, &.{ std.mem.span(@as([*:0]const u8, capture_dir)), "snippets_preview.png" });
+        defer t.allocator.free(path);
+        capture_editor = &editor;
+        capture_gui = &g;
+        const file = try std.Io.Dir.cwd().createFile(dvui.io, path, .{});
+        defer file.close(dvui.io);
+        var wbuf: [4096]u8 = undefined;
+        var writer = file.writer(dvui.io, &wbuf);
+        try dvui.testing.capturePng(captureWindowFrame, null, &writer.interface);
+        try writer.end();
+    }
+    // Three wheel notches down over the preview scroll it, not the list;
+    // far past the end it stops at the end.
+    _ = try ui.window.addEventMouseWheel(-3 * dvui.scroll_speed, .vertical, null);
+    try snippetsTestFrame(ui.window, &editor, &g, &ms);
+    try t.expectApproxEqAbs(9 * m.line_height, snippets_preview_scroll, 0.5);
+    try t.expectEqual(@as(usize, 0), editor.snippet_panel.scroll);
+    _ = try ui.window.addEventMouseWheel(-100 * dvui.scroll_speed, .vertical, null);
+    try snippetsTestFrame(ui.window, &editor, &g, &ms);
+    try t.expectApproxEqAbs(snippets_preview_overflow, snippets_preview_scroll, 0.5);
+    try t.expect(snippets_preview_scroll > 9 * m.line_height);
+    // Another item previewed starts at its top.
+    _ = try ui.window.addEventMouseMotion(.{ .pt = snippetsTestRowPoint(m, 1) });
+    try snippetsTestFrame(ui.window, &editor, &g, &ms);
+    try t.expectEqual(@as(?u32, print), snippets_preview_def);
+    try t.expectEqual(@as(f32, 0), snippets_preview_scroll);
+}
+
+test "GUI snippets panel: dragging a band's edge far past its minimum hides it and keeps its width" {
+    if (!build_options.has_gui) return error.SkipZigTest;
+    const t = std.testing;
+    var tmp = t.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(t.io, ".", t.allocator);
+    defer t.allocator.free(root);
+    var ui = try dvui.testing.init(.{ .window_size = .{ .w = 900, .h = 600 } });
+    defer ui.deinit();
+    var editor = try Editor.init(t.allocator, t.io);
+    defer editor.deinit();
+    var g = try GuiState.init(t.allocator);
+    defer g.deinit();
+    defer win_ui = undefined;
+    applyWindowFonts(ui.window, &g, &editor);
+    try snippetsTestSetup(&editor);
+    editor.snippets_visible = true;
+    var ms: u64 = 0;
+    for (0..3) |_| try snippetsTestFrame(ui.window, &editor, &g, &ms);
+    // Docked right: its left edge dragged to 30 px from its right edge.
+    // The band stays at its minimum, and the status bar says what the
+    // release will do.
+    var rect = snippets_band.rect orelse return error.TestUnexpectedResult;
+    const scale = snippets_band.scale;
+    const mid_y = rect.y + rect.h / 2;
+    _ = try ui.window.addEventMouseMotion(.{ .pt = .{ .x = rect.x, .y = mid_y } });
+    _ = try ui.window.addEventMouseButton(.left, .press);
+    try snippetsTestFrame(ui.window, &editor, &g, &ms);
+    _ = try ui.window.addEventMouseMotion(.{ .pt = .{ .x = rect.x + rect.w - 30 * scale, .y = mid_y } });
+    try snippetsTestFrame(ui.window, &editor, &g, &ms);
+    try t.expect(snippets_band.resizing and snippets_band.hide_pending);
+    try t.expectApproxEqAbs(@as(f32, 120), editor.snippets_width, 1);
+    try t.expect(std.mem.indexOf(u8, editor.status_message, "Release to hide") != null);
+    _ = try ui.window.addEventMouseButton(.left, .release);
+    for (0..2) |_| try snippetsTestFrame(ui.window, &editor, &g, &ms);
+    try t.expect(!editor.snippets_visible);
+    try t.expect(snippets_band.rect == null);
+    try t.expectApproxEqAbs(@as(f32, 260), editor.snippets_width, 1);
+    try t.expect(std.mem.indexOf(u8, editor.status_message, "Snippets panel hidden") != null);
+    // Ctrl+Alt+B brings it back at its old width.
+    const ctrl_alt: dvui.enums.Mod = @enumFromInt(@intFromEnum(dvui.enums.Mod.lcontrol) | @intFromEnum(dvui.enums.Mod.lalt));
+    try dvui.testing.pressKey(.b, ctrl_alt);
+    for (0..2) |_| try snippetsTestFrame(ui.window, &editor, &g, &ms);
+    rect = snippets_band.rect orelse return error.TestUnexpectedResult;
+    try t.expectApproxEqAbs(@as(f32, 260), rect.w / scale, 1);
+    // The file tree (docked left) hides the same way, by its right edge,
+    // and keeps its width too.
+    editor.filetree_git_colors = false;
+    editor.filetree_auto_reveal = false;
+    try t.expect(editor.setFiletreeRoot(root));
+    for (0..2) |_| try snippetsTestFrame(ui.window, &editor, &g, &ms);
+    const tree = filetree_band.rect orelse return error.TestUnexpectedResult;
+    const tree_w = editor.filetree_width;
+    _ = try ui.window.addEventMouseMotion(.{ .pt = .{ .x = tree.x + tree.w, .y = mid_y } });
+    _ = try ui.window.addEventMouseButton(.left, .press);
+    try snippetsTestFrame(ui.window, &editor, &g, &ms);
+    try t.expect(filetree_band.resizing);
+    _ = try ui.window.addEventMouseMotion(.{ .pt = .{ .x = tree.x + 10 * scale, .y = mid_y } });
+    _ = try ui.window.addEventMouseButton(.left, .release);
+    for (0..2) |_| try snippetsTestFrame(ui.window, &editor, &g, &ms);
+    try t.expect(!editor.filetree_visible);
+    try t.expect(filetree_band.rect == null);
+    try t.expectEqual(tree_w, editor.filetree_width);
+    try t.expect(std.mem.indexOf(u8, editor.status_message, "File tree hidden") != null);
+    try t.expect(editor.snippets_visible);
 }
 
 const SheetIcon = struct { name: []const u8, tvg: []const u8 };

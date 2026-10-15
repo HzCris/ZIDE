@@ -321,8 +321,9 @@ pub const KeybindMap = struct {
         try self.set("ctrl+`", "toggle_terminal");
         try self.set("ctrl+shift+`", "open_terminal_right");
         try self.set("ctrl+alt+`", "detach_terminal");
-        // File tree
+        // Side panels
         try self.set("ctrl+b", "toggle_filetree");
+        try self.set("ctrl+alt+b", "toggle_snippets");
     }
 };
 
@@ -376,6 +377,7 @@ test "keybind defaults" {
     try std.testing.expectEqualStrings("lsp_workspace_symbols", kb.get("ctrl+t").?);
     try std.testing.expectEqualStrings("lsp_signature_help", kb.get("ctrl+shift+space").?);
     try std.testing.expectEqualStrings("toggle_filetree", kb.get("ctrl+b").?);
+    try std.testing.expectEqualStrings("toggle_snippets", kb.get("ctrl+alt+b").?);
     // Windows
     try std.testing.expectEqualStrings("open_in_new_window", kb.get("ctrl+shift+n").?);
     try std.testing.expectEqualStrings("open_in_new_window", kb.get("ctrl+alt+n").?);

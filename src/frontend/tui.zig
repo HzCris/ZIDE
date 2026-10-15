@@ -286,7 +286,7 @@ fn applyPaste(editor: *Editor, text: []const u8) void {
             .terminal => if (activeTerminal(editor)) |term| term.paste(text),
             .editor => pasteIntoDocument(editor, text),
             .search => typeLine(editor, firstLine(text)),
-            .filetree => {},
+            .filetree, .snippets => {},
         },
         .find, .find_replace, .file_open, .folder_open, .save_as, .command_palette, .picker, .goto_line, .file_finder, .symbol_rename => typeLine(editor, firstLine(text)),
         .filetree_prompt => if (editor.filetree_prompt_kind != .delete_confirm) typeLine(editor, firstLine(text)),
@@ -575,7 +575,7 @@ pub fn run(allocator: std.mem.Allocator, editor: *Editor) !void {
             // search panel draw their own selection / field marker).
             .normal => switch (editor.keyboardOwner()) {
                 .editor, .terminal => positionCursor(win, editor, width, height),
-                .filetree, .search => win.hideCursor(),
+                .filetree, .snippets, .search => win.hideCursor(),
             },
         }
 
@@ -608,6 +608,10 @@ fn dispatchKey(editor: *Editor, key: Key) void {
         switch (editor.keyboardOwner()) {
             .terminal => return handleTerminalKey(editor, key),
             .filetree => return handleFiletreeKey(editor, key),
+            .snippets => {
+                hideSnippetsPanel(editor);
+                return dispatchKey(editor, key);
+            },
             .search => return handleSearchKey(editor, key),
             .editor => {},
         }
@@ -822,8 +826,19 @@ var filetree_poll_ns: i128 = 0;
 /// Last open-document external-change probe (same event-driven cadence).
 var doc_poll_ns: i128 = 0;
 
+/// The Snippets panel exists in the GUI only so far: the TUI hides it as
+/// soon as it shows up and says so, so no keys vanish into a band that is
+/// not drawn. Its TUI band is the next checkpoint.
+fn hideSnippetsPanel(editor: *Editor) void {
+    if (!editor.snippets_visible and !editor.snippets_focused) return;
+    editor.snippets_visible = false;
+    editor.snippets_focused = false;
+    editor.status_message = "Snippets panel: not in the terminal version yet";
+}
+
 /// Draw the full editor screen.
 fn drawEditor(win: Window, editor: *Editor, width: u16, height: u16) void {
+    hideSnippetsPanel(editor);
     pane_rect_count = 0;
     filetree_band = null;
     search_band = null;
@@ -4201,7 +4216,7 @@ test "TUI snippets: dispatched keys edit fields and respect search focus" {
     const t = std.testing;
     var editor = try Editor.init(t.allocator, t.io);
     defer editor.deinit();
-    _ = try editor.registerSnippet("*", "demo", "Demo", "${1:first} ${2:tail}$0");
+    _ = try editor.registerSnippet(.{ .language = "*", .prefix = "demo", .description = "Demo", .body = "${1:first} ${2:tail}$0" });
     const doc = editor.activeDoc();
     try doc.loadText("demo");
     doc.cursors.primary().moveToEnd(&doc.buffer);

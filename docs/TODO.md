@@ -157,7 +157,9 @@ Legend: **N** = native Zig, **L** = buildable as a Lua extension on the public A
 
 - **GUI unsaved-changes prompts as real dialogs** (N, S). The close-tab / quit `[S]ave [D]iscard
   [C]ancel` banner is drawn inside the editor in the theme's own colors and font, so it blends
-  in and is easy to miss. Make it a modal floating window like the encoding and recovery
+  in and is easy to miss — and in a very small window it is practically invisible (user,
+  2026-10-15: shrinking the window to make the Snippets panel hide itself left the prompt
+  nowhere to be seen). Make it a modal floating window like the encoding and recovery
   dialogs (buttons + the same S/D/C keys), and audit the other in-editor banners
   (overwrite/reload, Git stage, task save-before-run) for the same treatment.
 
@@ -185,6 +187,33 @@ Legend: **N** = native Zig, **L** = buildable as a Lua extension on the public A
 - **Regex in find/replace and workspace search** (N, M). No regex engine in std — a small
   backtracking engine (fun sub-project) or a vendored one. The same engine unlocks
   comma-separated include/exclude lists in the search panel.
+
+## Snippets panel (user, 2026-10-14; plan in ~/.claude/plans/playful-herding-wave.md)
+
+A Kate-style Snippets side panel: syntax skeletons by plain name ("Print", "For each item")
+in collapsible groups, click to insert, a preview with plain-language notes — so a learner
+does not need to know the syntax before completion can finish it.
+
+- **Step 1, checkpoint 1: engine + GUI panel + starter set** (N, L) — **DONE 2026-10-15**:
+  `snippet_panel.zig` model, `.snippets` keyboard owner, `toggle_snippets` on Ctrl+Alt+B,
+  `group`/`notes`/optional `prefix` on `register_snippet` (`~slug` command names), the four
+  `snippets_*` settings, 54 compiler-checked Zig skeletons in `snippets-zig.lua`, and the
+  self-upgrading bundled file (pristine copies replaced, edited ones kept). Smoke-test round
+  (user, 2026-10-15): `snippets_double_click` (a click selects and keeps the preview, a
+  double-click inserts), the preview takes a short list's free space and scrolls long notes
+  (wheel or scrollbar), dragging either band's edge far past its minimum hides it (width
+  kept), and the five `snippets_*` rows in the Settings dialog (pulled up from checkpoint 2).
+- **Step 1, checkpoint 2: TUI band** (N, M). `drawSnippetsPanel`, `snippets_band`
+  hit-testing, `handleSnippetsKey`, both bands' width math (tree outermost, saturating),
+  click-selects-then-click-inserts (no hover in the TUI), the preview scrolling long notes and
+  wrapping long code as the GUI does, `│` guides under open groups as the TUI tree draws.
+  Until then the TUI hides the panel with a status message.
+- **Step 2: make your own** (N, M). "Save as snippet" from the selection (a form: name,
+  folder, optional trigger, notes) written to the user's own snippets file; edit and delete
+  from the panel; a filter box at the top.
+- **Step 3 (maybe): mirrored blanks** (N, M). The same field number in two places (`list` in
+  the ArrayList skeleton) updating together; the bundled bodies hard-code repeats today and
+  the notes say so.
 
 ## Debugging and tasks
 
@@ -266,6 +295,15 @@ Legend: **N** = native Zig, **L** = buildable as a Lua extension on the public A
   outline reuses the `cursor` color, so anyone who themes around blue loses both the caret and
   the match marker. Add `color_bracket_match` / `tui_color_bracket_match` theme fields (plus
   template entries and the docs' field counts), and consider a separate caret-outline color.
+- **Colored folder guides, Kate-style** (N, S) — user, 2026-10-15. Each open folder's indent
+  guide (and, to match, its folder icon) gets its own color from a small cycling palette, so a
+  deep hierarchy in a big code base reads at a glance (`zig-out` one color, `bin` inside it a
+  second, `fug` a third). Needs: per-depth (or per-folder) palette fields in both themes
+  (`color_guide_1..n` / `tui_color_guide_*`), the file tree and the Snippets list drawing
+  their guides from it, the TUI's `│` columns too, and tinted folder icons — the GUI's TinyVG
+  folder icons are already tinted at draw time (`renderIconTinted`), so matching colors may
+  need no new art; the user can draw variants in Inkscape otherwise. One color = today's
+  `panel_border` look, which stays the default.
 
 ## Built on the runtime (the v2 dogfoods)
 
@@ -311,7 +349,7 @@ split panes (nested), multiple OS windows with per-window tabs, command palette,
 with live preview, workspace search/replace with `.gitignore` pruning, external-change guard,
 auto-save, crash-recovery snapshots, EditorConfig, format-on-save via the language server,
 hover/rename/format, tasks + problem matchers, Git Changes panel + buffer-vs-index gutter
-marks, full DAP debugger, snippets engine (needs docs, not code), encodings, themes incl.
+marks, full DAP debugger, snippets engine + Snippets panel (GUI), encodings, themes incl.
 high-contrast, welcome screen, comment toggle, duplicate/move/delete line, TODO highlighting.
 
 Deliberately skipped (user decisions — don't re-pitch): native `zig fmt` integration (CLI

@@ -23,6 +23,7 @@ pub const search_mod = @import("search.zig");
 pub const text_file = @import("text_file.zig");
 const text_input = @import("text_input.zig");
 const snippets_mod = @import("snippets.zig");
+pub const snippet_panel_mod = @import("snippet_panel.zig");
 const nav_history = @import("nav_history.zig");
 const picker_mod = @import("picker.zig");
 const WalkIgnore = @import("walk_ignore.zig").WalkIgnore;
@@ -402,6 +403,19 @@ pub const Editor = struct {
     filetree_clip_paths: std.ArrayList([]u8) = .empty,
     filetree_clip_cut: bool = false,
 
+    /// Snippets side panel (snippet_panel.zig): shown, owning the keyboard,
+    /// its side (null = opposite the file tree, see snippetsSide), GUI
+    /// width in pixels, TUI width in columns, whether a click only selects
+    /// an item and a double-click inserts it (false: a click inserts), and
+    /// the rows.
+    snippets_visible: bool = false,
+    snippets_focused: bool = false,
+    snippets_side: ?FiletreeSide = null,
+    snippets_width: f32 = 260,
+    tui_snippets_width: u16 = 32,
+    snippets_double_click: bool = false,
+    snippet_panel: snippet_panel_mod.State = .{},
+
     pub const EncodingChoice = struct { path: []u8, encoding: text_file.TextEncoding };
     pub const EncodingAction = enum { choose, open, reopen, save };
 
@@ -597,6 +611,7 @@ pub const Editor = struct {
         self.lsp_doc_owner.deinit(self.allocator);
         self.lsp_too_large.deinit(self.allocator);
         self.commands.deinit();
+        self.snippet_panel.deinit(self.allocator);
         self.snippets.deinit(self.allocator);
         self.keybinds.deinit();
         var prof_it = self.lang_profiles.iterator();
@@ -743,65 +758,74 @@ pub const Editor = struct {
     // and normalizeKeyboardFocus repairs direct writes once per tick.
 
     /// Who gets keys and text in normal mode.
-    pub const KeyboardOwner = enum { editor, terminal, filetree, search };
+    pub const KeyboardOwner = enum { editor, terminal, filetree, snippets, search };
     /// What takeKeyboardFocus hands the keyboard to: the focused pane
     /// (editor or terminal, whichever it is) or one of the side panels.
-    pub const FocusTarget = enum { pane, filetree, search };
+    pub const FocusTarget = enum { pane, filetree, snippets, search };
 
     /// Pure read. The side panels live in the primary window and own the
-    /// keyboard only while it is focused (the tree before the search
-    /// panel); otherwise the focused pane does.
+    /// keyboard only while it is focused (the tree before the Snippets
+    /// panel before the search panel); otherwise the focused pane does.
     pub fn keyboardOwner(self: *const Editor) KeyboardOwner {
         if (self.active_window == 0) {
             if (self.filetree_focused) return .filetree;
+            if (self.snippets_focused) return .snippets;
             if (self.search_focused) return .search;
         }
         return if (self.activePaneIsTerminal()) .terminal else .editor;
     }
 
     /// THE setter of panel focus. `.pane` gives the keyboard back to the
-    /// focused pane (both panel flags cleared). A panel target focuses the
+    /// focused pane (every panel flag cleared). A panel target focuses the
     /// primary window, shows the panel, takes the keyboard from the other
-    /// panel and closes the editor's completion popup; false when the file
+    /// panels and closes the editor's completion popup; false when the file
     /// tree cannot be opened (the tree is then hidden and unfocused).
     pub fn takeKeyboardFocus(self: *Editor, target: FocusTarget) bool {
+        if (target != .pane and self.active_window != 0) self.focusWindow(0);
+        if (target == .filetree) {
+            // A tree that cannot open leaves the current owner alone.
+            self.filetree_visible = true;
+            if (self.ensureFiletree() == null) return false;
+        }
+        self.filetree_focused = false;
+        self.snippets_focused = false;
+        self.search_focused = false;
         switch (target) {
-            .pane => {
-                self.filetree_focused = false;
-                self.search_focused = false;
+            .pane => return true,
+            .filetree => self.filetree_focused = true,
+            .snippets => {
+                self.snippets_visible = true;
+                self.snippets_focused = true;
             },
-            .filetree, .search => {
-                if (self.active_window != 0) self.focusWindow(0);
-                if (target == .filetree) {
-                    self.filetree_visible = true;
-                    if (self.ensureFiletree() == null) return false;
-                    self.search_focused = false;
-                    self.filetree_focused = true;
-                } else {
-                    self.search_visible = true;
-                    self.filetree_focused = false;
-                    self.search_focused = true;
-                }
-                self.clearCompletionItems();
+            .search => {
+                self.search_visible = true;
+                self.search_focused = true;
             },
         }
+        self.clearCompletionItems();
         return true;
     }
 
     /// Repair panel focus that a direct flag write, or a panel hidden under
     /// it, left inconsistent: a flag whose panel is hidden (or whose tree
-    /// was never built) is cleared, both are while a secondary window is
-    /// focused, and when both are set the tree keeps the keyboard. First
-    /// thing in serviceTick.
+    /// was never built) is cleared, all are while a secondary window is
+    /// focused, and when several are set the tree keeps the keyboard, then
+    /// the Snippets panel. First thing in serviceTick.
     pub fn normalizeKeyboardFocus(self: *Editor) void {
         if (self.active_window != 0) {
             self.filetree_focused = false;
+            self.snippets_focused = false;
             self.search_focused = false;
             return;
         }
         if (!self.filetree_visible or self.filetree == null) self.filetree_focused = false;
+        if (!self.snippets_visible) self.snippets_focused = false;
         if (!self.search_visible) self.search_focused = false;
-        if (self.filetree_focused and self.search_focused) self.search_focused = false;
+        if (self.filetree_focused) {
+            self.snippets_focused = false;
+            self.search_focused = false;
+        }
+        if (self.snippets_focused) self.search_focused = false;
     }
 
     /// The editing chords a focused side panel takes over (panelAction).
@@ -824,6 +848,8 @@ pub const Editor = struct {
                 .paste => self.filetreePaste(),
                 .select_all, .delete_word_backward, .delete_word_forward => {},
             },
+            // The Snippets panel edits nothing: the chords are swallowed.
+            .snippets => {},
             .search => self.searchFieldChord(chord),
         }
         return true;
@@ -1574,6 +1600,93 @@ pub const Editor = struct {
         const was_visible = self.filetree_visible;
         if (!self.takeKeyboardFocus(.filetree)) return;
         if (was_visible) self.filetree.?.scroll_to_selected = true;
+    }
+
+    /// Ctrl+Alt+B: the same cycle as toggleFiletree for the Snippets panel.
+    pub fn toggleSnippets(self: *Editor) void {
+        if (self.snippets_visible and self.keyboardOwner() == .snippets) {
+            self.snippets_visible = false;
+            self.snippets_focused = false;
+            return;
+        }
+        const was_visible = self.snippets_visible;
+        _ = self.takeKeyboardFocus(.snippets);
+        if (was_visible) self.snippet_panel.scroll_to_selected = true;
+    }
+
+    /// Where the Snippets panel docks: its own setting, else opposite the
+    /// file tree.
+    pub fn snippetsSide(self: *const Editor) FiletreeSide {
+        return self.snippets_side orelse (if (self.filetree_side == .left) .right else .left);
+    }
+
+    /// `snippet_panel.sync`'s view of which languages the editor knows.
+    const KnownLanguages = struct {
+        editor: *const Editor,
+        pub fn isKnown(self: KnownLanguages, name: []const u8) bool {
+            return self.editor.findLanguageByName(name) != null;
+        }
+    };
+
+    /// The Snippets panel's rows for the main window's document (the file
+    /// tree's auto-reveal follows the same one). Rebuilds only when the
+    /// registry, the document's language or a toggle changed. Frontends
+    /// call it before reading the rows, after handling input.
+    pub fn syncSnippetPanel(self: *Editor) *snippet_panel_mod.State {
+        const doc = &self.documents.items[self.windowDocIdx(0)];
+        self.snippet_panel.sync(self.allocator, self.snippets.items.items, .{
+            .revision = self.snippets.revision,
+            .language = if (doc.language) |lang| lang.name else null,
+            .any_language = doc.file_path == null and doc.language == null,
+            .languages_known = self.languages.items.len,
+        }, KnownLanguages{ .editor = self });
+        return &self.snippet_panel;
+    }
+
+    /// Enter or a click on panel row `index`: a group opens or closes, an
+    /// item is inserted. The rows are fresh afterwards.
+    pub fn activateSnippetRow(self: *Editor, index: usize) void {
+        const panel = self.syncSnippetPanel();
+        const row = panel.rowAt(index) orelse return;
+        switch (row.kind) {
+            .group => panel.toggle(self.allocator, row.group),
+            .item => self.insertSnippetFromPanel(row.def),
+        }
+        _ = self.syncSnippetPanel();
+    }
+
+    /// Insert registry definition `index` from the Snippets panel into the
+    /// main window's document and give it the keyboard, so Tab walks the
+    /// fields right away. An untitled document without a language adopts
+    /// the snippet's language first (indentation and the language check
+    /// read it). Refusals explain themselves in the status bar and leave
+    /// the panel focused.
+    pub fn insertSnippetFromPanel(self: *Editor, index: usize) void {
+        if (self.mode != .normal or index >= self.snippets.items.items.len) return;
+        if (self.active_window != 0) self.focusWindow(0);
+        if (self.activePaneIsTerminal()) {
+            self.status_message = "Snippets insert into an editor pane: focus one first";
+            return;
+        }
+        const doc = self.activeDoc();
+        if (doc.readonly) {
+            self.status_message = if (doc.reader != null) "Read-only review view — Enter opens the real file" else "Read-only document";
+            return;
+        }
+        if (doc.cursors.count() != 1) {
+            self.status_message = "Snippets require a single cursor";
+            return;
+        }
+        const def = &self.snippets.items.items[index];
+        if (doc.file_path == null and doc.language == null and !std.mem.eql(u8, def.language, "*")) {
+            const lang = self.findLanguageByName(def.language) orelse {
+                self.status_message = std.fmt.bufPrint(&self.status_buf, "No language named '{s}' is registered", .{def.language}) catch "The snippet's language is not registered";
+                return;
+            };
+            self.setDocLanguage(doc, lang);
+        }
+        _ = self.takeKeyboardFocus(.pane);
+        _ = self.execCommand(def.command, null);
     }
 
     /// Mark the selected entry for a move (tree 'x'). 'p' pastes it into
@@ -4787,10 +4900,16 @@ pub const Editor = struct {
     /// (in-place re-registration already invalidated the highlight cache).
     pub fn relanguageDoc(self: *Editor, doc: *Document) void {
         const ext = doc.fileExtension() orelse return;
-        const new_lang = self.findLanguage(ext);
-        if (new_lang == doc.language) return;
+        self.setDocLanguage(doc, self.findLanguage(ext));
+    }
+
+    /// Give a document another language (or none): the LSP forgets it
+    /// under the old one first and the highlight cache is dropped. Same
+    /// pointer = nothing to do.
+    pub fn setDocLanguage(self: *Editor, doc: *Document, lang: ?*const syntax.LanguageDef) void {
+        if (lang == doc.language) return;
         self.lspForgetDoc(doc);
-        doc.language = new_lang;
+        doc.language = lang;
         doc.invalidateLineStates(0);
     }
 
@@ -5259,8 +5378,8 @@ pub const Editor = struct {
         };
     }
 
-    pub fn registerSnippet(self: *Editor, language: []const u8, prefix: []const u8, description: []const u8, body: []const u8) ![]const u8 {
-        var def = try snippets_mod.Definition.init(self.allocator, language, prefix, description, body, self.loading_extensions);
+    pub fn registerSnippet(self: *Editor, spec: snippets_mod.Spec) ![]const u8 {
+        var def = try snippets_mod.Definition.init(self.allocator, spec, self.loading_extensions);
         errdefer def.deinit(self.allocator);
         var replace: ?usize = null;
         for (self.snippets.items.items, 0..) |*old, i| {
@@ -5275,6 +5394,7 @@ pub const Editor = struct {
             self.snippets.items.items[i].deinit(self.allocator);
             self.snippets.items.items[i] = def;
         } else self.snippets.items.appendAssumeCapacity(def);
+        self.snippets.revision += 1;
         return def.command;
     }
 
@@ -5288,6 +5408,7 @@ pub const Editor = struct {
             self.commands.removeSnippet(def.command);
             def.deinit(self.allocator);
         }
+        self.snippets.revision += 1;
     }
 
     pub fn editorOwnsInput(self: *Editor) bool {

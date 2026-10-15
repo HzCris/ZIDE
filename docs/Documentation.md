@@ -103,6 +103,7 @@ Reloading extensions cancels their tasks, disconnects their active debug session
 | Ctrl+Shift+` | Open terminal (side-by-side split) |
 | Ctrl+Alt+` | Detach the focused terminal into its own OS window (GUI; TUI: second terminal at the side) |
 | Ctrl+B | Toggle file tree side panel |
+| Ctrl+Alt+B | Toggle the Snippets side panel — syntax skeletons by plain name, click to insert (GUI; the TUI band is next — see *Snippets*) |
 | Ctrl+Shift+O | Open a folder as the project (GUI: native dialog; TUI: path prompt) |
 | Ctrl+F8 | Review changed files (verdicts, progress, baseline) |
 | F8 / Shift+F8 | Read the next / previous changed file in the review reader |
@@ -234,6 +235,7 @@ Windows terminals commonly intercept Alt combos (Windows Terminal binds Alt+arro
     - Review: `review_stage_on_approve` (true; approving a changed file also stages it — off = verdicts never touch git)
     - Appearance: `theme` ("dark"), `tui_theme` ("terminal"), `gutter_min_digits` (3, 1–10, both frontends), `secondary_window_chrome` (true; GUI: menu bar + status bar in extra windows, false = bare pane containers), `page_size` (accepted but overwritten by the viewport height every frame, so it has no lasting effect)
     - File tree: `filetree_visible` (true), `filetree_side` ("left"/"right"), `filetree_width` (240 GUI px, 120–600), `tui_filetree_width` (30 columns, 16–80), `filetree_root` (starting directory, "" = cwd; stored unvalidated from Lua — the Settings dialog checks it), `filetree_git_colors` (true; off = no tree Git colors, Changes and gutters remain available), `filetree_auto_reveal` (true, read by the GUI), `tui_filetree_icons` (false), `filetree_font_size` (0 = theme font, 0–32), `filetree_icon_scale` (90, 50–200)
+    - Snippets panel: `snippets_visible` (false; at runtime hiding it also returns the keyboard to the pane), `snippets_side` ("auto"/"left"/"right"; auto docks opposite the file tree), `snippets_width` (260 GUI px, 120–600), `tui_snippets_width` (32 columns, 16–80; read once the TUI band exists), `snippets_double_click` (false; GUI: true makes a click only select a snippet and keep its preview — a double-click or Enter inserts it). All five have rows in the Settings dialog
   - `zide.set("mono_font_path", "/path/to/font.ttf")` — use a custom monospace font (GUI only; read once at startup, so a change needs a restart, and a bad path falls back to the bundled font with a logged warning; pick a Nerd Font to keep box-drawing/powerline glyphs and tree icons)
   - `zide.set("mono_font_size", 14)` — override the default monospace font size (GUI only, applies live)
   - `zide.set("tui_theme", name)` — switch TUI theme ("terminal", "dark", "light", "high_contrast")
@@ -272,7 +274,7 @@ Cross-frontend gaps are tracked in [TODO.md](TODO.md) (verified backlog: navigat
 
 - DVUI + SDL3 window with editor pane
 - Text editing through the shared editor commands — undo/redo, clipboard, word motion, indentation and auto-indent behave as described under *TUI — Implemented Features*
-- Keyboard focus follows the core rule (see *Keyboard focus* under Command System): clicking an editor or terminal pane takes the keyboard back from the file tree or search panel, and an editor pane that becomes the owner (Escape out of a panel, Ctrl+backtick, F6, a split, startup) takes input focus by itself — no click needed before typing
+- Keyboard focus follows the core rule (see *Keyboard focus* under Command System): clicking an editor or terminal pane takes the keyboard back from the file tree, the Snippets panel or the search panel, and an editor pane that becomes the owner (Escape out of a panel, Ctrl+backtick, F6, a split, startup) takes input focus by itself — no click needed before typing
 - Syntax highlighting (Zig built-in, extensible via Lua — see Syntax Highlighting section)
 - Matching-bracket highlight (an outline in the caret color around the bracket at the caret and its partner) and smart Enter between bracket pairs — as described under *TUI — Implemented Features*
 - TODO comment highlighting: `TODO`/`FIXME`/`XXX`/`HACK`/`BUG`/`NOTE` inside comments get the `todo` syntax color; `next_todo` command (palette) jumps to the next marker with wrap-around
@@ -295,6 +297,7 @@ Cross-frontend gaps are tracked in [TODO.md](TODO.md) (verified backlog: navigat
 - Quick open (Ctrl+E): fuzzy file finder with live preview behind a bottom-anchored panel — same behavior as the TUI (Enter opens a normal tab, Escape restores; previews never appear in the tab bar; clicking the menu bar or the tab bar closes quick open first); PageUp/PageDown and the mouse wheel scroll the preview
 - Workspace search & replace (Ctrl+Shift+F): same engine and behavior as the TUI, with a VS Code-style panel — bordered input boxes with placeholders, clickable `Aa`/`W` toggle chips inside the search box (toggling re-runs the search), results **grouped under file headers** (collapse chevron + type icon + name + directory + match count — click a header to fold/unfold its file; the current file's header stays **pinned at the top** while its matches scroll, VS Code-style) with the match **highlighted inside each excerpt** and long excerpts ellipsis-windowed around the match; click fields to focus, double-click a result to open it, wheel scrolls, F4/Shift+F4 cycle results while editing
 - Keybinding remapping (Lua integration — `zide.bind`/`zide.unbind` via init.lua, global or per-language with `{ language = "zig" }`)
+- Snippets side panel (Ctrl+Alt+B, View > Snippets): the document language's snippets in collapsible groups by plain name, a preview with notes at the bottom (it takes the room a short list leaves free; notes that still do not fit scroll with the wheel or its scrollbar), click or Enter inserts at the caret and hands the keyboard back so Tab walks the blanks (with `snippets_double_click` a click selects and a double-click inserts); its own side (default: opposite the file tree) and drag-resizable width — drag the edge well past the minimum to hide it; right-click moves it — see *Snippets*
 - Auto-save (off by default; saves dirty documents with file paths after a configurable interval, default 5s)
 - Application icon embedded in exe
 - SDL3GPU backend (GPU-accelerated rendering, opt-in via `zig build -Dgpu=true`, default SDL3 for lower memory)
@@ -581,7 +584,7 @@ zide.on("save", function(path) zide.status("zig file saved") end, { language = "
 | Call | Description |
 |------|-------------|
 | `zide.command(name, desc, fn)` | Register a command — listed in the palette, runnable via `zide.bind`/`zide.exec`. `name` must be valid UTF-8. Re-registering a name replaces it; shadowing a built-in is allowed (logged). `fn` receives the optional args string (usually nil). |
-| `zide.register_snippet{...}` | Register a Tab-expandable snippet — see the *Snippets* section. Returns the palette command name (`snippet.<language>.<prefix>`), or `nil, message`; it never raises. |
+| `zide.register_snippet{...}` | Register a snippet for the Snippets panel and the palette, Tab-expandable when it has a `prefix` — see the *Snippets* section. Returns the command name (`snippet.<language>.<prefix>`, or `snippet.<language>.~<slug>` for one without a prefix), or `nil, message`; it never raises. |
 | `zide.on(event, fn [, opts])` | Hook an event. Events: `"open"` (file opened into a tab), `"save"` (file written — fires per document on auto-save too). `fn(path, language)` gets the file path (or nil) and the document's language name (or nil for plain text); handlers that only declare `path` keep working. `opts.language = "zig"` fires the handler only for documents of that language (case-insensitive). Nested event firing is capped at 8 levels. |
 | `zide.exec(name)` → bool | Run any action or command by name — the same names keybinds use (`"save"`, `"undo"`, `"toggle_filetree"`, other Lua commands, …). Returns whether the name was recognized. |
 | `zide.status(msg)` | Show a transient message in the status bar (both frontends): at most 128 bytes, cut at a character boundary; malformed bytes show as U+FFFD, control characters as spaces. |
@@ -680,13 +683,21 @@ file is deleted.
 #### The Shipped Extension: snippets-zig.lua
 
 Also created on first launch — and, unlike the other two, re-created whenever it is
-**missing**, at startup and on every `reload_extensions`: nine Tab-expandable Zig snippets
-(`fn`, `if`, `ifelse`, `while`, `for`, `switch`, `struct`, `enum`, `test`). Deleting the file
-does not remove them (it comes back); to disable them, empty the file or comment out its
-contents instead. Edit it freely to tweak the bodies — the *Snippets* section documents the
-template syntax and expansion rules. Because init.lua runs before extensions, a snippet
-registered there with the same language and prefix is replaced by the bundled one at the next
-load — change `snippets-zig.lua` itself instead.
+**missing**, at startup and on every `reload_extensions`: 54 Zig syntax skeletons for the
+Snippets panel, filed in groups (Start here, Values, Functions, If & switch, Loops, Types,
+Errors, Memory, Tests), each with plain-language notes, and seventeen of them with a Tab
+trigger (`hello`, `fn`, `pfn`, `fnerr`, `if`, `ifelse`, `elif`, `switch`, `while`, `whilei`,
+`for`, `fori`, `forr`, `struct`, `enum`, `errset`, `test`). Every body is compiled by the
+real Zig compiler in the test suite (`zig build test -Dtest-tools`).
+
+**Upgrades.** ZIDE replaces the installed file with the newest bundled set as long as it is
+unchanged from a version ZIDE shipped (line endings do not count as a change); the moment you
+edit it, it is yours and is never touched again — delete it to get the newest set back.
+Deleting the file does not remove the snippets (it comes back); to disable them, empty the
+file or comment out its contents instead. Edit it freely to tweak the bodies — the *Snippets*
+section documents the template syntax and expansion rules. Because init.lua runs before
+extensions, a snippet registered there with the same language and name is replaced by the
+bundled one at the next load — change `snippets-zig.lua` itself instead.
 
 The `reload_extensions` command (palette) drops all Lua-registered commands
 and event handlers and re-runs every `extensions/*.lua` — edit-extension,
@@ -706,7 +717,7 @@ mapping applies to files that are already open.
 ├── extensions/                       # Language + runtime extensions
 │   ├── example-lint-zig.lua          # Bundled on-save linter demo (commented out)
 │   ├── markdown.lua                  # Bundled toggle_checkbox command
-│   ├── snippets-zig.lua              # Bundled Zig snippets (recreated when missing)
+│   ├── snippets-zig.lua              # Bundled Zig snippets (updated until you edit it)
 │   ├── python.lua
 │   ├── c.lua
 │   └── ...
@@ -857,6 +868,7 @@ Press **F12** to jump to the definition of the symbol under the cursor. If the d
 | `src/core/search.zig` | Workspace search/replace engine (background walk, streaming results) |
 | `src/core/walk_ignore.zig` | Top-level `.gitignore` pruning for quick open and workspace search |
 | `src/core/snippets.zig` | Snippet templates: parsing, indentation-aware insertion, field tracking |
+| `src/core/snippet_panel.zig` | Snippets side panel model: the registry's definitions for one document as collapsible group rows, selection and preview |
 | `src/core/recovery.zig` | Crash-recovery snapshots (per-workspace/instance dirs, off-thread encode) |
 | `src/core/editorconfig.zig` | EditorConfig resolution and save-time normalization |
 | `src/core/text_file.zig` | File read/write: encoding detection and conversion, atomic saves |
@@ -990,9 +1002,9 @@ All editing actions go through named commands in `CommandRegistry`. Commands can
 
 Key combos for `zide.bind` / `zide.unbind` accept any case and modifier order (`Ctrl+Shift+K` = `shift+ctrl+k`; `control` works for `ctrl`). Key name aliases: `pageup`/`pgup` → `page_up`, `pagedown`/`pgdn` → `page_down`, `esc` → `escape`, `return` → `enter`, `del` → `delete`, `ins` → `insert`, `\` → `backslash`, plus `space` and the dvui-style punctuation names `slash`, `period`, `semicolon`, `comma`, `minus`, `equal`, `grave`, `apostrophe`, `left_bracket`, `right_bracket`. Both frontends deliver letters, digits, F1–F12, the named keys (arrows, `home`, `end`, `page_up`, `page_down`, `insert`, `delete`, `tab`, `enter`, `escape`, `backspace`, `space`, `backslash`) and the punctuation `[ ] ; ' , . / - =` plus backtick (`grave`), so `ctrl+1` or `ctrl+insert` work in the GUI and the TUI alike; Ctrl+Space (`ctrl+space`) works in the TUI too. `zide.bind` logs one warning for a key or modifier that can never fire and one when the command is not registered (yet); the binding still stands, so an extension may register the command later.
 
-**Keyboard focus.** In normal mode exactly one of the focused editor pane, the focused terminal pane, the file tree and the search panel owns the keyboard. The side panels live in the main window and can own the keyboard only while that window is focused. Clicking any pane, clicking a tab, splitting, F6 / Shift+F6, switching windows and `toggle_terminal` (Ctrl+backtick) give the keyboard back to the pane; `toggle_terminal` with a panel focused over a terminal pane focuses that terminal instead of opening another. While a panel owns the keyboard, clipboard, select-all and word-delete chords never touch the document behind it: in the search panel the keys bound to copy and cut take the whole focused field, paste appends the clipboard's first line and Ctrl+Backspace deletes the previous word, while Ctrl+A and Ctrl+Delete do nothing; in the file tree the keys bound to copy, cut and paste drive the file clipboard. The Edit menu's Cut/Copy/Paste/Select All follow the same rule.
+**Keyboard focus.** In normal mode exactly one of the focused editor pane, the focused terminal pane, the file tree, the Snippets panel and the search panel owns the keyboard (when flags disagree, the tree wins, then the Snippets panel). The side panels live in the main window and can own the keyboard only while that window is focused. Clicking any pane, clicking a tab, splitting, F6 / Shift+F6, switching windows and `toggle_terminal` (Ctrl+backtick) give the keyboard back to the pane; `toggle_terminal` with a panel focused over a terminal pane focuses that terminal instead of opening another. While a panel owns the keyboard, clipboard, select-all and word-delete chords never touch the document behind it: in the search panel the keys bound to copy and cut take the whole focused field, paste appends the clipboard's first line and Ctrl+Backspace deletes the previous word, while Ctrl+A and Ctrl+Delete do nothing; in the file tree the keys bound to copy, cut and paste drive the file clipboard; the Snippets panel swallows them all. The Edit menu's Cut/Copy/Paste/Select All follow the same rule.
 
-About 165 registered commands; every one is listed in the command palette and bindable with `zide.bind`. The tables below are the complete set (names as the code registers them, 2026-10-08). "Default key" is the shipped binding; **hard-wired** means the frontends dispatch that plain key themselves, so it is not in the keybind map — the command can still be bound to a chord of your own. `theme_*`, `gui_theme_*` and `tui_theme_*` re-apply `themes/syntax-theme.lua` and the `syn_theme_<lang>.lua` files on top of the new palette (the editor-color override files `gui-theme.lua` / `tui-theme.lua` are not re-run until the next launch).
+About 166 registered commands; every one is listed in the command palette and bindable with `zide.bind`. The tables below are the complete set (names as the code registers them, 2026-10-15). "Default key" is the shipped binding; **hard-wired** means the frontends dispatch that plain key themselves, so it is not in the keybind map — the command can still be bound to a chord of your own. `theme_*`, `gui_theme_*` and `tui_theme_*` re-apply `themes/syntax-theme.lua` and the `syn_theme_<lang>.lua` files on top of the new palette (the editor-color override files `gui-theme.lua` / `tui-theme.lua` are not re-run until the next launch).
 
 **Files, tabs and projects**
 
@@ -1116,6 +1128,7 @@ About 165 registered commands; every one is listed in the command palette and bi
 | `snippet_expand` | Tab (hard-wired) | Expand the exact trigger before the caret |
 | `snippet_next` / `snippet_previous` | Tab / Shift+Tab (hard-wired) | Visit the next / previous placeholder |
 | `snippet_cancel` | Escape (hard-wired) | End snippet navigation |
+| `toggle_snippets` | Ctrl+Alt+B | Show, focus or hide the Snippets side panel (the same three-step cycle as `toggle_filetree`) |
 
 **Tasks, problems, Git and debugging**
 
@@ -1149,10 +1162,53 @@ About 165 registered commands; every one is listed in the command palette and bi
 
 ## Snippets
 
-Tab-expandable templates with placeholder fields, registered from Lua. Nine Zig snippets ship
-active by default — see *The Shipped Extension: snippets-zig.lua* under the Extension System.
+Templates with placeholder fields, registered from Lua: skeletons of syntax you reach by plain
+name from the **Snippets panel** or the palette, and — when they have a trigger — by typing
+it and pressing Tab. 54 Zig skeletons ship active by default, filed in groups with notes —
+see *The Shipped Extension: snippets-zig.lua* under the Extension System.
 
-### Using them
+### The Snippets panel
+
+- **Ctrl+Alt+B** (`toggle_snippets`, View > Snippets) cycles like Ctrl+B does for the file
+  tree: hidden → shown + focused → (from the editor) focus the panel → (from the panel)
+  hidden. Escape gives the keyboard back and leaves the panel open. GUI for now; the TUI band
+  is the next checkpoint (there, the command only says so).
+- It lists the snippets of the main window's document language plus every `"*"` snippet, in
+  collapsible groups in the order they were registered; the first group starts open. Click a
+  group (or Enter, Left, Right) to open or close it. In an **untitled file without a
+  language** it offers every language ZIDE knows, with the language in front of each group,
+  and inserting a snippet makes the file that language (a Zig snippet turns a new file into a
+  Zig file). A saved file ZIDE has no language for sees only `"*"` snippets.
+- **Click an item or press Enter** on it: the snippet lands at the caret, the keyboard goes
+  back to the editor and the first blank is selected, so Tab walks the blanks right away. It
+  refuses — with a status-bar message, keeping the panel focused — when the focused pane is a
+  terminal, the document is read-only or several cursors are active. Prefer Kate's way? With
+  `snippets_double_click` (Settings dialog: "Snippets Insert on Double-Click") a click only
+  selects the item and gives the panel the keyboard — its preview stays put while you read
+  it — and a double-click inserts. Either way, to drive the list from the keyboard press
+  Ctrl+Alt+B once more (it focuses the open panel) or click its header, a group or the empty
+  space below the rows.
+- The **preview** at the bottom shows the highlighted item (the hovered one in the GUI, else
+  the selected one): the code as it will be inserted with its blanks tinted (soft-wrapped to
+  the panel's width like the notes, a continued row indented two columns), the Tab trigger
+  if it has one, and the snippet's notes. It takes the room a short list leaves free (at
+  least 40% of the panel); when the notes still do not fit, the wheel over the preview, or
+  its scrollbar, scrolls them. The panel's edge, its dividers, the code box and the guide
+  lines under open groups use the `color_panel_border` theme color.
+- Keys while it owns the keyboard: Up/Down, PageUp/PageDown, Home/End, Left (close the group
+  or jump to it), Right (open the group or step into it), Enter, Escape. Clipboard chords are
+  swallowed; global chords (Ctrl+B, Ctrl+P, …) keep working.
+- It docks **left or right** with the same rules as the file tree: `snippets_side` (default
+  `"auto"` = opposite the tree; on a shared side the tree sits outside) and `snippets_width`;
+  right-click the panel to move it, drag its edge to resize — both persist to init.lua — and
+  drag the edge well past the minimum width to hide it (the status bar says so before you
+  let go; the width is kept, and Ctrl+Alt+B brings the panel back). `zide.set("snippets_visible",
+  true)` opens it on every launch; Ctrl+Alt+B never writes settings. When the window has no
+  room for it beside the editor (the panes keep 240 px next to the bands) it hides itself and
+  says so in the status bar — widen the window and press Ctrl+Alt+B. A double-click on a row
+  counts once. The Settings dialog (Preferences) has rows for all of these settings.
+
+### Using them with Tab
 
 - Type a trigger and press **Tab**: when the whole identifier just before the caret exactly
   matches a snippet prefix for the document's language, it expands (case-sensitive; `obj.fn`
@@ -1167,8 +1223,11 @@ active by default — see *The Shipped Extension: snippets-zig.lua* under the Ex
   when an edit crosses the field's edge (Backspace at its start), on undo/redo, when a second
   cursor appears, on tab/pane/split/window switches, when the search panel, file tree or any
   prompt takes the keyboard, and on `reload_extensions`.
-- Every snippet is also a **palette command** named `snippet.<language>.<prefix>` — bindable
-  with `zide.bind` and callable via `zide.exec`. It inserts at the caret (replacing a
+- Every snippet is also a **palette command** named `snippet.<language>.<prefix>` — or, for
+  one without a trigger, `snippet.<language>.~<slug>` where the slug is the description
+  lowercased with runs of punctuation and spaces folded to `-` (`Hello world program` →
+  `snippet.zig.~hello-world-program`; the `~` keeps the two kinds apart) — bindable with
+  `zide.bind` and callable via `zide.exec`. It inserts at the caret (replacing a
   selection) with no trigger typed; running one for another language reports
   `Snippet language does not match this document`. The commands `snippet_expand`,
   `snippet_next`, `snippet_previous` and `snippet_cancel` exist for chords (`snippet_expand`
@@ -1184,16 +1243,24 @@ active by default — see *The Shipped Extension: snippets-zig.lua* under the Ex
 ```lua
 zide.register_snippet({
     language = "zig",          -- a language name (case-insensitive), or "*" for every document
-    prefix = "fn",             -- the Tab trigger: letters, digits, _ or non-ASCII; no leading digit, no @
+    prefix = "fn",             -- optional Tab trigger: letters, digits, _ or non-ASCII; no leading digit, no @
     body = "fn ${1:name}($2) $3 {\n\t$0\n}",
-    description = "Function",  -- optional; defaults to the prefix
+    description = "Function",  -- the name in the panel and the palette; defaults to the prefix
+    group = "Functions",       -- optional panel folder; defaults to "Other"
+    notes = "A named block of code you call with name().",  -- optional; shown in the preview, never inserted
 })
 ```
 
+A snippet needs a `prefix` or a `description`. Most of the bundled skeletons have no trigger:
+Tab expands an exact trigger *before* it accepts an open completion, and also after a dot, so
+a trigger named like everyday code (`print`) would fire while you complete `std.debug.print`.
+`description` and `group` must be one line of valid UTF-8; `notes` may contain line breaks
+but no other control characters (both frontends draw them).
+
 Returns the command name (`"snippet.zig.fn"`), or `nil, message` on failure — it never raises.
-Re-registering the same language + prefix replaces the snippet; a name already owned by a
-`zide.command` is refused. A language-specific snippet beats a `"*"` snippet with the same
-prefix. Snippets from `extensions/*.lua` are dropped and re-created by `reload_extensions`,
+Re-registering the same language + prefix (or, without a prefix, the same language +
+description) replaces the snippet; a name already owned by a `zide.command` is refused. A
+language-specific snippet beats a `"*"` snippet with the same prefix. Snippets from `extensions/*.lua` are dropped and re-created by `reload_extensions`,
 while ones registered from init.lua survive reloads — but init.lua runs before extensions, so
 a bundled snippet with the same language and prefix replaces it at every load (edit
 `snippets-zig.lua` itself instead).
@@ -1256,13 +1323,13 @@ A toggleable side panel for browsing and managing the project directory, backed 
 
 ### Basics
 - **Ctrl+B** (`toggle_filetree`) cycles: hidden → shown + focused → (from the editor) focus the tree → (from the tree) hidden. Together with Escape this gives a full keyboard round-trip between editor and tree.
-- Docks **left or right** (`filetree_side` setting, default left); width via `filetree_width` (GUI px) / `tui_filetree_width` (TUI columns).
+- Docks **left or right** (`filetree_side` setting, default left); width via `filetree_width` (GUI px) / `tui_filetree_width` (TUI columns) — in the GUI drag its editor-facing edge to resize it, or drag the edge well past the minimum width to hide it (the status bar says so before you let go; the width is kept, and Ctrl+B brings the tree back). The Snippets panel docks the same way (default: the other side; on a shared side the tree sits outside) — see *Snippets*.
 - Starts **visible** by default — to launch with it closed, uncheck "File Tree Visible" in the settings dialog (persists to init.lua) or `zide.set("filetree_visible", false)` (at runtime that also returns the keyboard to the pane); Ctrl+B at runtime never writes settings.
 - Root = current directory by default, or the folder given on the command line (`zide path/to/project` — see *Hybrid Launch*). Change it in the Settings dialog ("File Tree Root" — type a path, Enter applies; a bad path keeps the previous root and shows why) or `zide.set("filetree_root", "/path")`; "" resets to cwd. At runtime `zide.set("filetree_root", …)` clears the file clipboard and a pending move and rebuilds the tree on the next frame. **Backspace / u** (or `filetree_root_up`) re-roots at the parent directory to climb the hierarchy.
 - The panel header shows a clickable **up-button** (level-up icon in the GUI, `^` in the TUI) plus the full root path, truncated from the left (`...\Zig\ZIDE`) so the tail stays readable — click it to go up one folder.
 - Files created, deleted, or renamed **outside ZIDE** (Explorer, a terminal) appear automatically: a cheap directory-mtime probe runs every ~1.5s and triggers a rescan when something changes (the multi-selection survives it, as with Shift+R). Both frontends wake for these deadlines even without input.
 - Directories sort first, names case-insensitive; children scan lazily on first expand; everything is listed, dotfiles and `.git` included.
-- Indent guide lines mark each ancestor level (thin rules in the GUI, `│` columns in the TUI) so deep nesting stays readable.
+- Indent guide lines mark each ancestor level (thin rules in the GUI, `│` columns in the TUI) so deep nesting stays readable. The GUI draws them, the panel's editor-facing edge and the Snippets panel's dividers in the `color_panel_border` theme color (`zide.set("color_panel_border", "#5a5a62")` to change it; the TUI keeps `tui_color_gutter_separator` for its `│` columns).
 - **GUI rows render VS Code-style**: chevron expanders on folders, per-type file icons in fixed accent colors (Zig orange, Lua blue, Markdown blue, images purple, executables green, folders steel blue, unknown types a dimmed generic document), the UI font instead of mono, a hover highlight under the pointer, and a selection bar that dims while the tree doesn't own the keyboard. Classification lives in `src/core/fileicons.zig` (frontend-agnostic — both frontends draw the same nerdfont glyphs, **per-language logos included**: the Zig zero, Lua moon, Rust gear, ...); special basenames beat extensions (README → book, LICENSE → shield, `.gitignore` → git, Makefile/Dockerfile/dotfiles → gear). The GUI renders the glyphs as text from the bundled Fira Code Nerd Font Mono, so they're always present — but if you point `mono_font_path` at a non-Nerd font, tree icons will show as boxes (pick any "NF" font to keep them). The panel chrome (chevrons, header buttons) and the tool dialogs' buttons draw the CFPB Design System icons (`src/icons/svg`, a US government work in the public domain under CC0) plus ZIDE's own drawings for the shapes that pack lacks (`src/icons/svg/zide`: pin, diff, stop, pause, the debugger steps, breakpoint, terminal, refresh) — nothing to credit; `src/frontend/icons.zig` converts them to TinyVG on first use, and DVUI's Entypo icons are only the fallback for an icon that fails to convert. The Debug view's overview rows carry the debugger's icons (continue, pause, step over / into / out, stop). Extensions can override any assignment with `zide.set_icon` (see Extension Runtime API).
 - **TUI icons** (opt-in): the `toggle_tui_icons` palette command (Ctrl+P — works live in the TUI and persists), `zide.set("tui_filetree_icons", true)`, or the GUI Settings dialog swaps the `+`/`-` glyphs for ▸/▾ chevrons plus nerdfont glyphs in truecolor accents — **per-language logos** where Nerd Fonts have them (the Zig zero, Lua moon, Rust gear, Python snakes, PowerShell badge, ... — codepoints follow nvim-web-devicons), category glyphs otherwise. The terminal font must be a patched Nerd Font or the glyphs render as boxes; off (the default) keeps the classic look. `zide.set_icon` overrides render the chosen kind's category glyph.
 - **GUI scrollbar**: a slim pill appears over the rows' right edge when they overflow — drag it, or click the empty track above/below to page; the wheel still scrolls. (TUI rows are unchanged: `+`/`-` glyphs, terminal colors.)

@@ -160,6 +160,7 @@ const welcome_text =
     \\//   Ctrl+`            toggle terminal    Ctrl+Shift+`     terminal in split
     \\//   Ctrl+Alt+`        detach terminal to its own window (GUI)
     \\//   Ctrl+B            toggle file tree   Ctrl+Space       completion (LSP)
+    \\//   Ctrl+Alt+B        snippets panel: syntax skeletons by plain name (click to insert)
     \\//   Ctrl+Shift+O      open folder as project   (palette: recent_projects; tree: o)
     \\//   F12               go to definition   Shift+F12        find references
     \\//   Ctrl+F12          symbols in file    Ctrl+T           workspace symbols
@@ -687,6 +688,7 @@ comptime {
     _ = @import("core/commands.zig");
     _ = @import("core/editor.zig");
     _ = @import("core/snippets.zig");
+    _ = @import("core/snippet_panel.zig");
     _ = @import("core/snippet_integration_tests.zig");
     _ = @import("core/keybind.zig");
     _ = @import("core/syntax.zig");

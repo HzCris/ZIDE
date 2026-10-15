@@ -52,6 +52,10 @@ pub const EditorTheme = struct {
     gutter_text: ThemeColor,
     gutter_text_active: ThemeColor,
     gutter_separator: ThemeColor,
+    /// Side panels (file tree, Snippets): their editor-facing edge, the
+    /// header and preview dividers, the preview's code box and the indent
+    /// guides — visibly lighter than gutter_separator.
+    panel_border: ThemeColor,
 
     // Decorations
     wrap_marker: ThemeColor,
@@ -174,6 +178,7 @@ pub const gui_dark = EditorTheme{
     .gutter_text = .{ .r = 130, .g = 130, .b = 130, .a = 200 },
     .gutter_text_active = .{ .r = 225, .g = 225, .b = 230 },
     .gutter_separator = .{ .r = 80, .g = 80, .b = 80, .a = 100 },
+    .panel_border = .{ .r = 90, .g = 90, .b = 98 },
 
     .wrap_marker = .{ .r = 100, .g = 100, .b = 100, .a = 150 },
     .tilde = .{ .r = 100, .g = 100, .b = 100, .a = 128 },
@@ -213,6 +218,7 @@ pub const gui_light = EditorTheme{
     .gutter_text = .{ .r = 140, .g = 140, .b = 140, .a = 200 },
     .gutter_text_active = .{ .r = 30, .g = 30, .b = 30 },
     .gutter_separator = .{ .r = 180, .g = 180, .b = 180, .a = 100 },
+    .panel_border = .{ .r = 170, .g = 170, .b = 178 },
 
     .wrap_marker = .{ .r = 180, .g = 180, .b = 180, .a = 150 },
     .tilde = .{ .r = 180, .g = 180, .b = 180, .a = 128 },
@@ -252,6 +258,7 @@ pub const gui_high_contrast = EditorTheme{
     .gutter_text = .{ .r = 160, .g = 160, .b = 160 },
     .gutter_text_active = .{ .r = 255, .g = 255, .b = 255 },
     .gutter_separator = .{ .r = 128, .g = 128, .b = 128 },
+    .panel_border = .{ .r = 200, .g = 200, .b = 200 },
 
     .wrap_marker = .{ .r = 128, .g = 128, .b = 128 },
     .tilde = .{ .r = 128, .g = 128, .b = 128 },

@@ -245,6 +245,7 @@ fn createGuiThemeTemplate(path: [:0]const u8) void {
         \\-- zide.set("color_gutter_text", "#828282c8")   -- Inactive line numbers
         \\-- zide.set("color_gutter_text_active", "#e1e1e6") -- Active line number
         \\-- zide.set("color_gutter_separator", "#50505064") -- Gutter/editor border line
+        \\-- zide.set("color_panel_border", "#5a5a62")   -- Side panel edges, dividers, indent guides
         \\
         \\-- === Decorations ===
         \\-- zide.set("color_wrap_marker", "#64646496")   -- Soft-wrap continuation dot
@@ -949,6 +950,37 @@ fn luaSet(state: ?*zlua.LuaState) callconv(.c) c_int {
         if (val >= 16 and val <= 80) {
             editor.tui_filetree_width = @intCast(val);
         }
+    } else if (std.mem.eql(u8, key_str, "snippets_visible")) {
+        editor.snippets_visible = lua.toBoolean(2);
+        if (!editor.snippets_visible) editor.snippets_focused = false;
+    } else if (std.mem.eql(u8, key_str, "snippets_side")) {
+        // zide.set("snippets_side", "auto") / "left" / "right"; auto docks
+        // opposite the file tree.
+        const val = lua.toString(2) catch return 0;
+        const val_str: []const u8 = val;
+        if (std.mem.eql(u8, val_str, "auto")) {
+            editor.snippets_side = null;
+        } else if (std.mem.eql(u8, val_str, "left")) {
+            editor.snippets_side = .left;
+        } else if (std.mem.eql(u8, val_str, "right")) {
+            editor.snippets_side = .right;
+        } else {
+            std.log.warn("zide.set: snippets_side must be \"auto\", \"left\" or \"right\", got '{s}'", .{val_str});
+        }
+    } else if (std.mem.eql(u8, key_str, "snippets_width")) {
+        const val = lua.toInteger(2) catch return 0;
+        if (val >= 120 and val <= 600) {
+            editor.snippets_width = @floatFromInt(val);
+        }
+    } else if (std.mem.eql(u8, key_str, "tui_snippets_width")) {
+        const val = lua.toInteger(2) catch return 0;
+        if (val >= 16 and val <= 80) {
+            editor.tui_snippets_width = @intCast(val);
+        }
+    } else if (std.mem.eql(u8, key_str, "snippets_double_click")) {
+        // GUI: true = a click only selects a snippet (its preview stays
+        // put); a double-click or Enter inserts it.
+        editor.snippets_double_click = lua.toBoolean(2);
     } else if (std.mem.eql(u8, key_str, "filetree_font_size")) {
         const val = lua.toInteger(2) catch return 0;
         if (val >= 0 and val <= 32) {
@@ -1198,6 +1230,21 @@ fn luaGet(state: ?*zlua.LuaState) callconv(.c) c_int {
         return 1;
     } else if (std.mem.eql(u8, key_str, "tui_filetree_width")) {
         lua.pushInteger(@intCast(editor.tui_filetree_width));
+        return 1;
+    } else if (std.mem.eql(u8, key_str, "snippets_visible")) {
+        lua.pushBoolean(editor.snippets_visible);
+        return 1;
+    } else if (std.mem.eql(u8, key_str, "snippets_side")) {
+        _ = lua.pushString(if (editor.snippets_side) |side| @tagName(side) else "auto");
+        return 1;
+    } else if (std.mem.eql(u8, key_str, "snippets_width")) {
+        lua.pushInteger(@intFromFloat(editor.snippets_width));
+        return 1;
+    } else if (std.mem.eql(u8, key_str, "tui_snippets_width")) {
+        lua.pushInteger(@intCast(editor.tui_snippets_width));
+        return 1;
+    } else if (std.mem.eql(u8, key_str, "snippets_double_click")) {
+        lua.pushBoolean(editor.snippets_double_click);
         return 1;
     } else if (std.mem.eql(u8, key_str, "filetree_font_size")) {
         lua.pushInteger(@intFromFloat(editor.filetree_font_size));
@@ -1728,14 +1775,78 @@ pub fn loadExtensions(lua: *Lua) void {
 
 pub const zig_snippets = @embedFile("../extensions/snippets-zig.lua");
 
-/// Exclusive creation also preserves edits if another instance starts concurrently.
+/// Every snippets-zig.lua ZIDE has shipped, as snippetFileHash values. An
+/// installed copy matching one of them is pristine and is replaced by the
+/// current file; anything else was edited by the user and is kept. The
+/// current file must be listed too (a test checks), so the next version
+/// can recognise it.
+const shipped_snippet_hashes = [_]u64{
+    0xfdc1db773038343c, // v1 (2026-09-22): nine triggers, no groups or notes
+    0xf43f4a6d0749008d, // v2 (2026-10-15): 54 skeletons in groups with notes, for the Snippets panel
+};
+
+/// Wyhash of `text` with CRLF read as LF, so a checkout or an editor that
+/// converted the line endings still counts as pristine.
+pub fn snippetFileHash(text: []const u8) u64 {
+    var h = std.hash.Wyhash.init(0);
+    var start: usize = 0;
+    var i: usize = 0;
+    while (i < text.len) : (i += 1) {
+        if (text[i] == '\r' and i + 1 < text.len and text[i + 1] == '\n') {
+            h.update(text[start..i]);
+            start = i + 1;
+        }
+    }
+    h.update(text[start..]);
+    return h.final();
+}
+
+/// Install the bundled snippets file when it is missing, or upgrade a
+/// pristine older copy. Exclusive creation also preserves edits if
+/// another instance starts concurrently.
 pub fn ensureSnippetExtension(dir: std.Io.Dir, io: std.Io) !void {
+    return ensureSnippetExtensionWith(dir, io, &shipped_snippet_hashes);
+}
+
+/// `old_hashes` are the shipped versions an installed copy may be upgraded from.
+pub fn ensureSnippetExtensionWith(dir: std.Io.Dir, io: std.Io, old_hashes: []const u64) !void {
     const file = dir.createFile(io, "snippets-zig.lua", .{ .exclusive = true }) catch |err| switch (err) {
-        error.PathAlreadyExists => return,
+        error.PathAlreadyExists => return upgradeSnippetExtension(dir, io, old_hashes),
         else => return err,
     };
     defer file.close(io);
     try file.writeStreamingAll(io, zig_snippets);
+}
+
+/// Replace a pristine older copy with the current file, atomically; an
+/// edited copy is the user's and stays.
+fn upgradeSnippetExtension(dir: std.Io.Dir, io: std.Io, old_hashes: []const u64) !void {
+    const allocator = std.heap.page_allocator;
+    const installed = try dir.readFileAlloc(io, "snippets-zig.lua", allocator, .limited(1 << 20));
+    defer allocator.free(installed);
+    const hash = snippetFileHash(installed);
+    if (hash == snippetFileHash(zig_snippets)) return;
+    for (old_hashes) |old| {
+        if (hash == old) break;
+    } else return;
+    var atomic = try dir.createFileAtomic(io, "snippets-zig.lua", .{ .replace = true });
+    defer atomic.deinit(io);
+    try atomic.file.writeStreamingAll(io, zig_snippets);
+    try atomic.file.sync(io);
+    try atomic.replace(io);
+    std.log.info("Upgraded extensions/snippets-zig.lua to the current bundled set", .{});
+}
+
+test "snippets-zig.lua: the bundled file is a listed shipped version" {
+    const hash = snippetFileHash(zig_snippets);
+    for (shipped_snippet_hashes) |shipped| if (shipped == hash) return;
+    std.debug.print("snippets-zig.lua changed: add 0x{x} to shipped_snippet_hashes in lua_settings.zig\n", .{hash});
+    return error.UnlistedSnippetFile;
+}
+
+test "snippets-zig.lua: hashing folds CRLF to LF" {
+    try std.testing.expectEqual(snippetFileHash("a\nb\n"), snippetFileHash("a\r\nb\r\n"));
+    try std.testing.expect(snippetFileHash("a\nb\n") != snippetFileHash("a\nb"));
 }
 
 /// Create extensions/example-lint-zig.lua (fully commented out) if it

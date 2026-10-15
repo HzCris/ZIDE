@@ -323,6 +323,18 @@ fn snippetStringField(lua: *Lua, key: [:0]const u8) ?[]const u8 {
     return if (lua.typeOf(-1) == .string) lua.toString(-1) catch null else null;
 }
 
+/// Optional string field of the option table: absent reads as "", and a
+/// value of another type is refused (raw access, like snippetStringField).
+fn snippetOptionalField(lua: *Lua, key: [:0]const u8) error{NotAString}![]const u8 {
+    const kind = lua_settings.getFieldRaw(lua, 1, key);
+    defer lua.pop(1);
+    return switch (kind) {
+        .nil, .none => "",
+        .string => lua.toString(-1) catch "",
+        else => error.NotAString,
+    };
+}
+
 fn snippetError(lua: *Lua, message: []const u8) c_int {
     lua.pushNil();
     _ = lua.pushString(message);
@@ -334,14 +346,12 @@ fn luaRegisterSnippet(state: ?*zlua.LuaState) callconv(.c) c_int {
     const editor = lua_settings.getEditor(state) orelse return 0;
     if (lua.typeOf(1) != .table) return snippetError(lua, "register_snippet expects a table");
     const language = snippetStringField(lua, "language") orelse return snippetError(lua, "Snippet language (string) is required");
-    const prefix = snippetStringField(lua, "prefix") orelse return snippetError(lua, "Snippet prefix (string) is required");
     const body = snippetStringField(lua, "body") orelse return snippetError(lua, "Snippet body (string) is required");
-    _ = lua_settings.getFieldRaw(lua, 1, "description");
-    const valid_description = lua.isNil(-1) or lua.typeOf(-1) == .string;
-    lua.pop(1);
-    if (!valid_description) return snippetError(lua, "Snippet description must be a string");
-    const description = snippetStringField(lua, "description") orelse prefix;
-    const command = editor.registerSnippet(language, prefix, description, body) catch |err|
+    const prefix = snippetOptionalField(lua, "prefix") catch return snippetError(lua, "Snippet prefix must be a string");
+    const description = snippetOptionalField(lua, "description") catch return snippetError(lua, "Snippet description must be a string");
+    const group = snippetOptionalField(lua, "group") catch return snippetError(lua, "Snippet group must be a string");
+    const notes = snippetOptionalField(lua, "notes") catch return snippetError(lua, "Snippet notes must be a string");
+    const command = editor.registerSnippet(.{ .language = language, .body = body, .prefix = prefix, .description = description, .group = group, .notes = notes }) catch |err|
         return snippetError(lua, @import("snippets.zig").errorMessage(err));
     _ = lua.pushString(command);
     return 1;
