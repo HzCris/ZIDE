@@ -1212,8 +1212,9 @@ see *The Shipped Extension: snippets-zig.lua* under the Extension System.
   it keeps 40 columns for the panes beside both bands and hides itself with a message when
   fewer than 16 columns are left for it. There is no hover (`snippets_double_click` is
   GUI-only): a click on a row selects it and shows its preview, a click on the highlighted
-  item inserts it, a click on a group opens or closes it. j/k move like in the tree.
-  Shift+Up/Down and Shift+PageUp/PageDown scroll the preview (the wheel over it too); when
+  item inserts it, a click on a group opens or closes it. The arrow keys move (no letter
+  keys: nothing modal). Shift+Up/Down and Shift+PageUp/PageDown scroll the preview (the
+  wheel over it too); when
   notes are cut off, the preview's last row says `▼ Shift+Down for more`. Code wraps to the
   band with a two-column continuation indent, blanks are drawn in the selection colors, and a
   `│` guide sits under each open group, all in the TUI theme's `gutter_separator` color.

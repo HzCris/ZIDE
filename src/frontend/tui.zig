@@ -1556,8 +1556,9 @@ fn handleSnippetsClick(editor: *Editor, band: SnippetsBand, row_abs: u16) void {
 /// Keys while the Snippets panel owns the keyboard (normal mode). Global
 /// ctrl/alt chords hit the keybind map first and never reach the panel,
 /// which types nothing (Space does nothing: its text must not land in a
-/// blank). Shift+Up/Down and Shift+PageUp/PageDown scroll the preview;
-/// the rest drives the list as in the GUI, j/k like the tree.
+/// blank; no letter keys either — nothing modal). Shift+Up/Down and
+/// Shift+PageUp/PageDown scroll the preview; the rest drives the list as
+/// in the GUI.
 fn handleSnippetsKey(editor: *Editor, key: Key) void {
     if (key.isModifier()) return;
     editor.status_message = "";
@@ -1575,8 +1576,6 @@ fn handleSnippetsKey(editor: *Editor, key: Key) void {
         Key.down => if (shift) {
             snippets_preview_scroll +|= 1;
         } else panel.move(1),
-        'k' => panel.move(-1),
-        'j' => panel.move(1),
         Key.page_up => if (shift) {
             snippets_preview_scroll -|= snippets_preview_rows;
         } else panel.move(-page),
@@ -5684,14 +5683,16 @@ test "TUI snippets panel: docks beside the tree, a click selects then inserts, k
     testKey(&editor, Key.tab, .{});
     try t.expectEqualStrings("values", doc.selectedText().?);
 
-    // Ctrl+Alt+B focuses the open panel; j then Enter inserts Constant.
-    // Escape hands the keys back and leaves the panel open; the next
-    // Ctrl+Alt+B pair hides it.
+    // Ctrl+Alt+B focuses the open panel; Down then Enter inserts Constant
+    // (letters do nothing: the panel is not modal). Escape hands the keys
+    // back and leaves the panel open; the next Ctrl+Alt+B pair hides it.
     testKey(&editor, Key.escape, .{});
     testKey(&editor, 'b', .{ .ctrl = true, .alt = true });
     try t.expect(editor.snippets_visible);
     try t.expectEqual(Editor.KeyboardOwner.snippets, editor.keyboardOwner());
     testKey(&editor, 'j', .{});
+    try t.expectEqual(@as(usize, 1), editor.snippet_panel.selected);
+    testKey(&editor, Key.down, .{});
     try t.expectEqual(@as(usize, 2), editor.snippet_panel.selected);
     testKey(&editor, Key.enter, .{});
     try t.expect(std.mem.indexOf(u8, doc.buffer.slice(0, doc.buffer.byteLen()), "const name: i32 = 0;") != null);
