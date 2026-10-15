@@ -203,11 +203,11 @@ does not need to know the syntax before completion can finish it.
   double-click inserts), the preview takes a short list's free space and scrolls long notes
   (wheel or scrollbar), dragging either band's edge far past its minimum hides it (width
   kept), and the five `snippets_*` rows in the Settings dialog (pulled up from checkpoint 2).
-- **Step 1, checkpoint 2: TUI band** (N, M). `drawSnippetsPanel`, `snippets_band`
-  hit-testing, `handleSnippetsKey`, both bands' width math (tree outermost, saturating),
-  click-selects-then-click-inserts (no hover in the TUI), the preview scrolling long notes and
-  wrapping long code as the GUI does, `│` guides under open groups as the TUI tree draws.
-  Until then the TUI hides the panel with a status message.
+- **Step 1, checkpoint 2: TUI band** (N, M) — **DONE 2026-10-15**: `drawSnippetsPanel`,
+  `snippets_band` hit-testing, `handleSnippetsKey`, both bands' width math (tree outermost,
+  saturating, the panes keep 40 columns), click-selects-then-click-inserts (no hover in the
+  TUI), the preview scrolling long notes (Shift+Up/Down, Shift+PgUp/PgDn, the wheel; a `▼`
+  marker row) and wrapping long code as the GUI does, `│` guides under open groups.
 - **Step 2: make your own** (N, M). "Save as snippet" from the selection (a form: name,
   folder, optional trigger, notes) written to the user's own snippets file; edit and delete
   from the panel; a filter box at the top.

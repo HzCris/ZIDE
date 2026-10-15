@@ -103,7 +103,7 @@ Reloading extensions cancels their tasks, disconnects their active debug session
 | Ctrl+Shift+` | Open terminal (side-by-side split) |
 | Ctrl+Alt+` | Detach the focused terminal into its own OS window (GUI; TUI: second terminal at the side) |
 | Ctrl+B | Toggle file tree side panel |
-| Ctrl+Alt+B | Toggle the Snippets side panel — syntax skeletons by plain name, click to insert (GUI; the TUI band is next — see *Snippets*) |
+| Ctrl+Alt+B | Toggle the Snippets side panel — syntax skeletons by plain name; click a row to select it, click the highlighted one to insert it — see *Snippets* |
 | Ctrl+Shift+O | Open a folder as the project (GUI: native dialog; TUI: path prompt) |
 | Ctrl+F8 | Review changed files (verdicts, progress, baseline) |
 | F8 / Shift+F8 | Read the next / previous changed file in the review reader |
@@ -235,7 +235,7 @@ Windows terminals commonly intercept Alt combos (Windows Terminal binds Alt+arro
     - Review: `review_stage_on_approve` (true; approving a changed file also stages it — off = verdicts never touch git)
     - Appearance: `theme` ("dark"), `tui_theme` ("terminal"), `gutter_min_digits` (3, 1–10, both frontends), `secondary_window_chrome` (true; GUI: menu bar + status bar in extra windows, false = bare pane containers), `page_size` (accepted but overwritten by the viewport height every frame, so it has no lasting effect)
     - File tree: `filetree_visible` (true), `filetree_side` ("left"/"right"), `filetree_width` (240 GUI px, 120–600), `tui_filetree_width` (30 columns, 16–80), `filetree_root` (starting directory, "" = cwd; stored unvalidated from Lua — the Settings dialog checks it), `filetree_git_colors` (true; off = no tree Git colors, Changes and gutters remain available), `filetree_auto_reveal` (true, read by the GUI), `tui_filetree_icons` (false), `filetree_font_size` (0 = theme font, 0–32), `filetree_icon_scale` (90, 50–200)
-    - Snippets panel: `snippets_visible` (false; at runtime hiding it also returns the keyboard to the pane), `snippets_side` ("auto"/"left"/"right"; auto docks opposite the file tree), `snippets_width` (260 GUI px, 120–600), `tui_snippets_width` (32 columns, 16–80; read once the TUI band exists), `snippets_double_click` (false; GUI: true makes a click only select a snippet and keep its preview — a double-click or Enter inserts it). All five have rows in the Settings dialog
+    - Snippets panel: `snippets_visible` (false; at runtime hiding it also returns the keyboard to the pane), `snippets_side` ("auto"/"left"/"right"; auto docks opposite the file tree), `snippets_width` (260 GUI px, 120–600), `tui_snippets_width` (32 columns, 16–80), `snippets_double_click` (false; GUI: true makes a click only select a snippet and keep its preview — a double-click or Enter inserts it). All five have rows in the Settings dialog
   - `zide.set("mono_font_path", "/path/to/font.ttf")` — use a custom monospace font (GUI only; read once at startup, so a change needs a restart, and a bad path falls back to the bundled font with a logged warning; pick a Nerd Font to keep box-drawing/powerline glyphs and tree icons)
   - `zide.set("mono_font_size", 14)` — override the default monospace font size (GUI only, applies live)
   - `zide.set("tui_theme", name)` — switch TUI theme ("terminal", "dark", "light", "high_contrast")
@@ -251,6 +251,7 @@ Windows terminals commonly intercept Alt combos (Windows Terminal binds Alt+arro
   - Config load order: init.lua → themes/gui-theme.lua → themes/tui-theme.lua → themes/syntax-theme.lua → extensions/*.lua → themes/syn_theme_<lang>.lua — a later file's `zide.set` overrides an earlier one's, and extension files load in directory order (not sorted)
 - Data-driven keybinding map (all Ctrl/Alt shortcuts remappable, globally or per language)
 - File tree side panel (Ctrl+B) — dockable left/right column band with mouse + keyboard browsing, create/rename/delete prompts, reveal-current-file (see File Tree section)
+- Snippets side panel (Ctrl+Alt+B) — the document language's snippets in collapsible groups by plain name with a preview (the code with its blanks, the notes) under them; click a row to select it, click the highlighted item or press Enter to insert it at the caret with Tab walking the blanks; docks like the tree (`tui_snippets_width` columns), Shift+Up/Down scroll long notes (see *Snippets*)
 - Auto-save (off by default — `zide.set("auto_save", true)` or the Settings dialog; saves dirty documents with file paths after a configurable interval, default 5s; continues while the TUI is idle)
 - Application icon embedded in exe
 - Multiple cursor editing (Ctrl+Shift or Ctrl+Alt+Up/Down, Ctrl+D, Alt+click, Escape/click to clear; an added cursor keeps its column for the next Up/Down)
@@ -1171,8 +1172,8 @@ see *The Shipped Extension: snippets-zig.lua* under the Extension System.
 
 - **Ctrl+Alt+B** (`toggle_snippets`, View > Snippets) cycles like Ctrl+B does for the file
   tree: hidden → shown + focused → (from the editor) focus the panel → (from the panel)
-  hidden. Escape gives the keyboard back and leaves the panel open. GUI for now; the TUI band
-  is the next checkpoint (there, the command only says so).
+  hidden. Escape gives the keyboard back and leaves the panel open. Both frontends have the
+  panel; the terminal's differences are listed at the end of this section.
 - It lists the snippets of the main window's document language plus every `"*"` snippet, in
   collapsible groups in the order they were registered; the first group starts open. Click a
   group (or Enter, Left, Right) to open or close it. In an **untitled file without a
@@ -1207,6 +1208,15 @@ see *The Shipped Extension: snippets-zig.lua* under the Extension System.
   room for it beside the editor (the panes keep 240 px next to the bands) it hides itself and
   says so in the status bar — widen the window and press Ctrl+Alt+B. A double-click on a row
   counts once. The Settings dialog (Preferences) has rows for all of these settings.
+- **In the terminal** the band docks the same way, `tui_snippets_width` columns wide (16–80);
+  it keeps 40 columns for the panes beside both bands and hides itself with a message when
+  fewer than 16 columns are left for it. There is no hover (`snippets_double_click` is
+  GUI-only): a click on a row selects it and shows its preview, a click on the highlighted
+  item inserts it, a click on a group opens or closes it. j/k move like in the tree.
+  Shift+Up/Down and Shift+PageUp/PageDown scroll the preview (the wheel over it too); when
+  notes are cut off, the preview's last row says `▼ Shift+Down for more`. Code wraps to the
+  band with a two-column continuation indent, blanks are drawn in the selection colors, and a
+  `│` guide sits under each open group, all in the TUI theme's `gutter_separator` color.
 
 ### Using them with Tab
 

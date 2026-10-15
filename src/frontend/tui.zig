@@ -17,6 +17,7 @@ const terminal_mod = @import("../core/terminal.zig");
 const filetree_mod = @import("../core/filetree.zig");
 const fileicons = @import("../core/fileicons.zig");
 const FileTree = filetree_mod.FileTree;
+const snippets_mod = @import("../core/snippets.zig");
 
 const Key = vaxis.Key;
 const Cell = vaxis.Cell;
@@ -608,10 +609,7 @@ fn dispatchKey(editor: *Editor, key: Key) void {
         switch (editor.keyboardOwner()) {
             .terminal => return handleTerminalKey(editor, key),
             .filetree => return handleFiletreeKey(editor, key),
-            .snippets => {
-                hideSnippetsPanel(editor);
-                return dispatchKey(editor, key);
-            },
+            .snippets => return handleSnippetsKey(editor, key),
             .search => return handleSearchKey(editor, key),
             .editor => {},
         }
@@ -826,21 +824,27 @@ var filetree_poll_ns: i128 = 0;
 /// Last open-document external-change probe (same event-driven cadence).
 var doc_poll_ns: i128 = 0;
 
-/// The Snippets panel exists in the GUI only so far: the TUI hides it as
-/// soon as it shows up and says so, so no keys vanish into a band that is
-/// not drawn. Its TUI band is the next checkpoint.
-fn hideSnippetsPanel(editor: *Editor) void {
-    if (!editor.snippets_visible and !editor.snippets_focused) return;
-    editor.snippets_visible = false;
-    editor.snippets_focused = false;
-    editor.status_message = "Snippets panel: not in the terminal version yet";
-}
+/// Snippets band geometry from the last draw (absolute screen coords):
+/// `preview_y` is the band row its preview starts on (`h` when there is
+/// none). Null when the panel isn't shown.
+const SnippetsBand = struct { x: u16, y: u16, w: u16, h: u16, preview_y: u16 };
+var snippets_band: ?SnippetsBand = null;
+/// Rows the Snippets list showed last frame (the PageUp/PageDown step).
+var snippets_rows_visible: usize = 1;
+/// The Snippets preview: rows scrolled off its top, how many more it
+/// could not show (the scroll's limit), its row count (the Shift+PageUp/
+/// PageDown step) and the definition it showed (a new one starts at its
+/// top).
+var snippets_preview_scroll: usize = 0;
+var snippets_preview_overflow: usize = 0;
+var snippets_preview_rows: usize = 1;
+var snippets_preview_def: ?u32 = null;
 
 /// Draw the full editor screen.
 fn drawEditor(win: Window, editor: *Editor, width: u16, height: u16) void {
-    hideSnippetsPanel(editor);
     pane_rect_count = 0;
     filetree_band = null;
+    snippets_band = null;
     search_band = null;
     encoding_band = null;
     encoding_picker_band = null;
@@ -864,8 +868,10 @@ fn drawEditor(win: Window, editor: *Editor, width: u16, height: u16) void {
         drawTabBar(tab_win, editor, width);
     }
 
-    // File tree band — docks left or right of the pane area, below the
-    // tab bar. Skipped (focus released) when the terminal is too narrow.
+    // Side bands — the file tree and the Snippets panel — dock left or
+    // right of the pane area, below the tab bar; on a shared side the
+    // tree is the outer one. The tree is skipped (focus released) when
+    // the terminal is too narrow for it.
     var tree_w: u16 = 0;
     if (editor.filetree_visible) {
         if (width < 40) {
@@ -885,8 +891,35 @@ fn drawEditor(win: Window, editor: *Editor, width: u16, height: u16) void {
             filetree_band = .{ .x = band_x, .y = tab_bar_height, .w = tree_w, .h = content_height };
         }
     }
-    const content_x: u16 = if (tree_w > 0 and editor.filetree_side == .left) tree_w else 0;
-    const content_width = width - tree_w;
+    const tree_left: u16 = if (tree_w > 0 and editor.filetree_side == .left) tree_w else 0;
+    // The Snippets band leaves the panes 40 columns beside both bands;
+    // with fewer than 16 columns for it, it hides itself and says so
+    // (Ctrl+Alt+B must not cycle a panel nobody can see).
+    var snip_w: u16 = 0;
+    if (editor.snippets_visible) {
+        snip_w = @min(editor.tui_snippets_width, (width -| tree_w) -| 40);
+        if (snip_w < 16) {
+            snip_w = 0;
+            if (editor.keyboardOwner() == .snippets) _ = editor.takeKeyboardFocus(.pane);
+            editor.snippets_visible = false;
+            editor.snippets_focused = false;
+            editor.status_message = "Snippets panel: no room beside the editor \u{2014} widen the terminal, then Ctrl+Alt+B";
+        } else {
+            const side = editor.snippetsSide();
+            const band_x: u16 = if (side == .left) tree_left else width - (tree_w - tree_left) - snip_w;
+            const band_win = win.child(.{
+                .x_off = @intCast(band_x),
+                .y_off = @intCast(tab_bar_height),
+                .width = snip_w,
+                .height = content_height,
+            });
+            const preview_y = drawSnippetsPanel(band_win, editor, snip_w, content_height, side);
+            snippets_band = .{ .x = band_x, .y = tab_bar_height, .w = snip_w, .h = content_height, .preview_y = preview_y };
+        }
+    }
+    const snip_left: u16 = if (snip_w > 0 and editor.snippetsSide() == .left) snip_w else 0;
+    const content_x: u16 = tree_left + snip_left;
+    const content_width = (width -| tree_w) -| snip_w;
 
     // Render pane tree into the content area
     const content_win = win.child(.{
@@ -1134,6 +1167,439 @@ fn openFiletreeFileTui(editor: *Editor, ft: *FileTree, idx: u32) void {
         else
             "Open failed";
     };
+}
+
+/// Draw the Snippets band, the GUI panel's terminal twin: a header, one
+/// row per group or item of the core model's rows (snippet_panel.zig)
+/// with a │ guide under each open group, then the preview of the
+/// selected item — its code wrapped to the band with the blanks
+/// highlighted, how to fill it in, and its notes word-wrapped. What the
+/// preview cannot show scrolls (Shift+Up/Down, the wheel). Returns the
+/// band row the preview starts on (`h` when the band is too short for
+/// one).
+fn drawSnippetsPanel(win: Window, editor: *Editor, w: u16, h: u16, side: Editor.FiletreeSide) u16 {
+    if (w < 2 or h < 2) return h;
+    const theme = editor.tui_theme;
+    const bg = toVaxis(theme.text_bg);
+    const bg_style: Style = .{ .fg = toVaxis(theme.text_fg), .bg = bg };
+    const dim_style: Style = .{ .fg = toVaxis(theme.gutter_text), .bg = bg };
+    const line_style: Style = .{ .fg = toVaxis(theme.gutter_separator), .bg = bg };
+    win.fill(.{ .style = bg_style });
+    const focused = editor.keyboardOwner() == .snippets;
+
+    // Separator column on the edge facing the editor.
+    const sep_x: u16 = if (side == .left) w - 1 else 0;
+    for (0..h) |r| {
+        win.writeCell(sep_x, @intCast(r), .{
+            .char = .{ .grapheme = "\u{2502}", .width = 1 }, // │
+            .style = line_style,
+        });
+    }
+    const text_x: u16 = if (side == .left) 0 else 1;
+    const text_w: u16 = w - 1;
+
+    const panel = editor.syncSnippetPanel();
+    const rows = panel.rows.items;
+    const defs = editor.snippets.items.items;
+
+    // Header: "Snippets — <language>", bright while the panel has the keys.
+    const header_style: Style = .{
+        .fg = toVaxis(if (focused) theme.overlay_accent else theme.gutter_text),
+        .bg = bg,
+        .bold = focused,
+    };
+    var title_buf: [96]u8 = undefined;
+    const title = std.fmt.bufPrint(&title_buf, "Snippets \u{2014} {s}", .{panel.languageLabel()}) catch "Snippets";
+    _ = writeStr(win, text_x, 0, truncToWidth(title, text_w), header_style);
+
+    // The rows and the preview share the band under the header: the
+    // preview keeps at least 40% of it and takes what a short list leaves
+    // free (as the GUI; an empty list shows a hint, so keep it a few rows).
+    const body_h: usize = h - 1;
+    const list_rows: usize = (if (rows.len == 0) 6 else rows.len) + 1;
+    var preview_h: usize = @max(body_h * 2 / 5, body_h -| list_rows);
+    if (body_h - preview_h < 3) preview_h = body_h -| 3;
+    if (preview_h < 4) preview_h = 0;
+    const rows_h: usize = body_h - preview_h;
+    snippets_rows_visible = @max(1, rows_h);
+
+    // Keep the selection in view (keyboard moves set the flag), then clamp
+    // the scroll when rows disappeared (a group closed, a reload).
+    if (panel.scroll_to_selected) {
+        panel.scroll_to_selected = false;
+        if (panel.selected < panel.scroll) {
+            panel.scroll = panel.selected;
+        } else if (rows_h > 0 and panel.selected >= panel.scroll + rows_h) {
+            panel.scroll = panel.selected + 1 - rows_h;
+        }
+    }
+    if (panel.scroll > 0 and panel.scroll + rows_h > rows.len) panel.scroll = rows.len -| rows_h;
+
+    // --- Rows: groups (▾/▸, name, count) and their items (│ guide, name,
+    //     Tab trigger right-aligned) ---
+    const sel_style: Style = .{ .fg = toVaxis(theme.selection_fg), .bg = toVaxis(theme.selection_bg) };
+    var sel_dim_style = bg_style;
+    sel_dim_style.bg = toVaxis(theme.overlay_selection_bg);
+    const any_language = panel.anyLanguage();
+    if (rows.len == 0) {
+        var hint: RowSink = .{ .win = win, .x = text_x, .y = 1, .capacity = rows_h };
+        drawWrappedRows(&hint, text_w, panel.emptyHint(), dim_style);
+    }
+    var screen_row: u16 = 1;
+    var r = panel.scroll;
+    while (r < rows.len and screen_row < 1 + rows_h) : ({
+        r += 1;
+        screen_row += 1;
+    }) {
+        const row = rows[r];
+        const selected = r == panel.selected;
+        // A dimmed bar when the panel doesn't own the keyboard.
+        const style = if (!selected) bg_style else if (focused) sel_style else sel_dim_style;
+        if (selected) {
+            for (0..text_w) |ci| {
+                win.writeCell(@intCast(text_x + ci), screen_row, .{
+                    .char = .{ .grapheme = " ", .width = 1 },
+                    .style = style,
+                });
+            }
+        }
+        // Dim text (counts, triggers, a group's language) keeps the row's
+        // background and, on the selection bar, its colors.
+        var row_dim = if (selected) style else dim_style;
+        row_dim.bg = style.bg;
+        switch (row.kind) {
+            .group => {
+                const group = panel.groups.items[row.group];
+                var count_buf: [16]u8 = undefined;
+                const count = std.fmt.bufPrint(&count_buf, "{d}", .{group.count}) catch "";
+                const count_x: u16 = (text_x + text_w) -| @as(u16, @intCast(count.len));
+                _ = writeStr(win, count_x, screen_row, count, row_dim);
+                var x = writeStr(win, text_x, screen_row, if (group.expanded) "\u{25be} " else "\u{25b8} ", style); // ▾ ▸
+                if (any_language) {
+                    x = writeStr(win, x, screen_row, truncToWidth(group.language, (count_x -| 1) -| x), row_dim);
+                    x = writeStr(win, x, screen_row, " ", style);
+                }
+                _ = writeStr(win, x, screen_row, truncToWidth(group.name, (count_x -| 1) -| x), style);
+            },
+            .item => {
+                // Guide under the group's chevron, as the tree's folders have.
+                var guide_style = line_style;
+                guide_style.bg = style.bg;
+                win.writeCell(text_x, screen_row, .{
+                    .char = .{ .grapheme = "\u{2502}", .width = 1 }, // │
+                    .style = guide_style,
+                });
+                if (row.def >= defs.len) continue;
+                const def = &defs[row.def];
+                const name_x: u16 = text_x + 3;
+                var name_right: u16 = text_x + text_w;
+                if (def.hasTrigger()) {
+                    // Only beside a name that keeps a few letters.
+                    const trigger_cols: u16 = @intCast(@min(advanceCols(def.prefix, 0, 1), 64));
+                    const trigger_x = (text_x + text_w) -| trigger_cols;
+                    if (trigger_x > name_x + 5) {
+                        _ = writeStr(win, trigger_x, screen_row, def.prefix, row_dim);
+                        name_right = trigger_x - 1;
+                    }
+                }
+                _ = writeStr(win, name_x, screen_row, truncToWidth(def.description, name_right -| name_x), style);
+            },
+        }
+    }
+
+    // --- Preview of the selected item, under a divider ---
+    if (preview_h == 0) {
+        snippets_preview_overflow = 0;
+        snippets_preview_rows = 1;
+        return h;
+    }
+    const pv_y: u16 = @intCast(1 + rows_h);
+    for (0..text_w) |ci| {
+        win.writeCell(@intCast(text_x + ci), pv_y, .{
+            .char = .{ .grapheme = "\u{2500}", .width = 1 }, // ─
+            .style = line_style,
+        });
+    }
+    const content_y = pv_y + 1;
+    const capacity: usize = preview_h - 1;
+    snippets_preview_rows = capacity;
+    const preview_def = panel.previewDef(null);
+    if (!std.meta.eql(preview_def, snippets_preview_def)) snippets_preview_scroll = 0;
+    snippets_preview_def = preview_def;
+    const def: ?*const snippets_mod.Definition = if (preview_def) |di| (if (di < defs.len) &defs[di] else null) else null;
+    const d = def orelse {
+        snippets_preview_overflow = 0;
+        var sink: RowSink = .{ .win = win, .x = text_x, .y = content_y, .capacity = capacity };
+        drawWrappedRows(&sink, text_w, "Select a snippet to see the code it inserts", dim_style);
+        return pv_y;
+    };
+    const doc = &editor.documents.items[editor.windowDocIdx(0)];
+    const styles: PreviewStyles = .{
+        .text = bg_style,
+        .dim = dim_style,
+        .code = .{ .fg = toVaxis(theme.text_fg), .bg = toVaxis(theme.overlay_bg) },
+        .blank = sel_style,
+        .tab = tabStop(editor, doc),
+    };
+    // Measure (a sink that draws nothing), clamp the scroll, then draw;
+    // when rows are left over, the last row says how to reach them.
+    var measure: RowSink = .{ .win = win, .x = text_x, .y = content_y, .capacity = 0 };
+    drawSnippetPreview(&measure, d, text_w, styles);
+    const total = measure.index;
+    const content_cap = if (total <= capacity) capacity else capacity - 1;
+    snippets_preview_overflow = total -| content_cap;
+    if (snippets_preview_scroll > snippets_preview_overflow) snippets_preview_scroll = snippets_preview_overflow;
+    var sink: RowSink = .{ .win = win, .x = text_x, .y = content_y, .capacity = content_cap, .skip = snippets_preview_scroll };
+    drawSnippetPreview(&sink, d, text_w, styles);
+    if (snippets_preview_scroll < snippets_preview_overflow) {
+        const marker_y: u16 = content_y + @as(u16, @intCast(capacity - 1));
+        _ = writeStr(win, text_x, marker_y, truncToWidth("\u{25bc} Shift+Down for more", text_w), dim_style); // ▼
+    }
+    return pv_y;
+}
+
+/// The rows of a wrapped block, drawn from `y` on, `capacity` of them at
+/// most: the first `skip` rows (scrolled off) and any past the block are
+/// counted — `index` ends as the block's row count — but not drawn. A
+/// capacity of 0 only measures.
+const RowSink = struct {
+    win: Window,
+    x: u16,
+    y: u16,
+    capacity: usize,
+    skip: usize = 0,
+    index: usize = 0,
+
+    /// The screen row for the next row, or null when it is not drawn.
+    fn next(self: *RowSink) ?u16 {
+        const i = self.index;
+        self.index += 1;
+        if (i < self.skip or i - self.skip >= self.capacity) return null;
+        return self.y + @as(u16, @intCast(i - self.skip));
+    }
+};
+
+const PreviewStyles = struct {
+    text: Style,
+    dim: Style,
+    code: Style,
+    blank: Style,
+    /// Tab stop for the code (the document's).
+    tab: usize,
+};
+
+/// `text` word-wrapped to `width` cells through `sink`; its newlines
+/// break rows too (an empty paragraph is a blank row).
+fn drawWrappedRows(sink: *RowSink, width: u16, text: []const u8, style: Style) void {
+    var paragraphs = std.mem.splitScalar(u8, text, '\n');
+    while (paragraphs.next()) |par| {
+        var pos: usize = 0;
+        while (true) {
+            const end = if (par.len == 0) 0 else wrapAdvanceRow(par, width, pos, 1);
+            if (sink.next()) |y| {
+                _ = writeStr(sink.win, sink.x, y, std.mem.trimEnd(u8, par[pos..end], " "), style);
+            }
+            if (end >= par.len) break;
+            pos = end;
+        }
+    }
+}
+
+/// The preview's rows through `sink`: the code (each line wrapped to
+/// `width` cells, a continued row two cells in, on the code background
+/// with the blanks highlighted), a blank row, how to fill it in, then
+/// the notes.
+fn drawSnippetPreview(sink: *RowSink, d: *const snippets_mod.Definition, width: u16, styles: PreviewStyles) void {
+    const text = d.template.text;
+    const stops = d.template.stops;
+    const has_blanks = for (stops) |stop| {
+        if (stop.number != 0) break true;
+    } else false;
+    var start: usize = 0;
+    while (start <= text.len) {
+        const end = std.mem.indexOfScalarPos(u8, text, start, '\n') orelse text.len;
+        const line = std.mem.trimEnd(u8, text[start..end], "\r");
+        var pos: usize = 0;
+        var first = true;
+        while (true) {
+            const indent: u16 = if (first) 0 else 2;
+            const row_end = if (line.len == 0) 0 else wrapAdvanceRow(line, width -| indent, pos, styles.tab);
+            const last = row_end >= line.len;
+            if (sink.next()) |y| {
+                // The code box: the whole row on its background.
+                for (0..width) |ci| {
+                    sink.win.writeCell(@intCast(sink.x + ci), y, .{
+                        .char = .{ .grapheme = " ", .width = 1 },
+                        .style = styles.code,
+                    });
+                }
+                drawPreviewCodeRow(sink.win, sink.x + indent, y, line, start, pos, row_end, last, stops, styles);
+            }
+            if (last) break;
+            pos = row_end;
+            first = false;
+        }
+        if (end >= text.len) break;
+        start = end + 1;
+    }
+    const follows = has_blanks or d.hasTrigger() or d.notes.len > 0;
+    if (!follows) return;
+    _ = sink.next();
+    if (has_blanks) drawWrappedRows(sink, width, "Tab jumps between the highlighted blanks", styles.dim);
+    if (d.hasTrigger()) {
+        var trigger_buf: [256]u8 = undefined;
+        const trigger = std.fmt.bufPrint(&trigger_buf, "trigger: {s} + Tab", .{d.prefix}) catch "Type its trigger, then Tab";
+        drawWrappedRows(sink, width, trigger, styles.dim);
+    }
+    if (d.notes.len > 0) {
+        if (has_blanks or d.hasTrigger()) _ = sink.next();
+        drawWrappedRows(sink, width, d.notes, styles.text);
+    }
+}
+
+/// One visual row of a code line in the preview: `line[pos..row_end]`
+/// from cell `x`, tabs expanded (the row's own cell columns), the
+/// characters inside a blank in the blank style; an empty blank marks the
+/// character at its offset, or one cell after the text at the line's end
+/// (on its last row). `line_off` is the line's offset in the template.
+fn drawPreviewCodeRow(win: Window, x: u16, y: u16, line: []const u8, line_off: usize, pos: usize, row_end: usize, last_row: bool, stops: anytype, styles: PreviewStyles) void {
+    var cx = x;
+    var col: usize = 0;
+    var i = pos;
+    var run_start = pos;
+    var run_blank = blankAt(stops, line_off + pos);
+    while (i < row_end) {
+        const blank = blankAt(stops, line_off + i);
+        if (blank != run_blank) {
+            cx = drawCodeRun(win, cx, y, line[run_start..i], &col, styles.tab, if (run_blank) styles.blank else styles.code);
+            run_start = i;
+            run_blank = blank;
+        }
+        i += charAt(line, i).len;
+    }
+    cx = drawCodeRun(win, cx, y, line[run_start..row_end], &col, styles.tab, if (run_blank) styles.blank else styles.code);
+    if (last_row and emptyBlankAt(stops, line_off + line.len)) _ = writeStr(win, cx, y, " ", styles.blank);
+}
+
+/// `text` from cell `x`, its tabs expanded to spaces from cell column
+/// `col` (advanced past the text). Returns the cell after it.
+fn drawCodeRun(win: Window, x: u16, y: u16, text: []const u8, col: *usize, tab: usize, style: Style) u16 {
+    var buf: [512]u8 = undefined;
+    var n: usize = 0;
+    var i: usize = 0;
+    while (i < text.len) {
+        const ch = charAt(text, i);
+        const w = cellWidth(ch.cp, col.*, tab);
+        if (ch.cp == '\t') {
+            var k: usize = 0;
+            while (k < w and n < buf.len) : (k += 1) {
+                buf[n] = ' ';
+                n += 1;
+            }
+        } else if (n + ch.len <= buf.len) {
+            @memcpy(buf[n..][0..ch.len], text[i..][0..ch.len]);
+            n += ch.len;
+        }
+        col.* += w;
+        i += ch.len;
+    }
+    return writeStr(win, x, y, buf[0..n], style);
+}
+
+/// Whether template offset `off` is inside a blank — or is an empty
+/// blank's spot, which marks the character there.
+fn blankAt(stops: anytype, off: usize) bool {
+    for (stops) |stop| {
+        if (stop.number == 0) continue;
+        if (stop.start == stop.end) {
+            if (off == stop.start) return true;
+        } else if (off >= stop.start and off < stop.end) return true;
+    }
+    return false;
+}
+
+/// Whether an empty blank sits at template offset `off`.
+fn emptyBlankAt(stops: anytype, off: usize) bool {
+    for (stops) |stop| {
+        if (stop.number != 0 and stop.start == stop.end and stop.start == off) return true;
+    }
+    return false;
+}
+
+/// True when the mouse position is inside the Snippets band.
+fn mouseOverSnippets(mouse: vaxis.Mouse) bool {
+    const band = snippets_band orelse return false;
+    const mc: i32 = @intCast(mouse.col);
+    const mr: i32 = @intCast(mouse.row);
+    return mc >= band.x and mc < @as(i32, band.x) + band.w and
+        mr >= band.y and mr < @as(i32, band.y) + band.h;
+}
+
+/// Left click inside the Snippets band: the panel takes the keyboard; a
+/// group row opens or closes, an item row is selected (its preview shows)
+/// and, when it was the highlighted row already, inserted — there is no
+/// hover in a terminal. The header and the preview only focus the panel.
+fn handleSnippetsClick(editor: *Editor, band: SnippetsBand, row_abs: u16) void {
+    if (!editor.takeKeyboardFocus(.snippets)) return;
+    if (row_abs <= band.y or row_abs >= band.y + band.preview_y) return;
+    const panel = &editor.snippet_panel;
+    const r = panel.scroll + (row_abs - band.y - 1);
+    const row = panel.rowAt(r) orelse return;
+    if (row.kind == .item and r != panel.selected) {
+        panel.selected = r;
+        return;
+    }
+    panel.selected = r;
+    editor.activateSnippetRow(r);
+}
+
+/// Keys while the Snippets panel owns the keyboard (normal mode). Global
+/// ctrl/alt chords hit the keybind map first and never reach the panel,
+/// which types nothing (Space does nothing: its text must not land in a
+/// blank). Shift+Up/Down and Shift+PageUp/PageDown scroll the preview;
+/// the rest drives the list as in the GUI, j/k like the tree.
+fn handleSnippetsKey(editor: *Editor, key: Key) void {
+    if (key.isModifier()) return;
+    editor.status_message = "";
+    if (tryKeybindCommand(editor, key)) return;
+    // Super+letter is a desktop/OS chord, never a panel command
+    if (key.mods.super) return;
+    const panel = &editor.snippet_panel;
+    const page: isize = @intCast(@max(1, snippets_rows_visible));
+    const shift = key.mods.shift;
+    switch (key.codepoint) {
+        Key.escape => _ = editor.takeKeyboardFocus(.pane),
+        Key.up => if (shift) {
+            snippets_preview_scroll -|= 1;
+        } else panel.move(-1),
+        Key.down => if (shift) {
+            snippets_preview_scroll +|= 1;
+        } else panel.move(1),
+        'k' => panel.move(-1),
+        'j' => panel.move(1),
+        Key.page_up => if (shift) {
+            snippets_preview_scroll -|= snippets_preview_rows;
+        } else panel.move(-page),
+        Key.page_down => if (shift) {
+            snippets_preview_scroll +|= snippets_preview_rows;
+        } else panel.move(page),
+        Key.home => panel.home(),
+        Key.end => panel.end(),
+        // Left and Right can close or open a group: the next key moves
+        // over the rebuilt rows.
+        Key.left => {
+            panel.left(editor.allocator);
+            _ = editor.syncSnippetPanel();
+        },
+        Key.right => {
+            panel.right(editor.allocator);
+            _ = editor.syncSnippetPanel();
+        },
+        // An item goes in at the caret and the editor gets the keys back,
+        // so Tab walks the blanks; a group opens or closes.
+        Key.enter => editor.activateSnippetRow(panel.selected),
+        else => {},
+    }
 }
 
 /// Recursively render the layout tree into the given window.
@@ -2533,6 +2999,15 @@ fn mousePress(editor: *Editor, mouse: vaxis.Mouse) void {
         }
     }
 
+    // Snippets band: a click focuses the panel and selects a row; the
+    // highlighted item inserts on its next click
+    if (snippets_band) |band| {
+        if (mouseOverSnippets(mouse)) {
+            handleSnippetsClick(editor, band, @intCast(mouse.row));
+            return;
+        }
+    }
+
     // A pane click focuses that pane, which takes the keyboard back from the
     // tree and the search panel alike (Editor.focusPane)
     const hit = resolvePaneAt(editor, mouse.col, mouse.row) orelse return;
@@ -2622,6 +3097,19 @@ fn mouseWheel(editor: *Editor, mouse: vaxis.Mouse, down: bool) void {
         // Clamped at draw time
         if (down) editor.tui_filetree_scroll +|= 3 else editor.tui_filetree_scroll -|= 3;
         return;
+    }
+    if (snippets_band) |band| {
+        if (mouseOverSnippets(mouse)) {
+            // Over the preview its notes scroll, else the list (both
+            // clamped at draw time)
+            if (mouse.row >= @as(i32, band.y) + band.preview_y) {
+                if (down) snippets_preview_scroll +|= 3 else snippets_preview_scroll -|= 3;
+            } else {
+                const panel = &editor.snippet_panel;
+                if (down) panel.scroll +|= 3 else panel.scroll -|= 3;
+            }
+            return;
+        }
     }
     // The document under the mouse scrolls — not the focused one — and
     // nothing does over a terminal pane (no scrollback) or outside the panes.
@@ -4401,6 +4889,36 @@ fn testCells(screen: *vaxis.Screen, x: u16, y: u16, len: u16, buf: []u8) []const
     return buf[0..n];
 }
 
+/// Tests only: ZIDE_CAPTURE_DIR when it is set — screen dumps go there.
+fn testCaptureDir(allocator: std.mem.Allocator) ?[]u8 {
+    var env = std.testing.environ.createMap(allocator) catch return null;
+    defer env.deinit();
+    const dir = env.get("ZIDE_CAPTURE_DIR") orelse return null;
+    return allocator.dupe(u8, dir) catch null;
+}
+
+/// Tests only: the screen as text, one line per row (an empty cell is a
+/// space), saved as `name` in ZIDE_CAPTURE_DIR; nothing without it.
+fn testCaptureScreen(screen: *vaxis.Screen, name: []const u8) !void {
+    const t = std.testing;
+    const dir = testCaptureDir(t.allocator) orelse return;
+    defer t.allocator.free(dir);
+    const path = try std.fs.path.join(t.allocator, &.{ dir, name });
+    defer t.allocator.free(path);
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(t.allocator);
+    for (0..screen.height) |y| {
+        for (0..screen.width) |x| {
+            const g = screen.readCell(@intCast(x), @intCast(y)).?.char.grapheme;
+            try out.appendSlice(t.allocator, if (g.len == 0) " " else g);
+        }
+        try out.append(t.allocator, '\n');
+    }
+    const file = try std.Io.Dir.cwd().createFile(t.io, path, .{});
+    defer file.close(t.io);
+    try file.writeStreamingAll(t.io, out.items);
+}
+
 const TestClipboard = struct {
     // Nothing reaches the system clipboard; getClipboard reads editor.clipboard.
     fn set(_: []const u8) void {}
@@ -5103,4 +5621,189 @@ test "TUI Open prompt reports why a file did not open" {
     try t.expectEqual(Editor.Mode.normal, editor.mode);
     try t.expect(std.mem.startsWith(u8, editor.status_message, "Open failed ("));
     try t.expect(std.mem.endsWith(u8, editor.status_message, "zide-no-such-dir/missing.txt"));
+}
+
+test "TUI snippets panel: docks beside the tree, a click selects then inserts, keys drive the list" {
+    const t = std.testing;
+    var tmp = t.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(t.io, .{ .sub_path = "a.txt", .data = "a\n" });
+    const root = try tmp.dir.realPathFileAlloc(t.io, ".", t.allocator);
+    defer t.allocator.free(root);
+    var editor = try Editor.init(t.allocator, t.io);
+    defer editor.deinit();
+    editor.lsp_enabled = false;
+    editor.filetree_visible = false;
+    _ = try editor.registerSnippet(.{ .language = "zig", .description = "Print", .group = "Start here", .notes = "Writes text to the terminal.", .body = "std.debug.print(\"${1:text}\n\", .{${2:values}});" });
+    _ = try editor.registerSnippet(.{ .language = "zig", .description = "Constant", .group = "Start here", .notes = "A value that never changes.", .body = "const ${1:name}: ${2:i32} = ${3:0};" });
+    _ = try editor.registerSnippet(.{ .language = "zig", .prefix = "fn", .description = "Function", .group = "Functions", .notes = "A named block of code.", .body = "fn ${1:name}($2) ${3:void} {\n\t$0\n}" });
+    const doc = editor.activeDoc();
+    doc.language = editor.findLanguage("zig");
+    var screen = try testScreen(t.allocator);
+    defer screen.deinit(t.allocator);
+    const win = testWin(&screen);
+    var buf: [256]u8 = undefined;
+
+    // Hidden: no band. Ctrl+Alt+B shows it focused, opposite the (hidden)
+    // tree: right of the panes, tui_snippets_width columns wide.
+    testFrame(win, &editor);
+    try t.expect(snippets_band == null);
+    testKey(&editor, 'b', .{ .ctrl = true, .alt = true });
+    try t.expect(editor.snippets_visible);
+    try t.expectEqual(Editor.KeyboardOwner.snippets, editor.keyboardOwner());
+    testFrame(win, &editor);
+    var band = snippets_band.?;
+    try t.expectEqual(@as(u16, 68), band.x);
+    try t.expectEqual(@as(u16, 32), band.w);
+    try t.expectEqual(@as(u16, 29), band.h);
+    const tx = band.x + 1; // the separator column faces the editor
+    try t.expectEqualStrings("Snippets \u{2014} zig", testCells(&screen, tx, 0, 14, &buf));
+    try t.expectEqualStrings("\u{25be} Start here", testCells(&screen, tx, 1, 12, &buf));
+    try t.expectEqualStrings("\u{2502}  Print", testCells(&screen, tx, 2, 8, &buf));
+    try t.expectEqualStrings("\u{2502}  Constant", testCells(&screen, tx, 3, 11, &buf));
+    try t.expectEqualStrings("\u{25b8} Functions", testCells(&screen, tx, 4, 11, &buf));
+    // Four rows: the preview starts right under them, with a divider.
+    try t.expectEqual(@as(u16, 6), band.preview_y);
+    try t.expectEqualStrings("\u{2500}", testCells(&screen, tx, band.preview_y, 1, &buf));
+
+    // Click Print: selected and previewed, not inserted, the keyboard
+    // stays with the panel. Click it again: inserted, its first blank
+    // selected, the editor has the keys, so Tab walks to the next blank.
+    testClick(&editor, tx + 4, 2);
+    try t.expectEqual(@as(usize, 1), editor.snippet_panel.selected);
+    try t.expectEqual(@as(usize, 0), doc.buffer.byteLen());
+    try t.expectEqual(Editor.KeyboardOwner.snippets, editor.keyboardOwner());
+    testFrame(win, &editor);
+    try t.expectEqual(@as(?u32, 0), snippets_preview_def);
+    try t.expectEqualStrings("std.debug.print(\"text", testCells(&screen, tx, band.preview_y + 1, 21, &buf));
+    try testCaptureScreen(&screen, "snippets_tui_list.txt");
+    testClick(&editor, tx + 4, 2);
+    try t.expectEqualStrings("std.debug.print(\"text\n\", .{values});", doc.buffer.slice(0, doc.buffer.byteLen()));
+    try t.expectEqualStrings("text", doc.selectedText().?);
+    try t.expectEqual(Editor.KeyboardOwner.editor, editor.keyboardOwner());
+    testKey(&editor, Key.tab, .{});
+    try t.expectEqualStrings("values", doc.selectedText().?);
+
+    // Ctrl+Alt+B focuses the open panel; j then Enter inserts Constant.
+    // Escape hands the keys back and leaves the panel open; the next
+    // Ctrl+Alt+B pair hides it.
+    testKey(&editor, Key.escape, .{});
+    testKey(&editor, 'b', .{ .ctrl = true, .alt = true });
+    try t.expect(editor.snippets_visible);
+    try t.expectEqual(Editor.KeyboardOwner.snippets, editor.keyboardOwner());
+    testKey(&editor, 'j', .{});
+    try t.expectEqual(@as(usize, 2), editor.snippet_panel.selected);
+    testKey(&editor, Key.enter, .{});
+    try t.expect(std.mem.indexOf(u8, doc.buffer.slice(0, doc.buffer.byteLen()), "const name: i32 = 0;") != null);
+    try t.expectEqual(Editor.KeyboardOwner.editor, editor.keyboardOwner());
+    testKey(&editor, 'b', .{ .ctrl = true, .alt = true });
+    testKey(&editor, Key.escape, .{});
+    try t.expectEqual(Editor.KeyboardOwner.editor, editor.keyboardOwner());
+    try t.expect(editor.snippets_visible);
+    testKey(&editor, 'b', .{ .ctrl = true, .alt = true });
+    testKey(&editor, 'b', .{ .ctrl = true, .alt = true });
+    try t.expect(!editor.snippets_visible);
+    testFrame(win, &editor);
+    try t.expect(snippets_band == null);
+
+    // With the tree (left, 30 columns) the panel keeps the panes 40
+    // columns: 30 wide at the right edge. On the tree's side the tree
+    // stays outermost, left and right alike.
+    editor.filetree_root = try t.allocator.dupe(u8, root);
+    editor.filetree_visible = true;
+    editor.snippets_visible = true;
+    testFrame(win, &editor);
+    band = snippets_band.?;
+    try t.expectEqual(@as(u16, 0), filetree_band.?.x);
+    try t.expectEqual(@as(u16, 70), band.x);
+    try t.expectEqual(@as(u16, 30), band.w);
+    try t.expectEqual(@as(u16, 40), pane_rects[0].w);
+    editor.snippets_side = .left;
+    testFrame(win, &editor);
+    band = snippets_band.?;
+    try t.expectEqual(@as(u16, 0), filetree_band.?.x);
+    try t.expectEqual(@as(u16, 30), band.x);
+    try t.expectEqual(@as(u16, 60), pane_rects[0].x);
+    editor.filetree_side = .right;
+    editor.snippets_side = .right;
+    testFrame(win, &editor);
+    band = snippets_band.?;
+    try t.expectEqual(@as(u16, 70), filetree_band.?.x);
+    try t.expectEqual(@as(u16, 40), band.x);
+    try t.expectEqual(@as(u16, 0), pane_rects[0].x);
+    try t.expectEqual(@as(u16, 40), pane_rects[0].w);
+
+    // Too narrow for both bands and 40 columns of panes: the panel hides
+    // itself, says so, and its keyboard goes back to the pane.
+    _ = editor.takeKeyboardFocus(.snippets);
+    frameArenaReset();
+    drawEditor(win, &editor, 70, 30);
+    try t.expect(snippets_band == null);
+    try t.expect(!editor.snippets_visible and !editor.snippets_focused);
+    try t.expectEqual(Editor.KeyboardOwner.editor, editor.keyboardOwner());
+    try t.expect(std.mem.indexOf(u8, editor.status_message, "no room") != null);
+}
+
+test "TUI snippets panel: the preview wraps long code, highlights the blanks and scrolls long notes" {
+    const t = std.testing;
+    var editor = try Editor.init(t.allocator, t.io);
+    defer editor.deinit();
+    editor.lsp_enabled = false;
+    editor.filetree_visible = false;
+    _ = try editor.registerSnippet(.{ .language = "zig", .description = "Long", .group = "Start here", .notes = "Long notes, longer than the preview can show at once. " ** 30, .body = "const value = some_function(argument_one, ${1:argument_two});" });
+    const doc = editor.activeDoc();
+    doc.language = editor.findLanguage("zig");
+    var screen = try testScreen(t.allocator);
+    defer screen.deinit(t.allocator);
+    const win = testWin(&screen);
+    var buf: [256]u8 = undefined;
+    _ = editor.takeKeyboardFocus(.snippets);
+    testFrame(win, &editor);
+    editor.snippet_panel.selected = 1;
+    testFrame(win, &editor);
+    const band = snippets_band.?;
+    const tx = band.x + 1;
+    const code_y = band.preview_y + 1;
+
+    // The 57-column line wraps to the 31-column band at its spaces: the
+    // continued rows sit two cells in, on the code background, and the
+    // blank is highlighted where it lands.
+    try t.expectEqualStrings("const value =", testCells(&screen, tx, code_y, 13, &buf));
+    try t.expectEqualStrings("  some_function(", testCells(&screen, tx, code_y + 1, 16, &buf));
+    try t.expectEqualStrings("  argument_two);", testCells(&screen, tx, code_y + 2, 16, &buf));
+    try t.expect(std.meta.eql(toVaxis(editor.tui_theme.selection_bg), screen.readCell(tx + 2, code_y + 2).?.style.bg));
+    try t.expect(std.meta.eql(toVaxis(editor.tui_theme.overlay_bg), screen.readCell(tx, code_y + 2).?.style.bg));
+    try testCaptureScreen(&screen, "snippets_tui_preview.txt");
+
+    // The notes overflow: the last row says how to see more. Shift+Down
+    // scrolls one row, Shift+PageDown a page, the wheel over the preview
+    // three; far past the end it stops at the end and the marker goes.
+    try t.expect(snippets_preview_overflow > 0);
+    const last_y = band.y + band.h - 1;
+    try t.expectEqualStrings("\u{25bc}", testCells(&screen, tx, last_y, 1, &buf));
+    testKey(&editor, Key.down, .{ .shift = true });
+    try t.expectEqual(@as(usize, 1), snippets_preview_scroll);
+    testKey(&editor, Key.page_down, .{ .shift = true });
+    try t.expectEqual(1 + snippets_preview_rows, snippets_preview_scroll);
+    handleMouse(&editor, .{ .row = @intCast(last_y), .col = @intCast(tx + 3), .button = .wheel_down, .type = .press, .mods = .{} });
+    try t.expectEqual(4 + snippets_preview_rows, snippets_preview_scroll);
+    testFrame(win, &editor);
+    try t.expect(snippets_preview_scroll <= snippets_preview_overflow);
+    for (0..100) |_| testKey(&editor, Key.down, .{ .shift = true });
+    testFrame(win, &editor);
+    try t.expectEqual(snippets_preview_overflow, snippets_preview_scroll);
+    try t.expect(!std.mem.eql(u8, "\u{25bc}", testCells(&screen, tx, last_y, 1, &buf)));
+    // The wheel over the rows scrolls the list, not the preview (two rows:
+    // it stays at the top).
+    handleMouse(&editor, .{ .row = 2, .col = @intCast(tx + 3), .button = .wheel_down, .type = .press, .mods = .{} });
+    testFrame(win, &editor);
+    try t.expectEqual(@as(usize, 0), editor.snippet_panel.scroll);
+    try t.expectEqual(snippets_preview_overflow, snippets_preview_scroll);
+    // Another selection starts the preview at its top: Up onto the group
+    // shows no preview at all.
+    testKey(&editor, Key.up, .{});
+    testFrame(win, &editor);
+    try t.expectEqual(@as(usize, 0), snippets_preview_scroll);
+    try t.expectEqual(@as(?u32, null), snippets_preview_def);
+    try t.expectEqualStrings("Select a snippet", testCells(&screen, tx, code_y, 16, &buf));
 }
