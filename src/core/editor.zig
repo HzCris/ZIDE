@@ -3712,6 +3712,20 @@ pub const Editor = struct {
     /// Close the currently focused pane. If it's the last pane, does nothing.
     pub fn closePaneAction(self: *Editor) void {
         const win = self.activeWindow();
+        // A terminal pane closes first, split or not: closeTerminal turns
+        // the main window's sole pane back into an editor pane and closes
+        // a secondary window with its only pane, so Ctrl+Alt+Q never
+        // strands a shell behind the "no split panes" message.
+        if (win.active_pane < win.layout.panes.items.len) {
+            switch (win.layout.panes.items[win.active_pane].content) {
+                .terminal => |idx| {
+                    self.cancelSnippets();
+                    self.closeTerminal(idx);
+                    return;
+                },
+                .editor => {},
+            }
+        }
         if (win.layout.paneCount() <= 1) {
             // The only pane of a secondary window: closing it closes the window.
             if (self.active_window != 0) {
@@ -3725,16 +3739,6 @@ pub const Editor = struct {
         }
         const closed_pane = win.active_pane;
         self.cancelSnippets();
-        // If closing a terminal pane, clean up the terminal
-        if (closed_pane < win.layout.panes.items.len) {
-            switch (win.layout.panes.items[closed_pane].content) {
-                .terminal => |idx| {
-                    self.closeTerminal(idx);
-                    return;
-                },
-                .editor => {},
-            }
-        }
         // Focus moves to the closed pane's sibling (its first leaf) — the
         // spatial neighbour, not the next pane in traversal order.
         if (win.layout.closePane(closed_pane)) |sibling| win.active_pane = sibling;
@@ -4271,7 +4275,12 @@ pub const Editor = struct {
 
     /// Close the active pane's terminal (if it is one).
     pub fn closeActiveTerminal(self: *Editor) void {
-        if (self.activePaneTerminalIdx()) |idx| self.closeTerminal(idx);
+        if (self.activePaneTerminalIdx()) |idx| {
+            self.closeTerminal(idx);
+        } else {
+            // From the palette or the View menu with an editor pane focused.
+            self.status_message = "Close terminal: focus a terminal pane first (Ctrl+Alt+Q closes any pane)";
+        }
     }
 
     // ---- Language / syntax theme operations ----
@@ -6218,6 +6227,29 @@ test "windows: a terminal-only secondary closes with its terminal" {
     editor.retireClosedWindows();
     try t.expectEqual(@as(usize, 1), editor.windows.items.len);
     try t.expectEqual(@as(usize, 2), editor.terminals.items.len);
+}
+
+test "panes: close_pane closes a terminal that is the main window's only pane" {
+    const t = std.testing;
+    var editor = try Editor.init(t.allocator, t.io);
+    defer editor.deinit();
+    try editor.terminals.append(t.allocator, null); // fake slot: no shell
+    const win = editor.windows.items[0];
+    win.layout.panes.items[0].content = .{ .terminal = 0 };
+    try t.expect(editor.activePaneIsTerminal());
+    // The sole pane: the terminal goes and the pane shows the document
+    // again, with no "no split panes" lecture.
+    try t.expect(editor.execAction("close_pane"));
+    try t.expect(!editor.activePaneIsTerminal());
+    try t.expectEqual(@as(usize, 1), win.layout.paneCount());
+    try t.expect(editor.terminals.items[0] == null);
+    try t.expect(std.mem.indexOf(u8, editor.status_message, "No split panes") == null);
+    // An editor pane that is the only pane still gets the explanation.
+    try t.expect(editor.execAction("close_pane"));
+    try t.expect(std.mem.indexOf(u8, editor.status_message, "No split panes") != null);
+    // close_terminal from an editor pane says what it needs.
+    try t.expect(editor.execAction("close_terminal"));
+    try t.expect(std.mem.indexOf(u8, editor.status_message, "terminal") != null);
 }
 
 test "windows: paneShowDoc never replaces a terminal pane" {

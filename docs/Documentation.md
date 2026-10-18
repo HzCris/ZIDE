@@ -1296,8 +1296,9 @@ a bundled snippet with the same language and prefix replaces it at every load (e
 
 ZIDE includes a built-in terminal emulator that integrates with the split pane system — in both frontends (in the TUI, the shell's grid renders as cells and the reader thread wakes the event loop via `terminal_wake_fn`, the same pattern the LSP uses).
 
-### Opening a Terminal
+### Opening and closing a terminal
 - **Ctrl+`** (backtick): from an editor pane opens a **new** terminal in a bottom split (even when one already exists); from a terminal pane it returns to the editor; with the file tree or search panel focused over a terminal pane it focuses that terminal instead
+- **Closing**: Ctrl+Alt+Q or Ctrl+F4 (`close_pane`) closes the focused terminal — also when it is the window's only pane, which then shows your document again; `close_terminal` in the palette (and View > Close Terminal in the GUI) does the same; and once the shell has ended (`exit`), the next key you press in the pane closes it
 - Shell: PowerShell on Windows; on Linux/macOS `$SHELL` when it names an executable, else `/bin/bash`, else `/bin/sh`, started with `TERM=xterm-256color` (and `COLORTERM=truecolor` unless already set)
 
 ### Terminal Features
@@ -1305,7 +1306,7 @@ ZIDE includes a built-in terminal emulator that integrates with the split pane s
 - 16-color, 256-color, and 24-bit RGB color support
 - Bold, underline, and reverse video attributes
 - Automatic resize when the pane dimensions change
-- Process exit detection with `[Process exited]` message, on Windows too; the pane keeps the program's last screen
+- Process exit detection with a `[Process exited — press any key to close]` message, on Windows too; the pane keeps the program's last screen until a key closes it
 - Modified keys reach the shell xterm-style: Shift/Ctrl/Alt with arrows, Home/End, PgUp/PgDn, Ins/Del send a modifier parameter (Ctrl+Right = `ESC[1;5C`, so shell word-jumps work), Shift+Tab sends `ESC[Z`, Ctrl+Space sends NUL
 - Keys reach the program in both frontends: arrows, Home/End, PgUp/PgDn, Ins/Del and F1–F12 as VT sequences (unmodified arrows, Home and End in SS3 form while the program has application cursor keys on — vim, less), Ctrl+letter and Ctrl+`[ \ ] ^ _ /` as control bytes (Ctrl+[ is ESC), Alt as an ESC prefix, emoji, CJK and multi-code-point keys whole. F-keys bound to pane or window actions (F6 focuses the next pane) stay with ZIDE. A paste goes to the program, in bracketed-paste markers when it asked for them
 - GUI: typing follows the OS keyboard layout (AltGr, dead keys, IME commit); IME composition is sent only once committed and is not drawn while composing
@@ -1315,7 +1316,7 @@ ZIDE includes a built-in terminal emulator that integrates with the split pane s
 |---------|---------|-------------|
 | `toggle_terminal` | `Ctrl+\`` | New bottom terminal; from a terminal, back to the editor |
 | `open_terminal_right` | `Ctrl+Shift+\`` | Open a terminal in a side-by-side split |
-| `close_terminal` | — | Close the active terminal pane |
+| `close_terminal` | — | Close the focused terminal pane (View > Close Terminal in the GUI; `close_pane`, Ctrl+Alt+Q / Ctrl+F4, closes a focused terminal too) |
 | `detach_terminal` | `Ctrl+Alt+\`` | Move the focused terminal into its own OS window (GUI; TUI: a second terminal at the side) |
 
 While a terminal pane is focused, typing goes to the shell — only the pane / window / terminal management chords are let through (toggle, close, detach, focus next/prev pane, close window, open terminal right), in both frontends. In a TUI terminal pane Ctrl+Shift+` also returns to the editor (the hard-wired toggle ignores Shift), and Ctrl+Tab reaches the shell — switch tabs from an editor pane there; the GUI's hard-wired Ctrl+Tab switches tabs even over a terminal. A detached terminal window shows just the shell (plus menu/status bar per `secondary_window_chrome`); closing that window ends the shell, and `toggle_terminal` inside it reports "No editor pane in this window" instead of jumping to another window. On Linux, closing a terminal gives the shell ~500 ms after SIGHUP before it is killed, so a stubborn child cannot hang the editor.

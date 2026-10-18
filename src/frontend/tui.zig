@@ -704,6 +704,12 @@ fn handleTerminalKey(editor: *Editor, key: Key) void {
     }
 
     const term = activeTerminal(editor) orelse return;
+    // The shell has ended: the next key closes the pane instead of being
+    // typed into nothing (the status bar says so).
+    if (term.exited) {
+        _ = editor.execAction("close_terminal");
+        return;
+    }
     var out: [64]u8 = undefined;
     const bytes = terminalKeyBytes(key, term.appCursorKeys(), &out);
     if (bytes.len > 0) term.writeInput(bytes);
@@ -2687,7 +2693,7 @@ fn drawStatusBar(win: Window, editor: *Editor, width: u16) void {
             if (editor.activePaneTerminalIdx()) |ti| {
                 if (ti < editor.terminals.items.len) {
                     if (editor.terminals.items[ti]) |t| {
-                        if (t.exited) break :blk " [TERMINAL - exited]";
+                        if (t.exited) break :blk " [TERMINAL - exited: press a key to close]";
                     }
                 }
             }
@@ -5807,4 +5813,44 @@ test "TUI snippets panel: the preview wraps long code, highlights the blanks and
     try t.expectEqual(@as(usize, 0), snippets_preview_scroll);
     try t.expectEqual(@as(?u32, null), snippets_preview_def);
     try t.expectEqualStrings("Select a snippet", testCells(&screen, tx, code_y, 16, &buf));
+}
+
+test "TUI terminal: after the shell exits, the next key closes the pane" {
+    const cmd = switch (builtin.os.tag) {
+        .windows => "cmd.exe /c exit",
+        .linux => "true",
+        else => return error.SkipZigTest,
+    };
+    const t = std.testing;
+    var editor = try Editor.init(t.allocator, t.io);
+    defer editor.deinit();
+    editor.lsp_enabled = false;
+    editor.filetree_visible = false;
+    const term = try terminal_mod.Terminal.init(t.allocator, t.io, 40, 5, cmd);
+    try editor.terminals.append(t.allocator, term);
+    editor.windows.items[0].layout.panes.items[0].content = .{ .terminal = 0 };
+    try t.expect(editor.activePaneIsTerminal());
+    // Wait for the shell to end (the exit watcher sets `exited`).
+    var exited = false;
+    var waited: usize = 0;
+    while (!exited and waited < 10_000) : (waited += 20) {
+        try std.Io.sleep(t.io, .fromMilliseconds(20), .awake);
+        term.mutex.lockUncancelable(term.io);
+        exited = term.exited;
+        term.mutex.unlock(term.io);
+    }
+    try t.expect(exited);
+    var screen = try testScreen(t.allocator);
+    defer screen.deinit(t.allocator);
+    const win = testWin(&screen);
+    testFrame(win, &editor);
+    // The status bar says what the next key does; then a plain key closes
+    // the pane, which shows the document again, and frees the slot.
+    var buf: [512]u8 = undefined;
+    try t.expect(std.mem.indexOf(u8, testCells(&screen, 0, 29, 100, &buf), "press a key to close") != null);
+    testKey(&editor, 'a', .{});
+    try t.expect(!editor.activePaneIsTerminal());
+    try t.expect(editor.terminals.items[0] == null);
+    testFrame(win, &editor);
+    try t.expect(std.mem.indexOf(u8, testCells(&screen, 0, 29, 100, &buf), "TERMINAL") == null);
 }

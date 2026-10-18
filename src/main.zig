@@ -148,17 +148,18 @@ const welcome_text =
     \\//   Ctrl+Shift+Tab    previous tab       (also Ctrl+PgDn / Ctrl+PgUp)
     \\//   Ctrl+Shift+T      reopen closed tab
     \\//   Alt+\             split vertical     Alt+Shift+\      split horizontal
-    \\//   Alt+Left/Right    focus pane         Ctrl+Alt+Q       close split pane
+    \\//   Alt+Left/Right    focus pane         Ctrl+Alt+Q       close pane / terminal
     \\//   Ctrl+Shift+N      open in new window (GUI; also Ctrl+Alt+N; TUI: split)
     \\//
     \\// Terminal eats Alt+...? These always work:
     \\//   Ctrl+\            split vertical     Ctrl+Shift+\     split horizontal
-    \\//   F6 / Shift+F6     focus pane         Ctrl+F4          close split pane
+    \\//   F6 / Shift+F6     focus pane         Ctrl+F4          close pane / terminal
     \\//   Ctrl+Shift+PgUp/PgDn                 move line
     \\//
     \\// Terminal & code intelligence
     \\//   Ctrl+`            toggle terminal    Ctrl+Shift+`     terminal in split
     \\//   Ctrl+Alt+`        detach terminal to its own window (GUI)
+    \\//   Ctrl+Alt+Q        close terminal     (or type exit, then press any key)
     \\//   Ctrl+B            toggle file tree   Ctrl+Space       completion (LSP)
     \\//   Ctrl+Alt+B        snippets panel: syntax skeletons by plain name (click to insert)
     \\//   Ctrl+Shift+O      open folder as project   (palette: recent_projects; tree: o)

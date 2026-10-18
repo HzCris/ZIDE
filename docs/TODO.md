@@ -31,7 +31,7 @@ Legend: **N** = native Zig, **L** = buildable as a Lua extension on the public A
   tree).
 - **Multiple terminals** (N, S–M). The core already stores a list of terminals, so the model
   allows it; what's missing is the front door. Add a `new_terminal` command that always creates
-  another shell (today's commands reuse/focus the existing one), a way to cycle or pick them
+  another shell (Ctrl+` already opens another one each time), a way to cycle or pick them
   (`next_terminal`, or a picker listing Terminal 1..N with their running programs), and a
   status-bar hint for which one is focused. Pairs with "start the shell in the workspace root"
   under Terminal gaps below.

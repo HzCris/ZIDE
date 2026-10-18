@@ -896,6 +896,10 @@ fn menuBar(editor: *Editor) void {
                 _ = editor.execAction("close_pane");
                 m.close();
             }
+            if (dvui.menuItemLabel(@src(), "Close Terminal", .{}, .{ .expand = .horizontal }) != null) {
+                _ = editor.execAction("close_terminal");
+                m.close();
+            }
             if (dvui.menuItemLabel(@src(), "Open in New Window  Ctrl+Shift+N", .{}, .{ .expand = .horizontal }) != null) {
                 _ = editor.execAction("open_in_new_window");
                 m.close();
@@ -5731,7 +5735,7 @@ fn terminalPane(editor: *Editor, pane_id: u8, term_idx: usize) void {
 
     // Show exit message
     if (t_exited) {
-        const msg = "[Process exited]";
+        const msg = "[Process exited \u{2014} press any key to close]";
         const msg_y = area.y + @as(f32, @floatFromInt(t_rows / 2)) * line_height;
         const msg_x = area.x + 8 * scale;
         dvui.renderText(.{
@@ -5761,6 +5765,10 @@ fn handleTerminalKeyEvents(editor: *Editor, term: *terminal_mod.Terminal, wd: *d
     if (!build_options.has_gui) return false;
 
     const events = dvui.events();
+    // The shell has ended: the next key closes the pane (the pane says so)
+    // — once per frame, deferred like the chords since it changes the
+    // layout.
+    var closing = false;
     for (events, 0..) |*e, i| {
         if (e.handled) continue;
         if (!terminalTakesKeys(editor)) break;
@@ -5780,6 +5788,14 @@ fn handleTerminalKeyEvents(editor: *Editor, term: *terminal_mod.Terminal, wd: *d
                         deferRun(editor, .action, action);
                         continue;
                     }
+                }
+                if (term.exited) {
+                    e.handle(@src(), wd);
+                    if (!closing) {
+                        closing = true;
+                        deferRun(editor, .action, "close_terminal");
+                    }
+                    continue;
                 }
 
                 var out: [16]u8 = undefined;
@@ -5813,6 +5829,13 @@ fn handleTerminalKeyEvents(editor: *Editor, term: *terminal_mod.Terminal, wd: *d
                     // characters come as key events.
                     if (val.selected or !isTypedText(val.txt)) continue;
                     e.handle(@src(), wd);
+                    if (term.exited) {
+                        if (!closing) {
+                            closing = true;
+                            deferRun(editor, .action, "close_terminal");
+                        }
+                        continue;
+                    }
                     term.writeInput(val.txt);
                 },
                 else => {},
