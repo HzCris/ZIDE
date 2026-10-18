@@ -560,6 +560,12 @@ pub fn run(allocator: std.mem.Allocator, editor: *Editor) !void {
             // caret at the end of its active field; with no room for the
             // band there is no caret either.
             .snippet_form => if (snippet_form_band == null) win.hideCursor(),
+            .snippet_delete_confirm => {
+                // vaxis keeps the slice until the render: frame storage,
+                // not this block's buffer.
+                var prompt_buf: [256]u8 = undefined;
+                drawOverlay(win, editor, frameArenaDupe(editor.snippetDeletePrompt(&prompt_buf)), "", width, height);
+            },
             .filetree_prompt => {
                 switch (editor.filetree_prompt_kind) {
                     .create => drawOverlay(win, editor, "New (end with / for folder): ", editor.open_buf[0..editor.open_buf_len], width, height),
@@ -678,7 +684,19 @@ fn dispatchKey(editor: *Editor, key: Key) void {
             if (key.codepoint == Key.escape) editor.setMode(.normal);
         },
         .snippet_form => handleSnippetFormKey(editor, key),
+        .snippet_delete_confirm => handleSnippetDeleteKey(editor, key),
         .filetree_prompt => handleFiletreePromptKey(editor, key),
+    }
+}
+
+/// "Delete snippet … ? [Y]es / any other key cancels": only a plain y
+/// deletes (a chord is never an answer), anything else cancels — the
+/// tree's delete prompt's rule.
+fn handleSnippetDeleteKey(editor: *Editor, key: Key) void {
+    if (key.isModifier() or hasCommandMod(key)) return;
+    switch (key.codepoint) {
+        'y', 'Y' => editor.applySnippetDelete(),
+        else => editor.cancelSnippetDelete(),
     }
 }
 
@@ -1231,8 +1249,9 @@ fn openFiletreeFileTui(editor: *Editor, ft: *FileTree, idx: u32) void {
     };
 }
 
-/// Draw the Snippets band, the GUI panel's terminal twin: a header, one
-/// row per group or item of the core model's rows (snippet_panel.zig)
+/// Draw the Snippets band, the GUI panel's terminal twin: a header (with
+/// the filter typed into the panel), one row per group or item of the
+/// core model's rows (snippet_panel.zig; an empty list shows its hint)
 /// with a │ guide under each open group, then the preview of the
 /// selected item — its code wrapped to the band with the blanks
 /// highlighted, how to fill it in, and its notes word-wrapped. What the
@@ -1264,14 +1283,19 @@ fn drawSnippetsPanel(win: Window, editor: *Editor, w: u16, h: u16, side: Editor.
     const rows = panel.rows.items;
     const defs = editor.snippets.items.items;
 
-    // Header: "Snippets — <language>", bright while the panel has the keys.
+    // Header: "Snippets — <language>", bright while the panel has the
+    // keys; a filter follows as "  /<text>" (cut at the band's edge too).
     const header_style: Style = .{
         .fg = toVaxis(if (focused) theme.overlay_accent else theme.gutter_text),
         .bg = bg,
         .bold = focused,
     };
-    var title_buf: [96]u8 = undefined;
-    const title = std.fmt.bufPrint(&title_buf, "Snippets \u{2014} {s}", .{panel.languageLabel()}) catch "Snippets";
+    // Room for the longest language label and filter (64 bytes each).
+    var title_buf: [160]u8 = undefined;
+    const title = (if (panel.filterActive())
+        std.fmt.bufPrint(&title_buf, "Snippets \u{2014} {s}  /{s}", .{ panel.languageLabel(), panel.filterText() })
+    else
+        std.fmt.bufPrint(&title_buf, "Snippets \u{2014} {s}", .{panel.languageLabel()})) catch "Snippets";
     _ = writeStr(win, text_x, 0, truncToWidth(title, text_w), header_style);
 
     // The rows and the preview share the band under the header: the
@@ -1615,15 +1639,29 @@ fn handleSnippetsClick(editor: *Editor, band: SnippetsBand, row_abs: u16) void {
     editor.activateSnippetRow(r);
 }
 
-/// Keys while the Snippets panel owns the keyboard (normal mode). Global
-/// ctrl/alt chords hit the keybind map first and never reach the panel,
-/// which types nothing (Space does nothing: its text must not land in a
-/// blank; no letter keys either — nothing modal). Shift+Up/Down and
-/// Shift+PageUp/PageDown scroll the preview; the rest drives the list as
-/// in the GUI.
+/// Keys while the Snippets panel owns the keyboard (normal mode). Typed
+/// text — letters, digits, Space — filters the rows and never reaches the
+/// document (no letter is a command either: the panel is not modal);
+/// Backspace edits the filter and Escape clears it, or with no filter
+/// hands the keys back. F2 opens the selected snippet in the form — to
+/// edit it when it is one of my-snippets.lua, else to copy it there — and
+/// Delete asks before removing one of my-snippets.lua. Ctrl/Alt chords
+/// and the other F-keys hit the keybind map and never reach the panel,
+/// so the filter takes plain keys only. Shift+Up/Down and Shift+PageUp/
+/// PageDown scroll the preview; the rest drives the list as in the GUI.
 fn handleSnippetsKey(editor: *Editor, key: Key) void {
     if (key.isModifier()) return;
     editor.status_message = "";
+    // Fresh rows first: the run loop handles every queued key before it
+    // draws (and syncs) again, and a delete or a reload in between shifts
+    // the registry — a stale row would point F2 or Delete at a neighbor.
+    _ = editor.syncSnippetPanel();
+    // F2 is the panel's before the keybind map, which takes every F-key,
+    // bound or not.
+    if (key.codepoint == Key.f2 and !hasCommandMod(key)) {
+        editor.snippetPanelEdit();
+        return;
+    }
     if (tryKeybindCommand(editor, key)) return;
     // Super+letter is a desktop/OS chord, never a panel command
     if (key.mods.super) return;
@@ -1631,7 +1669,11 @@ fn handleSnippetsKey(editor: *Editor, key: Key) void {
     const page: isize = @intCast(@max(1, snippets_rows_visible));
     const shift = key.mods.shift;
     switch (key.codepoint) {
-        Key.escape => _ = editor.takeKeyboardFocus(.pane),
+        Key.escape => if (editor.snippetsFilterClear()) {
+            _ = editor.syncSnippetPanel();
+        } else {
+            _ = editor.takeKeyboardFocus(.pane);
+        },
         Key.up => if (shift) {
             snippets_preview_scroll -|= 1;
         } else panel.move(-1),
@@ -1659,7 +1701,26 @@ fn handleSnippetsKey(editor: *Editor, key: Key) void {
         // An item goes in at the caret and the editor gets the keys back,
         // so Tab walks the blanks; a group opens or closes.
         Key.enter => editor.activateSnippetRow(panel.selected),
-        else => {},
+        // Only a snippet of my-snippets.lua, after a [Y]es on the status
+        // line (handleSnippetDeleteKey); others say so there.
+        Key.delete => editor.snippetPanelDelete(),
+        Key.backspace => {
+            editor.snippetsFilterBackspace();
+            _ = editor.syncSnippetPanel();
+        },
+        // Typed text narrows the rows; the selection follows the first
+        // match, so Enter inserts it.
+        else => {
+            if (hasCommandMod(key)) return;
+            if (key.text) |text| {
+                editor.snippetsFilterAppend(text);
+            } else if (isTextCodepoint(key.codepoint)) {
+                var bytes: [4]u8 = undefined;
+                const n = std.unicode.utf8Encode(key.codepoint, &bytes) catch return;
+                editor.snippetsFilterAppend(bytes[0..n]);
+            } else return;
+            _ = editor.syncSnippetPanel();
+        },
     }
 }
 
@@ -5919,14 +5980,32 @@ test "TUI snippets panel: docks beside the tree, a click selects then inserts, k
     testKey(&editor, Key.tab, .{});
     try t.expectEqualStrings("values", doc.selectedText().?);
 
-    // Ctrl+Alt+B focuses the open panel; Down then Enter inserts Constant
-    // (letters do nothing: the panel is not modal). Escape hands the keys
-    // back and leaves the panel open; the next Ctrl+Alt+B pair hides it.
+    // Ctrl+Alt+B focuses the open panel. Letters filter the rows, never
+    // the document behind (the panel is not modal): "con" leaves Constant,
+    // selected, under its open group, and the header shows the text.
+    // Escape clears the filter — the panel keeps the keys, the selection
+    // stays on Constant — and Up, Down, Enter insert it. Escape then hands
+    // the keys back and leaves the panel open; the next Ctrl+Alt+B pair
+    // hides it.
     testKey(&editor, Key.escape, .{});
     testKey(&editor, 'b', .{ .ctrl = true, .alt = true });
     try t.expect(editor.snippets_visible);
     try t.expectEqual(Editor.KeyboardOwner.snippets, editor.keyboardOwner());
-    testKey(&editor, 'j', .{});
+    testType(&editor, "con");
+    try t.expectEqual(@as(usize, 2), editor.snippet_panel.rows.items.len);
+    try t.expectEqual(@as(usize, 1), editor.snippet_panel.selected);
+    try t.expectEqualStrings("std.debug.print(\"text\n\", .{values});", doc.buffer.slice(0, doc.buffer.byteLen()));
+    testFrame(win, &editor);
+    try t.expectEqualStrings("Snippets \u{2014} zig  /con ", testCells(&screen, tx, 0, 21, &buf));
+    try t.expectEqualStrings("\u{25be} Start here", testCells(&screen, tx, 1, 12, &buf));
+    try t.expectEqualStrings("\u{2502}  Constant", testCells(&screen, tx, 2, 11, &buf));
+    try t.expectEqualStrings(" " ** 11, testCells(&screen, tx, 3, 11, &buf));
+    testKey(&editor, Key.escape, .{});
+    try t.expectEqual(Editor.KeyboardOwner.snippets, editor.keyboardOwner());
+    try t.expect(!editor.snippet_panel.filterActive());
+    try t.expectEqual(@as(usize, 4), editor.snippet_panel.rows.items.len);
+    try t.expectEqual(@as(usize, 2), editor.snippet_panel.selected);
+    testKey(&editor, Key.up, .{});
     try t.expectEqual(@as(usize, 1), editor.snippet_panel.selected);
     testKey(&editor, Key.down, .{});
     try t.expectEqual(@as(usize, 2), editor.snippet_panel.selected);
@@ -6043,6 +6122,177 @@ test "TUI snippets panel: the preview wraps long code, highlights the blanks and
     try t.expectEqual(@as(usize, 0), snippets_preview_scroll);
     try t.expectEqual(@as(?u32, null), snippets_preview_def);
     try t.expectEqualStrings("Select a snippet", testCells(&screen, tx, code_y, 16, &buf));
+}
+
+test "TUI snippets panel: typing filters and the header shows it, F2 opens the edit form, Delete asks [Y]es" {
+    const t = std.testing;
+    const lua_settings = @import("../core/lua_settings.zig");
+    const snippet_file = @import("../core/snippet_file.zig");
+    var tmp = t.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(t.io, ".", t.allocator);
+    defer t.allocator.free(root);
+    lua_settings.test_config_dir = root;
+    defer lua_settings.test_config_dir = null;
+    var editor = try Editor.init(t.allocator, t.io);
+    defer editor.deinit();
+    editor.lsp_enabled = false;
+    editor.filetree_visible = false;
+    _ = try editor.registerSnippet(.{ .language = "zig", .description = "Print", .group = "Start here", .notes = "Writes text to the terminal.", .body = "std.debug.print(\"${1:text}\n\", .{${2:values}});" });
+    _ = try editor.registerSnippet(.{ .language = "zig", .description = "Constant", .group = "Start here", .notes = "A value that never changes.", .body = "const ${1:name}: ${2:i32} = ${3:0};" });
+    _ = try editor.registerSnippet(.{ .language = "zig", .prefix = "fn", .description = "Function", .group = "Functions", .notes = "A named block of code.", .body = "fn ${1:name}($2) ${3:void} {\n\t$0\n}" });
+    // One of my own, registered as my-snippets.lua registers it, with its
+    // block in that file for the delete to remove.
+    const mine = "snippet.zig.~loop";
+    const mine_spec: snippets_mod.Spec = .{ .language = "zig", .description = "Loop", .group = "Mine", .notes = "Runs once per item.", .body = "for (${1:items}) |${2:item}| {\n\t$0\n}" };
+    editor.loading_extensions = true;
+    editor.loading_extension_name = snippet_file.file_name;
+    _ = try editor.registerSnippet(mine_spec);
+    editor.loading_extensions = false;
+    editor.loading_extension_name = null;
+    try t.expect(snippet_file.isMine(editor.snippets.command(mine).?));
+    const path = try std.fs.path.join(t.allocator, &.{ root, "extensions", snippet_file.file_name });
+    defer t.allocator.free(path);
+    {
+        const block = try snippet_file.renderBlock(t.allocator, mine, mine_spec);
+        defer t.allocator.free(block);
+        const text = try snippet_file.upsert(t.allocator, "", mine, block);
+        defer t.allocator.free(text);
+        try snippet_file.write(t.allocator, t.io, path, text);
+    }
+    const marker = snippet_file.marker_prefix ++ mine;
+    const doc = editor.activeDoc();
+    doc.language = editor.findLanguage("zig");
+    var screen = try testScreen(t.allocator);
+    defer screen.deinit(t.allocator);
+    const win = testWin(&screen);
+    var buf: [512]u8 = undefined;
+    const panel = &editor.snippet_panel;
+
+    // Typing filters: only the matches show, under their open groups, the
+    // first one selected; the header shows the text after a slash, and
+    // the document behind is never touched.
+    try t.expect(editor.takeKeyboardFocus(.snippets));
+    testFrame(win, &editor);
+    const tx = snippets_band.?.x + 1;
+    try t.expectEqualStrings("Snippets \u{2014} zig ", testCells(&screen, tx, 0, 15, &buf));
+    try t.expectEqual(@as(usize, 5), panel.rows.items.len);
+    testType(&editor, "fun");
+    try t.expectEqualStrings("fun", panel.filterText());
+    try t.expectEqual(@as(usize, 2), panel.rows.items.len);
+    try t.expectEqual(@as(usize, 1), panel.selected);
+    try t.expectEqual(@as(usize, 0), doc.buffer.byteLen());
+    testFrame(win, &editor);
+    try t.expectEqualStrings("Snippets \u{2014} zig  /fun ", testCells(&screen, tx, 0, 21, &buf));
+    try t.expectEqualStrings("\u{25be} Functions", testCells(&screen, tx, 1, 11, &buf));
+    try t.expectEqualStrings("\u{2502}  Function", testCells(&screen, tx, 2, 11, &buf));
+    try testCaptureScreen(&screen, "snippets_tui_filter.txt");
+
+    // Backspace edits the filter: three take it away, every row is back.
+    for (0..3) |_| testKey(&editor, Key.backspace, .{});
+    try t.expect(!panel.filterActive());
+    try t.expectEqual(@as(usize, 5), panel.rows.items.len);
+
+    // No match: no rows, and the hint says how to get out of it.
+    testType(&editor, "zzz");
+    try t.expectEqual(@as(usize, 0), panel.rows.items.len);
+    testFrame(win, &editor);
+    try t.expectEqualStrings("Snippets \u{2014} zig  /zzz", testCells(&screen, tx, 0, 20, &buf));
+    try t.expect(std.mem.indexOf(u8, testCells(&screen, tx, 1, 31, &buf), "Backspace") != null);
+
+    // Escape clears the filter; the panel keeps the keys.
+    testKey(&editor, Key.escape, .{});
+    try t.expect(!panel.filterActive());
+    try t.expectEqual(@as(usize, 5), panel.rows.items.len);
+    try t.expectEqual(Editor.KeyboardOwner.snippets, editor.keyboardOwner());
+
+    // The filter takes plain keys only: a key that arrives without text
+    // types its character, a functional key types nothing, and a bound
+    // chord still runs from the panel (Ctrl+Alt+B hides it) without
+    // typing; the filter is still there when the panel comes back.
+    testKey(&editor, 'c', .{});
+    testKey(&editor, Key.insert, .{});
+    testKey(&editor, Key.tab, .{});
+    testType(&editor, "on");
+    testKey(&editor, 'b', .{ .ctrl = true, .alt = true });
+    try t.expect(!editor.snippets_visible);
+    try t.expectEqualStrings("con", editor.snippets_filter[0..editor.snippets_filter_len]);
+    testKey(&editor, 'b', .{ .ctrl = true, .alt = true });
+    try t.expectEqual(Editor.KeyboardOwner.snippets, editor.keyboardOwner());
+    testFrame(win, &editor);
+    try t.expectEqualStrings("Snippets \u{2014} zig  /con", testCells(&screen, tx, 0, 20, &buf));
+    testKey(&editor, Key.escape, .{});
+    try t.expect(!panel.filterActive());
+
+    // F2 on a snippet of my-snippets.lua opens the edit form, on any other
+    // the copy form; Escape leaves either, the panel keeping the keys.
+    // End and Right open the Mine group, Down selects Loop.
+    testKey(&editor, Key.end, .{});
+    testKey(&editor, Key.right, .{});
+    testKey(&editor, Key.down, .{});
+    try t.expectEqual(@as(usize, 5), panel.selected);
+    testKey(&editor, Key.f2, .{});
+    try t.expectEqual(Editor.Mode.snippet_form, editor.mode);
+    try t.expectEqual(snippet_form_mod.Kind.edit, editor.snippet_form.kind);
+    try t.expectEqualStrings("Loop", editor.snippet_form.text(.name));
+    testFrame(win, &editor);
+    try t.expectEqualStrings("Edit snippet", testCells(&screen, 0, snippet_form_band.?.y, 12, &buf));
+    testKey(&editor, Key.escape, .{});
+    try t.expectEqual(Editor.Mode.normal, editor.mode);
+    try t.expectEqual(Editor.KeyboardOwner.snippets, editor.keyboardOwner());
+    panel.selected = 1;
+    testKey(&editor, Key.f2, .{});
+    try t.expectEqual(Editor.Mode.snippet_form, editor.mode);
+    try t.expectEqual(snippet_form_mod.Kind.copy, editor.snippet_form.kind);
+    try t.expectEqualStrings("Print", editor.snippet_form.text(.name));
+    testKey(&editor, Key.escape, .{});
+    try t.expectEqual(Editor.Mode.normal, editor.mode);
+
+    // Delete on mine asks on the status line (the run loop draws the
+    // prompt over the status bar after drawEditor; the same call here).
+    // Any key but y cancels.
+    panel.selected = 5;
+    testKey(&editor, Key.delete, .{});
+    try t.expectEqual(Editor.Mode.snippet_delete_confirm, editor.mode);
+    testFrame(win, &editor);
+    var prompt_buf: [256]u8 = undefined;
+    drawOverlay(win, &editor, editor.snippetDeletePrompt(&prompt_buf), "", 100, 30);
+    try t.expect(std.mem.indexOf(u8, testCells(&screen, 0, 29, 100, &buf), "Delete snippet \"Loop\"") != null);
+    testKey(&editor, 'n', .{});
+    try t.expectEqual(Editor.Mode.normal, editor.mode);
+    try t.expect(editor.snippets.command(mine) != null);
+    {
+        const kept = try snippet_file.read(t.allocator, t.io, path);
+        defer t.allocator.free(kept);
+        try t.expect(std.mem.indexOf(u8, kept, marker) != null);
+    }
+
+    // y deletes: the block leaves the file and the snippet the panel.
+    testKey(&editor, Key.delete, .{});
+    try t.expectEqual(Editor.Mode.snippet_delete_confirm, editor.mode);
+    testKey(&editor, 'y', .{});
+    try t.expectEqual(Editor.Mode.normal, editor.mode);
+    try t.expect(editor.snippets.command(mine) == null);
+    try t.expectEqualStrings("Deleted from my-snippets.lua: Loop", editor.status_message);
+    {
+        const left = try snippet_file.read(t.allocator, t.io, path);
+        defer t.allocator.free(left);
+        try t.expect(std.mem.indexOf(u8, left, marker) == null);
+    }
+    testFrame(win, &editor);
+    try t.expectEqual(@as(usize, 4), panel.rows.items.len);
+
+    // Only mine can be deleted here: Delete on another says so on the
+    // status line. F2 on a group asks for a snippet.
+    panel.selected = 1;
+    testKey(&editor, Key.delete, .{});
+    try t.expectEqual(Editor.Mode.normal, editor.mode);
+    try t.expect(std.mem.startsWith(u8, editor.status_message, "Only snippets in my-snippets.lua"));
+    try t.expect(editor.snippets.command("snippet.zig.~print") != null);
+    panel.selected = 0;
+    testKey(&editor, Key.f2, .{});
+    try t.expectEqual(Editor.Mode.normal, editor.mode);
+    try t.expectEqualStrings("Select a snippet first", editor.status_message);
 }
 
 test "TUI snippet form: Ctrl+Alt+S shows the bottom form prefilled, Tab cycles the fields, Backspace edits, Enter saves and Escape cancels" {

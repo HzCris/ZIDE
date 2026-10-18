@@ -423,6 +423,12 @@ pub const Editor = struct {
     /// The "Save as snippet" form (snippet_form.zig), shown while
     /// `mode == .snippet_form`.
     snippet_form: snippet_form_mod.State = .{},
+    /// The command of the snippet a `.snippet_delete_confirm` prompt is
+    /// about (owned; freed when the prompt ends).
+    snippet_delete_target: ?[]u8 = null,
+    /// The panel's type-to-filter text (snippet_panel.View.filter).
+    snippets_filter: [snippet_panel_mod.max_filter]u8 = undefined,
+    snippets_filter_len: usize = 0,
 
     pub const EncodingChoice = struct { path: []u8, encoding: text_file.TextEncoding };
     pub const EncodingAction = enum { choose, open, reopen, save };
@@ -508,6 +514,10 @@ pub const Editor = struct {
         /// dialog pinned to `snippet_form.window_id` in the GUI, a bottom
         /// band in the TUI.
         snippet_form,
+        /// "Delete snippet … from my-snippets.lua?" (`snippet_delete_target`):
+        /// `y` deletes, any other key cancels — the TUI's status line, the
+        /// GUI's small dialog.
+        snippet_delete_confirm,
     };
 
     /// One editor window: a layout tree of panes plus its focused pane.
@@ -625,6 +635,7 @@ pub const Editor = struct {
         self.commands.deinit();
         self.snippet_panel.deinit(self.allocator);
         self.snippet_form.deinit(self.allocator);
+        self.freeSnippetDeleteTarget();
         self.snippets.deinit(self.allocator);
         self.keybinds.deinit();
         var prof_it = self.lang_profiles.iterator();
@@ -1652,8 +1663,25 @@ pub const Editor = struct {
             .language = if (doc.language) |lang| lang.name else null,
             .any_language = doc.file_path == null and doc.language == null,
             .languages_known = self.languages.items.len,
+            .filter = self.snippets_filter[0..self.snippets_filter_len],
         }, KnownLanguages{ .editor = self });
         return &self.snippet_panel;
+    }
+
+    /// Type-to-filter in the Snippets panel: typed text narrows the rows
+    /// (name, trigger or group containing it), Backspace edits it and
+    /// Escape clears it (true when there was something to clear). The
+    /// frontends sync the panel afterwards.
+    pub fn snippetsFilterAppend(self: *Editor, text: []const u8) void {
+        text_input.append(&self.snippets_filter, &self.snippets_filter_len, text);
+    }
+    pub fn snippetsFilterBackspace(self: *Editor) void {
+        text_input.backspace(&self.snippets_filter, &self.snippets_filter_len);
+    }
+    pub fn snippetsFilterClear(self: *Editor) bool {
+        const had = self.snippets_filter_len > 0;
+        self.snippets_filter_len = 0;
+        return had;
     }
 
     /// Enter or a click on panel row `index`: a group opens or closes, an
@@ -3879,6 +3907,7 @@ pub const Editor = struct {
                 .git_stage_prompt => self.git.resolveStage(self, false),
                 .task_save_prompt => self.tasks.resolveSave(self, .cancel),
                 .snippet_form => self.snippet_form.reset(self.allocator),
+                .snippet_delete_confirm => self.freeSnippetDeleteTarget(),
                 else => {},
             }
         }
@@ -5558,6 +5587,30 @@ pub const Editor = struct {
             return false;
         };
         defer self.allocator.free(text);
+        if (form.editing) |old| {
+            // Editing: the block must still be there as the panel wrote it
+            // (a hand edit may have removed or doubled its markers) — else
+            // the file is the place to work on it.
+            const found = snippet_file.findBlock(text, old) catch |err| {
+                self.snippetFormOpenFileInstead(path, switch (err) {
+                    error.Duplicate => "my-snippets.lua has two blocks for this snippet: opening the file",
+                    error.Unterminated => "my-snippets.lua has a damaged block for this snippet (no `-- zide:end` line): opening the file",
+                });
+                return true;
+            };
+            if (found == null) {
+                self.snippetFormOpenFileInstead(path, "my-snippets.lua no longer has a block for this snippet: opening the file");
+                return true;
+            }
+            // A new name must not take over another snippet's block.
+            if (!std.mem.eql(u8, old, probe.command)) {
+                const clash = snippet_file.findBlock(text, probe.command) catch null;
+                if (clash != null) {
+                    form.error_message = "my-snippets.lua already has a snippet with this name";
+                    return false;
+                }
+            }
+        }
         const block = snippet_file.renderBlock(self.allocator, probe.command, spec) catch |err| {
             form.error_message = switch (err) {
                 error.MarkerInBody => "A snippet body cannot contain a `-- zide:` marker line",
@@ -5583,6 +5636,10 @@ pub const Editor = struct {
         // A clean tab shows the new text at once (the external-change poll
         // would reload it a second later and overwrite the status line).
         if (open_doc) |idx| self.documents.items[idx].reloadFromDisk(self.io) catch {};
+        // A renamed snippet: its old definition goes with its old name.
+        if (form.editing) |old| {
+            if (!std.mem.eql(u8, old, probe.command)) _ = self.removeSnippet(old);
+        }
         // Register it the way the file will on the next load: an extension
         // snippet from my-snippets.lua.
         self.loading_extensions = true;
@@ -5601,6 +5658,161 @@ pub const Editor = struct {
         self.setMode(.normal);
         if (self.snippets_visible) self.selectSnippetRow(command);
         return true;
+    }
+
+    // ---- Snippets panel: edit, copy and delete the user's own ----
+
+    fn freeSnippetDeleteTarget(self: *Editor) void {
+        if (self.snippet_delete_target) |target| self.allocator.free(target);
+        self.snippet_delete_target = null;
+    }
+
+    /// Fill the form from a registered snippet (its body with the blanks).
+    fn fillSnippetFormFrom(self: *Editor, def: *const snippets_mod.Definition) void {
+        const form = &self.snippet_form;
+        form.reset(self.allocator);
+        form.set(.name, def.description);
+        form.set(.folder, def.group);
+        form.set(.trigger, def.prefix);
+        form.set(.language, def.language);
+        form.setRaw(.notes, def.notes);
+        form.setRaw(.body, def.body);
+    }
+
+    /// F2 / the context menu on a snippet of my-snippets.lua: the form
+    /// with its fields; Save rewrites its block (a new name moves it).
+    pub fn startSnippetEdit(self: *Editor, def_index: usize) void {
+        if (self.mode != .normal or def_index >= self.snippets.items.items.len) return;
+        const def = &self.snippets.items.items[def_index];
+        self.fillSnippetFormFrom(def);
+        self.snippet_form.editing = self.allocator.dupe(u8, def.command) catch {
+            self.status_message = "Edit snippet: out of memory";
+            return;
+        };
+        self.openSnippetForm(.edit);
+    }
+
+    /// F2 / the context menu on any other snippet: the form with its
+    /// fields; Save puts a copy into my-snippets.lua (under the same name
+    /// it replaces the original in the panel, since that file loads last).
+    pub fn startSnippetCopy(self: *Editor, def_index: usize) void {
+        if (self.mode != .normal or def_index >= self.snippets.items.items.len) return;
+        self.fillSnippetFormFrom(&self.snippets.items.items[def_index]);
+        self.openSnippetForm(.copy);
+    }
+
+    /// Delete on a snippet of my-snippets.lua: ask first.
+    pub fn startSnippetDelete(self: *Editor, def_index: usize) void {
+        if (self.mode != .normal or def_index >= self.snippets.items.items.len) return;
+        const def = &self.snippets.items.items[def_index];
+        if (!snippet_file.isMine(def)) {
+            self.status_message = "Only snippets in my-snippets.lua can be deleted here (F2 copies one there)";
+            return;
+        }
+        self.freeSnippetDeleteTarget();
+        self.snippet_delete_target = self.allocator.dupe(u8, def.command) catch {
+            self.status_message = "Delete snippet: out of memory";
+            return;
+        };
+        self.setMode(.snippet_delete_confirm);
+    }
+
+    /// The question both frontends ask while `.snippet_delete_confirm`.
+    pub fn snippetDeletePrompt(self: *const Editor, buf: []u8) []const u8 {
+        const name: []const u8 = if (self.snippet_delete_target) |cmd| (if (self.snippets.command(cmd)) |def| def.description else cmd) else "";
+        return std.fmt.bufPrint(buf, "Delete snippet \"{s}\" from my-snippets.lua? [Y]es / any other key cancels: ", .{name}) catch "Delete this snippet from my-snippets.lua? [Y]es / any other key cancels: ";
+    }
+
+    pub fn cancelSnippetDelete(self: *Editor) void {
+        if (self.mode == .snippet_delete_confirm) self.setMode(.normal);
+    }
+
+    /// `y` to the question: the block leaves my-snippets.lua and the
+    /// snippet leaves the registry and the panel.
+    pub fn applySnippetDelete(self: *Editor) void {
+        if (self.mode != .snippet_delete_confirm) return;
+        var cmd_buf: [512]u8 = undefined;
+        const target = self.snippet_delete_target orelse {
+            self.setMode(.normal);
+            return;
+        };
+        const n = @min(target.len, cmd_buf.len);
+        @memcpy(cmd_buf[0..n], target[0..n]);
+        const command: []const u8 = cmd_buf[0..n];
+        self.setMode(.normal); // frees the target
+        var name_buf: [128]u8 = undefined;
+        const name: []const u8 = blk: {
+            const def = self.snippets.command(command) orelse break :blk command;
+            const m = @min(def.description.len, name_buf.len);
+            @memcpy(name_buf[0..m], def.description[0..m]);
+            break :blk name_buf[0..m];
+        };
+        var path_buf: [512]u8 = undefined;
+        const path = mySnippetsPath(&path_buf) orelse {
+            self.status_message = "No config directory (HOME / USERPROFILE is not set)";
+            return;
+        };
+        const open_doc: ?usize = self.findDocument(path) catch null;
+        if (open_doc) |idx| {
+            if (self.documents.items[idx].dirty) {
+                self.status_message = "my-snippets.lua has unsaved changes in a tab: save or close it first";
+                return;
+            }
+        }
+        const text = snippet_file.read(self.allocator, self.io, path) catch |err| {
+            self.status_message = std.fmt.bufPrint(&self.status_buf, "Cannot read my-snippets.lua: {s}", .{@errorName(err)}) catch "Cannot read my-snippets.lua";
+            return;
+        };
+        defer self.allocator.free(text);
+        const removal = snippet_file.remove(self.allocator, text, command) catch {
+            self.status_message = "Delete snippet: out of memory";
+            return;
+        };
+        defer self.allocator.free(removal.text);
+        if (removal.removed > 0) {
+            snippet_file.write(self.allocator, self.io, path, removal.text) catch |err| {
+                self.status_message = std.fmt.bufPrint(&self.status_buf, "Cannot write my-snippets.lua: {s}", .{@errorName(err)}) catch "Cannot write my-snippets.lua";
+                return;
+            };
+            if (open_doc) |idx| self.documents.items[idx].reloadFromDisk(self.io) catch {};
+        }
+        _ = self.removeSnippet(command);
+        self.status_message = if (removal.removed > 0)
+            std.fmt.bufPrint(&self.status_buf, "Deleted from my-snippets.lua: {s}", .{name}) catch "Deleted from my-snippets.lua"
+        else
+            std.fmt.bufPrint(&self.status_buf, "my-snippets.lua had no block for {s}: removed from the panel only", .{name}) catch "my-snippets.lua had no block for it: removed from the panel only";
+    }
+
+    /// F2 / the context menu on the panel's selected row: a snippet of
+    /// my-snippets.lua opens for editing, any other for copying there.
+    pub fn snippetPanelEdit(self: *Editor) void {
+        const def_index = self.snippetPanelSelectedDef() orelse return;
+        if (snippet_file.isMine(&self.snippets.items.items[def_index])) self.startSnippetEdit(def_index) else self.startSnippetCopy(def_index);
+    }
+
+    /// Delete on the panel's selected row (snippets of my-snippets.lua only).
+    pub fn snippetPanelDelete(self: *Editor) void {
+        const def_index = self.snippetPanelSelectedDef() orelse return;
+        self.startSnippetDelete(def_index);
+    }
+
+    /// The registry index of the panel's selected item; a group or no
+    /// selection says so in the status bar.
+    fn snippetPanelSelectedDef(self: *Editor) ?usize {
+        const panel = &self.snippet_panel;
+        if (panel.rowAt(panel.selected)) |row| {
+            if (row.kind == .item and row.def < self.snippets.items.items.len) return row.def;
+        }
+        self.status_message = "Select a snippet first";
+        return null;
+    }
+
+    /// Edit found no usable block: say so, leave the form and open the
+    /// file, where the snippet can be fixed by hand.
+    fn snippetFormOpenFileInstead(self: *Editor, path: []const u8, message: []const u8) void {
+        self.cancelSnippetForm();
+        _ = self.openOrFocus(path) catch null;
+        self.status_message = message;
     }
 
     /// Put the panel's selection on the snippet registered as `command`,

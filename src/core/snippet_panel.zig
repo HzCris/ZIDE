@@ -43,10 +43,16 @@ pub const View = struct {
     /// How many languages the editor knows — a language registered later
     /// can make more snippets eligible in any-language mode.
     languages_known: usize = 0,
+    /// Text every shown item must contain (ASCII case-insensitively) in
+    /// its name, trigger or group; "" shows everything. While it is set,
+    /// every group with a match is open and the rest are hidden.
+    filter: []const u8 = "",
 };
 
 /// Longest language name the change detection compares in full.
 const max_lang = 64;
+/// Longest filter text (the Editor's buffer is this big).
+pub const max_filter = 64;
 
 /// What the rows were last built for; a change rebuilds them.
 const Key = struct {
@@ -56,28 +62,58 @@ const Key = struct {
     has_lang: bool,
     lang_len: u8,
     lang: [max_lang]u8,
+    filter_len: u8,
+    filter: [max_filter]u8,
 
     fn init(view: View) Key {
-        var key: Key = .{ .revision = view.revision, .any_language = view.any_language, .languages_known = view.languages_known, .has_lang = view.language != null, .lang_len = 0, .lang = undefined };
+        var key: Key = .{ .revision = view.revision, .any_language = view.any_language, .languages_known = view.languages_known, .has_lang = view.language != null, .lang_len = 0, .lang = undefined, .filter_len = 0, .filter = undefined };
         if (view.language) |name| {
             const n = @min(name.len, max_lang);
             @memcpy(key.lang[0..n], name[0..n]);
             key.lang_len = @intCast(n);
         }
+        const f = @min(view.filter.len, max_filter);
+        @memcpy(key.filter[0..f], view.filter[0..f]);
+        key.filter_len = @intCast(f);
         return key;
     }
     fn language(self: *const Key) ?[]const u8 {
         return if (self.has_lang) self.lang[0..self.lang_len] else null;
+    }
+    fn filterText(self: *const Key) []const u8 {
+        return self.filter[0..self.filter_len];
     }
     fn sameLanguage(self: *const Key, other: *const Key) bool {
         if (self.has_lang != other.has_lang or self.any_language != other.any_language) return false;
         const mine = self.language() orelse return true;
         return std.ascii.eqlIgnoreCase(mine, other.language().?);
     }
+    fn sameFilter(self: *const Key, other: *const Key) bool {
+        return std.mem.eql(u8, self.filterText(), other.filterText());
+    }
     fn eql(self: *const Key, other: *const Key) bool {
-        return self.revision == other.revision and self.languages_known == other.languages_known and self.sameLanguage(other);
+        return self.revision == other.revision and self.languages_known == other.languages_known and self.sameLanguage(other) and self.sameFilter(other);
     }
 };
+
+/// Whether `haystack` contains `needle`, ASCII letters compared without
+/// case (std.ascii has no indexOfIgnoreCase).
+fn containsIgnoreCase(haystack: []const u8, needle: []const u8) bool {
+    if (needle.len == 0) return true;
+    if (needle.len > haystack.len) return false;
+    var i: usize = 0;
+    while (i + needle.len <= haystack.len) : (i += 1) {
+        if (std.ascii.startsWithIgnoreCase(haystack[i..], needle)) return true;
+    }
+    return false;
+}
+
+/// Whether the filter lets `def` through: its name, trigger or group
+/// contains the text.
+fn matchesFilter(def: *const Definition, filter: []const u8) bool {
+    return filter.len == 0 or containsIgnoreCase(def.description, filter) or
+        containsIgnoreCase(def.prefix, filter) or containsIgnoreCase(def.group, filter);
+}
 
 /// A toggled group, remembered by content (the registry's slices are
 /// borrowed, so the set owns copies).
@@ -130,7 +166,11 @@ pub const State = struct {
     pub fn sync(self: *State, a: Allocator, defs: []const Definition, view: View, languages: anytype) void {
         const key = Key.init(view);
         const language_changed = if (self.key) |*old| !old.sameLanguage(&key) else true;
-        if (!self.dirty and !language_changed) if (self.key) |*old| if (old.eql(&key)) return;
+        const filter_changed = if (self.key) |*old| !old.sameFilter(&key) else false;
+        if (!self.dirty and !language_changed and !filter_changed) if (self.key) |*old| if (old.eql(&key)) return;
+        // The item selected before, to keep it selected through a filter
+        // change when it is still shown.
+        const kept: ?u32 = if (self.rowAt(self.selected)) |row| (if (row.kind == .item) row.def else null) else null;
         self.rebuild(a, defs, view, languages) catch {
             self.groups.clearRetainingCapacity();
             self.rows.clearRetainingCapacity();
@@ -140,14 +180,39 @@ pub const State = struct {
         if (language_changed) {
             self.selected = 0;
             self.scroll = 0;
+        } else if (filter_changed) {
+            // The same item when it is still there, else the first match:
+            // Enter inserts it right away.
+            self.selected = 0;
+            for (self.rows.items, 0..) |row, i| {
+                if (row.kind != .item) continue;
+                if (kept != null and row.def == kept.?) {
+                    self.selected = i;
+                    break;
+                }
+                if (self.selected == 0) self.selected = i;
+            }
+            self.scroll = 0;
+            self.scroll_to_selected = true;
         } else {
             self.selected = @min(self.selected, self.rows.items.len -| 1);
         }
     }
 
     fn included(def: *const Definition, view: View, languages: anytype) bool {
+        if (!matchesFilter(def, view.filter)) return false;
         if (view.any_language) return std.mem.eql(u8, def.language, "*") or languages.isKnown(def.language);
         return def.matchesLanguage(view.language);
+    }
+
+    /// Whether a filter is narrowing the rows (every shown group is open).
+    pub fn filterActive(self: *const State) bool {
+        return if (self.key) |key| key.filter_len > 0 else false;
+    }
+
+    /// The filter the rows were built for (what the frontends draw).
+    pub fn filterText(self: *const State) []const u8 {
+        return if (self.key) |*key| key.filterText() else "";
     }
 
     fn findGroup(self: *const State, language: []const u8, name: []const u8) ?usize {
@@ -171,7 +236,9 @@ pub const State = struct {
             }
         }
         for (self.groups.items, 0..) |*group, gi| {
-            group.expanded = (gi == 0) != self.toggled.contains(.{ .language = group.language, .name = group.name });
+            // A filter shows every match: its groups stay open (the
+            // toggles are kept for when it clears).
+            group.expanded = view.filter.len > 0 or ((gi == 0) != self.toggled.contains(.{ .language = group.language, .name = group.name }));
             group.row = self.rows.items.len;
             try self.rows.append(a, .{ .kind = .group, .group = @intCast(gi), .def = 0 });
             if (!group.expanded) continue;
@@ -187,6 +254,8 @@ pub const State = struct {
     /// effect at the next sync (the Editor syncs right after).
     pub fn toggle(self: *State, a: Allocator, gi: usize) void {
         if (gi >= self.groups.items.len) return;
+        // While a filter narrows the rows every group stays open.
+        if (self.filterActive()) return;
         const group = self.groups.items[gi];
         if (self.toggled.fetchRemove(.{ .language = group.language, .name = group.name })) |kv| {
             a.free(kv.key.language);
@@ -272,6 +341,7 @@ pub const State = struct {
     /// The message for a panel with no rows.
     pub fn emptyHint(self: *const State) []const u8 {
         const key = &(self.key orelse return "");
+        if (key.filter_len > 0) return "No snippets match — Backspace edits the filter, Escape clears it";
         if (key.any_language) return "No snippets registered yet";
         if (key.language() == null) return "Only * snippets apply to a file without a language";
         return "No snippets for this language — see Documentation.md, Snippets";
@@ -325,6 +395,44 @@ fn expectRows(state: *const State, defs: []const Definition, expected: []const [
         };
         try std.testing.expectEqualStrings(want, got);
     }
+}
+
+test "snippet panel filter: case-insensitive over name, trigger and group, matching groups open, others hidden, the selection follows, toggles come back" {
+    const a = std.testing.allocator;
+    const defs = try testDefs(a);
+    defer freeDefs(a, defs);
+    var state: State = .{};
+    defer state.deinit(a);
+    state.sync(a, defs, .{ .revision = 1, .language = "zig" }, AllKnown{});
+    try expectRows(&state, defs, &.{ "Functions", "Function", "Start here", "Any" });
+    // "PRI" matches a name: only its group, open, and the item selected.
+    state.sync(a, defs, .{ .revision = 1, .language = "zig", .filter = "PRI" }, AllKnown{});
+    try expectRows(&state, defs, &.{ "Start here", "Print" });
+    try std.testing.expectEqual(@as(usize, 1), state.selected);
+    try std.testing.expect(state.filterActive());
+    try std.testing.expectEqualStrings("PRI", state.filterText());
+    // A trigger ("fn") and a group name ("start") match too.
+    state.sync(a, defs, .{ .revision = 1, .language = "zig", .filter = "fn" }, AllKnown{});
+    try expectRows(&state, defs, &.{ "Functions", "Function" });
+    state.sync(a, defs, .{ .revision = 1, .language = "zig", .filter = "start" }, AllKnown{});
+    try expectRows(&state, defs, &.{ "Start here", "Print", "Main" });
+    // The selected item stays selected while it still matches.
+    state.selected = 2; // Main
+    state.sync(a, defs, .{ .revision = 1, .language = "zig", .filter = "ma" }, AllKnown{});
+    try expectRows(&state, defs, &.{ "Start here", "Main" });
+    try std.testing.expectEqual(@as(usize, 1), state.selected);
+    // Toggles are ignored while filtering; no match says what to do.
+    state.toggle(a, 0);
+    state.sync(a, defs, .{ .revision = 1, .language = "zig", .filter = "ma" }, AllKnown{});
+    try expectRows(&state, defs, &.{ "Start here", "Main" });
+    state.sync(a, defs, .{ .revision = 1, .language = "zig", .filter = "zzz" }, AllKnown{});
+    try expectRows(&state, defs, &.{});
+    try std.testing.expect(std.mem.indexOf(u8, state.emptyHint(), "Backspace") != null);
+    // Cleared: the rows as before, the first group open as before.
+    state.sync(a, defs, .{ .revision = 1, .language = "zig" }, AllKnown{});
+    try expectRows(&state, defs, &.{ "Functions", "Function", "Start here", "Any" });
+    try std.testing.expect(!state.filterActive());
+    try std.testing.expectEqualStrings("", state.filterText());
 }
 
 test "snippet panel lists one language plus * snippets, groups in first-registration order, first group open" {

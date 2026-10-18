@@ -213,9 +213,11 @@ does not need to know the syntax before completion can finish it.
   `snippet_form.zig` (the form state both frontends share), `Definition.body`/`source` and
   `removeSnippet`, `my-snippets.lua` loads last, `snippet_save_selection` on Ctrl+Alt+S, the
   GUI dialog and the TUI bottom band.
-- **Step 2, checkpoint 2: edit, delete, copy to mine, filter** (N, M). Right-click / F2 /
-  Delete on panel rows (mine: edit and delete; bundled: copy to my snippets), a delete
-  confirmation, and type-to-filter in the panel (GUI box, TUI header).
+- **Step 2, checkpoint 2: edit, delete, copy to mine, filter** (N, M) — **DONE 2026-10-17**:
+  right-click / F2 / Delete on panel rows (mine: edit and delete, with a rename moving the
+  block; bundled: copy to my snippets), `Mode.snippet_delete_confirm` (GUI dialog, TUI status
+  line), a hand-edited block opens the file instead, and type-to-filter in the panel
+  (`snippet_panel.View.filter`; GUI box under the header, TUI `/text` in the header).
 - **Step 3 (maybe): mirrored blanks** (N, M). The same field number in two places (`list` in
   the ArrayList skeleton) updating together; the bundled bodies hard-code repeats today and
   the notes say so.

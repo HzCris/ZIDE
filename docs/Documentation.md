@@ -252,7 +252,7 @@ Windows terminals commonly intercept Alt combos (Windows Terminal binds Alt+arro
   - Config load order: init.lua → themes/gui-theme.lua → themes/tui-theme.lua → themes/syntax-theme.lua → extensions/*.lua → themes/syn_theme_<lang>.lua — a later file's `zide.set` overrides an earlier one's, and extension files load in directory order (not sorted)
 - Data-driven keybinding map (all Ctrl/Alt shortcuts remappable, globally or per language)
 - File tree side panel (Ctrl+B) — dockable left/right column band with mouse + keyboard browsing, create/rename/delete prompts, reveal-current-file (see File Tree section)
-- Snippets side panel (Ctrl+Alt+B) — the document language's snippets in collapsible groups by plain name with a preview (the code with its blanks, the notes) under them; click a row to select it, click the highlighted item or press Enter to insert it at the caret with Tab walking the blanks; docks like the tree (`tui_snippets_width` columns), Shift+Up/Down scroll long notes (see *Snippets*)
+- Snippets side panel (Ctrl+Alt+B) — the document language's snippets in collapsible groups by plain name with a preview (the code with its blanks, the notes) under them; click a row to select it, click the highlighted item or press Enter to insert it at the caret with Tab walking the blanks; docks like the tree (`tui_snippets_width` columns), Shift+Up/Down scroll long notes; typing filters the list, F2 edits your snippet or copies a bundled one into your file, Delete asks before removing yours (see *Snippets*)
 - Save as snippet (Ctrl+Alt+S) — a bottom panel with Name, Folder, Trigger, Language and Notes rows (Tab moves between them, Enter saves, Escape cancels) saves the selection to `extensions/my-snippets.lua` and registers it at once (see *Snippets*)
 - Auto-save (off by default — `zide.set("auto_save", true)` or the Settings dialog; saves dirty documents with file paths after a configurable interval, default 5s; continues while the TUI is idle)
 - Application icon embedded in exe
@@ -300,7 +300,7 @@ Cross-frontend gaps are tracked in [TODO.md](TODO.md) (verified backlog: navigat
 - Quick open (Ctrl+E): fuzzy file finder with live preview behind a bottom-anchored panel — same behavior as the TUI (Enter opens a normal tab, Escape restores; previews never appear in the tab bar; clicking the menu bar or the tab bar closes quick open first); PageUp/PageDown and the mouse wheel scroll the preview
 - Workspace search & replace (Ctrl+Shift+F): same engine and behavior as the TUI, with a VS Code-style panel — bordered input boxes with placeholders, clickable `Aa`/`W` toggle chips inside the search box (toggling re-runs the search), results **grouped under file headers** (collapse chevron + type icon + name + directory + match count — click a header to fold/unfold its file; the current file's header stays **pinned at the top** while its matches scroll, VS Code-style) with the match **highlighted inside each excerpt** and long excerpts ellipsis-windowed around the match; click fields to focus, double-click a result to open it, wheel scrolls, F4/Shift+F4 cycle results while editing
 - Keybinding remapping (Lua integration — `zide.bind`/`zide.unbind` via init.lua, global or per-language with `{ language = "zig" }`)
-- Snippets side panel (Ctrl+Alt+B, View > Snippets): the document language's snippets in collapsible groups by plain name, a preview with notes at the bottom (it takes the room a short list leaves free; notes that still do not fit scroll with the wheel or its scrollbar), click or Enter inserts at the caret and hands the keyboard back so Tab walks the blanks (with `snippets_double_click` a click selects and a double-click inserts); its own side (default: opposite the file tree) and drag-resizable width — drag the edge well past the minimum to hide it; right-click moves it — see *Snippets*
+- Snippets side panel (Ctrl+Alt+B, View > Snippets): the document language's snippets in collapsible groups by plain name, a preview with notes at the bottom (it takes the room a short list leaves free; notes that still do not fit scroll with the wheel or its scrollbar), click or Enter inserts at the caret and hands the keyboard back so Tab walks the blanks (with `snippets_double_click` a click selects and a double-click inserts); its own side (default: opposite the file tree) and drag-resizable width — drag the edge well past the minimum to hide it; right-click moves it, or edits, deletes or copies the snippet under the pointer (also F2 / Delete), and typing into the box under the header filters the list — see *Snippets*
 - Save as snippet (Ctrl+Alt+S, Edit > Save Selection as Snippet…, the editor's right-click menu): a dialog with Name, Folder, Trigger, Language, Notes and an editable Body (add blanks like `${1:text}` right there) saves the selection to `extensions/my-snippets.lua` and registers it at once — see *Snippets*
 - Auto-save (off by default; saves dirty documents with file paths after a configurable interval, default 5s)
 - Application icon embedded in exe
@@ -739,7 +739,10 @@ for (items) |item| {
 The panel rewrites only the text between a block's two marker lines (new blocks go at the
 end); everything else in the file is left byte for byte, so you can add your own Lua above or
 below the blocks or edit a block by hand (then run `reload_extensions`). Keep the marker lines
-as they are — a block the panel cannot find any more is one it offers to open the file for.
+as they are — when Edit or Delete in the panel cannot find a block any more (its marker line
+changed, or the file has two blocks for the same name), the panel says so and opens the file
+instead of touching it. F2 on a bundled snippet copies it here, so you never edit the bundled
+file itself.
 Bodies are written as Lua long strings (`[[...]]`, or `[=[...]=]` when the body contains
 `]]`), so nothing inside them needs escaping. The file runs **after every other extension
 file**, whatever order the operating system lists them in, so a snippet saved here replaces a
@@ -1234,8 +1237,15 @@ see *The Shipped Extension: snippets-zig.lua* under the Extension System.
   its scrollbar, scrolls them. The panel's edge, its dividers, the code box and the guide
   lines under open groups use the `color_panel_border` theme color.
 - Keys while it owns the keyboard: Up/Down, PageUp/PageDown, Home/End, Left (close the group
-  or jump to it), Right (open the group or step into it), Enter, Escape. Clipboard chords are
-  swallowed; global chords (Ctrl+B, Ctrl+P, …) keep working.
+  or jump to it), Right (open the group or step into it), Enter, Escape. **Type to filter**:
+  letters and other plain keys go into a filter (the box under the header in the GUI, `/text`
+  after the language in the TUI header) that keeps only snippets whose name, trigger or folder
+  contains the text, case-insensitively, with every matching folder open; Backspace edits it,
+  Escape clears it first and releases the keyboard only when it is already empty. **F2** edits
+  the selected snippet when it is one of yours, or copies any other into your file (see
+  *Making your own*); **Delete** asks before removing one of yours. Clipboard chords are
+  swallowed; global chords (Ctrl+B, Ctrl+P, …) keep working (a global `f2` binding would win
+  over the panel's F2 in the GUI).
 - It docks **left or right** with the same rules as the file tree: `snippets_side` (default
   `"auto"` = opposite the tree; on a shared side the tree sits outside) and `snippets_width`;
   right-click the panel to move it, drag its edge to resize — both persist to init.lua — and
@@ -1249,9 +1259,9 @@ see *The Shipped Extension: snippets-zig.lua* under the Extension System.
   it keeps 40 columns for the panes beside both bands and hides itself with a message when
   fewer than 16 columns are left for it. There is no hover (`snippets_double_click` is
   GUI-only): a click on a row selects it and shows its preview, a click on the highlighted
-  item inserts it, a click on a group opens or closes it. The arrow keys move (no letter
-  keys: nothing modal). Shift+Up/Down and Shift+PageUp/PageDown scroll the preview (the
-  wheel over it too); when
+  item inserts it, a click on a group opens or closes it. The arrow keys move; typing filters
+  (there are no letter commands). Shift+Up/Down and Shift+PageUp/PageDown scroll the preview
+  (the wheel over it too); when
   notes are cut off, the preview's last row says `▼ Shift+Down for more`. Code wraps to the
   band with a two-column continuation indent, blanks are drawn in the selection colors, and a
   `│` guide sits under each open group, all in the TUI theme's `gutter_separator` color.
@@ -1286,8 +1296,16 @@ see *The Shipped Extension: snippets-zig.lua* under the Extension System.
   `my-snippets.lua` open in a tab with unsaved changes blocks the save (save or close it
   first); a clean tab reloads to show the new block.
 - That file is yours: *Your snippets: my-snippets.lua* under the Extension System describes
-  its format and the rules the panel follows when rewriting it. Editing and deleting snippets
-  from the panel is the next step.
+  its format and the rules the panel follows when rewriting it.
+- **Editing and deleting.** In the panel, **F2** (or the GUI's right-click menu, "Edit
+  Snippet…") on one of your snippets opens the same form filled in; Save rewrites its block in
+  place, and a new name moves the block to the new name. **Delete** (or "Delete Snippet" in the
+  menu) asks "Delete snippet … from my-snippets.lua?" — `y` deletes, anything else cancels —
+  then removes the block and the snippet. Both work only for snippets in your file; on a
+  bundled snippet F2 (or "Copy to My Snippets…") opens the form filled with its code and
+  notes and saves a copy into your file: keep the name and your copy replaces the bundled one
+  in the panel, since your file loads last. If a block was edited by hand so that the panel
+  can no longer find its marker lines, Edit opens the file for you instead of guessing.
 
 ### Using them with Tab
 

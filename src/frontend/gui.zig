@@ -22,6 +22,7 @@ const fileicons = @import("../core/fileicons.zig");
 const snippet_panel = @import("../core/snippet_panel.zig");
 const snippets_mod = @import("../core/snippets.zig");
 const snippet_form_mod = @import("../core/snippet_form.zig");
+const snippet_file = @import("../core/snippet_file.zig");
 const icons = @import("icons.zig");
 const cursor_mod = @import("../core/cursor.zig");
 const keybind = @import("../core/keybind.zig");
@@ -717,7 +718,7 @@ fn treeTakesKeys(editor: *const Editor) bool {
     return guiMode(editor) == .normal and editor.keyboardOwner() == .filetree;
 }
 
-/// Key events go to the Snippets panel (it takes no text).
+/// Key and text events go to the Snippets panel (typing filters its rows).
 fn snippetsTakesKeys(editor: *const Editor) bool {
     return guiMode(editor) == .normal and editor.keyboardOwner() == .snippets;
 }
@@ -1016,7 +1017,7 @@ fn dismissFinderOnBarPress(editor: *Editor, bar: dvui.Rect.Physical) void {
 }
 
 /// Dialogs of the current window (Settings, the snippet form, the delete
-/// confirmation) and the active window's prompts. Declared before the
+/// confirmations) and the active window's prompts. Declared before the
 /// panes so their widgets consume their events first.
 fn modalDialogs(editor: *Editor) void {
     if (cur_win == editor.active_window) {
@@ -1064,6 +1065,8 @@ fn modalDialogs(editor: *Editor) void {
     if (editor.mode == .filetree_prompt and editor.filetree_prompt_kind == .delete_confirm and editor.active_window == cur_win) {
         filetreeDeleteDialog(editor);
     }
+    // The Snippets panel's "Delete snippet" question, the same way.
+    if (editor.mode == .snippet_delete_confirm and editor.active_window == cur_win) snippetDeleteDialog(editor);
 }
 
 /// Tab bar of the current window: the documents it owns (EditorWindow.tabs);
@@ -3442,6 +3445,12 @@ const SnippetsMetrics = struct {
     area: dvui.Rect.Physical,
     scale: f32,
     line_height: f32,
+    /// The title row's height; the filter box's row follows it.
+    header_h: f32,
+    /// The type-to-filter box, inset in its row under the header (the rows
+    /// start below that row). A click on it gives the panel the keyboard,
+    /// and typing then narrows the rows.
+    filter: dvui.Rect.Physical,
     rows_y: f32,
     rows_h: f32,
     visible_rows: usize,
@@ -3463,17 +3472,21 @@ const SnippetsMetrics = struct {
 /// does not need to the preview.
 fn snippetsMetrics(area: dvui.Rect.Physical, scale: f32, line_height: f32, row_count: usize) SnippetsMetrics {
     const header_h = line_height + 4 * scale;
+    // The filter box's row: a box a little taller than its text, with a
+    // few px of air above and below.
+    const filter_h = line_height + 10 * scale;
+    const top_h = header_h + filter_h;
     // The preview keeps at least 40% of the panel — sized by its content,
     // the list would grow and shrink under the pointer as the hover moved
     // — and takes whatever a short list leaves free (an empty list shows
     // a hint: keep it a few rows).
     const rows_f: f32 = @floatFromInt(if (row_count == 0) 6 else row_count);
-    const list_h = header_h + rows_f * line_height + 4 * scale;
+    const list_h = top_h + rows_f * line_height + 4 * scale;
     var preview_h = @max(@floor(area.h * 0.4), @floor(area.h - list_h));
-    const list_min = header_h + 3 * line_height;
+    const list_min = top_h + 3 * line_height;
     if (area.h - preview_h < list_min) preview_h = @max(0, area.h - list_min);
     if (preview_h < 3 * line_height) preview_h = 0;
-    const rows_h = @max(0, area.h - header_h - preview_h);
+    const rows_h = @max(0, area.h - top_h - preview_h);
     const sb_w = 6 * scale;
     const pad_l = 6 * scale;
     const chevron_w = 14 * scale;
@@ -3482,7 +3495,14 @@ fn snippetsMetrics(area: dvui.Rect.Physical, scale: f32, line_height: f32, row_c
         .area = area,
         .scale = scale,
         .line_height = line_height,
-        .rows_y = area.y + header_h,
+        .header_h = header_h,
+        .filter = .{
+            .x = area.x + 6 * scale,
+            .y = area.y + header_h + 3 * scale,
+            .w = @max(0, area.w - 12 * scale),
+            .h = filter_h - 6 * scale,
+        },
+        .rows_y = area.y + top_h,
         .rows_h = rows_h,
         .visible_rows = if (rows_h > line_height) @intFromFloat(@floor(rows_h / line_height)) else 1,
         .preview = .{ .x = area.x, .y = area.y + area.h - preview_h, .w = area.w, .h = preview_h },
@@ -3527,8 +3547,11 @@ fn snippetsSbThumb(panel: *const snippet_panel.State, m: SnippetsMetrics) ?dvui.
 /// (snippet_panel.zig owns the rows). A click or Enter inserts an item at
 /// the caret and hands the keyboard back so Tab walks its blanks; the
 /// preview at the bottom shows what the hovered (else the selected) item
-/// inserts. Custom rows in the file tree's style; `width` is the band's
-/// logical width this frame (snippetsBandWidth).
+/// inserts. While the panel has the keyboard, typing narrows the rows (the
+/// filter box under the header), and F2 / Delete — or the right-click menu
+/// — edit, copy or delete the selected snippet. Custom rows in the file
+/// tree's style; `width` is the band's logical width this frame
+/// (snippetsBandWidth).
 fn snippetsPanel(editor: *Editor, width: f32) void {
     if (!build_options.has_gui) return;
     var pbox = dvui.box(@src(), .{ .dir = .vertical }, .{
@@ -3557,11 +3580,16 @@ fn snippetsPanel(editor: *Editor, width: f32) void {
     var m = snippetsMetrics(area, scale, line_height, rows_before);
 
     // Input first, then the sync: a click or a key can open or close a
-    // group, or give an untitled file a language, and every count and
-    // clamp below must see the rows that left (a stale row count was an
-    // out-of-bounds panic in the file tree).
+    // group, narrow the filter or give an untitled file a language, and
+    // every count and clamp below must see the rows that left (a stale row
+    // count was an out-of-bounds panic in the file tree).
     handleSnippetsMouse(editor, wd, m);
     if (snippetsTakesKeys(editor)) handleSnippetsKeys(editor, wd, m.visible_rows);
+    // SDL delivers .text events only while someone declares a text-input
+    // region (see filetreePanel): without this the filter never hears the
+    // typing. After the input: a click may just have given the panel the
+    // keyboard, Enter or Escape handed it back.
+    if (snippetsTakesKeys(editor)) dvui.wantTextInput(m.filter.toNatural());
     const panel = editor.syncSnippetPanel();
     const rows = panel.rows.items;
     // Rows came or went: the list and the preview share the panel anew.
@@ -3597,8 +3625,8 @@ fn snippetsPanel(editor: *Editor, width: f32) void {
         defer dvui.clipSet(prev_clip);
 
         // --- Header: "Snippets — <language>", bold while it has the keyboard ---
-        fillBar(area, 0, m.rows_y - area.y, toDvui(editor.theme.gutter_bg));
-        const header_line: dvui.Rect.Physical = .{ .x = area.x, .y = m.rows_y - line_w, .w = area.w, .h = line_w };
+        fillBar(area, 0, m.header_h, toDvui(editor.theme.gutter_bg));
+        const header_line: dvui.Rect.Physical = .{ .x = area.x, .y = area.y + m.header_h - line_w, .w = area.w, .h = line_w };
         header_line.fill(.{}, .{ .color = guide_color, .fade = 1.0 });
         var title_buf: [128]u8 = undefined;
         const title: []const u8 = if (std.fmt.bufPrint(&title_buf, "Snippets — {s}", .{panel.languageLabel()})) |t| blk: {
@@ -3609,6 +3637,16 @@ fn snippetsPanel(editor: *Editor, width: f32) void {
         const title_font = if (focused) dvui.Font.theme(.heading) else font;
         const title_fit = fitOverlayText(title_font, title, area.w - 16 * scale, scale);
         renderOverlayText(title_font, title_fit, area.x + 8 * scale, area.y + 2 * scale, rs, if (focused) header_fg else dim);
+
+        // --- Filter box under the header: the text the rows are narrowed
+        //     to, in the search panel's input box colored as dvui colors a
+        //     text entry: the content color inside, the focus color around
+        //     it and a caret while typing lands there (not while a prompt
+        //     or a dialog takes it). Opaque inside: the gutter color is
+        //     translucent, and through it the border's fill washed the
+        //     typing out. ---
+        const ui_theme = dvui.themeGet();
+        drawSearchBox(font, rs, m.filter.x, m.filter.y, m.filter.w, m.filter.h, scale, "Type to filter", panel.filterText(), snippetsTakesKeys(editor), text_color, dim, ui_theme.focus, ui_theme.color(.content, .fill));
 
         // --- Rows: groups (chevron, name, count) and their items (name,
         //     Tab trigger right-aligned) ---
@@ -3959,7 +3997,8 @@ fn drawWrappedText(font: dvui.Font, text: []const u8, x: f32, top: f32, max_w: f
 /// Clicks, the wheel and hover over the Snippets panel. Position and
 /// motion events are never marked handled: the file tree tracks its drags
 /// and hover outside its own rect, and a band drawn before it must not
-/// swallow them. Right presses stay unhandled for the context menu.
+/// swallow them. A right press selects the row under it and stays
+/// unhandled for the context menu.
 fn handleSnippetsMouse(editor: *Editor, wd: *dvui.WidgetData, m: SnippetsMetrics) void {
     const panel = &editor.snippet_panel;
     for (dvui.events()) |*e| {
@@ -4019,7 +4058,8 @@ fn handleSnippetsMouse(editor: *Editor, wd: *dvui.WidgetData, m: SnippetsMetrics
                     snippets_pv_sb_hover = false;
                     continue;
                 }
-                dvui.cursorSet(.arrow);
+                // A text cursor over the filter box: typing goes there.
+                dvui.cursorSet(if (m.filter.contains(me.p)) .ibeam else .arrow);
                 snippets_sb_hover = in_sb_band;
                 snippets_pv_sb_hover = in_pv_sb_band and snippetsPreviewThumb(m) != null;
                 // Only a pointer that moved sets the hover: a keyboard
@@ -4037,7 +4077,21 @@ fn handleSnippetsMouse(editor: *Editor, wd: *dvui.WidgetData, m: SnippetsMetrics
             // stay deaf (it only re-takes focus when the owner changes).
             .focus => if (inside) e.handle(@src(), wd),
             .press => {
-                if (!inside or me.button != .left) continue;
+                if (!inside) continue;
+                if (me.button == .right) {
+                    // The row under the pointer is what the context menu
+                    // acts on: select it and take the keyboard, so F2 or
+                    // Delete act on it too. Unhandled: the panel's
+                    // ContextWidget opens the menu on this press (as the
+                    // file tree's).
+                    if (!in_sb_band) {
+                        if (snippetsRowAt(panel, m, me.p.y)) |r| panel.selected = r;
+                    }
+                    _ = editor.takeKeyboardFocus(.snippets);
+                    dvui.focusWidget(wd.id, null, e.num);
+                    continue;
+                }
+                if (me.button != .left) continue;
                 e.handle(@src(), wd);
                 // The rows can change under the pointer: hover anew.
                 snippets_hover_pt = null;
@@ -4100,8 +4154,9 @@ fn handleSnippetsMouse(editor: *Editor, wd: *dvui.WidgetData, m: SnippetsMetrics
                     }
                     continue;
                 }
-                // The header, a group, the preview or the empty space: the
-                // panel takes the keyboard, and a group opens or closes.
+                // The header, the filter box, a group, the preview or the
+                // empty space: the panel takes the keyboard (typing then
+                // filters), and a group opens or closes.
                 _ = editor.takeKeyboardFocus(.snippets);
                 dvui.focusWidget(wd.id, null, e.num);
                 if (guiMode(editor) != .normal or repeat) continue;
@@ -4142,21 +4197,52 @@ fn snippetsInsert(editor: *Editor, index: usize) void {
     dvui.refresh(null, @src(), null);
 }
 
-/// Keys while the Snippets panel owns the keyboard (snippetsTakesKeys).
-/// Ctrl/Alt/Cmd chords are left for the global keybind map. The panel
-/// types nothing: Space does nothing (were it to insert, its text event
-/// would land in the first blank), and Tab is swallowed so dvui does not
-/// walk its widget focus to the menu bar.
+/// Keys and text while the Snippets panel owns the keyboard
+/// (snippetsTakesKeys). Ctrl/Alt/Cmd chords are left for the global
+/// keybind map. Typed text narrows the rows (the panel's filter):
+/// Backspace edits it, Escape clears it, and Escape with no filter hands
+/// the keyboard back. Space is typed into the filter like any other
+/// character — it never inserts (its text event would land in the first
+/// blank) — and Tab is swallowed so dvui does not walk its widget focus to
+/// the menu bar. F2 edits the selected snippet when it is one of
+/// my-snippets.lua and copies it there otherwise; Delete asks before
+/// deleting one of mine. An F-key gets here only while unbound:
+/// dispatchGlobalKeys runs F-keys through the keybind map first, so a
+/// user's binding for f2 wins over the panel's F2.
 fn handleSnippetsKeys(editor: *Editor, wd: *dvui.WidgetData, visible_rows: usize) void {
     const panel = &editor.snippet_panel;
     const page: isize = @intCast(@max(1, visible_rows));
     for (dvui.events()) |*e| {
         if (e.handled) continue;
-        // Enter on an item and Escape hand the keyboard back: the rest of
-        // the input is the editor pane's.
+        // Enter on an item and Escape hand the keyboard back, F2 and
+        // Delete open a dialog: the rest of the input is not the panel's.
         if (!snippetsTakesKeys(editor)) break;
-        if (e.evt != .key) continue;
-        const key = e.evt.key;
+        const key = switch (e.evt) {
+            .key => |key| key,
+            .text => |te| {
+                switch (te.action) {
+                    .value => |val| {
+                        // `selected` = uncommitted IME composition.
+                        if (val.txt.len == 0 or val.selected) continue;
+                        e.handle(@src(), wd);
+                        // Windows also types a " " for a Ctrl+Space chord,
+                        // which the keybind map already ran.
+                        if (win_ui.swallow_space and std.mem.eql(u8, val.txt, " ")) {
+                            win_ui.swallow_space = false;
+                            continue;
+                        }
+                        editor.snippetsFilterAppend(val.txt);
+                        _ = editor.syncSnippetPanel();
+                        // The rows changed under the pointer: the
+                        // selection (the first match) drives the preview.
+                        snippets_hover_row = null;
+                    },
+                    else => {},
+                }
+                continue;
+            },
+            else => continue,
+        };
         if (key.action != .down and key.action != .repeat) continue;
         if (hasCommandMod(key.mod)) continue;
         switch (key.code) {
@@ -4176,6 +4262,10 @@ fn handleSnippetsKeys(editor: *Editor, wd: *dvui.WidgetData, visible_rows: usize
                 panel.right(editor.allocator);
                 _ = editor.syncSnippetPanel();
             },
+            .backspace => {
+                editor.snippetsFilterBackspace();
+                _ = editor.syncSnippetPanel();
+            },
             .enter => {
                 // Handled before the insert: the pane that gets the
                 // keyboard must not see it too.
@@ -4191,10 +4281,28 @@ fn handleSnippetsKeys(editor: *Editor, wd: *dvui.WidgetData, visible_rows: usize
             },
             .escape => {
                 e.handle(@src(), wd);
+                // A filter is cleared first, and the panel keeps the
+                // keyboard; the rows come back around the selection.
+                if (editor.snippetsFilterClear()) {
+                    _ = editor.syncSnippetPanel();
+                    snippets_hover_row = null;
+                    continue;
+                }
                 _ = editor.takeKeyboardFocus(.pane);
                 filetree_release_focus = true;
                 // A pane drawn before the panel takes it on the next frame.
                 dvui.refresh(null, @src(), null);
+                continue;
+            },
+            // A dialog opens (the snippet form, the delete question):
+            // handled first, so it does not see the key too. A held key's
+            // repeat does nothing — Delete would ask again the moment the
+            // question was answered.
+            .f2, .delete => {
+                e.handle(@src(), wd);
+                if (key.action != .down) continue;
+                snippets_hover_row = null;
+                if (key.code == .f2) editor.snippetPanelEdit() else editor.snippetPanelDelete();
                 continue;
             },
             .tab => {},
@@ -4206,8 +4314,12 @@ fn handleSnippetsKeys(editor: *Editor, wd: *dvui.WidgetData, visible_rows: usize
     }
 }
 
-/// Right-click context menu for the Snippets panel: dock it on the other
-/// side (persisted, like the tree's side).
+/// Right-click context menu for the Snippets panel, about the selected row
+/// (the right press selected the row under it, handleSnippetsMouse): on a
+/// snippet of my-snippets.lua Edit and Delete, on any other snippet Copy
+/// to My Snippets — F2 and Delete do the same from the keyboard — then, on
+/// any row, dock the panel on the other side (persisted, like the tree's
+/// side).
 fn snippetsContextMenu(editor: *Editor, area: dvui.Rect.Physical) void {
     const ctext = dvui.context(@src(), .{ .rect = area }, .{});
     defer ctext.deinit();
@@ -4216,6 +4328,26 @@ fn snippetsContextMenu(editor: *Editor, area: dvui.Rect.Physical) void {
         var fw = dvui.floatingMenu(@src(), .{ .from = dvui.Rect.Natural.fromPoint(cp) }, .{});
         defer fw.deinit();
 
+        // These open a dialog: the snippet form, or the delete question.
+        const panel = &editor.snippet_panel;
+        const defs = editor.snippets.items.items;
+        const selected_def: ?u32 = if (panel.rowAt(panel.selected)) |row| (if (row.kind == .item and row.def < defs.len) row.def else null) else null;
+        if (selected_def) |def| {
+            if (snippet_file.isMine(&defs[def])) {
+                if (dvui.menuItemLabel(@src(), "Edit Snippet…      F2", .{}, .{ .expand = .horizontal, .tag = "snippets_menu_edit" }) != null) {
+                    editor.startSnippetEdit(def);
+                    fw.close();
+                }
+                if (dvui.menuItemLabel(@src(), "Delete Snippet     Del", .{}, .{ .expand = .horizontal, .tag = "snippets_menu_delete" }) != null) {
+                    editor.startSnippetDelete(def);
+                    fw.close();
+                }
+            } else if (dvui.menuItemLabel(@src(), "Copy to My Snippets…   F2", .{}, .{ .expand = .horizontal, .tag = "snippets_menu_copy" }) != null) {
+                editor.startSnippetCopy(def);
+                fw.close();
+            }
+        }
+
         const other: Editor.FiletreeSide = if (editor.snippetsSide() == .left) .right else .left;
         const side_label: []const u8 = if (other == .left) "Move Snippets to Left" else "Move Snippets to Right";
         if (dvui.menuItemLabel(@src(), side_label, .{}, .{ .expand = .horizontal }) != null) {
@@ -4223,6 +4355,57 @@ fn snippetsContextMenu(editor: *Editor, area: dvui.Rect.Physical) void {
             lua_settings.writeStringSettingToFile("snippets_side", @tagName(other)) catch {};
             fw.close();
         }
+    }
+}
+
+/// "Delete snippet" question (mode .snippet_delete_confirm), modelled on
+/// filetreeDeleteDialog: a modal dialog declared from modalDialogs before
+/// the panes, so its buttons see their clicks first. Keys go through the
+/// modal key path (handleSnippetDeleteKeyGui): only `y`, or the Delete
+/// button, deletes. It takes no text, and swallows what comes: the
+/// answering letter's text event follows its key, and once the question
+/// is answered it would land in the panel's filter (the panel keeps the
+/// keyboard throughout).
+fn snippetDeleteDialog(editor: *Editor) void {
+    if (!build_options.has_gui) return;
+    var float = dvui.floatingWindow(@src(), .{ .modal = true }, .{ .min_size_content = .{ .w = 340 } });
+    defer {
+        float.deinit();
+        // A button answered: the base window takes the keyboard back. Only
+        // after deinit — inside the dialog, "the current subwindow" is the
+        // dialog itself.
+        if (editor.mode != .snippet_delete_confirm) dvui.focusSubwindow(null, null);
+    }
+    float.dragAreaSet(dvui.windowHeader("Delete snippet", "", null));
+
+    var vbox = dvui.box(@src(), .{ .dir = .vertical }, .{ .expand = .both, .padding = dvui.Rect.all(8) });
+    defer vbox.deinit();
+    for (dvui.events()) |*e| {
+        if (!e.handled and e.evt == .text) e.handle(@src(), vbox.data());
+    }
+
+    // The snippet's name; its command when a reload took it away meanwhile.
+    const name: []const u8 = if (editor.snippet_delete_target) |command|
+        (if (editor.snippets.command(command)) |def| def.description else command)
+    else
+        "";
+    var buf: [600]u8 = undefined;
+    const question = std.fmt.bufPrint(&buf, "Delete \"{s}\" from my-snippets.lua?", .{name}) catch "Delete this snippet from my-snippets.lua?";
+    dvui.labelNoFmt(@src(), question, .{}, .{});
+    dvui.labelNoFmt(@src(), "Press y to delete; Enter, n or Esc cancels.", .{}, .{
+        .color_text = toDvui(editor.theme.overlay_hint),
+    });
+
+    var hbox = dvui.box(@src(), .{ .dir = .horizontal }, .{
+        .gravity_x = 1.0,
+        .padding = .{ .x = 0, .y = 8, .w = 0, .h = 0 },
+    });
+    defer hbox.deinit();
+    if (dvui.button(@src(), "Cancel", .{}, .{ .tag = "snippet_delete_cancel" })) {
+        editor.cancelSnippetDelete();
+    }
+    if (dvui.button(@src(), "Delete", .{}, .{ .tag = "snippet_delete_button" })) {
+        editor.applySnippetDelete();
     }
 }
 
@@ -7323,6 +7506,7 @@ fn handleModalKey(editor: *Editor, key: dvui.Event.Key) void {
         .tool_panel, .task_save_prompt, .git_stage_prompt => handleToolKeyGui(editor, key),
         .settings => {}, // DVUI dialog handles its own input (settingsDialog)
         .snippet_form => {}, // DVUI dialog handles its own input (snippetFormDialog)
+        .snippet_delete_confirm => handleSnippetDeleteKeyGui(editor, key),
         .file_open, .folder_open, .save_as => {}, // handled by native dialogs in GUI
         .filetree_prompt => handleFiletreePromptKeyGui(editor, key),
         .normal => {},
@@ -7557,6 +7741,21 @@ fn handleFiletreePromptKeyGui(editor: *Editor, key: dvui.Event.Key) void {
         },
         else => {},
     }
+}
+
+/// "Delete snippet … from my-snippets.lua?" (snippetDeleteDialog draws it):
+/// the tree's delete rule, as the TUI's handleSnippetDeleteKey — only a
+/// fresh, plain `y` (Shift+Y too) deletes; a chord (Ctrl+Y, ...), a
+/// modifier on its own or a held key's repeat (the Delete that asked,
+/// still down) answers nothing; any other key cancels, n, Enter and
+/// Escape among them.
+fn handleSnippetDeleteKeyGui(editor: *Editor, key: dvui.Event.Key) void {
+    if (hasCommandMod(key.mod) or isModifierKey(key.code) or key.action != .down) return;
+    if (key.code == .y) editor.applySnippetDelete() else editor.cancelSnippetDelete();
+    // The dialog goes with the question: the base window takes the
+    // keyboard back now rather than a frame later. (Called from the pane
+    // or the window-level prompt: the current subwindow is the base.)
+    dvui.focusSubwindow(null, null);
 }
 
 /// Confirm Overwrite mode (disk changed under a save).
@@ -9608,16 +9807,37 @@ test "GUI snippets panel: a click on a group opens it and the keys drive the lis
     try snippetsTestFrame(ui.window, &editor, &g, &ms);
     try t.expectEqual(@as(usize, 4), panel.rows.items.len);
     try t.expectEqual(@as(usize, 3), panel.selected);
-    // Space, text and Tab change nothing: the panel types nothing.
-    try dvui.testing.pressKey(.space, .none);
-    try dvui.testing.writeText(" ");
+    // Typing filters the rows and never reaches the document: "con" leaves
+    // Constant under its group, selected for Enter. Tab still does nothing.
+    try dvui.testing.writeText("con");
     try dvui.testing.pressKey(.tab, .none);
     try snippetsTestFrame(ui.window, &editor, &g, &ms);
+    try t.expectEqualStrings("con", panel.filterText());
+    try t.expectEqual(@as(usize, 2), panel.rows.items.len);
+    try t.expectEqual(snippet_panel.RowKind.group, panel.rows.items[0].kind);
+    try t.expectEqual(try snippetsTestDef(&editor, "Constant"), panel.rows.items[1].def);
+    try t.expectEqual(@as(usize, 1), panel.selected);
     try t.expectEqual(@as(usize, 0), doc.buffer.byteLen());
     try t.expectEqual(Editor.KeyboardOwner.snippets, editor.keyboardOwner());
-    // Up, Up, Enter: Print goes in at the caret, its first blank selected,
-    // and the editor has the keyboard.
-    try dvui.testing.pressKey(.up, .none);
+    // Escape clears the filter and the panel keeps the keyboard: the rows
+    // are back, Constant still selected. A second Escape hands the
+    // keyboard back as before, and Ctrl+Alt+B gives it to the panel again.
+    try dvui.testing.pressKey(.escape, .none);
+    try snippetsTestFrame(ui.window, &editor, &g, &ms);
+    try t.expect(!panel.filterActive());
+    try t.expectEqual(@as(usize, 4), panel.rows.items.len);
+    try t.expectEqual(@as(usize, 2), panel.selected);
+    try t.expectEqual(Editor.KeyboardOwner.snippets, editor.keyboardOwner());
+    try dvui.testing.pressKey(.escape, .none);
+    try snippetsTestFrame(ui.window, &editor, &g, &ms);
+    try t.expectEqual(Editor.KeyboardOwner.editor, editor.keyboardOwner());
+    const ctrl_alt: dvui.enums.Mod = @enumFromInt(@intFromEnum(dvui.enums.Mod.lcontrol) | @intFromEnum(dvui.enums.Mod.lalt));
+    try dvui.testing.pressKey(.b, ctrl_alt);
+    try snippetsTestFrame(ui.window, &editor, &g, &ms);
+    try t.expectEqual(Editor.KeyboardOwner.snippets, editor.keyboardOwner());
+    try t.expectEqual(@as(usize, 0), doc.buffer.byteLen());
+    // Up (from Constant), Enter: Print goes in at the caret, its first
+    // blank selected, and the editor has the keyboard.
     try dvui.testing.pressKey(.up, .none);
     try dvui.testing.pressKey(.enter, .none);
     try snippetsTestFrame(ui.window, &editor, &g, &ms);
@@ -9626,7 +9846,6 @@ test "GUI snippets panel: a click on a group opens it and the keys drive the lis
     try t.expectEqual(Editor.KeyboardOwner.editor, editor.keyboardOwner());
     // Ctrl+Alt+B focuses the shown panel, Escape hands the keyboard back,
     // and twice more hides it.
-    const ctrl_alt: dvui.enums.Mod = @enumFromInt(@intFromEnum(dvui.enums.Mod.lcontrol) | @intFromEnum(dvui.enums.Mod.lalt));
     try dvui.testing.pressKey(.b, ctrl_alt);
     try snippetsTestFrame(ui.window, &editor, &g, &ms);
     try t.expectEqual(Editor.KeyboardOwner.snippets, editor.keyboardOwner());
@@ -10051,7 +10270,6 @@ fn snippetFormTestCapture(editor: *Editor, g: *GuiState, ms: *u64, name: []const
 test "GUI snippet form: Ctrl+Alt+S opens the dialog prefilled from the selection, Enter in Name saves, the panel shows the new snippet" {
     if (!build_options.has_gui) return error.SkipZigTest;
     const t = std.testing;
-    const snippet_file = @import("../core/snippet_file.zig");
     var tmp = t.tmpDir(.{});
     defer tmp.cleanup();
     const root = try tmp.dir.realPathFileAlloc(t.io, ".", t.allocator);
@@ -10142,7 +10360,6 @@ test "GUI snippet form: Ctrl+Alt+S opens the dialog prefilled from the selection
 test "GUI snippet form: refusals without a selection or in a terminal pane, Escape cancels without writing, the dialog stays in its window" {
     if (!build_options.has_gui) return error.SkipZigTest;
     const t = std.testing;
-    const snippet_file = @import("../core/snippet_file.zig");
     var tmp = t.tmpDir(.{});
     defer tmp.cleanup();
     const root = try tmp.dir.realPathFileAlloc(t.io, ".", t.allocator);
@@ -10262,6 +10479,230 @@ test "GUI snippet form: refusals without a selection or in a terminal pane, Esca
     try snippetsTestFrame(ui.window, &editor, &g, &ms);
     try t.expectEqual(Editor.Mode.normal, editor.mode);
     try t.expectError(error.FileNotFound, tmp.dir.access(t.io, my_snippets, .{}));
+}
+
+test "GUI snippets panel: typing filters the rows, Backspace edits the filter, Escape clears it before releasing the keyboard" {
+    if (!build_options.has_gui) return error.SkipZigTest;
+    const t = std.testing;
+    var ui = try dvui.testing.init(.{ .window_size = .{ .w = 900, .h = 600 } });
+    defer ui.deinit();
+    var editor = try Editor.init(t.allocator, t.io);
+    defer editor.deinit();
+    var g = try GuiState.init(t.allocator);
+    defer g.deinit();
+    defer win_ui = undefined;
+    applyWindowFonts(ui.window, &g, &editor);
+    try snippetsTestSetup(&editor);
+    editor.snippets_visible = true;
+    var ms: u64 = 0;
+    for (0..3) |_| try snippetsTestFrame(ui.window, &editor, &g, &ms);
+    const panel = &editor.snippet_panel;
+    const doc = editor.activeDoc();
+    const function = try snippetsTestDef(&editor, "Function");
+    // The filter box has its own row, between the header and the rows.
+    const m = try snippetsTestMetrics(&editor);
+    try t.expect(m.filter.w > 0 and m.filter.h > 0);
+    try t.expect(m.filter.y >= m.area.y + m.header_h);
+    try t.expect(m.filter.y + m.filter.h <= m.rows_y);
+    try t.expectEqual(@as(usize, 4), panel.rows.items.len);
+    // Ctrl+Alt+B gives the panel the keyboard; "fun" leaves the Functions
+    // group, open, on its item, which is selected and previewed.
+    const ctrl_alt: dvui.enums.Mod = @enumFromInt(@intFromEnum(dvui.enums.Mod.lcontrol) | @intFromEnum(dvui.enums.Mod.lalt));
+    try dvui.testing.pressKey(.b, ctrl_alt);
+    try snippetsTestFrame(ui.window, &editor, &g, &ms);
+    try t.expectEqual(Editor.KeyboardOwner.snippets, editor.keyboardOwner());
+    try dvui.testing.writeText("fun");
+    try snippetsTestFrame(ui.window, &editor, &g, &ms);
+    try t.expectEqualStrings("fun", panel.filterText());
+    try t.expectEqual(@as(usize, 2), panel.rows.items.len);
+    try t.expectEqual(snippet_panel.RowKind.group, panel.rows.items[0].kind);
+    try t.expectEqualStrings("Functions", panel.groups.items[panel.rows.items[0].group].name);
+    try t.expectEqual(function, panel.rows.items[1].def);
+    try t.expectEqual(@as(usize, 1), panel.selected);
+    try t.expectEqual(@as(?u32, function), snippets_preview_def);
+    try t.expectEqual(@as(usize, 0), doc.buffer.byteLen());
+    // ZIDE_CAPTURE_DIR=<dir>: a picture of the filtered panel there
+    // (snippets_filter.png).
+    try snippetFormTestCapture(&editor, &g, &ms, "snippets_filter.png");
+    // Three Backspaces edit the filter away: every row is back, the
+    // Functions group closed again.
+    for (0..3) |_| try dvui.testing.pressKey(.backspace, .none);
+    try snippetsTestFrame(ui.window, &editor, &g, &ms);
+    try t.expect(!panel.filterActive());
+    try t.expectEqual(@as(usize, 4), panel.rows.items.len);
+    // Nothing matches "zzz": no rows, and the hint says what brings them back.
+    try dvui.testing.writeText("zzz");
+    try snippetsTestFrame(ui.window, &editor, &g, &ms);
+    try t.expectEqual(@as(usize, 0), panel.rows.items.len);
+    try t.expect(std.mem.indexOf(u8, panel.emptyHint(), "Backspace") != null);
+    try t.expectEqual(@as(?u32, null), snippets_preview_def);
+    // Escape clears the filter and the panel keeps the keyboard; a second
+    // Escape hands it back to the editor, whose typing then goes to the
+    // document, not to the filter.
+    try dvui.testing.pressKey(.escape, .none);
+    try snippetsTestFrame(ui.window, &editor, &g, &ms);
+    try t.expect(!panel.filterActive());
+    try t.expectEqual(@as(usize, 4), panel.rows.items.len);
+    try t.expectEqual(Editor.KeyboardOwner.snippets, editor.keyboardOwner());
+    try dvui.testing.pressKey(.escape, .none);
+    for (0..2) |_| try snippetsTestFrame(ui.window, &editor, &g, &ms);
+    try t.expectEqual(Editor.KeyboardOwner.editor, editor.keyboardOwner());
+    try dvui.testing.writeText("x");
+    try snippetsTestFrame(ui.window, &editor, &g, &ms);
+    try t.expectEqualStrings("x", doc.buffer.slice(0, doc.buffer.byteLen()));
+    try t.expect(!panel.filterActive());
+    try t.expectEqual(@as(usize, 4), panel.rows.items.len);
+}
+
+test "GUI snippets panel: a right-click selects the row, F2 edits a mine snippet, Delete asks first" {
+    if (!build_options.has_gui) return error.SkipZigTest;
+    const t = std.testing;
+    var tmp = t.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(t.io, ".", t.allocator);
+    defer t.allocator.free(root);
+    lua_settings.test_config_dir = root;
+    defer lua_settings.test_config_dir = null;
+    var ui = try dvui.testing.init(.{ .window_size = .{ .w = 900, .h = 600 } });
+    defer ui.deinit();
+    var editor = try Editor.init(t.allocator, t.io);
+    defer editor.deinit();
+    var g = try GuiState.init(t.allocator);
+    defer g.deinit();
+    defer win_ui = undefined;
+    applyWindowFonts(ui.window, &g, &editor);
+    try snippetsTestSetup(&editor);
+    // One snippet of my own beside the three bundled-style ones, registered
+    // as loading my-snippets.lua registers it, with its block in the file.
+    const spec: snippets_mod.Spec = .{ .language = "zig", .description = "My loop", .group = "Start here", .notes = "Mine.", .body = "for (${1:items}) |item| {\n\t$0\n}" };
+    editor.loading_extensions = true;
+    editor.loading_extension_name = snippet_file.file_name;
+    const registered = editor.registerSnippet(spec);
+    editor.loading_extensions = false;
+    editor.loading_extension_name = null;
+    // A copy: the registry frees its own with the snippet.
+    const command = try t.allocator.dupe(u8, try registered);
+    defer t.allocator.free(command);
+    {
+        const block = try snippet_file.renderBlock(t.allocator, command, spec);
+        defer t.allocator.free(block);
+        const text = try snippet_file.upsert(t.allocator, "", command, block);
+        defer t.allocator.free(text);
+        var path_buf: [512]u8 = undefined;
+        const path = Editor.mySnippetsPath(&path_buf) orelse return error.TestUnexpectedResult;
+        try snippet_file.write(t.allocator, t.io, path, text);
+    }
+    editor.snippets_visible = true;
+    var ms: u64 = 0;
+    for (0..3) |_| try snippetsTestFrame(ui.window, &editor, &g, &ms);
+    const panel = &editor.snippet_panel;
+    const doc = editor.activeDoc();
+    // Rows: Start here, Print, Constant, My loop, Functions.
+    const mine = try snippetsTestDef(&editor, "My loop");
+    try t.expectEqual(@as(usize, 5), panel.rows.items.len);
+    try t.expectEqual(mine, panel.rows.items[3].def);
+    try t.expect(snippet_file.isMine(&editor.snippets.items.items[mine]));
+    try t.expect(!snippet_file.isMine(&editor.snippets.items.items[try snippetsTestDef(&editor, "Constant")]));
+    const m = try snippetsTestMetrics(&editor);
+
+    // A right-click on My loop selects it (inserting nothing) and gives the
+    // panel the keyboard; its menu offers Edit and Delete, not Copy.
+    _ = try ui.window.addEventMouseMotion(.{ .pt = snippetsTestRowPoint(m, 3) });
+    _ = try ui.window.addEventMouseButton(.right, .press);
+    _ = try ui.window.addEventMouseButton(.right, .release);
+    for (0..2) |_| try snippetsTestFrame(ui.window, &editor, &g, &ms);
+    try t.expectEqual(@as(usize, 3), panel.selected);
+    try t.expectEqual(Editor.KeyboardOwner.snippets, editor.keyboardOwner());
+    try t.expectEqual(@as(usize, 0), doc.buffer.byteLen());
+    try dvui.testing.expectVisible("snippets_menu_edit");
+    try dvui.testing.expectVisible("snippets_menu_delete");
+    try t.expect(dvui.tagGet("snippets_menu_copy") == null);
+    // F2 opens it for editing, prefilled (the menu closes under the
+    // dialog); Escape, which the dialog catches, leaves it.
+    try dvui.testing.pressKey(.f2, .none);
+    for (0..3) |_| try snippetsTestFrame(ui.window, &editor, &g, &ms);
+    try t.expectEqual(Editor.Mode.snippet_form, editor.mode);
+    try t.expectEqual(snippet_form_mod.Kind.edit, editor.snippet_form.kind);
+    try t.expectEqualStrings("My loop", editor.snippet_form.text(.name));
+    try t.expect(dvui.tagGet("snippets_menu_edit") == null);
+    try dvui.testing.pressKey(.escape, .none);
+    try snippetsTestFrame(ui.window, &editor, &g, &ms);
+    try t.expectEqual(Editor.Mode.normal, editor.mode);
+    try t.expectEqual(Editor.KeyboardOwner.snippets, editor.keyboardOwner());
+    // F2 on a bundled snippet offers to copy it to my snippets.
+    try dvui.testing.pressKey(.up, .none);
+    try snippetsTestFrame(ui.window, &editor, &g, &ms);
+    try t.expectEqual(@as(usize, 2), panel.selected);
+    try dvui.testing.pressKey(.f2, .none);
+    for (0..3) |_| try snippetsTestFrame(ui.window, &editor, &g, &ms);
+    try t.expectEqual(Editor.Mode.snippet_form, editor.mode);
+    try t.expectEqual(snippet_form_mod.Kind.copy, editor.snippet_form.kind);
+    try t.expectEqualStrings("Constant", editor.snippet_form.text(.name));
+    try dvui.testing.pressKey(.escape, .none);
+    try snippetsTestFrame(ui.window, &editor, &g, &ms);
+    try t.expectEqual(Editor.Mode.normal, editor.mode);
+
+    // Delete on My loop asks first. n cancels, with its text event (a real
+    // key types one), and that letter must not land in the filter: the
+    // panel keeps the keyboard throughout.
+    try dvui.testing.pressKey(.down, .none);
+    try dvui.testing.pressKey(.delete, .none);
+    for (0..3) |_| try snippetsTestFrame(ui.window, &editor, &g, &ms);
+    try t.expectEqual(Editor.Mode.snippet_delete_confirm, editor.mode);
+    try dvui.testing.expectVisible("snippet_delete_button");
+    // ZIDE_CAPTURE_DIR=<dir>: the question there (snippet_delete.png).
+    try snippetFormTestCapture(&editor, &g, &ms, "snippet_delete.png");
+    try dvui.testing.pressKey(.n, .none);
+    try dvui.testing.writeText("n");
+    for (0..2) |_| try snippetsTestFrame(ui.window, &editor, &g, &ms);
+    try t.expectEqual(Editor.Mode.normal, editor.mode);
+    try t.expect(editor.snippets.command(command) != null);
+    try t.expect(!panel.filterActive());
+    try t.expect(dvui.tagGet("snippet_delete_button") == null);
+    try t.expectEqual(Editor.KeyboardOwner.snippets, editor.keyboardOwner());
+    // The dialog's Cancel button cancels too, and the snippet stays.
+    try dvui.testing.pressKey(.delete, .none);
+    for (0..3) |_| try snippetsTestFrame(ui.window, &editor, &g, &ms);
+    try t.expectEqual(Editor.Mode.snippet_delete_confirm, editor.mode);
+    try dvui.testing.moveTo("snippet_delete_cancel");
+    try dvui.testing.click(.left);
+    for (0..2) |_| try snippetsTestFrame(ui.window, &editor, &g, &ms);
+    try t.expectEqual(Editor.Mode.normal, editor.mode);
+    try t.expect(editor.snippets.command(command) != null);
+    // From the menu this time, and y deletes it: the block leaves the file,
+    // the snippet the registry, and its row the panel.
+    _ = try ui.window.addEventMouseMotion(.{ .pt = snippetsTestRowPoint(m, 3) });
+    _ = try ui.window.addEventMouseButton(.right, .press);
+    _ = try ui.window.addEventMouseButton(.right, .release);
+    for (0..2) |_| try snippetsTestFrame(ui.window, &editor, &g, &ms);
+    try t.expectEqual(@as(usize, 3), panel.selected);
+    try dvui.testing.moveTo("snippets_menu_delete");
+    try dvui.testing.click(.left);
+    for (0..3) |_| try snippetsTestFrame(ui.window, &editor, &g, &ms);
+    try t.expectEqual(Editor.Mode.snippet_delete_confirm, editor.mode);
+    try dvui.testing.expectVisible("snippet_delete_button");
+    try dvui.testing.pressKey(.y, .none);
+    try dvui.testing.writeText("y");
+    for (0..2) |_| try snippetsTestFrame(ui.window, &editor, &g, &ms);
+    try t.expectEqual(Editor.Mode.normal, editor.mode);
+    try t.expect(editor.snippets.command(command) == null);
+    try t.expectEqualStrings("Deleted from my-snippets.lua: My loop", editor.status_message);
+    try t.expectEqual(@as(usize, 4), panel.rows.items.len);
+    try t.expect(!panel.filterActive());
+    try t.expectEqual(Editor.KeyboardOwner.snippets, editor.keyboardOwner());
+    {
+        const text = try tmp.dir.readFileAlloc(t.io, "extensions/" ++ snippet_file.file_name, t.allocator, .limited(1 << 20));
+        defer t.allocator.free(text);
+        try t.expect(std.mem.indexOf(u8, text, command) == null);
+    }
+    // Delete on a bundled snippet is refused in the status bar: no question.
+    try dvui.testing.pressKey(.up, .none);
+    try dvui.testing.pressKey(.delete, .none);
+    for (0..2) |_| try snippetsTestFrame(ui.window, &editor, &g, &ms);
+    try t.expectEqual(@as(usize, 2), panel.selected);
+    try t.expectEqual(Editor.Mode.normal, editor.mode);
+    try t.expect(std.mem.indexOf(u8, editor.status_message, "Only snippets in my-snippets.lua") != null);
+    try t.expect(dvui.tagGet("snippet_delete_button") == null);
 }
 
 const SheetIcon = struct { name: []const u8, tvg: []const u8 };
