@@ -1897,6 +1897,45 @@ test "reload_extensions drops Lua commands and handlers" {
     try testing.expectEqualStrings("Extensions reloaded", editor.status_message);
 }
 
+test "loadExtensions runs my-snippets.lua last and tags each definition with its file" {
+    var lua = try Lua.init(testing.allocator);
+    defer lua.deinit();
+    lua.openLibs();
+    var editor = try Editor.init(testing.allocator, testing.io);
+    defer editor.deinit();
+    lua_settings.registerApi(lua, &editor);
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(testing.io, "extensions");
+    // "zzz" lists after "my-snippets" on every file system: only the rule
+    // that the user's file runs last lets its snippet win.
+    for ([_][2][]const u8{
+        .{ "extensions/zzz.lua", "zide.register_snippet{language='zig', description='Shadowed', body='bundled'}\nzide.register_snippet{language='zig', description='Other', body='o'}\n" },
+        .{ "extensions/my-snippets.lua", "zide.register_snippet{language='zig', description='Shadowed', body='mine'}\n" },
+    }) |file| {
+        const f = try tmp.dir.createFile(testing.io, file[0], .{});
+        defer f.close(testing.io);
+        try f.writeStreamingAll(testing.io, file[1]);
+    }
+    const root = try tmp.dir.realPathFileAlloc(testing.io, ".", testing.allocator);
+    defer testing.allocator.free(root);
+    lua_settings.test_config_dir = root;
+    defer lua_settings.test_config_dir = null;
+
+    for (0..2) |_| {
+        reloadExtensions(&editor);
+        try testing.expectEqualStrings("Extensions reloaded", editor.status_message);
+        const shadowed = editor.snippets.command("snippet.zig.~shadowed").?;
+        try testing.expectEqualStrings("mine", shadowed.body);
+        try testing.expectEqualStrings("my-snippets.lua", shadowed.source);
+        const other = editor.snippets.command("snippet.zig.~other").?;
+        try testing.expectEqualStrings("zzz.lua", other.source);
+        try testing.expect(other.from_extension);
+    }
+    try testing.expect(editor.loading_extension_name == null);
+}
+
 test "reload_extensions: a broken file reaches the status bar and the Lua stack stays level" {
     testing.log_level = .err; // the load error warns
     defer testing.log_level = .warn;

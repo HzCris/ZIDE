@@ -208,7 +208,13 @@ pub const Definition = struct {
     notes: []u8,
     command: []u8,
     template: Template,
+    /// The body as registered, blanks and all (the template has parsed
+    /// them away): what the panel's Edit and Copy write back out.
+    body: []u8,
     from_extension: bool,
+    /// The extension file that registered it (`my-snippets.lua`), or ""
+    /// for init.lua and the Lua runtime.
+    source: []u8 = &.{},
 
     pub fn init(a: Allocator, spec: Spec, from_extension: bool) !Definition {
         // The language is part of the command name the palette draws.
@@ -240,13 +246,15 @@ pub const Definition = struct {
         errdefer a.free(group_name);
         const notes = try a.dupe(u8, spec.notes);
         errdefer a.free(notes);
+        const body = try a.dupe(u8, spec.body);
+        errdefer a.free(body);
         // A trigger-less snippet is named by its description behind a `~`,
         // which no trigger can contain, so the two kinds never collide.
         const command = if (trigger.len > 0)
             try std.fmt.allocPrint(a, "snippet.{s}.{s}", .{ lang, trigger })
         else
             try std.fmt.allocPrint(a, "snippet.{s}.~{s}", .{ lang, name_slug });
-        return .{ .language = lang, .prefix = trigger, .description = desc, .group = group_name, .notes = notes, .command = command, .template = template, .from_extension = from_extension };
+        return .{ .language = lang, .prefix = trigger, .description = desc, .group = group_name, .notes = notes, .command = command, .template = template, .body = body, .from_extension = from_extension };
     }
     pub fn deinit(self: *Definition, a: Allocator) void {
         a.free(self.language);
@@ -255,6 +263,8 @@ pub const Definition = struct {
         a.free(self.group);
         a.free(self.notes);
         a.free(self.command);
+        a.free(self.body);
+        a.free(self.source);
         self.template.deinit(a);
     }
     pub fn matchesLanguage(self: *const Definition, language: ?[]const u8) bool {

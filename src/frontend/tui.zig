@@ -18,6 +18,7 @@ const filetree_mod = @import("../core/filetree.zig");
 const fileicons = @import("../core/fileicons.zig");
 const FileTree = filetree_mod.FileTree;
 const snippets_mod = @import("../core/snippets.zig");
+const snippet_form_mod = @import("../core/snippet_form.zig");
 
 const Key = vaxis.Key;
 const Cell = vaxis.Cell;
@@ -274,10 +275,10 @@ fn firstLine(text: []const u8) []const u8 {
 }
 
 /// Where a paste goes: the focused terminal's program (bracketed when it
-/// asked for that), the document as one edit, the search field or a
-/// single-line prompt as typed text (its first line). Pickers and
-/// confirmation prompts never take a paste — a pasted letter must not
-/// answer them.
+/// asked for that), the document as one edit, the search field, the
+/// snippet form's active field or a single-line prompt as typed text (its
+/// first line). Pickers and confirmation prompts never take a paste — a
+/// pasted letter must not answer them.
 fn applyPaste(editor: *Editor, text: []const u8) void {
     if (text.len == 0) return;
     editor.validateSnippetState();
@@ -289,7 +290,7 @@ fn applyPaste(editor: *Editor, text: []const u8) void {
             .search => typeLine(editor, firstLine(text)),
             .filetree, .snippets => {},
         },
-        .find, .find_replace, .file_open, .folder_open, .save_as, .command_palette, .picker, .goto_line, .file_finder, .symbol_rename => typeLine(editor, firstLine(text)),
+        .find, .find_replace, .file_open, .folder_open, .save_as, .command_palette, .picker, .goto_line, .file_finder, .symbol_rename, .snippet_form => typeLine(editor, firstLine(text)),
         .filetree_prompt => if (editor.filetree_prompt_kind != .delete_confirm) typeLine(editor, firstLine(text)),
         else => {},
     }
@@ -555,6 +556,10 @@ pub fn run(allocator: std.mem.Allocator, editor: *Editor) !void {
                 // Settings panel is GUI-only; in TUI just show a hint
                 drawOverlay(win, editor, "Settings: edit ~/.config/zide/init.lua (Esc to close)", "", width, height);
             },
+            // The snippet form is a band inside drawEditor, which puts the
+            // caret at the end of its active field; with no room for the
+            // band there is no caret either.
+            .snippet_form => if (snippet_form_band == null) win.hideCursor(),
             .filetree_prompt => {
                 switch (editor.filetree_prompt_kind) {
                     .create => drawOverlay(win, editor, "New (end with / for folder): ", editor.open_buf[0..editor.open_buf_len], width, height),
@@ -672,7 +677,34 @@ fn dispatchKey(editor: *Editor, key: Key) void {
             // Settings panel is GUI-only; Escape returns to normal
             if (key.codepoint == Key.escape) editor.setMode(.normal);
         },
+        .snippet_form => handleSnippetFormKey(editor, key),
         .filetree_prompt => handleFiletreePromptKey(editor, key),
+    }
+}
+
+/// Keys while the snippet form band is up (Save / Edit / Copy a snippet):
+/// Escape cancels, Enter saves, Tab / Shift+Tab and Down / Up move between
+/// the fields, Backspace edits, anything typed lands in the active field.
+/// The band is drawn by drawSnippetForm; a click on a field row picks it.
+fn handleSnippetFormKey(editor: *Editor, key: Key) void {
+    if (key.isModifier()) return;
+    const form = &editor.snippet_form;
+    switch (key.codepoint) {
+        Key.escape => editor.cancelSnippetForm(),
+        Key.enter => _ = editor.submitSnippetForm(),
+        Key.tab, Key.down => form.cycle(!(key.mods.shift and key.codepoint == Key.tab), false),
+        Key.up => form.cycle(false, false),
+        Key.backspace => form.backspace(),
+        else => {
+            if (hasCommandMod(key)) return;
+            if (key.text) |text| {
+                form.append(text);
+            } else if (isTextCodepoint(key.codepoint)) {
+                var bytes: [4]u8 = undefined;
+                const n = std.unicode.utf8Encode(key.codepoint, &bytes) catch return;
+                form.append(bytes[0..n]);
+            }
+        },
     }
 }
 
@@ -814,6 +846,11 @@ var filetree_band: ?FiletreeBand = null;
 /// hidden. Used for mouse hit-testing like filetree_band.
 const SearchBand = struct { y: u16, h: u16 };
 var search_band: ?SearchBand = null;
+/// The snippet form band (full width, above the search panel and the
+/// status bar) with the rows it showed, from the last draw; null when
+/// hidden. Clicks pick a field through it.
+const SnippetFormBand = struct { y: u16, h: u16, rows: SnippetFormRows };
+var snippet_form_band: ?SnippetFormBand = null;
 var encoding_band: ?FiletreeBand = null;
 var encoding_picker_band: ?FiletreeBand = null;
 var recent_projects_band: ?FiletreeBand = null;
@@ -852,6 +889,7 @@ fn drawEditor(win: Window, editor: *Editor, width: u16, height: u16) void {
     filetree_band = null;
     snippets_band = null;
     search_band = null;
+    snippet_form_band = null;
     encoding_band = null;
     encoding_picker_band = null;
     recent_projects_band = null;
@@ -866,7 +904,12 @@ fn drawEditor(win: Window, editor: *Editor, width: u16, height: u16) void {
         @min(14, (height -| tab_bar_height -| status_height) / 2)
     else
         0;
-    const content_height = height -| tab_bar_height -| status_height -| search_h;
+    // The snippet form band, above the search panel and the status bar:
+    // eight rows, never more than half of what is left for the panes (one
+    // at least: the form takes the typing, which must not land unseen).
+    const form_room = height -| tab_bar_height -| status_height -| search_h;
+    const form_h: u16 = if (editor.mode == .snippet_form) @min(8, @max(1, form_room / 2), form_room) else 0;
+    const content_height = form_room -| form_h;
 
     // Tab bar (global, spans full width)
     if (tab_bar_height > 0) {
@@ -940,15 +983,28 @@ fn drawEditor(win: Window, editor: *Editor, width: u16, height: u16) void {
     // and skewing mouse hit-testing.)
     renderPaneLayout(content_win, editor, 0, content_x, tab_bar_height, content_width, content_height);
 
+    // Snippet form band (full width, above the search panel)
+    if (form_h > 0) {
+        const form_y = tab_bar_height + content_height;
+        const fw = win.child(.{
+            .y_off = @intCast(form_y),
+            .height = form_h,
+            .width = width,
+        });
+        const rows = drawSnippetForm(fw, editor, width, form_h);
+        snippet_form_band = .{ .y = form_y, .h = form_h, .rows = rows };
+    }
+
     // Docked search panel (full width, above the status bar)
     if (search_h > 0) {
+        const search_y = tab_bar_height + content_height + form_h;
         const sw = win.child(.{
-            .y_off = @intCast(tab_bar_height + content_height),
+            .y_off = @intCast(search_y),
             .height = search_h,
             .width = width,
         });
         drawSearchPanel(sw, editor, width, search_h);
-        search_band = .{ .y = tab_bar_height + content_height, .h = search_h };
+        search_band = .{ .y = search_y, .h = search_h };
     }
 
     // Status bar
@@ -2944,6 +3000,13 @@ fn handleMouse(editor: *Editor, mouse: vaxis.Mouse) void {
             }
             return;
         }
+        // The snippet form: a click on a field row moves the typing there
+        if (editor.mode == .snippet_form) {
+            if (snippet_form_band) |b| {
+                if (mouse.row >= b.y and mouse.row < b.y + b.h) handleSnippetFormClick(editor, b, @intCast(mouse.row));
+            }
+            return;
+        }
         if (editor.mode == .normal) if (encoding_band) |b| {
             if (mouse.row == b.y and mouse.col >= b.x) {
                 editor.startEncoding(.choose);
@@ -3517,11 +3580,13 @@ fn drawSearchPanel(win: Window, editor: *Editor, width: u16, panel_h: u16) void 
     const label_active: Style = .{ .bg = toVaxis(th.overlay_bg), .fg = toVaxis(th.overlay_fg), .bold = true, .reverse = true };
     win.fill(.{ .style = bg_style });
 
-    const focused = editor.search_focused;
-    drawSearchInputRow(win, 0, width, "Search ", sp.query(), focused and sp.field == .query, bg_style, label_active);
-    drawSearchInputRow(win, 1, width, "Replace", sp.replacement(), focused and sp.field == .replace, bg_style, label_active);
-    drawSearchInputRow(win, 2, width, "Include", sp.filter(), focused and sp.field == .filter, bg_style, label_active);
-    drawSearchInputRow(win, 3, width, "Exclude", sp.exclude(), focused and sp.field == .exclude, bg_style, label_active);
+    // Its field looks active only while the panel gets the keys (not
+    // under the snippet form or a prompt).
+    const focused = editor.search_focused and editor.mode == .normal;
+    _ = drawSearchInputRow(win, 0, width, "Search ", sp.query(), focused and sp.field == .query, bg_style, label_active);
+    _ = drawSearchInputRow(win, 1, width, "Replace", sp.replacement(), focused and sp.field == .replace, bg_style, label_active);
+    _ = drawSearchInputRow(win, 2, width, "Include", sp.filter(), focused and sp.field == .filter, bg_style, label_active);
+    _ = drawSearchInputRow(win, 3, width, "Exclude", sp.exclude(), focused and sp.field == .exclude, bg_style, label_active);
 
     // Status / confirm row
     var sbuf: [300]u8 = undefined;
@@ -3562,13 +3627,17 @@ fn drawSearchPanel(win: Window, editor: *Editor, width: u16, panel_h: u16) void 
     }
 }
 
-fn drawSearchInputRow(win: Window, y: u16, width: u16, label: []const u8, value: []const u8, active: bool, base: Style, active_label: Style) void {
+/// One labelled input row of a docked band (the search panel, the snippet
+/// form): an active row's label in reverse video and a `_` after its
+/// value. Returns the column after the value, where that `_` goes.
+fn drawSearchInputRow(win: Window, y: u16, width: u16, label: []const u8, value: []const u8, active: bool, base: Style, active_label: Style) u16 {
     const row = win.child(.{ .y_off = @intCast(y), .height = 1, .width = width });
     row.fill(.{ .style = base });
     var x = writeStr(row, 0, 0, label, if (active) active_label else base);
     x = writeStr(row, x, 0, " ", base);
     x = writeStr(row, x, 0, value, base);
     if (active) _ = writeStr(row, x, 0, "_", base);
+    return x;
 }
 
 /// Keys while the search panel owns the keyboard.
@@ -3669,6 +3738,167 @@ fn handleSearchClick(editor: *Editor, band: SearchBand, row: u16) void {
             }
         },
     }
+}
+
+/// The snippet form's field labels, padded to one width (the Body row
+/// lines up with them).
+const snippet_form_labels = [_][]const u8{ "Name    ", "Folder  ", "Trigger ", "Language", "Notes   " };
+
+/// The rows a snippet form band `h` rows tall shows, by band row: the
+/// title, the five fields Name to Notes, the body summary, then the keys
+/// (or the form's error). A shorter band drops the keys row, then the body
+/// row — an error keeps the one spare row, or else shows on the title row
+/// — and below six rows the field rows scroll to keep the active field in
+/// view (one row: the active field alone).
+const SnippetFormRows = struct {
+    title: bool = true,
+    /// The band row of the first field row; it shows `first_field`.
+    fields_y: u16 = 1,
+    first_field: u8 = 0,
+    field_rows: u8 = snippet_form_labels.len,
+    body_y: ?u16 = null,
+    message_y: ?u16 = null,
+};
+
+fn snippetFormRows(h: u16, active: snippet_form_mod.Field, has_error: bool) SnippetFormRows {
+    var rows: SnippetFormRows = .{};
+    if (h < 2) {
+        rows.title = false;
+        rows.fields_y = 0;
+    }
+    const room = h -| rows.fields_y;
+    rows.field_rows = @intCast(@min(snippet_form_labels.len, room));
+    const idx: u8 = @min(@intFromEnum(active), snippet_form_labels.len - 1);
+    if (rows.field_rows > 0 and idx >= rows.field_rows) rows.first_field = idx + 1 - rows.field_rows;
+    const after = rows.fields_y + rows.field_rows;
+    switch (room -| snippet_form_labels.len) {
+        0 => {},
+        1 => if (has_error) {
+            rows.message_y = after;
+        } else {
+            rows.body_y = after;
+        },
+        else => {
+            rows.body_y = after;
+            rows.message_y = after + 1;
+        },
+    }
+    return rows;
+}
+
+/// Draw the snippet form band (Save / Edit / Copy a snippet), the GUI
+/// dialog's terminal twin: the title, one row per field — the active one
+/// marked as the search panel marks its field, with the terminal caret at
+/// its end — the body's size and where to add blanks, then the keys, or
+/// the form's error after a refused Enter. Returns the rows it showed
+/// (for snippet_form_band).
+fn drawSnippetForm(win: Window, editor: *Editor, width: u16, h: u16) SnippetFormRows {
+    const form = &editor.snippet_form;
+    const th = &editor.tui_theme;
+    const base: Style = .{ .bg = toVaxis(th.overlay_bg), .fg = toVaxis(th.overlay_fg) };
+    const dim: Style = .{ .bg = toVaxis(th.overlay_bg), .fg = toVaxis(th.overlay_dim) };
+    const warn: Style = .{ .bg = toVaxis(th.overlay_bg), .fg = toVaxis(th.overlay_warn) };
+    const title_style: Style = .{ .bg = toVaxis(th.overlay_bg), .fg = toVaxis(th.overlay_accent), .bold = true };
+    const label_active: Style = .{ .bg = toVaxis(th.overlay_bg), .fg = toVaxis(th.overlay_fg), .bold = true, .reverse = true };
+    win.fill(.{ .style = base });
+    // The active field's row shows the caret again below: none stays
+    // where the last frame left it.
+    win.hideCursor();
+
+    const err = form.error_message;
+    const rows = snippetFormRows(h, form.field, err.len > 0);
+    if (rows.title) {
+        const title: []const u8 = switch (form.kind) {
+            .save => "Save as snippet \u{2014} my-snippets.lua",
+            .edit => "Edit snippet",
+            .copy => "Copy to my snippets",
+        };
+        _ = writeStr(win, 0, 0, title, title_style);
+        // An error with no row of its own goes to the end of this one
+        if (err.len > 0 and rows.message_y == null) {
+            const cols = @min(win.gwidth(err), width);
+            _ = writeStr(win, width -| cols -| 1, 0, err, warn);
+        }
+    }
+    const value_x: u16 = @intCast(snippet_form_labels[0].len + 1);
+    for (0..rows.field_rows) |i| {
+        const idx = rows.first_field + i;
+        const field: snippet_form_mod.Field = @enumFromInt(idx);
+        const y = rows.fields_y + @as(u16, @intCast(i));
+        const active = field == form.field;
+        var shown_buf: [snippet_field_shown_max]u8 = undefined;
+        const keep_end: ?u16 = if (active) width -| value_x -| 1 else null;
+        const shown = snippetFieldShown(win, &shown_buf, form.text(field), keep_end);
+        const caret_x = drawSearchInputRow(win, y, width, snippet_form_labels[idx], shown, active, base, label_active);
+        if (active and caret_x < width) {
+            win.showCursor(caret_x, y);
+            win.setCursorShape(.beam_blink);
+        }
+    }
+    if (rows.body_y) |y| {
+        const body = form.text(.body);
+        const lines: usize = if (body.len == 0) 0 else std.mem.count(u8, body, "\n") + 1;
+        var count_buf: [32]u8 = undefined;
+        const count = std.fmt.bufPrint(&count_buf, "{d} {s}", .{ lines, if (lines == 1) "line" else "lines" }) catch "";
+        const row = win.child(.{ .y_off = @intCast(y), .height = 1, .width = width });
+        var x = writeStr(row, 0, 0, "Body     ", base);
+        x = writeStr(row, x, 0, count, base);
+        _ = writeStr(row, x, 0, " \u{2014} add blanks like ${1:text} and $0 by editing my-snippets.lua", dim);
+    }
+    if (rows.message_y) |y| {
+        const row = win.child(.{ .y_off = @intCast(y), .height = 1, .width = width });
+        if (err.len > 0) {
+            _ = writeStr(row, 0, 0, err, warn);
+        } else {
+            _ = writeStr(row, 0, 0, "Enter saves \u{00b7} Tab/Shift+Tab fields \u{00b7} Esc cancels", dim);
+        }
+    }
+    return rows;
+}
+
+/// Bytes a form field's row may need: Notes, the longest field, with
+/// every byte a line break drawn as a 3-byte ↵, plus the … cut marker.
+const snippet_field_shown_max = 3 * @sizeOf(@FieldType(snippet_form_mod.State, "notes")) + 3;
+
+/// A field's value as one row: line breaks (an edited snippet's notes)
+/// show as ↵, and with `keep_end` set (the active field) a value wider
+/// than that many columns shows its end, where typing lands, after a ….
+fn snippetFieldShown(win: Window, buf: []u8, value: []const u8, keep_end: ?u16) []const u8 {
+    const marker = "\u{2026}";
+    // The value goes after room for the marker
+    var n: usize = marker.len;
+    for (value) |b| {
+        if (b == '\n') {
+            if (n + 3 > buf.len) break;
+            @memcpy(buf[n..][0..3], "\u{21b5}");
+            n += 3;
+        } else {
+            if (n >= buf.len) break;
+            buf[n] = b;
+            n += 1;
+        }
+    }
+    const text = buf[marker.len..n];
+    const cols = keep_end orelse return text;
+    if (win.gwidth(text) <= cols) return text;
+    if (cols == 0) return text[text.len..];
+    // Its last cols - 1 columns, starting on a character, behind the marker
+    var start = text.len - filetree_mod.pathTail(text, cols - 1).len;
+    while (start < text.len and win.gwidth(text[start..]) > cols - 1) {
+        start += std.unicode.utf8ByteSequenceLength(text[start]) catch 1;
+    }
+    start = @min(start, text.len);
+    @memcpy(buf[start..][0..marker.len], marker);
+    return buf[start..n];
+}
+
+/// Click inside the snippet form band: the field on that row takes the
+/// typing (the title, body and keys rows do nothing).
+fn handleSnippetFormClick(editor: *Editor, band: SnippetFormBand, row: u16) void {
+    const rows = band.rows;
+    const rel = row - band.y;
+    if (rel < rows.fields_y or rel - rows.fields_y >= rows.field_rows) return;
+    editor.snippet_form.field = @enumFromInt(rows.first_field + (rel - rows.fields_y));
 }
 
 /// Draw the fuzzy file finder overlay (same layout as the palette; the
@@ -5813,6 +6043,200 @@ test "TUI snippets panel: the preview wraps long code, highlights the blanks and
     try t.expectEqual(@as(usize, 0), snippets_preview_scroll);
     try t.expectEqual(@as(?u32, null), snippets_preview_def);
     try t.expectEqualStrings("Select a snippet", testCells(&screen, tx, code_y, 16, &buf));
+}
+
+test "TUI snippet form: Ctrl+Alt+S shows the bottom form prefilled, Tab cycles the fields, Backspace edits, Enter saves and Escape cancels" {
+    const t = std.testing;
+    const lua_settings = @import("../core/lua_settings.zig");
+    var tmp = t.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(t.io, ".", t.allocator);
+    defer t.allocator.free(root);
+    lua_settings.test_config_dir = root;
+    defer lua_settings.test_config_dir = null;
+    var editor = try Editor.init(t.allocator, t.io);
+    defer editor.deinit();
+    editor.lsp_enabled = false;
+    editor.filetree_visible = false;
+    const doc = editor.activeDoc();
+    doc.language = editor.findLanguage("zig");
+    const code = "    for (items) |item| {\n        use(item);\n    }\n";
+    try doc.loadText(code);
+    var screen = try testScreen(t.allocator);
+    defer screen.deinit(t.allocator);
+    const win = testWin(&screen);
+    var buf: [256]u8 = undefined;
+    const form = &editor.snippet_form;
+    const Field = snippet_form_mod.Field;
+
+    // Nothing selected: refused on the status line, and no band.
+    testKey(&editor, 's', .{ .ctrl = true, .alt = true });
+    try t.expectEqual(Editor.Mode.normal, editor.mode);
+    try t.expectEqualStrings("Save as snippet: select the code first", editor.status_message);
+    testFrame(win, &editor);
+    try t.expect(snippet_form_band == null);
+
+    // A selection: eight rows right above the status bar, the panes above
+    // them. Name is active, the caret at its end; Folder and Language are
+    // prefilled; then the body's size and the keys.
+    _ = editor.execCommand("select_all", null);
+    testKey(&editor, 's', .{ .ctrl = true, .alt = true });
+    try t.expectEqual(Editor.Mode.snippet_form, editor.mode);
+    testFrame(win, &editor);
+    const band = snippet_form_band.?;
+    try t.expectEqual(@as(u16, 8), band.h);
+    try t.expectEqual(@as(u16, 29), band.y + band.h);
+    try t.expectEqual(band.y, pane_rects[0].h);
+    try t.expectEqualStrings("Save as snippet \u{2014} my-snippets.lua", testCells(&screen, 0, band.y, 33, &buf));
+    try t.expectEqualStrings("Name     _", testCells(&screen, 0, band.y + 1, 10, &buf));
+    try t.expect(screen.readCell(0, band.y + 1).?.style.reverse);
+    try t.expectEqualStrings("Folder   Mine ", testCells(&screen, 0, band.y + 2, 14, &buf));
+    try t.expect(!screen.readCell(0, band.y + 2).?.style.reverse);
+    try t.expectEqualStrings("Trigger   ", testCells(&screen, 0, band.y + 3, 10, &buf));
+    try t.expectEqualStrings("Language zig ", testCells(&screen, 0, band.y + 4, 13, &buf));
+    try t.expectEqualStrings("Notes     ", testCells(&screen, 0, band.y + 5, 10, &buf));
+    try t.expectEqualStrings("Body     3 lines \u{2014} add blanks like ${1:text} and $0 by editing my-snippets.lua", testCells(&screen, 0, band.y + 6, 78, &buf));
+    try t.expectEqualStrings("Enter saves \u{00b7} Tab/Shift+Tab fields \u{00b7} Esc cancels", testCells(&screen, 0, band.y + 7, 48, &buf));
+    try t.expect(screen.cursor_vis);
+    try t.expectEqual(@as(u16, 9), screen.cursor.col);
+    try t.expectEqual(band.y + 1, screen.cursor.row);
+
+    // Enter with no name: the form stays, its error on the keys' row.
+    testKey(&editor, Key.enter, .{});
+    try t.expectEqual(Editor.Mode.snippet_form, editor.mode);
+    try t.expect(form.error_message.len > 0);
+    testFrame(win, &editor);
+    try t.expectEqualStrings(form.error_message, testCells(&screen, 0, band.y + 7, @intCast(form.error_message.len), &buf));
+    try t.expect(std.meta.eql(toVaxis(editor.tui_theme.overlay_warn), screen.readCell(0, band.y + 7).?.style.fg));
+
+    // Typing fills Name; Tab / Shift+Tab (and Down / Up, wrapping around)
+    // move between the fields; Backspace edits the active one. The
+    // document behind the form is never touched.
+    testType(&editor, "My loop");
+    try t.expectEqualStrings("My loop", form.text(.name));
+    testKey(&editor, Key.tab, .{});
+    try t.expectEqual(Field.folder, form.field);
+    testKey(&editor, Key.tab, .{ .shift = true });
+    try t.expectEqual(Field.name, form.field);
+    testKey(&editor, Key.up, .{});
+    try t.expectEqual(Field.notes, form.field);
+    testKey(&editor, Key.down, .{});
+    try t.expectEqual(Field.name, form.field);
+    testKey(&editor, Key.backspace, .{});
+    try t.expectEqualStrings("My loo", form.text(.name));
+    testType(&editor, "p");
+    try t.expectEqualStrings("My loop", form.text(.name));
+    try t.expectEqualStrings(code, doc.buffer.slice(0, doc.buffer.byteLen()));
+
+    // A click on a field row moves the typing there; a paste types its
+    // first line into the active field.
+    testClick(&editor, 20, band.y + 5);
+    try t.expectEqual(Field.notes, form.field);
+    applyPaste(&editor, "Runs the body once per item.\nNot this line.");
+    try t.expectEqualStrings("Runs the body once per item.", form.text(.notes));
+    testFrame(win, &editor);
+    try t.expectEqualStrings("Name     My loop ", testCells(&screen, 0, band.y + 1, 17, &buf));
+    try t.expectEqualStrings("Notes    Runs the body once per item._", testCells(&screen, 0, band.y + 5, 38, &buf));
+    try t.expectEqual(@as(u16, 37), screen.cursor.col);
+    try t.expectEqual(band.y + 5, screen.cursor.row);
+    try testCaptureScreen(&screen, "snippet_form_tui.txt");
+
+    // Enter saves: the band goes, the status line says where, and the
+    // block is in <config>/extensions/my-snippets.lua.
+    testKey(&editor, Key.enter, .{});
+    try t.expectEqual(Editor.Mode.normal, editor.mode);
+    try t.expect(std.mem.startsWith(u8, editor.status_message, "Saved to my-snippets.lua"));
+    try t.expect(editor.snippets.command("snippet.zig.~my-loop") != null);
+    const path = try std.fs.path.join(t.allocator, &.{ root, "extensions", "my-snippets.lua" });
+    defer t.allocator.free(path);
+    const saved = try std.Io.Dir.cwd().readFileAlloc(t.io, path, t.allocator, .limited(1 << 20));
+    defer t.allocator.free(saved);
+    try t.expect(std.mem.indexOf(u8, saved, "-- zide:snippet snippet.zig.~my-loop") != null);
+    try t.expect(std.mem.indexOf(u8, saved, "Runs the body once per item.") != null);
+    testFrame(win, &editor);
+    try t.expect(snippet_form_band == null);
+    try t.expectEqual(@as(u16, 29), pane_rects[0].h);
+
+    // Open it again and Escape: the band goes and nothing is written.
+    _ = editor.execCommand("select_all", null);
+    testKey(&editor, 's', .{ .ctrl = true, .alt = true });
+    try t.expectEqual(Editor.Mode.snippet_form, editor.mode);
+    testType(&editor, "Never saved");
+    testKey(&editor, Key.escape, .{});
+    try t.expectEqual(Editor.Mode.normal, editor.mode);
+    try t.expectEqualStrings("", form.text(.name));
+    try t.expect(editor.snippets.command("snippet.zig.~never-saved") == null);
+    const after = try std.Io.Dir.cwd().readFileAlloc(t.io, path, t.allocator, .limited(1 << 20));
+    defer t.allocator.free(after);
+    try t.expectEqualStrings(saved, after);
+    testFrame(win, &editor);
+    try t.expect(snippet_form_band == null);
+}
+
+test "TUI snippet form: a short band drops the keys row, then the body row, keeps the error in view and scrolls to the active field" {
+    const t = std.testing;
+    var editor = try Editor.init(t.allocator, t.io);
+    defer editor.deinit();
+    editor.lsp_enabled = false;
+    editor.filetree_visible = false;
+    try t.expect(editor.takeKeyboardFocus(.search));
+    try editor.activeDoc().loadText("x = 1;\n");
+    _ = editor.execCommand("select_all", null);
+    editor.startSnippetSave();
+    try t.expectEqual(Editor.Mode.snippet_form, editor.mode);
+    const form = &editor.snippet_form;
+    var screen = try testScreen(t.allocator);
+    defer screen.deinit(t.allocator);
+    const win = testWin(&screen);
+    var buf: [256]u8 = undefined;
+
+    // Beside the search panel 30 rows leave the band seven, right above
+    // the panel (whose field no longer looks focused: the form has the
+    // keys). The keys row goes first, and an error takes the body's.
+    testFrame(win, &editor);
+    var band = snippet_form_band.?;
+    try t.expectEqual(@as(u16, 7), band.h);
+    try t.expectEqual(search_band.?.y, band.y + band.h);
+    try t.expect(!screen.readCell(0, search_band.?.y).?.style.reverse);
+    try t.expectEqualStrings("Body     1 line ", testCells(&screen, 0, band.y + 6, 16, &buf));
+    form.error_message = "Snippet needs a name";
+    testFrame(win, &editor);
+    try t.expectEqualStrings("Snippet needs a name", testCells(&screen, 0, band.y + 6, 20, &buf));
+
+    // Six rows: no body row; the error goes to the end of the title row.
+    frameArenaReset();
+    drawEditor(win, &editor, 100, 25);
+    band = snippet_form_band.?;
+    try t.expectEqual(@as(u16, 6), band.h);
+    try t.expectEqualStrings("Snippet needs a name", testCells(&screen, 79, band.y, 20, &buf));
+    try t.expectEqualStrings("Notes    ", testCells(&screen, 0, band.y + 5, 9, &buf));
+
+    // Four rows: the three field rows follow the active field, and a click
+    // picks the field drawn on its row (the title row picks none).
+    form.field = .notes;
+    frameArenaReset();
+    drawEditor(win, &editor, 100, 19);
+    band = snippet_form_band.?;
+    try t.expectEqual(@as(u16, 4), band.h);
+    try t.expectEqualStrings("Trigger  ", testCells(&screen, 0, band.y + 1, 9, &buf));
+    try t.expectEqualStrings("Notes    _", testCells(&screen, 0, band.y + 3, 10, &buf));
+    try t.expectEqual(band.y + 3, screen.cursor.row);
+    testClick(&editor, 4, band.y + 1);
+    try t.expectEqual(snippet_form_mod.Field.trigger, form.field);
+    testClick(&editor, 4, band.y);
+    try t.expectEqual(snippet_form_mod.Field.trigger, form.field);
+
+    // A value wider than its row keeps its end, where typing lands, in view.
+    form.field = .notes;
+    form.set(.notes, "word " ** 40);
+    testFrame(win, &editor);
+    band = snippet_form_band.?;
+    const notes_y = band.y + 5;
+    try t.expectEqualStrings("Notes    \u{2026}ord ", testCells(&screen, 0, notes_y, 14, &buf));
+    try t.expectEqualStrings("word _", testCells(&screen, 94, notes_y, 6, &buf));
+    try t.expect(screen.cursor_vis);
+    try t.expectEqual(@as(u16, 99), screen.cursor.col);
+    try t.expectEqual(notes_y, screen.cursor.row);
 }
 
 test "TUI terminal: after the shell exits, the next key closes the pane" {

@@ -324,6 +324,7 @@ pub const KeybindMap = struct {
         // Side panels
         try self.set("ctrl+b", "toggle_filetree");
         try self.set("ctrl+alt+b", "toggle_snippets");
+        try self.set("ctrl+alt+s", "snippet_save_selection");
     }
 };
 
@@ -378,6 +379,7 @@ test "keybind defaults" {
     try std.testing.expectEqualStrings("lsp_signature_help", kb.get("ctrl+shift+space").?);
     try std.testing.expectEqualStrings("toggle_filetree", kb.get("ctrl+b").?);
     try std.testing.expectEqualStrings("toggle_snippets", kb.get("ctrl+alt+b").?);
+    try std.testing.expectEqualStrings("snippet_save_selection", kb.get("ctrl+alt+s").?);
     // Windows
     try std.testing.expectEqualStrings("open_in_new_window", kb.get("ctrl+shift+n").?);
     try std.testing.expectEqualStrings("open_in_new_window", kb.get("ctrl+alt+n").?);

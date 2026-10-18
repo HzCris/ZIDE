@@ -21,6 +21,7 @@ const FileTree = filetree_mod.FileTree;
 const fileicons = @import("../core/fileicons.zig");
 const snippet_panel = @import("../core/snippet_panel.zig");
 const snippets_mod = @import("../core/snippets.zig");
+const snippet_form_mod = @import("../core/snippet_form.zig");
 const icons = @import("icons.zig");
 const cursor_mod = @import("../core/cursor.zig");
 const keybind = @import("../core/keybind.zig");
@@ -836,6 +837,10 @@ fn menuBar(editor: *Editor) void {
                 if (!editor.panelAction("select_all")) _ = editor.execCommand("select_all", null);
                 m.close();
             }
+            if (dvui.menuItemLabel(@src(), "Save Selection as Snippet…  Ctrl+Alt+S", .{}, .{ .expand = .horizontal }) != null) {
+                _ = editor.execCommand("snippet_save_selection", null);
+                m.close();
+            }
             if (dvui.menuItemLabel(@src(), "Toggle Comment   Ctrl+/", .{}, .{ .expand = .horizontal }) != null) {
                 _ = editor.execCommand("toggle_comment", null);
                 m.close();
@@ -970,14 +975,27 @@ fn menuBar(editor: *Editor) void {
     }
 }
 
-/// Settings + delete-confirm dialogs of the current window. Declared before
-/// the panes so their widgets consume their events first.
-/// The editor mode as seen by the current window: the Settings dialog is
-/// modal only for the window it is open in — everywhere else the mode reads
-/// as normal so keys, clicks and the shell keep working there.
+/// The editor mode as seen by the current window: the Settings dialog and
+/// the snippet form are modal only for the window they are open in —
+/// everywhere else the mode reads as normal so keys, clicks and the shell
+/// keep working there.
 fn guiMode(editor: *const Editor) Editor.Mode {
-    if (editor.mode == .settings and editor.windows.items[cur_win].id != editor.settings_window_id) return .normal;
+    const win_id = editor.windows.items[cur_win].id;
+    if (editor.mode == .settings and win_id != editor.settings_window_id) return .normal;
+    if (editor.mode == .snippet_form and win_id != snippetFormWindowId(editor)) return .normal;
     return editor.mode;
+}
+
+/// The window the snippet form's dialog shows in: the one it was opened
+/// from, or the primary once that one has closed (closeWindow moves a
+/// Settings dialog the same way; without this the form would stay open
+/// with no window drawing it, and Ctrl+Alt+S would do nothing).
+fn snippetFormWindowId(editor: *const Editor) u32 {
+    const id = editor.snippet_form.window_id;
+    for (editor.windows.items) |win| {
+        if (win.id == id) return id;
+    }
+    return editor.windows.items[0].id;
 }
 
 /// Quick-open ends when the menu bar or the tab bar of its window is
@@ -997,6 +1015,9 @@ fn dismissFinderOnBarPress(editor: *Editor, bar: dvui.Rect.Physical) void {
     }
 }
 
+/// Dialogs of the current window (Settings, the snippet form, the delete
+/// confirmation) and the active window's prompts. Declared before the
+/// panes so their widgets consume their events first.
 fn modalDialogs(editor: *Editor) void {
     if (cur_win == editor.active_window) {
         // zide.exec("file_open") and the palette land in this mode (Ctrl+O
@@ -1027,6 +1048,15 @@ fn modalDialogs(editor: *Editor) void {
     } else {
         // Re-arm the text-setting pre-fill for the next dialog open
         settings_text_prefill = true;
+    }
+    // --- Snippet form ("Save as snippet") — the same rules: a modal dvui
+    // dialog, declared before the panes, pinned to its window. ---
+    if (editor.mode == .snippet_form) {
+        if (editor.windows.items[cur_win].id == snippetFormWindowId(editor)) snippetFormDialog(editor);
+    } else {
+        // The next open puts the caret in Name again.
+        snippet_form_focus_pending = true;
+        snippet_form_error_hash = null;
     }
 
     // Delete confirmation dialog (clickable) — same declared-before-panes
@@ -1504,7 +1534,11 @@ fn editorArea(editor: *Editor, side_panels: bool) void {
         // Modal prompts normally live in the focused editor pane. With a
         // terminal pane focused (a detached terminal window, Ctrl+Q from a
         // shell) there is none — drive and draw them at window level.
-        if (editor.active_window == cur_win and editor.mode != .normal and editor.mode != .settings and editor.activePaneIsTerminal()) {
+        // Not Settings or the snippet form: dvui dialogs whose own entries
+        // take the keys and text. This stand-in would feed every event they
+        // leave to handleModalKey (a no-op for both) and claim text input
+        // for the whole editor area, away from the focused entry.
+        if (editor.active_window == cur_win and editor.mode != .normal and editor.mode != .settings and editor.mode != .snippet_form and editor.activePaneIsTerminal()) {
             windowLevelModal(editor, main_col.data());
         }
     }
@@ -4939,12 +4973,16 @@ fn editorPane(editor: *Editor, pane_id: u8) void {
 
     // --- Request text input from SDL — only for the focused pane that
     // takes keys (never under a side panel that owns the keyboard) ---
-    // Settings is excluded: the DVUI dialog's own text entries request
-    // input and focus; grabbing it here would steal their focus each frame.
+    // A modal prompt lives in this pane, so in any other mode the pane
+    // takes text input and dvui focus even when it is not focused.
+    // Settings and the snippet form are excluded: their DVUI dialogs' own
+    // text entries request input and focus; grabbing it here would steal
+    // their focus each frame (and the pane's prompt handling, which ignores
+    // both modes, would get the typing).
     const focused = if (dvui.focusedWidgetId()) |fid| fid == wd.id else false;
     const takes_keys = is_active_pane and editorTakesKeys(editor);
     if (takes_keys) {
-        const needs_text = focused or (editor.mode != .normal and editor.mode != .settings);
+        const needs_text = focused or (editor.mode != .normal and editor.mode != .settings and editor.mode != .snippet_form);
         if (needs_text) {
             dvui.wantTextInput(area.toNatural());
             if (!focused) dvui.focusWidget(wd.id, null, 0);
@@ -5958,6 +5996,10 @@ fn paneContextMenu(editor: *Editor, pane_id: u8, area: dvui.Rect.Physical) void 
             _ = editor.execCommand("select_all", null);
             fw.close();
         }
+        if (dvui.menuItemLabel(@src(), "Save Selection as Snippet…  Ctrl+Alt+S", .{}, .{ .expand = .horizontal }) != null) {
+            _ = editor.execCommand("snippet_save_selection", null);
+            fw.close();
+        }
         if (dvui.menuItemLabel(@src(), "Go to Definition F12", .{}, .{ .expand = .horizontal }) != null) {
             _ = editor.execAction("lsp_goto_definition");
             fw.close();
@@ -6362,11 +6404,13 @@ fn handleGuiKeyEvents(editor: *Editor, wd: *dvui.WidgetData) bool {
 
     // --- Modal input handling ---
     if (guiMode(editor) != .normal) {
-        // Settings uses a real DVUI floating dialog whose widgets already
-        // consumed their events (it is declared before the panes). Only
-        // catch a leftover Escape to close it — swallowing everything here
-        // would break Tab navigation and text entry inside the dialog.
-        if (editor.mode == .settings) {
+        // Settings and the snippet form are real DVUI floating dialogs
+        // whose widgets already consumed their events (declared before the
+        // panes). Only catch a leftover Escape to close them — swallowing
+        // everything here would break Tab navigation and text entry inside
+        // the dialog. (The snippet form takes Escape itself first: a
+        // focused entry would swallow it before it got here.)
+        if (editor.mode == .settings or editor.mode == .snippet_form) {
             for (dvui.events()) |*e| {
                 if (e.handled) continue;
                 if (e.evt != .key) continue;
@@ -6375,7 +6419,7 @@ fn handleGuiKeyEvents(editor: *Editor, wd: *dvui.WidgetData) bool {
                 if (key.code == .escape) {
                     e.handle(@src(), wd);
                     handled_any = true;
-                    editor.setMode(.normal);
+                    if (editor.mode == .snippet_form) editor.cancelSnippetForm() else editor.setMode(.normal);
                     // The dialog subwindow disappears next frame — refocus
                     // the base window so editor keys work immediately.
                     dvui.focusSubwindow(null, null);
@@ -7278,6 +7322,7 @@ fn handleModalKey(editor: *Editor, key: dvui.Event.Key) void {
         .lsp_panel, .symbol_rename, .workspace_preview => handleLspKeyGui(editor, key),
         .tool_panel, .task_save_prompt, .git_stage_prompt => handleToolKeyGui(editor, key),
         .settings => {}, // DVUI dialog handles its own input (settingsDialog)
+        .snippet_form => {}, // DVUI dialog handles its own input (snippetFormDialog)
         .file_open, .folder_open, .save_as => {}, // handled by native dialogs in GUI
         .filetree_prompt => handleFiletreePromptKeyGui(editor, key),
         .normal => {},
@@ -8015,6 +8060,222 @@ fn openThemeFolder(io: std.Io) void {
     // Under the process-wide spawn lock: Windows children inherit every
     // inheritable pipe end that exists while one is created.
     _ = jobs.spawnLocked(io, .{ .argv = &argv }) catch return;
+}
+
+// ===========================================================================
+// Snippet form: "Save as snippet" (Ctrl+Alt+S)
+// ===========================================================================
+
+/// The snippet form's Name entry has yet to take the keyboard: set while
+/// the form is closed and on the frame its dialog first shows in a window,
+/// cleared once dvui reports the entry focused.
+var snippet_form_focus_pending: bool = true;
+/// Hash of the error message the dialog showed last frame: when one
+/// appears, changes or goes, the dialog re-fits itself around it.
+var snippet_form_error_hash: ?u64 = null;
+
+/// The "Save as snippet" dialog (mode .snippet_form; its title already
+/// covers Edit and Copy): a modal floating window whose text entries edit
+/// the form's buffers in place. Enter in a one-line field, or Save,
+/// submits — a failure keeps it open with the reason in the warn color;
+/// Escape, Cancel or the header's X leaves without saving. In Notes and
+/// Body Enter types a line break. Tab / Shift+Tab move between the entries
+/// (dvui's own focus order). modalDialogs draws it only in its window.
+fn snippetFormDialog(editor: *Editor) void {
+    if (!build_options.has_gui) return;
+    const form = &editor.snippet_form;
+    var open = true;
+    var submit = false;
+    var float = dvui.floatingWindow(@src(), .{ .modal = true, .open_flag = &open }, .{
+        .min_size_content = .{ .w = 540 },
+    });
+    defer {
+        float.deinit();
+        if (!open) editor.cancelSnippetForm();
+        if (editor.mode != .snippet_form) {
+            // Saved or cancelled (the setMode hook has reset the form): the
+            // next open starts in Name, and the base window takes the
+            // keyboard back so the editor pane works without a click. Only
+            // after deinit: inside the dialog, "the current subwindow" is
+            // the dialog itself.
+            snippet_form_focus_pending = true;
+            snippet_form_error_hash = null;
+            dvui.focusSubwindow(null, null);
+        }
+    }
+    const title: []const u8 = switch (form.kind) {
+        .save => "Save as snippet",
+        .edit => "Edit snippet",
+        .copy => "Copy to my snippets",
+    };
+    float.dragAreaSet(dvui.windowHeader(title, "", &open));
+    // Its first frame in this window (just opened, or taken over by the
+    // primary when its own window closed): the caret goes to Name.
+    if (dvui.firstFrame(float.data().id)) snippet_form_focus_pending = true;
+
+    // Escape, before any entry sees it: a focused text entry swallows every
+    // key it does not use, so handleGuiKeyEvents' leftover-Escape catch
+    // would never get it while the caret is in a field.
+    for (dvui.events()) |*e| {
+        if (e.handled or e.evt != .key) continue;
+        if (e.evt.key.action == .down and e.evt.key.code == .escape) {
+            e.handle(@src(), float.data());
+            open = false;
+        }
+    }
+
+    const font = dvui.Font.theme(.body);
+    const dim = toDvui(editor.theme.overlay_hint);
+    // The field names' column, as wide as the widest of them.
+    const label_w = font.textSize("Language").w;
+    {
+        // A short window scrolls the fields; the buttons stay in view.
+        var scroll = dvui.scrollArea(@src(), .{}, .{
+            .expand = .both,
+            .max_size_content = .height(@max(160, dvui.windowRect().h - 110)),
+        });
+        defer scroll.deinit();
+        var fields = dvui.box(@src(), .{ .dir = .vertical }, .{
+            .expand = .horizontal,
+            .padding = .{ .x = 8, .y = 6, .w = 8, .h = 2 },
+        });
+        defer fields.deinit();
+
+        const name_id = snippetFormLine(form, .name, "Name", "snippet_form_name", null, "required — the name the panel shows", label_w, dim, &submit);
+        if (snippet_form_focus_pending) {
+            // dvui focuses a dialog's subwindow on its first frame only; a
+            // reopen right after a close is not one, so focus it here too.
+            // Retried every frame until the entry really holds the focus.
+            dvui.focusSubwindow(float.data().id, null);
+            dvui.focusWidget(name_id, null, null);
+            if (dvui.focusedWidgetId() == name_id) snippet_form_focus_pending = false;
+        }
+        _ = snippetFormLine(form, .folder, "Folder", "snippet_form_folder", "the panel group — empty means Mine", null, label_w, dim, &submit);
+        _ = snippetFormLine(form, .trigger, "Trigger", "snippet_form_trigger", "optional — type it and press Tab to insert", null, label_w, dim, &submit);
+        _ = snippetFormLine(form, .language, "Language", "snippet_form_language", "a language name, or * for every file", null, label_w, dim, &submit);
+        {
+            var row = dvui.box(@src(), .{ .dir = .horizontal }, .{ .expand = .horizontal });
+            defer row.deinit();
+            const label_id = snippetFormLabel("Notes", label_w);
+            const te = dvui.textEntry(@src(), .{
+                .text = .{ .buffer = &form.notes },
+                .multiline = true,
+                .break_lines = true,
+                .scroll_horizontal = false,
+                .placeholder = "optional — what it does, in plain words",
+            }, .{
+                .expand = .horizontal,
+                .min_size_content = font.sizeM(1, 3),
+                .tag = "snippet_form_notes",
+                .label = .{ .by_id = label_id },
+            });
+            form.notes_len = te.textGet().len;
+            te.deinit();
+        }
+        {
+            var row = dvui.box(@src(), .{ .dir = .horizontal }, .{ .expand = .horizontal });
+            defer row.deinit();
+            const label_id = snippetFormLabel("Body", label_w);
+            var col = dvui.box(@src(), .{ .dir = .vertical }, .{ .expand = .horizontal });
+            defer col.deinit();
+            // Code: the editor's font, no wrapping.
+            const te = dvui.textEntry(@src(), .{ .text = .{ .buffer = &form.body }, .multiline = true }, .{
+                .expand = .horizontal,
+                .min_size_content = .{ .w = 1, .h = 160 },
+                .font = dvui.Font.theme(.mono),
+                .tag = "snippet_form_body",
+                .label = .{ .by_id = label_id },
+            });
+            form.body_len = te.textGet().len;
+            te.deinit();
+            dvui.labelNoFmt(@src(), "Blanks: ${1:text} is a blank with a default,\n$0 is where the caret ends up, a leading tab is one indent.", .{}, .{ .color_text = dim });
+        }
+    }
+
+    // Beside the buttons: why the last save failed, else how to save.
+    const err_hash = std.hash.Wyhash.hash(0, form.error_message);
+    if (snippet_form_error_hash != err_hash) {
+        snippet_form_error_hash = err_hash;
+        float.autoSize();
+    }
+    {
+        var row = dvui.box(@src(), .{ .dir = .horizontal }, .{
+            .expand = .horizontal,
+            .padding = .{ .x = 8, .y = 4, .w = 8, .h = 8 },
+        });
+        defer row.deinit();
+        if (form.error_message.len > 0) {
+            var tl = dvui.textLayout(@src(), .{}, .{
+                .expand = .horizontal,
+                .gravity_y = 0.5,
+                .background = false,
+                // It wraps in what the buttons leave: its unbroken width
+                // must never widen the dialog.
+                .max_size_content = .width(120),
+                .tag = "snippet_form_error",
+            });
+            tl.addText(form.error_message, .{ .color_text = toDvui(editor.theme.overlay_warn) });
+            tl.deinit();
+        } else {
+            dvui.labelNoFmt(@src(), "Enter in a one-line field saves; Esc cancels", .{}, .{
+                .expand = .horizontal,
+                .gravity_y = 0.5,
+                .color_text = dim,
+            });
+        }
+        if (dvui.button(@src(), "Save", .{}, .{ .gravity_y = 0.5, .tag = "snippet_form_save" })) submit = true;
+        if (dvui.button(@src(), "Cancel", .{}, .{ .gravity_y = 0.5, .tag = "snippet_form_cancel" })) open = false;
+    }
+    // Last: every entry has copied its length back, and nothing after this
+    // touches the form, which a save resets.
+    if (submit and open) _ = editor.submitSnippetForm();
+}
+
+/// One row of the snippet form: the field's name, then a one-line entry
+/// editing `field`'s buffer in place (dvui keeps it NUL-terminated; the
+/// length is copied back every frame) — across the row, or short with the
+/// dim `desc` beside it. Enter in it sets `submit`. Returns the entry's id.
+fn snippetFormLine(
+    form: *snippet_form_mod.State,
+    field: snippet_form_mod.Field,
+    label: []const u8,
+    tag: []const u8,
+    desc: ?[]const u8,
+    placeholder: ?[]const u8,
+    label_w: f32,
+    dim: dvui.Color,
+    submit: *bool,
+) dvui.Id {
+    var row = dvui.box(@src(), .{ .dir = .horizontal }, .{ .expand = .horizontal, .id_extra = @intFromEnum(field) });
+    defer row.deinit();
+    const label_id = snippetFormLabel(label, label_w);
+    const slot = form.slot(field);
+    var opts: dvui.Options = .{ .tag = tag, .label = .{ .by_id = label_id } };
+    if (desc == null) {
+        opts.expand = .horizontal;
+    } else {
+        opts.min_size_content = dvui.Font.theme(.body).sizeM(12, 1);
+    }
+    const te = dvui.textEntry(@src(), .{ .text = .{ .buffer = slot.buf }, .placeholder = placeholder }, opts);
+    slot.len.* = te.textGet().len;
+    if (te.enter_pressed) submit.* = true;
+    const id = te.data().id;
+    te.deinit();
+    if (desc) |d| dvui.labelNoFmt(@src(), d, .{}, .{ .gravity_y = 0.5, .color_text = dim });
+    return id;
+}
+
+/// A snippet-form field name, level with the first text line of the entry
+/// beside it (an entry's margin, border and padding: 4 + 1 + 6). Returns
+/// its id: the entry's accessibility label.
+fn snippetFormLabel(text: []const u8, width: f32) dvui.Id {
+    var wd: dvui.WidgetData = undefined;
+    dvui.labelNoFmt(@src(), text, .{}, .{
+        .min_size_content = .{ .w = width },
+        .padding = .{ .x = 0, .y = 11, .w = 10, .h = 0 },
+        .data_out = &wd,
+    });
+    return wd.id;
 }
 
 /// Memoized find match count. The overlay queries this every frame while
@@ -9268,6 +9529,8 @@ fn snippetsTestSetup(editor: *Editor) !void {
     snippets_preview_scroll = 0;
     snippets_preview_overflow = 0;
     snippets_pv_sb_drag = false;
+    snippet_form_focus_pending = true;
+    snippet_form_error_hash = null;
 }
 
 /// Tests only: draw one GUI frame, then begin the next (`ms` is the
@@ -9764,6 +10027,241 @@ test "GUI snippets panel: dragging a band's edge far past its minimum hides it a
     try t.expectEqual(tree_w, editor.filetree_width);
     try t.expect(std.mem.indexOf(u8, editor.status_message, "File tree hidden") != null);
     try t.expect(editor.snippets_visible);
+}
+
+/// Tests only: with ZIDE_CAPTURE_DIR set, save the next frame of the
+/// window there as `name` (that frame runs like snippetsTestFrame's).
+fn snippetFormTestCapture(editor: *Editor, g: *GuiState, ms: *u64, name: []const u8) !void {
+    const Backend = @import("sdl-backend");
+    const capture_dir = Backend.c.SDL_getenv("ZIDE_CAPTURE_DIR");
+    if (capture_dir == null) return;
+    const path = try std.fs.path.join(std.testing.allocator, &.{ std.mem.span(@as([*:0]const u8, capture_dir)), name });
+    defer std.testing.allocator.free(path);
+    capture_editor = editor;
+    capture_gui = g;
+    const file = try std.Io.Dir.cwd().createFile(dvui.io, path, .{});
+    defer file.close(dvui.io);
+    var wbuf: [4096]u8 = undefined;
+    var writer = file.writer(dvui.io, &wbuf);
+    try dvui.testing.capturePng(captureWindowFrame, null, &writer.interface);
+    try writer.end();
+    ms.* += 100; // the capture's frame moved the window clock on
+}
+
+test "GUI snippet form: Ctrl+Alt+S opens the dialog prefilled from the selection, Enter in Name saves, the panel shows the new snippet" {
+    if (!build_options.has_gui) return error.SkipZigTest;
+    const t = std.testing;
+    const snippet_file = @import("../core/snippet_file.zig");
+    var tmp = t.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(t.io, ".", t.allocator);
+    defer t.allocator.free(root);
+    lua_settings.test_config_dir = root;
+    defer lua_settings.test_config_dir = null;
+    var ui = try dvui.testing.init(.{ .window_size = .{ .w = 900, .h = 600 } });
+    defer ui.deinit();
+    var editor = try Editor.init(t.allocator, t.io);
+    defer editor.deinit();
+    var g = try GuiState.init(t.allocator);
+    defer g.deinit();
+    defer win_ui = undefined;
+    applyWindowFonts(ui.window, &g, &editor);
+    try snippetsTestSetup(&editor);
+    editor.snippets_visible = true;
+    const doc = editor.activeDoc();
+    const source = "    for (items) |item| {\n        use(item);\n    }\n";
+    try doc.loadText(source);
+    _ = editor.execCommand("select_all", null);
+    var ms: u64 = 0;
+    for (0..3) |_| try snippetsTestFrame(ui.window, &editor, &g, &ms);
+    // Ctrl+Alt+S: the dialog opens prefilled — the selection dedented, the
+    // document's language, the default folder — with the caret in Name.
+    const ctrl_alt: dvui.enums.Mod = @enumFromInt(@intFromEnum(dvui.enums.Mod.lcontrol) | @intFromEnum(dvui.enums.Mod.lalt));
+    try dvui.testing.pressKey(.s, ctrl_alt);
+    for (0..3) |_| try snippetsTestFrame(ui.window, &editor, &g, &ms);
+    try t.expectEqual(Editor.Mode.snippet_form, editor.mode);
+    const form = &editor.snippet_form;
+    try t.expectEqualStrings("for (items) |item| {\n    use(item);\n}", form.text(.body));
+    try t.expectEqualStrings("zig", form.text(.language));
+    try t.expectEqualStrings("Mine", form.text(.folder));
+    try dvui.testing.expectVisible("snippet_form_body");
+    try dvui.testing.expectVisible("snippet_form_save");
+    try dvui.testing.expectFocused("snippet_form_name");
+    // Typing goes into Name, never into the document behind the dialog.
+    try dvui.testing.writeText("My loop");
+    try snippetsTestFrame(ui.window, &editor, &g, &ms);
+    try t.expectEqualStrings("My loop", form.text(.name));
+    try t.expectEqualStrings(source, doc.buffer.slice(0, doc.buffer.byteLen()));
+    // Tab moves on to Folder and Shift+Tab back: dvui's own focus order,
+    // which the pane behind the dialog leaves alone.
+    try dvui.testing.pressKey(.tab, .none);
+    try snippetsTestFrame(ui.window, &editor, &g, &ms);
+    try dvui.testing.expectFocused("snippet_form_folder");
+    try dvui.testing.pressKey(.tab, .lshift);
+    try snippetsTestFrame(ui.window, &editor, &g, &ms);
+    try dvui.testing.expectFocused("snippet_form_name");
+    try t.expectEqualStrings(source, doc.buffer.slice(0, doc.buffer.byteLen()));
+    // ZIDE_CAPTURE_DIR=<dir>: a picture of the open dialog there
+    // (snippet_form.png), to look at it without launching ZIDE.
+    try snippetFormTestCapture(&editor, &g, &ms, "snippet_form.png");
+    // Enter in Name saves: the file, the registry and the status bar ...
+    try dvui.testing.pressKey(.enter, .none);
+    try snippetsTestFrame(ui.window, &editor, &g, &ms);
+    try t.expectEqual(Editor.Mode.normal, editor.mode);
+    try t.expect(std.mem.startsWith(u8, editor.status_message, "Saved to my-snippets.lua"));
+    const def = editor.snippets.command("snippet.zig.~my-loop") orelse return error.TestUnexpectedResult;
+    try t.expectEqualStrings("Mine", def.group);
+    try t.expectEqualStrings("for (items) |item| {\n    use(item);\n}", def.body);
+    const text = try tmp.dir.readFileAlloc(t.io, "extensions/" ++ snippet_file.file_name, t.allocator, .limited(1 << 20));
+    defer t.allocator.free(text);
+    try t.expectEqual(@as(usize, 1), std.mem.count(u8, text, snippet_file.marker_prefix ++ "snippet.zig.~my-loop"));
+    // Reopened on the very next frame (no first frame for dvui, so no
+    // focus of its own): empty again, the folder remembered, and the caret
+    // in Name. Escape closes it.
+    try dvui.testing.pressKey(.s, ctrl_alt);
+    try snippetsTestFrame(ui.window, &editor, &g, &ms);
+    try t.expectEqual(Editor.Mode.snippet_form, editor.mode);
+    try t.expectEqualStrings("", form.text(.name));
+    try t.expectEqualStrings("Mine", form.text(.folder));
+    try dvui.testing.expectFocused("snippet_form_name");
+    try dvui.testing.pressKey(.escape, .none);
+    try snippetsTestFrame(ui.window, &editor, &g, &ms);
+    try t.expectEqual(Editor.Mode.normal, editor.mode);
+    // ... and the panel selects and previews the new snippet.
+    for (0..2) |_| try snippetsTestFrame(ui.window, &editor, &g, &ms);
+    try t.expectEqual(@as(?u32, try snippetsTestDef(&editor, "My loop")), snippets_preview_def);
+    // The dialog is gone and the editor pane has the keyboard back: Right
+    // ends the selection, the typing lands in the document.
+    try t.expect(dvui.tagGet("snippet_form_name") == null);
+    try dvui.testing.pressKey(.right, .none);
+    try dvui.testing.writeText("x");
+    try snippetsTestFrame(ui.window, &editor, &g, &ms);
+    try t.expectEqualStrings(source ++ "x", doc.buffer.slice(0, doc.buffer.byteLen()));
+}
+
+test "GUI snippet form: refusals without a selection or in a terminal pane, Escape cancels without writing, the dialog stays in its window" {
+    if (!build_options.has_gui) return error.SkipZigTest;
+    const t = std.testing;
+    const snippet_file = @import("../core/snippet_file.zig");
+    var tmp = t.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(t.io, ".", t.allocator);
+    defer t.allocator.free(root);
+    lua_settings.test_config_dir = root;
+    defer lua_settings.test_config_dir = null;
+    var ui = try dvui.testing.init(.{ .window_size = .{ .w = 900, .h = 600 } });
+    defer ui.deinit();
+    var editor = try Editor.init(t.allocator, t.io);
+    defer editor.deinit();
+    var g = try GuiState.init(t.allocator);
+    defer g.deinit();
+    defer win_ui = undefined;
+    applyWindowFonts(ui.window, &g, &editor);
+    try snippetsTestSetup(&editor);
+    const source = "const answer = 42;\n";
+    try editor.activeDoc().loadText(source);
+    var ms: u64 = 0;
+    for (0..3) |_| try snippetsTestFrame(ui.window, &editor, &g, &ms);
+    const ctrl_alt: dvui.enums.Mod = @enumFromInt(@intFromEnum(dvui.enums.Mod.lcontrol) | @intFromEnum(dvui.enums.Mod.lalt));
+    const my_snippets = "extensions/" ++ snippet_file.file_name;
+    // Nothing selected: refused in the status bar, and no dialog.
+    try dvui.testing.pressKey(.s, ctrl_alt);
+    for (0..2) |_| try snippetsTestFrame(ui.window, &editor, &g, &ms);
+    try t.expectEqual(Editor.Mode.normal, editor.mode);
+    try t.expect(std.mem.indexOf(u8, editor.status_message, "select the code") != null);
+    try t.expect(dvui.tagGet("snippet_form_name") == null);
+    // A terminal pane: its chords go to the shell, so the way there is the
+    // Edit menu's item (the command) — refused too.
+    _ = editor.execCommand("select_all", null);
+    try editor.terminals.append(t.allocator, null); // fake slot: no shell
+    editor.windows.items[0].layout.panes.items[0].content = .{ .terminal = 0 };
+    _ = editor.execCommand("snippet_save_selection", null);
+    try t.expectEqual(Editor.Mode.normal, editor.mode);
+    try t.expect(std.mem.indexOf(u8, editor.status_message, "editor pane") != null);
+    editor.windows.items[0].layout.panes.items[0].content = .{ .editor = 0 };
+
+    // With the selection the dialog opens. Enter with no name: the save
+    // fails, the dialog stays and says why, its buttons still in view.
+    try dvui.testing.pressKey(.s, ctrl_alt);
+    for (0..3) |_| try snippetsTestFrame(ui.window, &editor, &g, &ms);
+    try t.expectEqual(Editor.Mode.snippet_form, editor.mode);
+    try dvui.testing.expectFocused("snippet_form_name");
+    try dvui.testing.pressKey(.enter, .none);
+    for (0..3) |_| try snippetsTestFrame(ui.window, &editor, &g, &ms);
+    try t.expectEqual(Editor.Mode.snippet_form, editor.mode);
+    try t.expect(editor.snippet_form.error_message.len > 0);
+    try dvui.testing.expectVisible("snippet_form_error");
+    try dvui.testing.expectVisible("snippet_form_save");
+    try dvui.testing.expectFocused("snippet_form_name");
+    // ZIDE_CAPTURE_DIR=<dir>: the dialog with its error (snippet_form_error.png).
+    try snippetFormTestCapture(&editor, &g, &ms, "snippet_form_error.png");
+    // A long message wraps beside the buttons instead of widening the
+    // dialog: Save stays where it was.
+    const save_x = (try dvui.testing.tagGet("snippet_form_save")).rect.x;
+    editor.snippet_form.error_message = "my-snippets.lua has a damaged block for this snippet (no `-- zide:end` line): fix the file by hand";
+    for (0..3) |_| try snippetsTestFrame(ui.window, &editor, &g, &ms);
+    try t.expectEqual(save_x, (try dvui.testing.tagGet("snippet_form_save")).rect.x);
+    const line_h = dvui.Font.theme(.body).lineHeight() * dvui.windowNaturalScale();
+    try t.expect((try dvui.testing.tagGet("snippet_form_error")).rect.h >= 2 * line_h);
+    try dvui.testing.expectVisible("snippet_form_save");
+    // Escape from inside Name: back to normal, nothing written, the form
+    // empty again, and the editor pane has the keyboard back.
+    try dvui.testing.writeText("Never saved");
+    try snippetsTestFrame(ui.window, &editor, &g, &ms);
+    try t.expectEqualStrings("Never saved", editor.snippet_form.text(.name));
+    try dvui.testing.pressKey(.escape, .none);
+    try snippetsTestFrame(ui.window, &editor, &g, &ms);
+    try t.expectEqual(Editor.Mode.normal, editor.mode);
+    try t.expectEqualStrings("", editor.snippet_form.text(.name));
+    try t.expectEqualStrings("", editor.snippet_form.error_message);
+    try t.expect(editor.snippets.command("snippet.zig.~never-saved") == null);
+    try t.expectError(error.FileNotFound, tmp.dir.access(t.io, my_snippets, .{}));
+    try dvui.testing.pressKey(.right, .none);
+    try dvui.testing.writeText("y");
+    try snippetsTestFrame(ui.window, &editor, &g, &ms);
+    try t.expectEqualStrings(source ++ "y", editor.activeDoc().buffer.slice(0, editor.activeDoc().buffer.byteLen()));
+    // The Cancel button leaves it the same way.
+    _ = editor.execCommand("select_all", null);
+    try dvui.testing.pressKey(.s, ctrl_alt);
+    for (0..3) |_| try snippetsTestFrame(ui.window, &editor, &g, &ms);
+    try t.expectEqual(Editor.Mode.snippet_form, editor.mode);
+    try dvui.testing.moveTo("snippet_form_cancel");
+    try dvui.testing.click(.left);
+    try snippetsTestFrame(ui.window, &editor, &g, &ms);
+    try t.expectEqual(Editor.Mode.normal, editor.mode);
+
+    // Pinned to its window: other windows read the mode as normal. (No
+    // frame runs while there are two: that would open a real OS window.)
+    _ = editor.execCommand("select_all", null);
+    try dvui.testing.pressKey(.s, ctrl_alt);
+    for (0..3) |_| try snippetsTestFrame(ui.window, &editor, &g, &ms);
+    try dvui.testing.writeText("Kept");
+    try snippetsTestFrame(ui.window, &editor, &g, &ms);
+    try t.expectEqual(Editor.Mode.snippet_form, editor.mode);
+    editor.multi_window_supported = true;
+    const second = try editor.newWindow(.{ .editor = editor.active_doc_idx });
+    defer cur_win = 0;
+    try t.expectEqual(Editor.Mode.snippet_form, editor.mode);
+    cur_win = second;
+    try t.expectEqual(Editor.Mode.normal, guiMode(&editor));
+    cur_win = 0;
+    try t.expectEqual(Editor.Mode.snippet_form, guiMode(&editor));
+    // Opened from the second window, it is that window's; when that window
+    // closes, the primary takes the dialog over with what was typed.
+    editor.snippet_form.window_id = editor.windows.items[second].id;
+    try t.expectEqual(Editor.Mode.normal, guiMode(&editor));
+    cur_win = second;
+    try t.expectEqual(Editor.Mode.snippet_form, guiMode(&editor));
+    cur_win = 0;
+    try t.expect(editor.closeWindow(second));
+    try t.expectEqual(Editor.Mode.snippet_form, guiMode(&editor));
+    for (0..2) |_| try snippetsTestFrame(ui.window, &editor, &g, &ms);
+    try dvui.testing.expectVisible("snippet_form_name");
+    try t.expectEqualStrings("Kept", editor.snippet_form.text(.name));
+    try dvui.testing.pressKey(.escape, .none);
+    try snippetsTestFrame(ui.window, &editor, &g, &ms);
+    try t.expectEqual(Editor.Mode.normal, editor.mode);
+    try t.expectError(error.FileNotFound, tmp.dir.access(t.io, my_snippets, .{}));
 }
 
 const SheetIcon = struct { name: []const u8, tvg: []const u8 };

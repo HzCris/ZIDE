@@ -208,9 +208,14 @@ does not need to know the syntax before completion can finish it.
   saturating, the panes keep 40 columns), click-selects-then-click-inserts (no hover in the
   TUI), the preview scrolling long notes (Shift+Up/Down, Shift+PgUp/PgDn, the wheel; a `▼`
   marker row) and wrapping long code as the GUI does, `│` guides under open groups.
-- **Step 2: make your own** (N, M). "Save as snippet" from the selection (a form: name,
-  folder, optional trigger, notes) written to the user's own snippets file; edit and delete
-  from the panel; a filter box at the top.
+- **Step 2, checkpoint 1: save as snippet** (N, M) — **DONE 2026-10-17**: `snippet_file.zig`
+  (the marked-block format of `extensions/my-snippets.lua`, atomic rewrites),
+  `snippet_form.zig` (the form state both frontends share), `Definition.body`/`source` and
+  `removeSnippet`, `my-snippets.lua` loads last, `snippet_save_selection` on Ctrl+Alt+S, the
+  GUI dialog and the TUI bottom band.
+- **Step 2, checkpoint 2: edit, delete, copy to mine, filter** (N, M). Right-click / F2 /
+  Delete on panel rows (mine: edit and delete; bundled: copy to my snippets), a delete
+  confirmation, and type-to-filter in the panel (GUI box, TUI header).
 - **Step 3 (maybe): mirrored blanks** (N, M). The same field number in two places (`list` in
   the ArrayList skeleton) updating together; the bundled bodies hard-code repeats today and
   the notes say so.

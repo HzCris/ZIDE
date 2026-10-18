@@ -4,6 +4,7 @@ const Editor = @import("editor.zig").Editor;
 const lua_settings = @import("lua_settings.zig");
 const lua_api = @import("lua_api.zig");
 const snippets = @import("snippets.zig");
+const snippet_file = @import("snippet_file.zig");
 const Lua = @import("zlua").Lua;
 
 test "snippets integration: bundled Lua definitions reload and installation preserves customization" {
@@ -88,6 +89,123 @@ test "snippets integration: the bundled Zig set has 40+ skeletons, each filed in
         try t.expect(def.description.len > 0 and !std.mem.eql(u8, def.description, def.prefix));
     }
     try t.expect(editor.commands.get("snippet.zig.fn") != null);
+}
+
+test "my-snippets.lua: a rendered block loads in Lua and registers the same snippet" {
+    var lua = try Lua.init(t.allocator);
+    defer lua.deinit();
+    lua.openLibs();
+    var editor = try Editor.init(t.allocator, t.io);
+    defer editor.deinit();
+    lua_settings.registerApi(lua, &editor);
+    const body = "const s = \"q\\\"]]\";\n\tvar list = a[b[i]];\n$0";
+    const spec: snippets.Spec = .{ .language = "zig", .description = "Tricky \"one\"", .group = "Mine", .prefix = "trk", .notes = "line one\nline two", .body = body };
+    const block = try snippet_file.renderBlock(t.allocator, "snippet.zig.trk", spec);
+    defer t.allocator.free(block);
+    const blockz = try t.allocator.dupeZ(u8, block);
+    defer t.allocator.free(blockz);
+    try lua.doString(blockz);
+    const def = editor.snippets.command("snippet.zig.trk").?;
+    try t.expectEqualStrings("Tricky \"one\"", def.description);
+    try t.expectEqualStrings("Mine", def.group);
+    try t.expectEqualStrings("trk", def.prefix);
+    try t.expectEqualStrings("line one\nline two", def.notes);
+    try t.expectEqualStrings(body, def.body);
+    try t.expectEqualStrings("", def.source); // registered at runtime, not by a file
+    // The block round-trips through the file API too.
+    const file = try snippet_file.upsert(t.allocator, "", "snippet.zig.trk", block);
+    defer t.allocator.free(file);
+    const found = (try snippet_file.findBlock(file, "snippet.zig.trk")).?;
+    try t.expectEqualStrings(block, file[found.start..found.end]);
+}
+
+test "save selection as snippet: refusals, prefill, the file and the registry" {
+    var tmp = t.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(t.io, ".", t.allocator);
+    defer t.allocator.free(root);
+    lua_settings.test_config_dir = root;
+    defer lua_settings.test_config_dir = null;
+    var editor = try Editor.init(t.allocator, t.io);
+    defer editor.deinit();
+    editor.lsp_enabled = false;
+    const doc = editor.activeDoc();
+    doc.language = editor.findLanguage("zig");
+    try doc.loadText("    for (items) |item| {\r\n        use(item);\r\n    }\r\n");
+    // Nothing selected: refused.
+    editor.startSnippetSave();
+    try t.expectEqual(Editor.Mode.normal, editor.mode);
+    try t.expect(std.mem.indexOf(u8, editor.status_message, "select the code") != null);
+    // Two cursors: refused.
+    _ = editor.execCommand("select_all", null);
+    try doc.cursors.addCursor(0);
+    editor.startSnippetSave();
+    try t.expect(std.mem.indexOf(u8, editor.status_message, "single cursor") != null);
+    doc.cursors.clearSecondary();
+    // A terminal pane: refused.
+    try editor.terminals.append(t.allocator, null); // fake slot: no shell
+    editor.windows.items[0].layout.panes.items[0].content = .{ .terminal = 0 };
+    editor.startSnippetSave();
+    try t.expect(std.mem.indexOf(u8, editor.status_message, "editor pane") != null);
+    editor.windows.items[0].layout.panes.items[0].content = .{ .editor = 0 };
+    // The selection: the form opens prefilled with the dedented body, the
+    // document's language and the default folder.
+    _ = editor.execCommand("select_all", null);
+    editor.startSnippetSave();
+    try t.expectEqual(Editor.Mode.snippet_form, editor.mode);
+    const form = &editor.snippet_form;
+    try t.expectEqualStrings("for (items) |item| {\n    use(item);\n}", form.text(.body));
+    try t.expectEqualStrings("zig", form.text(.language));
+    try t.expectEqualStrings("Mine", form.text(.folder));
+    try t.expectEqualStrings("", form.text(.name));
+    // No name: the form stays and says why.
+    try t.expect(!editor.submitSnippetForm());
+    try t.expect(form.error_message.len > 0);
+    try t.expectEqual(Editor.Mode.snippet_form, editor.mode);
+    form.set(.name, "My loop");
+    form.set(.notes, "Runs the body once per item.");
+    try t.expect(editor.submitSnippetForm());
+    try t.expectEqual(Editor.Mode.normal, editor.mode);
+    try t.expectEqualStrings("Saved to my-snippets.lua: My loop", editor.status_message);
+    // Registered as the file's own, with the body and the folder.
+    const def = editor.snippets.command("snippet.zig.~my-loop").?;
+    try t.expect(snippet_file.isMine(def));
+    try t.expect(def.from_extension);
+    try t.expectEqualStrings("Mine", def.group);
+    try t.expectEqualStrings("for (items) |item| {\n    use(item);\n}", def.body);
+    try t.expectEqualStrings("Mine", form.lastFolder());
+    // The file holds the header and the block; saving the same name again
+    // replaces the block instead of adding one.
+    const path = try std.fs.path.join(t.allocator, &.{ root, "extensions", snippet_file.file_name });
+    defer t.allocator.free(path);
+    const text = try snippet_file.read(t.allocator, t.io, path);
+    defer t.allocator.free(text);
+    try t.expect(std.mem.startsWith(u8, text, snippet_file.header));
+    try t.expectEqual(@as(usize, 1), std.mem.count(u8, text, "-- zide:snippet snippet.zig.~my-loop"));
+    _ = editor.execCommand("select_all", null);
+    editor.startSnippetSave();
+    form.set(.name, "My loop");
+    form.set(.folder, "Loops");
+    try t.expect(editor.submitSnippetForm());
+    const text2 = try snippet_file.read(t.allocator, t.io, path);
+    defer t.allocator.free(text2);
+    try t.expectEqual(@as(usize, 1), std.mem.count(u8, text2, "-- zide:snippet snippet.zig.~my-loop"));
+    try t.expect(std.mem.indexOf(u8, text2, "group = \"Loops\"") != null);
+    try t.expectEqualStrings("Loops", editor.snippets.command("snippet.zig.~my-loop").?.group);
+    try t.expectEqualStrings("Loops", form.lastFolder());
+    // Cancelling leaves the form without writing, and clears it.
+    _ = editor.execCommand("select_all", null);
+    editor.startSnippetSave();
+    form.set(.name, "Never saved");
+    editor.cancelSnippetForm();
+    try t.expectEqual(Editor.Mode.normal, editor.mode);
+    try t.expect(editor.snippets.command("snippet.zig.~never-saved") == null);
+    try t.expectEqualStrings("", form.text(.name));
+    // removeSnippet drops the definition and its palette command.
+    try t.expect(editor.removeSnippet("snippet.zig.~my-loop"));
+    try t.expect(editor.snippets.command("snippet.zig.~my-loop") == null);
+    try t.expect(editor.commands.get("snippet.zig.~my-loop") == null);
+    try t.expect(!editor.removeSnippet("snippet.zig.~my-loop"));
 }
 
 test "snippets integration: Lua reads group, notes and an optional prefix raw and reports type errors" {

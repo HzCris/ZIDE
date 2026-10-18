@@ -1,6 +1,7 @@
 const std = @import("std");
 const zlua = @import("zlua");
 const Editor = @import("editor.zig").Editor;
+const snippet_file = @import("snippet_file.zig");
 const theme_mod = @import("theme.zig");
 const ThemeColor = theme_mod.ThemeColor;
 const syntax = @import("syntax.zig");
@@ -1755,22 +1756,46 @@ pub fn loadExtensions(lua: *Lua) void {
     ensureSnippetExtension(iter_dir, io) catch |err| std.log.warn("Cannot create snippets-zig.lua: {s}", .{@errorName(err)});
 
     // Tag what the extension files register (register_lsp reads this) so
-    // reload_extensions can drop and re-add exactly those configs.
+    // reload_extensions can drop and re-add exactly those configs; each
+    // snippet also records the file that registered it.
     const maybe_editor = getEditor(@ptrCast(lua));
     if (maybe_editor) |ed| ed.loading_extensions = true;
     defer if (maybe_editor) |ed| {
         ed.loading_extensions = false;
+        ed.loading_extension_name = null;
     };
 
     var iter = iter_dir.iterate();
     while (iter.next(io) catch null) |entry| {
         if (entry.kind != .file) continue;
         if (!std.mem.endsWith(u8, entry.name, ".lua")) continue;
-
-        var path_buf: [512]u8 = undefined;
-        const full_path = std.fmt.bufPrint(&path_buf, "{s}/extensions/{s}", .{ dir, entry.name }) catch continue;
-        if (runLuaFile(lua, full_path, entry.name) == .loaded) std.log.info("Loaded extension: {s}", .{entry.name});
+        // The user's own snippets file runs last (below).
+        if (std.mem.eql(u8, entry.name, snippet_file.file_name)) continue;
+        runExtensionFile(lua, maybe_editor, entry.name);
     }
+    // After every other file, so a snippet saved from the panel replaces a
+    // bundled one with the same name whatever order the OS lists files in.
+    runExtensionFile(lua, maybe_editor, snippet_file.file_name);
+}
+
+/// Run `extensions/<name>` with the editor's loading context naming the
+/// file; a missing file is nothing (the user's snippets file only exists
+/// once something was saved to it).
+fn runExtensionFile(lua: *Lua, maybe_editor: ?*Editor, name: []const u8) void {
+    var path_buf: [512]u8 = undefined;
+    const full_path = extensionFilePath(&path_buf, name) orelse return;
+    if (maybe_editor) |ed| ed.loading_extension_name = name;
+    defer if (maybe_editor) |ed| {
+        ed.loading_extension_name = null;
+    };
+    if (runLuaFile(lua, full_path, name) == .loaded) std.log.info("Loaded extension: {s}", .{name});
+}
+
+/// `<config dir>/extensions/<name>`, or null without a config directory
+/// (or a name that does not fit).
+pub fn extensionFilePath(buf: []u8, name: []const u8) ?[]const u8 {
+    const dir = getConfigDir() orelse return null;
+    return std.fmt.bufPrint(buf, "{s}/extensions/{s}", .{ dir, name }) catch null;
 }
 
 pub const zig_snippets = @embedFile("../extensions/snippets-zig.lua");

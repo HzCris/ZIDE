@@ -24,6 +24,8 @@ pub const text_file = @import("text_file.zig");
 const text_input = @import("text_input.zig");
 const snippets_mod = @import("snippets.zig");
 pub const snippet_panel_mod = @import("snippet_panel.zig");
+pub const snippet_form_mod = @import("snippet_form.zig");
+pub const snippet_file = @import("snippet_file.zig");
 const nav_history = @import("nav_history.zig");
 const picker_mod = @import("picker.zig");
 const WalkIgnore = @import("walk_ignore.zig").WalkIgnore;
@@ -278,6 +280,9 @@ pub const Editor = struct {
     /// True while extensions/*.lua are being (re)loaded — register_lsp tags
     /// configs so reload_extensions can drop and re-add exactly those.
     loading_extensions: bool = false,
+    /// The extension file being run right now (borrowed from the loader);
+    /// a snippet registered meanwhile records it as its `source`.
+    loading_extension_name: ?[]const u8 = null,
 
     /// Lua state for extension callbacks (set by lua_settings.registerApi;
     /// null in tests that don't create one). Owned by main.zig and must
@@ -415,6 +420,9 @@ pub const Editor = struct {
     tui_snippets_width: u16 = 32,
     snippets_double_click: bool = false,
     snippet_panel: snippet_panel_mod.State = .{},
+    /// The "Save as snippet" form (snippet_form.zig), shown while
+    /// `mode == .snippet_form`.
+    snippet_form: snippet_form_mod.State = .{},
 
     pub const EncodingChoice = struct { path: []u8, encoding: text_file.TextEncoding };
     pub const EncodingAction = enum { choose, open, reopen, save };
@@ -496,6 +504,10 @@ pub const Editor = struct {
         git_stage_prompt,
         settings,
         filetree_prompt,
+        /// The Save / Edit / Copy snippet form (`snippet_form`): a dvui
+        /// dialog pinned to `snippet_form.window_id` in the GUI, a bottom
+        /// band in the TUI.
+        snippet_form,
     };
 
     /// One editor window: a layout tree of panes plus its focused pane.
@@ -612,6 +624,7 @@ pub const Editor = struct {
         self.lsp_too_large.deinit(self.allocator);
         self.commands.deinit();
         self.snippet_panel.deinit(self.allocator);
+        self.snippet_form.deinit(self.allocator);
         self.snippets.deinit(self.allocator);
         self.keybinds.deinit();
         var prof_it = self.lang_profiles.iterator();
@@ -3827,7 +3840,9 @@ pub const Editor = struct {
     pub fn cancelTransientMode(self: *Editor) void {
         self.cancelSnippets();
         switch (self.mode) {
-            .normal, .settings, .encoding_picker, .confirm_reopen, .confirm_encoding, .confirm_overwrite, .save_as => {},
+            // The snippet form is pinned to one window, like Settings: what
+            // was typed into it survives a switch to another window.
+            .normal, .settings, .snippet_form, .encoding_picker, .confirm_reopen, .confirm_encoding, .confirm_overwrite, .save_as => {},
             else => self.setMode(.normal),
         }
         self.clearCompletionItems();
@@ -3863,6 +3878,7 @@ pub const Editor = struct {
                 .workspace_preview => self.lsp_tools.resolvePreview(self, false),
                 .git_stage_prompt => self.git.resolveStage(self, false),
                 .task_save_prompt => self.tasks.resolveSave(self, .cancel),
+                .snippet_form => self.snippet_form.reset(self.allocator),
                 else => {},
             }
         }
@@ -3902,8 +3918,10 @@ pub const Editor = struct {
     pub fn closeWindow(self: *Editor, idx: usize) bool {
         if (idx == 0 or idx >= self.windows.items.len) return false;
         const win = self.windows.items[idx];
-        // A Settings dialog open in this window carries on in the primary.
+        // A Settings dialog or a snippet form open in this window carries
+        // on in the primary, with what was typed.
         if (win.id == self.settings_window_id) self.settings_window_id = self.windows.items[0].id;
+        if (win.id == self.snippet_form.window_id) self.snippet_form.window_id = self.windows.items[0].id;
         // Its documents stay open: the tabs go back to the main window.
         self.windows.items[0].tabs.appendSlice(self.allocator, win.tabs.items) catch {};
         win.tabs.deinit(self.allocator);
@@ -5390,6 +5408,7 @@ pub const Editor = struct {
     pub fn registerSnippet(self: *Editor, spec: snippets_mod.Spec) ![]const u8 {
         var def = try snippets_mod.Definition.init(self.allocator, spec, self.loading_extensions);
         errdefer def.deinit(self.allocator);
+        if (self.loading_extension_name) |name| def.source = try self.allocator.dupe(u8, name);
         var replace: ?usize = null;
         for (self.snippets.items.items, 0..) |*old, i| {
             if (std.mem.eql(u8, old.command, def.command)) {
@@ -5418,6 +5437,198 @@ pub const Editor = struct {
             def.deinit(self.allocator);
         }
         self.snippets.revision += 1;
+    }
+
+    /// Drop the snippet registered as `command`, palette entry included;
+    /// false when there is none.
+    pub fn removeSnippet(self: *Editor, command: []const u8) bool {
+        for (self.snippets.items.items, 0..) |*def, i| {
+            if (!std.mem.eql(u8, def.command, command)) continue;
+            self.cancelSnippets();
+            var removed = self.snippets.items.orderedRemove(i);
+            self.commands.removeSnippet(removed.command);
+            removed.deinit(self.allocator);
+            self.snippets.revision += 1;
+            return true;
+        }
+        return false;
+    }
+
+    /// Where the panel keeps the user's own snippets:
+    /// `<config dir>/extensions/my-snippets.lua`; null without a config
+    /// directory.
+    pub fn mySnippetsPath(buf: []u8) ?[]const u8 {
+        return @import("lua_settings.zig").extensionFilePath(buf, snippet_file.file_name);
+    }
+
+    /// snippet_save_selection (Ctrl+Alt+S): open the form, prefilled from
+    /// the selection, to save it to my-snippets.lua. A refusal goes to the
+    /// status bar and opens nothing.
+    pub fn startSnippetSave(self: *Editor) void {
+        if (self.mode != .normal) return;
+        if (self.activePaneIsTerminal()) {
+            self.status_message = "Save as snippet: focus an editor pane with a selection first";
+            return;
+        }
+        const doc = self.activeDoc();
+        if (doc.cursors.count() != 1) {
+            self.status_message = "Save as snippet: needs a single cursor";
+            return;
+        }
+        const selection = doc.selectedText() orelse "";
+        if (selection.len == 0) {
+            self.status_message = "Save as snippet: select the code first";
+            return;
+        }
+        if (!std.unicode.utf8ValidateSlice(selection)) {
+            self.status_message = "Save as snippet: the selection is not valid UTF-8";
+            return;
+        }
+        // The selection may sit in a shared scratch buffer: prepare it now.
+        const body = snippet_form_mod.prepareBody(self.allocator, selection) catch {
+            self.status_message = "Save as snippet: out of memory";
+            return;
+        };
+        defer self.allocator.free(body);
+        if (body.len == 0) {
+            // Only blanks and line breaks were selected.
+            self.status_message = "Save as snippet: select the code first";
+            return;
+        }
+        if (body.len >= snippet_form_mod.max_body) {
+            self.status_message = "Save as snippet: the selection is too long (8 KiB max)";
+            return;
+        }
+        const form = &self.snippet_form;
+        form.reset(self.allocator);
+        form.set(.folder, form.lastFolder());
+        form.set(.language, if (doc.language) |lang| lang.name else "*");
+        form.setRaw(.body, body);
+        self.openSnippetForm(.save);
+    }
+
+    /// Show the form, its fields already filled, pinned to the active window.
+    fn openSnippetForm(self: *Editor, kind: snippet_form_mod.Kind) void {
+        const form = &self.snippet_form;
+        form.kind = kind;
+        form.field = .name;
+        form.error_message = "";
+        form.window_id = self.activeWindow().id;
+        self.setMode(.snippet_form);
+    }
+
+    /// Leave the form without saving (Escape, Cancel, the dialog's X).
+    pub fn cancelSnippetForm(self: *Editor) void {
+        if (self.mode == .snippet_form) self.setMode(.normal);
+    }
+
+    /// Save the form: check it the way the registry would, write its block
+    /// to my-snippets.lua, register the snippet and leave the form. False
+    /// keeps the form open with `snippet_form.error_message` saying why.
+    pub fn submitSnippetForm(self: *Editor) bool {
+        const form = &self.snippet_form;
+        form.error_message = "";
+        const spec = form.spec();
+        var probe = snippets_mod.Definition.init(self.allocator, spec, true) catch |err| {
+            form.error_message = snippet_form_mod.errorMessage(err);
+            return false;
+        };
+        defer probe.deinit(self.allocator);
+        if (self.commands.get(probe.command)) |existing| {
+            if (!existing.snippet) {
+                form.error_message = snippets_mod.errorMessage(error.CommandConflict);
+                return false;
+            }
+        }
+        var path_buf: [512]u8 = undefined;
+        const path = mySnippetsPath(&path_buf) orelse {
+            form.error_message = "No config directory (HOME / USERPROFILE is not set)";
+            return false;
+        };
+        // The file open in a tab with unsaved edits: writing would lose them.
+        const open_doc: ?usize = self.findDocument(path) catch null;
+        if (open_doc) |idx| {
+            if (self.documents.items[idx].dirty) {
+                form.error_message = "my-snippets.lua has unsaved changes in a tab: save or close it first";
+                return false;
+            }
+        }
+        const text = snippet_file.read(self.allocator, self.io, path) catch |err| {
+            form.error_message = form.fail("Cannot read my-snippets.lua: {s}", .{@errorName(err)});
+            return false;
+        };
+        defer self.allocator.free(text);
+        const block = snippet_file.renderBlock(self.allocator, probe.command, spec) catch |err| {
+            form.error_message = switch (err) {
+                error.MarkerInBody => "A snippet body cannot contain a `-- zide:` marker line",
+                error.OutOfMemory => "Save as snippet: out of memory",
+            };
+            return false;
+        };
+        defer self.allocator.free(block);
+        const lookup = form.editing orelse probe.command;
+        const new_text = snippet_file.upsert(self.allocator, text, lookup, block) catch |err| {
+            form.error_message = switch (err) {
+                error.Duplicate => "my-snippets.lua has two blocks for this snippet: fix the file by hand",
+                error.Unterminated => "my-snippets.lua has a damaged block for this snippet (no `-- zide:end` line): fix the file by hand",
+                error.OutOfMemory => "Save as snippet: out of memory",
+            };
+            return false;
+        };
+        defer self.allocator.free(new_text);
+        snippet_file.write(self.allocator, self.io, path, new_text) catch |err| {
+            form.error_message = form.fail("Cannot write my-snippets.lua: {s}", .{@errorName(err)});
+            return false;
+        };
+        // A clean tab shows the new text at once (the external-change poll
+        // would reload it a second later and overwrite the status line).
+        if (open_doc) |idx| self.documents.items[idx].reloadFromDisk(self.io) catch {};
+        // Register it the way the file will on the next load: an extension
+        // snippet from my-snippets.lua.
+        self.loading_extensions = true;
+        self.loading_extension_name = snippet_file.file_name;
+        const registered = self.registerSnippet(spec);
+        self.loading_extensions = false;
+        self.loading_extension_name = null;
+        const command = registered catch |err| {
+            // Written, so it is live after a reload; say what went wrong now.
+            self.status_message = snippets_mod.errorMessage(err);
+            self.setMode(.normal);
+            return true;
+        };
+        form.rememberFolder(spec.group);
+        self.status_message = std.fmt.bufPrint(&self.status_buf, "Saved to my-snippets.lua: {s}", .{spec.description}) catch "Saved to my-snippets.lua";
+        self.setMode(.normal);
+        if (self.snippets_visible) self.selectSnippetRow(command);
+        return true;
+    }
+
+    /// Put the panel's selection on the snippet registered as `command`,
+    /// opening its group when it is closed.
+    fn selectSnippetRow(self: *Editor, command: []const u8) void {
+        var opened = false;
+        while (true) {
+            const panel = self.syncSnippetPanel();
+            const defs = self.snippets.items.items;
+            for (panel.rows.items, 0..) |row, i| {
+                if (row.kind != .item or row.def >= defs.len) continue;
+                if (std.mem.eql(u8, defs[row.def].command, command)) {
+                    panel.selected = i;
+                    panel.scroll_to_selected = true;
+                    return;
+                }
+            }
+            if (opened) return;
+            const def = self.snippets.command(command) orelse return;
+            for (panel.groups.items, 0..) |g, gi| {
+                if (!g.expanded and std.mem.eql(u8, g.name, def.group) and std.ascii.eqlIgnoreCase(g.language, def.language)) {
+                    panel.toggle(self.allocator, gi);
+                    opened = true;
+                    break;
+                }
+            }
+            if (!opened) return;
+        }
     }
 
     pub fn editorOwnsInput(self: *Editor) bool {

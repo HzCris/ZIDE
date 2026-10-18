@@ -162,6 +162,7 @@ const welcome_text =
     \\//   Ctrl+Alt+Q        close terminal     (or type exit, then press any key)
     \\//   Ctrl+B            toggle file tree   Ctrl+Space       completion (LSP)
     \\//   Ctrl+Alt+B        snippets panel: syntax skeletons by plain name (click to insert)
+    \\//   Ctrl+Alt+S        save the selection as a snippet (name, folder, trigger → my-snippets.lua)
     \\//   Ctrl+Shift+O      open folder as project   (palette: recent_projects; tree: o)
     \\//   F12               go to definition   Shift+F12        find references
     \\//   Ctrl+F12          symbols in file    Ctrl+T           workspace symbols
@@ -690,6 +691,8 @@ comptime {
     _ = @import("core/editor.zig");
     _ = @import("core/snippets.zig");
     _ = @import("core/snippet_panel.zig");
+    _ = @import("core/snippet_file.zig");
+    _ = @import("core/snippet_form.zig");
     _ = @import("core/snippet_integration_tests.zig");
     _ = @import("core/keybind.zig");
     _ = @import("core/syntax.zig");

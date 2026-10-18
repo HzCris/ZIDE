@@ -104,6 +104,7 @@ Reloading extensions cancels their tasks, disconnects their active debug session
 | Ctrl+Alt+` | Detach the focused terminal into its own OS window (GUI; TUI: second terminal at the side) |
 | Ctrl+B | Toggle file tree side panel |
 | Ctrl+Alt+B | Toggle the Snippets side panel — syntax skeletons by plain name; click a row to select it, click the highlighted one to insert it — see *Snippets* |
+| Ctrl+Alt+S | Save the selection as a snippet — a small form (name, folder, trigger, language, notes) writes it to `extensions/my-snippets.lua` and the panel shows it — see *Snippets* |
 | Ctrl+Shift+O | Open a folder as the project (GUI: native dialog; TUI: path prompt) |
 | Ctrl+F8 | Review changed files (verdicts, progress, baseline) |
 | F8 / Shift+F8 | Read the next / previous changed file in the review reader |
@@ -252,6 +253,7 @@ Windows terminals commonly intercept Alt combos (Windows Terminal binds Alt+arro
 - Data-driven keybinding map (all Ctrl/Alt shortcuts remappable, globally or per language)
 - File tree side panel (Ctrl+B) — dockable left/right column band with mouse + keyboard browsing, create/rename/delete prompts, reveal-current-file (see File Tree section)
 - Snippets side panel (Ctrl+Alt+B) — the document language's snippets in collapsible groups by plain name with a preview (the code with its blanks, the notes) under them; click a row to select it, click the highlighted item or press Enter to insert it at the caret with Tab walking the blanks; docks like the tree (`tui_snippets_width` columns), Shift+Up/Down scroll long notes (see *Snippets*)
+- Save as snippet (Ctrl+Alt+S) — a bottom panel with Name, Folder, Trigger, Language and Notes rows (Tab moves between them, Enter saves, Escape cancels) saves the selection to `extensions/my-snippets.lua` and registers it at once (see *Snippets*)
 - Auto-save (off by default — `zide.set("auto_save", true)` or the Settings dialog; saves dirty documents with file paths after a configurable interval, default 5s; continues while the TUI is idle)
 - Application icon embedded in exe
 - Multiple cursor editing (Ctrl+Shift or Ctrl+Alt+Up/Down, Ctrl+D, Alt+click, Escape/click to clear; an added cursor keeps its column for the next Up/Down)
@@ -299,6 +301,7 @@ Cross-frontend gaps are tracked in [TODO.md](TODO.md) (verified backlog: navigat
 - Workspace search & replace (Ctrl+Shift+F): same engine and behavior as the TUI, with a VS Code-style panel — bordered input boxes with placeholders, clickable `Aa`/`W` toggle chips inside the search box (toggling re-runs the search), results **grouped under file headers** (collapse chevron + type icon + name + directory + match count — click a header to fold/unfold its file; the current file's header stays **pinned at the top** while its matches scroll, VS Code-style) with the match **highlighted inside each excerpt** and long excerpts ellipsis-windowed around the match; click fields to focus, double-click a result to open it, wheel scrolls, F4/Shift+F4 cycle results while editing
 - Keybinding remapping (Lua integration — `zide.bind`/`zide.unbind` via init.lua, global or per-language with `{ language = "zig" }`)
 - Snippets side panel (Ctrl+Alt+B, View > Snippets): the document language's snippets in collapsible groups by plain name, a preview with notes at the bottom (it takes the room a short list leaves free; notes that still do not fit scroll with the wheel or its scrollbar), click or Enter inserts at the caret and hands the keyboard back so Tab walks the blanks (with `snippets_double_click` a click selects and a double-click inserts); its own side (default: opposite the file tree) and drag-resizable width — drag the edge well past the minimum to hide it; right-click moves it — see *Snippets*
+- Save as snippet (Ctrl+Alt+S, Edit > Save Selection as Snippet…, the editor's right-click menu): a dialog with Name, Folder, Trigger, Language, Notes and an editable Body (add blanks like `${1:text}` right there) saves the selection to `extensions/my-snippets.lua` and registers it at once — see *Snippets*
 - Auto-save (off by default; saves dirty documents with file paths after a configurable interval, default 5s)
 - Application icon embedded in exe
 - SDL3GPU backend (GPU-accelerated rendering, opt-in via `zig build -Dgpu=true`, default SDL3 for lower memory)
@@ -710,6 +713,38 @@ Languages re-registered by the reload are replaced in place, and every open
 document's language is re-detected afterwards, so a new extension→language
 mapping applies to files that are already open.
 
+#### Your snippets: my-snippets.lua
+
+`~/.config/zide/extensions/my-snippets.lua` is created the first time you save a snippet from
+the editor (Ctrl+Alt+S — see *Making your own* under Snippets). It is ordinary Lua: one
+`zide.register_snippet({...})` call per snippet, each between a `-- zide:snippet <command>`
+line and a `-- zide:end` line:
+
+```lua
+-- zide:snippet snippet.zig.~for-each-item
+zide.register_snippet({
+    language = "zig",
+    description = "For each item",
+    group = "Mine",
+    prefix = "",
+    notes = "Runs the body once per item.",
+    body = [[
+for (items) |item| {
+    $0
+}]],
+})
+-- zide:end
+```
+
+The panel rewrites only the text between a block's two marker lines (new blocks go at the
+end); everything else in the file is left byte for byte, so you can add your own Lua above or
+below the blocks or edit a block by hand (then run `reload_extensions`). Keep the marker lines
+as they are — a block the panel cannot find any more is one it offers to open the file for.
+Bodies are written as Lua long strings (`[[...]]`, or `[=[...]=]` when the body contains
+`]]`), so nothing inside them needs escaping. The file runs **after every other extension
+file**, whatever order the operating system lists them in, so a snippet saved here replaces a
+bundled one with the same language and name, and a bundled-file upgrade cannot undo that.
+
 #### Extension Directory
 
 ```
@@ -719,6 +754,7 @@ mapping applies to files that are already open.
 │   ├── example-lint-zig.lua          # Bundled on-save linter demo (commented out)
 │   ├── markdown.lua                  # Bundled toggle_checkbox command
 │   ├── snippets-zig.lua              # Bundled Zig snippets (updated until you edit it)
+│   ├── my-snippets.lua               # Your saved snippets (the panel rewrites only its marked blocks)
 │   ├── python.lua
 │   ├── c.lua
 │   └── ...
@@ -1005,7 +1041,7 @@ Key combos for `zide.bind` / `zide.unbind` accept any case and modifier order (`
 
 **Keyboard focus.** In normal mode exactly one of the focused editor pane, the focused terminal pane, the file tree, the Snippets panel and the search panel owns the keyboard (when flags disagree, the tree wins, then the Snippets panel). The side panels live in the main window and can own the keyboard only while that window is focused. Clicking any pane, clicking a tab, splitting, F6 / Shift+F6, switching windows and `toggle_terminal` (Ctrl+backtick) give the keyboard back to the pane; `toggle_terminal` with a panel focused over a terminal pane focuses that terminal instead of opening another. While a panel owns the keyboard, clipboard, select-all and word-delete chords never touch the document behind it: in the search panel the keys bound to copy and cut take the whole focused field, paste appends the clipboard's first line and Ctrl+Backspace deletes the previous word, while Ctrl+A and Ctrl+Delete do nothing; in the file tree the keys bound to copy, cut and paste drive the file clipboard; the Snippets panel swallows them all. The Edit menu's Cut/Copy/Paste/Select All follow the same rule.
 
-About 166 registered commands; every one is listed in the command palette and bindable with `zide.bind`. The tables below are the complete set (names as the code registers them, 2026-10-15). "Default key" is the shipped binding; **hard-wired** means the frontends dispatch that plain key themselves, so it is not in the keybind map — the command can still be bound to a chord of your own. `theme_*`, `gui_theme_*` and `tui_theme_*` re-apply `themes/syntax-theme.lua` and the `syn_theme_<lang>.lua` files on top of the new palette (the editor-color override files `gui-theme.lua` / `tui-theme.lua` are not re-run until the next launch).
+About 167 registered commands; every one is listed in the command palette and bindable with `zide.bind`. The tables below are the complete set (names as the code registers them, 2026-10-17). "Default key" is the shipped binding; **hard-wired** means the frontends dispatch that plain key themselves, so it is not in the keybind map — the command can still be bound to a chord of your own. `theme_*`, `gui_theme_*` and `tui_theme_*` re-apply `themes/syntax-theme.lua` and the `syn_theme_<lang>.lua` files on top of the new palette (the editor-color override files `gui-theme.lua` / `tui-theme.lua` are not re-run until the next launch).
 
 **Files, tabs and projects**
 
@@ -1130,6 +1166,7 @@ About 166 registered commands; every one is listed in the command palette and bi
 | `snippet_next` / `snippet_previous` | Tab / Shift+Tab (hard-wired) | Visit the next / previous placeholder |
 | `snippet_cancel` | Escape (hard-wired) | End snippet navigation |
 | `toggle_snippets` | Ctrl+Alt+B | Show, focus or hide the Snippets side panel (the same three-step cycle as `toggle_filetree`) |
+| `snippet_save_selection` | Ctrl+Alt+S | Save the selection as a snippet through a form (name, folder, trigger, language, notes) into `my-snippets.lua` — see *Making your own* |
 
 **Tasks, problems, Git and debugging**
 
@@ -1219,6 +1256,39 @@ see *The Shipped Extension: snippets-zig.lua* under the Extension System.
   band with a two-column continuation indent, blanks are drawn in the selection colors, and a
   `│` guide sits under each open group, all in the TUI theme's `gutter_separator` color.
 
+### Making your own
+
+- **Ctrl+Alt+S** (`snippet_save_selection`; Edit > Save Selection as Snippet…, also in the
+  editor's right-click menu; on keyboard layouts where Ctrl+Alt is AltGr, use the palette or
+  the menu) turns the selection into a snippet. It refuses, with a status-bar message, when
+  nothing is selected (or only blanks), the focused pane is a terminal, several cursors are
+  active, the selection is not valid UTF-8, or it is longer than 8 KiB.
+- A small form opens. In the GUI it is a dialog window: Tab / Shift+Tab move between the
+  boxes, Enter in a one-line box saves (in Notes and Body it starts a new line; the Save
+  button always saves), Escape cancels; in the Body box Tab moves on rather than typing a
+  tab, so the selection's indentation stays as it was. In the TUI it is a panel above the
+  status bar: Tab / Shift+Tab or Down / Up move between its rows, Enter saves, Escape
+  cancels. The fields:
+  - **Name** (required): what the panel and the palette show.
+  - **Folder**: the panel group; empty means "Mine". The last folder you used is prefilled.
+  - **Trigger**: optional — letters, digits, `_` or non-ASCII, no leading digit. Leave it
+    empty for most skeletons (see *Using them with Tab* for why).
+  - **Language**: the document's language, or `*` for every file.
+  - **Notes**: the plain-language explanation the preview shows.
+  - **Body**: the selection, with its line endings normalized and the indentation every line
+    shares removed (a first line that started mid-line does not count). In the GUI you can
+    edit it right there — add blanks like `${1:text}` and `$0`; a hint under the box repeats
+    the syntax. The TUI saves the selection as it is (open my-snippets.lua to add blanks).
+- Save checks the same rules as `zide.register_snippet` (the message appears in the form),
+  writes the snippet into `~/.config/zide/extensions/my-snippets.lua` and registers it at
+  once: the status bar says "Saved to my-snippets.lua: <name>" and, when the panel is open,
+  selects the new row. The same name saved again replaces the earlier block. A
+  `my-snippets.lua` open in a tab with unsaved changes blocks the save (save or close it
+  first); a clean tab reloads to show the new block.
+- That file is yours: *Your snippets: my-snippets.lua* under the Extension System describes
+  its format and the rules the panel follows when rewriting it. Editing and deleting snippets
+  from the panel is the next step.
+
 ### Using them with Tab
 
 - Type a trigger and press **Tab**: when the whole identifier just before the caret exactly
@@ -1274,7 +1344,8 @@ description) replaces the snippet; a name already owned by a `zide.command` is r
 language-specific snippet beats a `"*"` snippet with the same prefix. Snippets from `extensions/*.lua` are dropped and re-created by `reload_extensions`,
 while ones registered from init.lua survive reloads — but init.lua runs before extensions, so
 a bundled snippet with the same language and prefix replaces it at every load (edit
-`snippets-zig.lua` itself instead).
+`snippets-zig.lua` itself instead). Your own `my-snippets.lua` runs after every other
+extension file, so a snippet saved from the panel wins over a bundled one with the same name.
 
 ### Template syntax
 

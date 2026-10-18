@@ -416,6 +416,7 @@ pub fn registerBuiltins(registry: *CommandRegistry) !void {
     // File tree commands
     try registry.register("toggle_filetree", "Toggle the file tree side panel", cmdToggleFiletree);
     try registry.register("toggle_snippets", "Toggle the Snippets side panel (syntax skeletons by plain name)", cmdToggleSnippets);
+    try registry.register("snippet_save_selection", "Save the selection as a snippet (a form: name, folder, trigger, notes)", cmdSnippetSaveSelection);
     try registry.register("filetree_reveal", "Reveal the current file in the file tree", cmdFiletreeReveal);
     try registry.register("filetree_refresh", "Refresh the file tree from disk", cmdFiletreeRefresh);
     try registry.register("filetree_root_up", "Re-root the file tree at the parent directory", cmdFiletreeRootUp);
@@ -1572,6 +1573,10 @@ fn cmdToggleFiletree(editor: *Editor, _: ?[]const u8) void {
 
 fn cmdToggleSnippets(editor: *Editor, _: ?[]const u8) void {
     editor.toggleSnippets();
+}
+
+fn cmdSnippetSaveSelection(editor: *Editor, _: ?[]const u8) void {
+    editor.startSnippetSave();
 }
 
 fn cmdFiletreeRefresh(editor: *Editor, _: ?[]const u8) void {
