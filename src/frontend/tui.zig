@@ -286,6 +286,7 @@ fn applyPaste(editor: *Editor, text: []const u8) void {
     switch (editor.mode) {
         .normal => switch (editor.keyboardOwner()) {
             .terminal => if (activeTerminal(editor)) |term| term.paste(text),
+            .terminal_panel => if (editor.terminalPanelTerminal()) |term| term.paste(text),
             .editor => pasteIntoDocument(editor, text),
             .search => typeLine(editor, firstLine(text)),
             .filetree, .snippets => {},
@@ -302,6 +303,12 @@ fn applyPaste(editor: *Editor, text: []const u8) void {
 fn pasteIntoDocument(editor: *Editor, text: []const u8) void {
     editor.clearCompletionItems();
     const doc = editor.activeDoc();
+    // A read-only tab (the review reader) refuses the edit: say that, not
+    // "out of memory".
+    if (doc.readonly) {
+        editor.status_message = if (doc.reader != null) "Read-only review view — Enter opens the real file" else "Read-only document";
+        return;
+    }
     const eol = doc.lineEnding();
     var out: std.ArrayList(u8) = .empty;
     defer out.deinit(editor.allocator);
@@ -587,6 +594,7 @@ pub fn run(allocator: std.mem.Allocator, editor: *Editor) !void {
             // search panel draw their own selection / field marker).
             .normal => switch (editor.keyboardOwner()) {
                 .editor, .terminal => positionCursor(win, editor, width, height),
+                .terminal_panel => positionTerminalPanelCursor(win, editor),
                 .filetree, .snippets, .search => win.hideCursor(),
             },
         }
@@ -619,6 +627,7 @@ fn dispatchKey(editor: *Editor, key: Key) void {
     if (editor.mode == .normal) {
         switch (editor.keyboardOwner()) {
             .terminal => return handleTerminalKey(editor, key),
+            .terminal_panel => return handleTerminalPanelKey(editor, key),
             .filetree => return handleFiletreeKey(editor, key),
             .snippets => return handleSnippetsKey(editor, key),
             .search => return handleSearchKey(editor, key),
@@ -734,11 +743,18 @@ fn hasCommandMod(key: Key) bool {
 
 /// Handle key events when focused on a terminal pane.
 fn handleTerminalKey(editor: *Editor, key: Key) void {
+    handleTerminalKeyFor(editor, key, activeTerminal(editor));
+}
+
+/// A key for `term` — the focused terminal pane's shell or the terminal
+/// panel's: the management chords stay with ZIDE, the rest is typed in.
+fn handleTerminalKeyFor(editor: *Editor, key: Key, maybe_term: ?*terminal_mod.Terminal) void {
     // Modifier keys alone send nothing (their private-use codes used to be
     // dropped by accident; now explicitly).
     if (key.isModifier()) return;
-    // ctrl+backtick (`) toggles back to editor
-    if (key.codepoint == '`' and key.mods.ctrl and !key.mods.alt) {
+    // ctrl+backtick (`) toggles back to editor (Ctrl+Shift+` is the
+    // terminal panel's chord, let through below)
+    if (key.codepoint == '`' and key.mods.ctrl and !key.mods.alt and !key.mods.shift) {
         editor.toggleTerminal();
         return;
     }
@@ -753,7 +769,7 @@ fn handleTerminalKey(editor: *Editor, key: Key) void {
         }
     }
 
-    const term = activeTerminal(editor) orelse return;
+    const term = maybe_term orelse return;
     // The shell has ended: the next key closes the pane instead of being
     // typed into nothing (the status bar says so).
     if (term.exited) {
@@ -901,11 +917,18 @@ var snippets_preview_overflow: usize = 0;
 var snippets_preview_rows: usize = 1;
 var snippets_preview_def: ?u32 = null;
 
+/// The terminal panel band from the last draw (absolute screen coords)
+/// and where its shell's grid starts inside it (`grid_x`/`grid_y`, past
+/// the header row and the separator column). Null when hidden.
+const TerminalPanelBand = struct { x: u16, y: u16, w: u16, h: u16, grid_x: u16, grid_y: u16, grid_w: u16, grid_h: u16 };
+var terminal_panel_band: ?TerminalPanelBand = null;
+
 /// Draw the full editor screen.
 fn drawEditor(win: Window, editor: *Editor, width: u16, height: u16) void {
     pane_rect_count = 0;
     filetree_band = null;
     snippets_band = null;
+    terminal_panel_band = null;
     search_band = null;
     snippet_form_band = null;
     encoding_band = null;
@@ -985,21 +1008,64 @@ fn drawEditor(win: Window, editor: *Editor, width: u16, height: u16) void {
         }
     }
     const snip_left: u16 = if (snip_w > 0 and editor.snippetsSide() == .left) snip_w else 0;
-    const content_x: u16 = tree_left + snip_left;
-    const content_width = (width -| tree_w) -| snip_w;
+    var content_x: u16 = tree_left + snip_left;
+    var content_width = (width -| tree_w) -| snip_w;
+    var panes_height = content_height;
+
+    // The terminal panel: a third band inward of the tree and the Snippets
+    // panel on a side (full height, like a chat column), or a strip at the
+    // bottom of the pane area between the side bands. A side band keeps
+    // the panes 40 columns, the bottom strip keeps them half the rows; with
+    // less than its minimum it hides itself and says so.
+    if (editor.terminal_panel_visible and editor.terminal_panel != null) {
+        const lim = Editor.terminal_panel_limits;
+        const side = editor.terminal_panel_side;
+        if (side == .bottom) {
+            const tp_h: u16 = @min(editor.tui_terminal_panel_height, content_height / 2);
+            if (tp_h < lim.tui_min_height) {
+                terminalPanelNoRoom(editor);
+            } else {
+                const band_y = tab_bar_height + content_height - tp_h;
+                const band_win = win.child(.{
+                    .x_off = @intCast(content_x),
+                    .y_off = @intCast(band_y),
+                    .width = content_width,
+                    .height = tp_h,
+                });
+                terminal_panel_band = drawTerminalPanel(band_win, editor, content_x, band_y, content_width, tp_h, .bottom);
+                panes_height = content_height - tp_h;
+            }
+        } else {
+            const tp_w: u16 = @min(editor.tui_terminal_panel_width, content_width -| 40);
+            if (tp_w < lim.tui_min_width) {
+                terminalPanelNoRoom(editor);
+            } else {
+                const band_x: u16 = if (side == .left) content_x else content_x + content_width - tp_w;
+                const band_win = win.child(.{
+                    .x_off = @intCast(band_x),
+                    .y_off = @intCast(tab_bar_height),
+                    .width = tp_w,
+                    .height = content_height,
+                });
+                terminal_panel_band = drawTerminalPanel(band_win, editor, band_x, tab_bar_height, tp_w, content_height, side);
+                if (side == .left) content_x += tp_w;
+                content_width -= tp_w;
+            }
+        }
+    }
 
     // Render pane tree into the content area
     const content_win = win.child(.{
         .x_off = @intCast(content_x),
         .y_off = @intCast(tab_bar_height),
-        .height = content_height,
+        .height = panes_height,
         .width = content_width,
     });
     // NOTE: screen_x comes before screen_y — the tab bar offsets Y only.
     // (These were swapped once: with 2+ tabs open every pane rect shifted
     // one row up / one col right, drawing the cursor next to the wrong line
     // and skewing mouse hit-testing.)
-    renderPaneLayout(content_win, editor, 0, content_x, tab_bar_height, content_width, content_height);
+    renderPaneLayout(content_win, editor, 0, content_x, tab_bar_height, content_width, panes_height);
 
     // Snippet form band (full width, above the search panel)
     if (form_h > 0) {
@@ -1621,6 +1687,15 @@ fn mouseOverSnippets(mouse: vaxis.Mouse) bool {
         mr >= band.y and mr < @as(i32, band.y) + band.h;
 }
 
+/// Whether the mouse is over the terminal panel band (last draw).
+fn mouseOverTerminalPanel(mouse: vaxis.Mouse) bool {
+    const band = terminal_panel_band orelse return false;
+    const mc: i32 = @intCast(mouse.col);
+    const mr: i32 = @intCast(mouse.row);
+    return mc >= band.x and mc < @as(i32, band.x) + band.w and
+        mr >= band.y and mr < @as(i32, band.y) + band.h;
+}
+
 /// Left click inside the Snippets band: the panel takes the keyboard; a
 /// group row opens or closes, an item row is selected (its preview shows)
 /// and, when it was the highlighted row already, inserted — there is no
@@ -1722,6 +1797,90 @@ fn handleSnippetsKey(editor: *Editor, key: Key) void {
             _ = editor.syncSnippetPanel();
         },
     }
+}
+
+/// The terminal panel ran out of room: it hides itself (the shell keeps
+/// running), lets go of the keyboard and says what to do.
+fn terminalPanelNoRoom(editor: *Editor) void {
+    if (editor.keyboardOwner() == .terminal_panel) _ = editor.takeKeyboardFocus(.pane);
+    editor.terminal_panel_visible = false;
+    editor.terminal_panel_focused = false;
+    editor.status_message = "Terminal panel: no room beside the editor — enlarge the window, then Ctrl+Shift+`";
+}
+
+/// Draw the terminal panel band: a header row ("Terminal", bright while
+/// the panel has the keys, with the way out), a separator on the edge
+/// facing the panes (a column for a side band; the header row itself at
+/// the bottom), and the shell's grid in the rest, sized to fit. `x`/`y`
+/// are the band's absolute screen position (for the mouse and the caret).
+fn drawTerminalPanel(win: Window, editor: *Editor, x: u16, y: u16, w: u16, h: u16, side: Editor.DockEdge) ?TerminalPanelBand {
+    if (w < 2 or h < 2) return null;
+    const theme = editor.tui_theme;
+    const bg = toVaxis(theme.text_bg);
+    const bg_style: Style = .{ .fg = toVaxis(theme.text_fg), .bg = bg };
+    const line_style: Style = .{ .fg = toVaxis(theme.gutter_separator), .bg = bg };
+    win.fill(.{ .style = bg_style });
+    const focused = editor.keyboardOwner() == .terminal_panel;
+
+    // Separator column on the edge facing the panes (side bands only).
+    var grid_x: u16 = 0;
+    var grid_w: u16 = w;
+    if (side != .bottom) {
+        const sep_x: u16 = if (side == .left) w - 1 else 0;
+        for (0..h) |r| {
+            win.writeCell(sep_x, @intCast(r), .{
+                .char = .{ .grapheme = "\u{2502}", .width = 1 }, // │
+                .style = line_style,
+            });
+        }
+        grid_x = if (side == .left) 0 else 1;
+        grid_w = w - 1;
+    } else {
+        // The header row doubles as the separator under the panes.
+        for (0..w) |c| {
+            win.writeCell(@intCast(c), 0, .{
+                .char = .{ .grapheme = "\u{2500}", .width = 1 }, // ─
+                .style = line_style,
+            });
+        }
+    }
+
+    const header_style: Style = .{
+        .fg = toVaxis(if (focused) theme.overlay_accent else theme.gutter_text),
+        .bg = bg,
+        .bold = focused,
+    };
+    const title: []const u8 = if (focused)
+        " Terminal — Ctrl+` back to the editor "
+    else
+        " Terminal — Ctrl+Shift+` focuses ";
+    _ = writeStr(win, grid_x, 0, truncToWidth(title, grid_w), header_style);
+
+    const grid_y: u16 = 1;
+    const grid_h: u16 = h - 1;
+    if (editor.terminalPanelTerminal()) |term| {
+        const grid_win = win.child(.{
+            .x_off = @intCast(grid_x),
+            .y_off = @intCast(grid_y),
+            .width = grid_w,
+            .height = grid_h,
+        });
+        drawTerminalInPane(grid_win, editor, term, grid_w, grid_h);
+        term.mutex.lockUncancelable(term.io);
+        const exited = term.exited;
+        term.mutex.unlock(term.io);
+        if (exited) {
+            const msg = "[Process exited — press any key to close]";
+            _ = writeStr(win, grid_x, grid_y + grid_h / 2, truncToWidth(msg, grid_w), .{ .fg = toVaxis(theme.gutter_text), .bg = bg });
+        }
+    }
+    return .{ .x = x, .y = y, .w = w, .h = h, .grid_x = x + grid_x, .grid_y = y + grid_y, .grid_w = grid_w, .grid_h = grid_h };
+}
+
+/// Keys while the terminal panel owns the keyboard: the same as a terminal
+/// pane's (handleTerminalKey), typed into the panel's shell.
+fn handleTerminalPanelKey(editor: *Editor, key: Key) void {
+    handleTerminalKeyFor(editor, key, editor.terminalPanelTerminal());
 }
 
 /// Recursively render the layout tree into the given window.
@@ -2804,6 +2963,21 @@ fn drawStatusBar(win: Window, editor: *Editor, width: u16) void {
     // Fill background
     win.fill(.{ .style = style });
 
+    // The terminal panel has the keys: say so (the document behind it is
+    // not what typing reaches).
+    if (editor.keyboardOwner() == .terminal_panel) {
+        const label: []const u8 = blk: {
+            if (editor.terminalPanelTerminal()) |t| {
+                t.mutex.lockUncancelable(t.io);
+                defer t.mutex.unlock(t.io);
+                if (t.exited) break :blk " [TERMINAL PANEL - exited: press a key to close]";
+            }
+            break :blk " [TERMINAL PANEL]";
+        };
+        _ = writeStr(win, 0, 0, label, style);
+        return;
+    }
+
     // Terminal pane: show simple label instead of doc info
     if (editor.activePaneIsTerminal()) {
         const label = blk: {
@@ -2988,6 +3162,31 @@ fn positionCursor(win: Window, editor: *Editor, width: u16, height: u16) void {
     }
 }
 
+/// The terminal caret while the terminal panel has the keys: the shell's
+/// own cursor inside the band's grid (hidden with the band, or while the
+/// shell hides it / has exited).
+fn positionTerminalPanelCursor(win: Window, editor: *Editor) void {
+    const band = terminal_panel_band orelse {
+        win.hideCursor();
+        return;
+    };
+    const t = editor.terminalPanelTerminal() orelse {
+        win.hideCursor();
+        return;
+    };
+    t.mutex.lockUncancelable(t.io);
+    const trow = t.cursor_row;
+    const tcol = t.cursor_col;
+    const visible = t.cursor_visible and !t.exited;
+    t.mutex.unlock(t.io);
+    if (visible and trow < band.grid_h and tcol < band.grid_w) {
+        win.showCursor(band.grid_x +| tcol, band.grid_y +| trow);
+        win.setCursorShape(.block);
+    } else {
+        win.hideCursor();
+    }
+}
+
 /// Buffer offset under pane-local cell (local_x, local_y) of editor pane
 /// `pane_id`, drawn `pane_w` cells wide. Null for a terminal pane, and for
 /// the gutter unless `clamp_gutter` (a drag) treats it as text column 0.
@@ -3135,6 +3334,12 @@ fn mousePress(editor: *Editor, mouse: vaxis.Mouse) void {
             handleSnippetsClick(editor, band, @intCast(mouse.row));
             return;
         }
+    }
+
+    // Terminal panel band: a click gives its shell the keyboard
+    if (mouseOverTerminalPanel(mouse)) {
+        _ = editor.takeKeyboardFocus(.terminal_panel);
+        return;
     }
 
     // A pane click focuses that pane, which takes the keyboard back from the
@@ -5311,6 +5516,17 @@ test "TUI paste: a bracketed paste is one verbatim edit; prompts take its first 
     try t.expect(try doc.undoAction());
     try t.expectEqualStrings("", doc.buffer.slice(0, doc.buffer.byteLen()));
 
+    // A read-only tab refuses the paste and says why (was "out of memory",
+    // with the real reason showing one command late)
+    doc.readonly = true;
+    handleInputEvent(&editor, .paste_start, null);
+    handleInputEvent(&editor, .{ .key_press = .{ .codepoint = 'x', .text = "x" } }, null);
+    handleInputEvent(&editor, .paste_end, null);
+    try t.expectEqualStrings("Read-only document", editor.status_message);
+    try t.expect(!doc.edit_refused);
+    try t.expectEqualStrings("", doc.buffer.slice(0, doc.buffer.byteLen()));
+    doc.readonly = false;
+
     // A single-line prompt takes the first line, as if typed
     _ = editor.execAction("find");
     handleInputEvent(&editor, .paste_start, null);
@@ -6058,6 +6274,120 @@ test "TUI snippets panel: docks beside the tree, a click selects then inserts, k
     try t.expect(!editor.snippets_visible and !editor.snippets_focused);
     try t.expectEqual(Editor.KeyboardOwner.editor, editor.keyboardOwner());
     try t.expect(std.mem.indexOf(u8, editor.status_message, "no room") != null);
+}
+
+test "TUI terminal panel: a strip at the bottom or a column inward of the tree, the keys go to its shell, no room hides it" {
+    const t = std.testing;
+    var tmp = t.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(t.io, .{ .sub_path = "a.txt", .data = "a\n" });
+    const root = try tmp.dir.realPathFileAlloc(t.io, ".", t.allocator);
+    defer t.allocator.free(root);
+    var editor = try Editor.init(t.allocator, t.io);
+    defer editor.deinit();
+    try editor.keybinds.loadDefaults();
+    editor.lsp_enabled = false;
+    editor.filetree_visible = false;
+    const doc = editor.activeDoc();
+    var screen = try testScreen(t.allocator);
+    defer screen.deinit(t.allocator);
+    const win = testWin(&screen);
+    var buf: [256]u8 = undefined;
+
+    // Hidden: no band. A docked slot (fake: no shell) at the default edge,
+    // the bottom: tui_terminal_panel_height rows under the panes, the
+    // full width between the (hidden) side bands, its header row on top;
+    // the status bar says where the keys go.
+    testFrame(win, &editor);
+    try t.expect(terminal_panel_band == null);
+    try editor.terminals.append(t.allocator, null);
+    editor.terminal_panel = 0;
+    try t.expect(editor.takeKeyboardFocus(.terminal_panel));
+    testFrame(win, &editor);
+    var band = terminal_panel_band.?;
+    try t.expectEqual(@as(u16, 0), band.x);
+    try t.expectEqual(@as(u16, 17), band.y);
+    try t.expectEqual(@as(u16, 100), band.w);
+    try t.expectEqual(@as(u16, 12), band.h);
+    try t.expectEqual(@as(u16, 0), band.grid_x);
+    try t.expectEqual(@as(u16, 18), band.grid_y);
+    try t.expectEqual(@as(u16, 11), band.grid_h);
+    try t.expectEqual(@as(u16, 17), pane_rects[0].h);
+    try t.expectEqual(@as(u16, 100), pane_rects[0].w);
+    try t.expectEqualStrings(" Terminal \u{2014} Ctrl+` back to the editor ", testCells(&screen, 0, 17, 38, &buf));
+    try t.expectEqualStrings(" [TERMINAL PANEL]", testCells(&screen, 0, 29, 17, &buf));
+    try testCaptureScreen(&screen, "terminal_panel_tui_bottom.txt");
+
+    // Typing reaches the shell, never the document behind the panel;
+    // Ctrl+` goes back to the editor (the panel stays), Ctrl+Shift+`
+    // focuses it again without opening another shell, and a click on the
+    // band does the same.
+    testType(&editor, "ls");
+    try t.expectEqual(@as(usize, 0), doc.buffer.byteLen());
+    testKey(&editor, '`', .{ .ctrl = true });
+    try t.expectEqual(Editor.KeyboardOwner.editor, editor.keyboardOwner());
+    try t.expect(editor.terminal_panel_visible);
+    testFrame(win, &editor);
+    try t.expectEqualStrings(" Terminal \u{2014} Ctrl+Shift+` focuses ", testCells(&screen, 0, 17, 33, &buf));
+    testKey(&editor, '`', .{ .ctrl = true, .shift = true });
+    try t.expectEqual(Editor.KeyboardOwner.terminal_panel, editor.keyboardOwner());
+    try t.expectEqual(@as(usize, 1), editor.terminals.items.len);
+    testKey(&editor, '`', .{ .ctrl = true });
+    testClick(&editor, 50, 20);
+    try t.expectEqual(Editor.KeyboardOwner.terminal_panel, editor.keyboardOwner());
+    testClick(&editor, 50, 5);
+    try t.expectEqual(Editor.KeyboardOwner.editor, editor.keyboardOwner());
+
+    // On the right: a full-height column, tui_terminal_panel_width wide,
+    // its separator column facing the panes; on the left the mirror image.
+    try t.expect(editor.execAction("move_terminal_panel_right"));
+    testFrame(win, &editor);
+    band = terminal_panel_band.?;
+    try t.expectEqual(@as(u16, 40), band.x);
+    try t.expectEqual(@as(u16, 0), band.y);
+    try t.expectEqual(@as(u16, 60), band.w);
+    try t.expectEqual(@as(u16, 29), band.h);
+    try t.expectEqual(@as(u16, 41), band.grid_x);
+    try t.expectEqual(@as(u16, 59), band.grid_w);
+    try t.expectEqual(@as(u16, 1), band.grid_y);
+    try t.expectEqual(@as(u16, 28), band.grid_h);
+    try t.expectEqual(@as(u16, 40), pane_rects[0].w);
+    try t.expectEqual(@as(u16, 29), pane_rects[0].h);
+    try t.expectEqualStrings("\u{2502}", testCells(&screen, 40, 10, 1, &buf));
+    try t.expect(editor.execAction("move_terminal_panel_left"));
+    testFrame(win, &editor);
+    band = terminal_panel_band.?;
+    try t.expectEqual(@as(u16, 0), band.x);
+    try t.expectEqual(@as(u16, 0), band.grid_x);
+    try t.expectEqual(@as(u16, 60), pane_rects[0].x);
+    try t.expectEqualStrings("\u{2502}", testCells(&screen, 59, 10, 1, &buf));
+
+    // Beside the tree (left, 30 columns) the panel sits inward of it and
+    // keeps the panes 40 columns: 30 wide.
+    editor.filetree_root = try t.allocator.dupe(u8, root);
+    editor.filetree_visible = true;
+    testFrame(win, &editor);
+    band = terminal_panel_band.?;
+    try t.expectEqual(@as(u16, 0), filetree_band.?.x);
+    try t.expectEqual(@as(u16, 30), band.x);
+    try t.expectEqual(@as(u16, 30), band.w);
+    try t.expectEqual(@as(u16, 60), pane_rects[0].x);
+    try t.expectEqual(@as(u16, 40), pane_rects[0].w);
+    try testCaptureScreen(&screen, "terminal_panel_tui_left.txt");
+
+    // Too narrow for the tree, the panel and 40 columns of panes: the
+    // panel hides itself, says so, and its keyboard goes back to the pane.
+    try t.expect(editor.takeKeyboardFocus(.terminal_panel));
+    frameArenaReset();
+    drawEditor(win, &editor, 70, 30);
+    try t.expect(terminal_panel_band == null);
+    try t.expect(!editor.terminal_panel_visible and !editor.terminal_panel_focused);
+    try t.expectEqual(Editor.KeyboardOwner.editor, editor.keyboardOwner());
+    try t.expect(std.mem.indexOf(u8, editor.status_message, "no room") != null);
+    // The shell is still docked: the toggle shows the panel again.
+    try t.expect(editor.execAction("toggle_terminal_panel"));
+    try t.expect(editor.terminal_panel_visible);
+    try t.expectEqual(@as(?usize, 0), editor.terminal_panel);
 }
 
 test "TUI snippets panel: the preview wraps long code, highlights the blanks and scrolls long notes" {

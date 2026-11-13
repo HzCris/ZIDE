@@ -123,6 +123,22 @@ pub const Template = struct {
     }
 };
 
+/// `text` as a body that inserts exactly `text`, with no blanks: every `$`
+/// gets a backslash, and so does a backslash the parser would read as an
+/// escape (one right before `$`, `}` or another backslash). The inverse of
+/// Template.parse for plain text — what turns a selection into a body.
+pub fn escapeLiteral(a: Allocator, text: []const u8) error{OutOfMemory}![]u8 {
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(a);
+    try out.ensureTotalCapacity(a, text.len);
+    for (text, 0..) |c, i| {
+        const next: u8 = if (i + 1 < text.len) text[i + 1] else 0;
+        if (c == '$' or (c == '\\' and (next == '$' or next == '}' or next == '\\'))) try out.append(a, '\\');
+        try out.append(a, c);
+    }
+    return out.toOwnedSlice(a);
+}
+
 pub const Expansion = struct {
     text: []u8,
     session: Session,
@@ -215,6 +231,11 @@ pub const Definition = struct {
     /// The extension file that registered it (`my-snippets.lua`), or ""
     /// for init.lua and the Lua runtime.
     source: []u8 = &.{},
+    /// The definition this one took the command name over from: another
+    /// file had registered it first (the bundled snippet behind your copy
+    /// of it). `Editor.removeSnippet` puts it back in the panel. No two
+    /// definitions in a chain come from the same file.
+    replaced: ?*Definition = null,
 
     pub fn init(a: Allocator, spec: Spec, from_extension: bool) !Definition {
         // The language is part of the command name the palette draws.
@@ -266,6 +287,26 @@ pub const Definition = struct {
         a.free(self.body);
         a.free(self.source);
         self.template.deinit(a);
+        if (self.replaced) |behind| {
+            behind.deinit(a);
+            a.destroy(behind);
+        }
+    }
+    /// Free the definitions kept behind this one that `source` registered
+    /// or, without a `source`, that any extension file registered.
+    pub fn dropReplaced(self: *Definition, a: Allocator, source: ?[]const u8) void {
+        var link = &self.replaced;
+        while (link.*) |behind| {
+            const drop = if (source) |name| std.mem.eql(u8, behind.source, name) else behind.from_extension;
+            if (!drop) {
+                link = &behind.replaced;
+                continue;
+            }
+            link.* = behind.replaced;
+            behind.replaced = null;
+            behind.deinit(a);
+            a.destroy(behind);
+        }
     }
     pub fn matchesLanguage(self: *const Definition, language: ?[]const u8) bool {
         return std.mem.eql(u8, self.language, "*") or
@@ -401,6 +442,39 @@ test "snippets reject malformed and unsupported syntax" {
             return error.ExpectedInvalidSnippet;
         } else |_| {}
     }
+}
+
+test "escapeLiteral: the escaped text parses back to the same text with no blanks" {
+    const a = std.testing.allocator;
+    const samples = [_][]const u8{
+        "",
+        "plain text",
+        "    \\\\Hello\n    \\\\World",
+        "echo $1 done",
+        "$HOME and ${name} and $",
+        "a \\$ b",
+        "C:\\dir\\file",
+        "C:\\\\dir",
+        "x\\}y}",
+        "ends with a backslash \\",
+        "ends with two \\\\",
+        "\\\\\\$",
+        "${1:default} $0",
+        "界 $ 界",
+    };
+    for (samples) |sample| {
+        const escaped = try escapeLiteral(a, sample);
+        defer a.free(escaped);
+        var t = try Template.parse(a, escaped);
+        defer t.deinit(a);
+        try std.testing.expectEqualStrings(sample, t.text);
+        try std.testing.expectEqual(@as(usize, 0), t.stops.len);
+        try std.testing.expectEqual(sample.len, t.final.start);
+    }
+    // Only what the parser would misread gets a backslash.
+    const lone = try escapeLiteral(a, "C:\\dir $x");
+    defer a.free(lone);
+    try std.testing.expectEqualStrings("C:\\dir \\$x", lone);
 }
 
 test "snippet definitions reject malformed UTF-8 in the language (it names a palette command)" {

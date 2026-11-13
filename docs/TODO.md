@@ -17,18 +17,48 @@ Legend: **N** = native Zig, **L** = buildable as a Lua extension on the public A
 
 ## User-requested (2026-09-30)
 
-- **Dockable terminal — move it to the sides like the file tree** (N, M). Motivation (user,
-  2026-10-08): run Claude Code or any LLM CLI in a full-height side terminal as a chat column
-  while a bottom terminal stays free for commands — commands run inside Claude Code render in
-  a tiny collapsible box and feed their output back to the model for nothing. Today a terminal
-  lives inside the split-pane tree: `toggle_terminal` makes a bottom split, `open_terminal_right`
-  a side-by-side split, `detach_terminal` its own window — so its position is whatever split you
-  built, and nothing about it persists. The ask: dock the terminal left/right/bottom the way the
-  file tree docks, with a remembered side and size. Design question to settle first: keep
-  terminals as splits and add placement commands plus remembered geometry (cheaper), or promote
-  the terminal to a real docked band like the file tree with `terminal_side` / `terminal_size`
-  settings (matches the file-tree precedent, but a second home for terminals outside the split
-  tree).
+- **Rearrangeable panels, Zed / VS Code style** (N, L) — user, 2026-10-18. Every docked
+  panel — the file tree, the Snippets panel, the search panel, and terminals (the item right
+  below) — should move between the left, right and bottom edges, by dragging its header to
+  another edge (a drop zone lights up while dragging) and from a right-click menu ("Move to
+  Left / Right / Bottom"), with the arrangement remembered in init.lua. Before this: only the
+  tree and the Snippets panel moved, left ↔ right, by GUI menu. Pieces: a shared "dock" model
+  in the core (side + order + size per panel, the bands laid out from it instead of each
+  frontend's hand-written rules), drag-and-drop between edges in the GUI (the file tree's
+  drag-in code is the precedent), menu/command moves in the TUI (no mouse on Windows), panels
+  stacking on one edge (tabs or a split, decide), and the terminal becoming a dockable panel
+  too. Supersedes the two-sided `filetree_side` / `snippets_side` settings once done (keep
+  them working).
+  - **Step 1 DONE 2026-10-18 (built in Zed with the API, not Claude Code; smoke test
+    pending):** the terminal panel — the item below — plus palette moves for every panel.
+    As built: `Editor.terminal_panel` (index into `terminals`, one shell), `terminal_panel_*`
+    fields/settings (`side` bottom|left|right, GUI width/height, TUI twins), a new
+    `KeyboardOwner.terminal_panel` / `FocusTarget.terminal_panel` (lowest panel precedence),
+    `Editor.movePanel(DockPanel, DockEdge)` behind `move_filetree_left/right`,
+    `move_snippets_left/right`, `move_terminal_panel_left/right/bottom`; actions
+    `toggle_terminal_panel` (now on Ctrl+Shift+` — `open_terminal_right` lost its key),
+    `hide_/close_terminal_panel`, `dock_terminal`, `undock_terminal`; `spawnShell` split out
+    of `openTerminalSplit`. GUI: `terminalPanel` band in `editorArea` (a `center_col` box
+    wraps the panes so the bottom strip sits between the side bands), `handleBandResizeAt`
+    generalizes the edge drag to a bottom edge, the terminal grid drawing is shared with
+    `terminalPane` (`terminalCellMetrics` / `fitTerminalGrid` / `drawTerminalGrid`),
+    `handleTerminalKeyEvents` takes the owner. TUI: `drawTerminalPanel`, `handleTerminalKeyFor`
+    shared with panes, `positionTerminalPanelCursor`, `[TERMINAL PANEL]` status. Tests: core
+    ("terminal panel: …" ×2), TUI, GUI (`zig build test-gui`). Docs: *The terminal panel*
+    under Embedded Terminal.
+  - **Next steps, in order:** (2) a shared dock model in the core so the tree / Snippets /
+    search panels can take the bottom too, with a user-chosen order on a shared edge;
+    (3) drag a panel header to another edge in the GUI (drop zones); (4) several panels on
+    one edge as tabs, and several shells in the terminal panel (tabs + `next_terminal`).
+- **Dockable terminal — move it to the sides like the file tree** (N, M). **DONE 2026-10-18**
+  as the terminal panel (step 1 above): a real docked band with `terminal_panel_side` /
+  `terminal_panel_width` / `terminal_panel_height` settings (the file-tree precedent won over
+  placement commands for splits), `dock_terminal` moves a Ctrl+` pane into it. Original
+  motivation (user, 2026-10-08): run Claude Code or any LLM CLI in a full-height side terminal
+  as a chat column while a bottom terminal stays free for commands — commands run inside
+  Claude Code render in a tiny collapsible box and feed their output back to the model for
+  nothing. Still open from the ask: nothing restores the panel's shell across runs (a shell
+  cannot be restored; the side and size are).
 - **Multiple terminals** (N, S–M). The core already stores a list of terminals, so the model
   allows it; what's missing is the front door. Add a `new_terminal` command that always creates
   another shell (Ctrl+` already opens another one each time), a way to cycle or pick them
@@ -137,6 +167,36 @@ Legend: **N** = native Zig, **L** = buildable as a Lua extension on the public A
 - **IME preedit in terminal panes** (N, S–M). Composition is sent once committed but not drawn
   while composing — draw the uncommitted text at the caret.
 
+## Two kinds of terminal (user, 2026-11-12 — the terminal panel's first on-screen run)
+
+Both notes came out of that run; neither is started. How the two kinds differ today is written
+up in Documentation.md (*Embedded Terminal → Two kinds of terminal*).
+
+- **The terminal key as a real toggle** (N, S). "Kind of weird having two different commands
+  to swap back and forth": Ctrl+` leaves a terminal (pane or panel) for the editor, but pressed
+  again in the editor it opens **another** terminal instead of going back to the one just left —
+  `Editor.toggleTerminal` ends in `self.openTerminal()` for every editor pane. So the way back
+  into the panel is the other key (Ctrl+Shift+`), the way back into a pane is a click or F6,
+  and a double tap leaves a stray shell behind. Proposed: from the editor, Ctrl+` focuses the
+  terminal this window used last — the panel (shown again when hidden) or a terminal pane —
+  and opens a new bottom terminal only when the window has none; further ones come from a
+  `new_terminal` command (palette + View menu — *Multiple terminals* above already asks for
+  it, and the View menu has no entry for a plain terminal at all today). Ctrl+Shift+` stays
+  the panel's own key. VS Code's defaults are the same idea: Ctrl+` toggles the terminal,
+  Ctrl+Shift+` makes a new one. To decide: a key for `new_terminal` now, or in the hotkey pass.
+- **A right-click menu for terminal panes, and a way to see which kind you are in** (N, S).
+  The panel's *Move Terminal to Left / Right / Bottom* does nothing on a Ctrl+` terminal,
+  because that one is a split pane — and little on screen says so: a terminal pane has no
+  title row and no right-click menu (GUI `terminalPane` only takes the press to focus), the one
+  hint is the status bar (*Terminal* vs *Terminal panel*). Proposed: a right-click menu on
+  terminal panes — *Dock in Panel* (it can then go left / right / bottom; greyed out, with the
+  reason, while the panel already holds a shell), *Move to New Window*, *Close Terminal*, and
+  *Copy* / *Paste* once the selection item under *Terminal gaps* exists. To decide: also give
+  panes the panel's one-line title row ("Terminal — Ctrl+` back to the editor"), which costs
+  a row per terminal. The TUI has no mouse menus; its status row already tells the two apart.
+  Longer term, step 4 of *Rearrangeable panels* (several shells in the panel, as tabs) makes
+  the pane kind optional.
+
 ## Overlay look and default themes (user, 2026-10-08)
 
 - **Opaque overlay panels** (N, S–M). The palette, picker, find bar and prompts draw a
@@ -162,6 +222,29 @@ Legend: **N** = native Zig, **L** = buildable as a Lua extension on the public A
   nowhere to be seen). Make it a modal floating window like the encoding and recovery
   dialogs (buttons + the same S/D/C keys), and audit the other in-editor banners
   (overwrite/reload, Git stage, task save-before-run) for the same treatment.
+
+## Status messages (user, 2026-11-12)
+
+- **Messages that are easy to see** (N, S–M). "Make pop up text have more visibility, like
+  maybe a contrasting color, so when something happens you can easily see it." Today a status
+  message — "Saved", every refusal, every error — is drawn in the status bar's own text color
+  between the line / column block and the file name (GUI; the TUI centers it), looks the same
+  whether it is a note or a failure, and is gone at the next key press or click: no minimum
+  time on screen. A long one is cut off — the GUI clips it before the file name, the TUI at
+  half the screen width: on 2026-11-12 "Deleted from my-snippets.lua: Hello world (the one
+  from snippets-zig.lua is back)" lost its ending in a window about 1000 px wide.
+  `Editor.status_message` is one slice assigned in about 290 places, so the change belongs in
+  the two painters and one small core helper, not at the call sites. Proposed: (1) a **fresh**
+  message (the text changed) is drawn as a filled block in a contrasting color pair — new
+  theme fields, GUI and TUI — for a few seconds, then settles into today's look; (2) while
+  fresh it may cover the rest of the bar instead of being cut, and the long delete message
+  gets shorter; (3) levels — note / warning / error — through a helper, failures in the error
+  color, the existing sites staying "note" until moved over; (4) maybe a `show_messages`
+  command listing the last few, for the one that was replaced before it was read. To decide:
+  whether a fresh message stays its few seconds even while you keep typing. Alternative to
+  (1): a small box in a corner of the editor that fades out, like VS Code's notifications.
+  Relatives: *GUI unsaved-changes prompts as real dialogs* (Prompts, above) and *Revisit the
+  default themes* (Overlay look).
 
 ## Safety and trust
 
@@ -346,6 +429,233 @@ does not need to know the syntax before completion can finish it.
 - **Per-view scroll/cursor state** — two panes showing one document currently share a viewport
   and fight over ensure-cursor-visible; real fix is a per-pane View struct. Design project.
 - **Sessions that record window/split layout** (folded into Open Folder item above).
+
+## Common IDE features still missing (2026-11-12 review)
+
+Asked for directly: "is there anything an IDE commonly has that ZIDE doesn't?" Every item below
+was checked against the code that day (a search for the request name, command, setting or theme
+field came back empty, or the code was read), and none of it repeats a section above. Grouped
+by area, most useful first inside each group. Almost all of it is native work, because it lives
+in the painters, the language-server client or input handling; the few Lua-sized pieces say so.
+
+**The order picked on 2026-11-12** (the user's, after reading the list). Nothing below is
+started; each pick is talked through before any code is written.
+
+1. **Find and replace in a document**, modeled on Kate's and VS Code's (*Find and replace in a
+   document*).
+2. **Code actions / quick fixes** and **mouse reach for language features** (*Language
+   server*).
+3. **Menus for what already exists** and **command palette rows that explain themselves**
+   (*Desktop behavior*).
+4. **Delete to the Recycle Bin** and **remember the window** (*Desktop behavior*).
+
+**On hold: *Build, run and debug*.** The user's reason: Zig's debugger situation is still in
+development and its Windows support is odd, so it gets a closer look (what debugs a Zig
+program on Windows today, and how well) before anything is planned. Known already: on this
+machine LLDB's adapter does not start at all — `lldb-dap.exe` needs a `python311.dll` that is
+not installed. *Zig tasks out of the box* needs no debugger and can go ahead whenever wanted.
+
+### Language server
+
+- **Code actions / quick fixes** (N, M). `textDocument/codeAction` is never requested, so the
+  server's fixes ("remove unused variable", "add missing import", "organize imports") cannot be
+  reached. Needs: a request for the caret or selection with that line's diagnostics, the titles
+  in the generic pick-list (Ctrl+. elsewhere), then applying the reply — a workspace edit (the
+  rename path already applies those, and `workspace/applyEdit` is answered) or a
+  `workspace/executeCommand` call. A dim marker in the gutter when the caret's line has fixes.
+- **Mouse reach for language features (GUI)** (N, S–M). `hover` is a palette command with no
+  key, and nothing shows when the pointer rests. Add: a popup after the pointer rests on a
+  symbol (the hover text) or on an underlined problem (its message — today that takes putting
+  the caret on the line and reading the status bar, or opening Problems); Ctrl+click = go to
+  definition (the editor pane reads only Alt and Shift on a click); and References / Rename /
+  Hover / Format in the right-click menu, which has Go to Definition alone. Optional twin for
+  both frontends: the problem's message dimmed at the end of its line.
+- **Highlight the symbol under the caret** (N, S–M). `textDocument/documentHighlight` is never
+  requested; without a server, tinting the other occurrences of the selected word is a plain
+  text scan of the visible lines. One theme color per frontend.
+- **Inlay hints** (N, M). `textDocument/inlayHint` is never requested: inferred types after
+  `const x =` and parameter names at call sites (zls offers both). Needs text that is drawn but
+  is not in the buffer, in both painters (the review reader's ghost rows are the whole-row
+  precedent; hints are the inside-a-line version), and a setting to turn them off.
+- **Completion round-out** (N, S–M). ZIDE announces only `insertReplaceSupport` and keeps four
+  fields of each item (label, detail, insert text, edit). Missing: the item's kind (function /
+  variable / type marker), its documentation beside the list (`documentation`,
+  `completionItem/resolve`), the server's own ordering and matching text (`sortText`,
+  `filterText`), snippet-style items (`snippetSupport` — a completed call would arrive with its
+  arguments as tab stops, and the snippet engine is already there to walk them), and
+  `additionalTextEdits` (the import a completion wants to add).
+- **Go to type definition / implementation / declaration** (N, S). Not requested; each is the
+  go-to-definition path with another method name.
+- **Server progress in the status bar** (N, S). `$/progress` is dropped (`handleNotification`
+  in `lsp.zig`), so a server indexing a large project looks idle. Show `zls: indexing 40%`.
+- **Tell servers about files changed outside the editor** (N, S–M).
+  `workspace/didChangeWatchedFiles` is never sent (`client/registerCapability` is acknowledged
+  and then ignored), so a server's picture of files that are not open goes stale after a
+  lazygit checkout or an AI tool's edits, until `lsp_restart`.
+- **Semantic highlighting from the server** (N, L). `textDocument/semanticTokens` is never
+  requested. Matters most for the Lua-defined languages, whose table tokenizers cannot tell a
+  type from a function. Large (token legend → theme fields, delta updates, both painters); a
+  later tier.
+
+### Find and replace in a document
+
+- **Find and replace round-out** (N, M; first pick of 2026-11-12 — the models are Kate's and
+  VS Code's bars). Today, read from the code:
+  - *Find* (Ctrl+F) is one row: typing searches forward from the caret, Enter goes to the next
+    match and wraps, Escape closes. *Replace* (Ctrl+H) adds a second row: Tab switches rows,
+    Enter in the replace row replaces the current match and moves on, Ctrl+Enter or Ctrl+A
+    replaces all (already one undo step).
+  - Always case-sensitive, no whole-word option: `find_case_sensitive` / `find_whole_word` in
+    `editor.zig` are never assigned. The workspace search panel has both toggles and ignores
+    case by default, so the two searches disagree about the same word.
+  - Forward only (`findNext`), and nothing works once the bar is closed (no `find_next`
+    command, F3 is unbound).
+  - The rows are painted text, not text boxes: characters go on at the end and Backspace takes
+    the last one — no caret inside the row, no selecting, no buttons, no mouse. In the GUI
+    Ctrl+V does nothing there, and both rows open empty every time with no history, so a
+    copied or selected word has to be retyped. 256 bytes per row.
+  - Only the current match is marked. The GUI shows `N matches` but not which one the caret is
+    on; the TUI shows no count.
+  - No regular expressions (their own entry under *Editing*: there is no engine yet), no `\n`
+    or `\t` in either row, no replace limited to the selection, no keep-the-case replace.
+
+  The target, from what Kate and VS Code share: rows that are real text boxes (caret,
+  selection, paste, Up / Down through earlier searches); toggles for match case and whole word
+  (Alt+C / Alt+W in VS Code and already in ZIDE's search panel) and, once an engine exists,
+  regular expressions (Alt+R); previous as well as next (Shift+Enter / Enter in the bar,
+  Shift+F3 / F3 anywhere, also after the bar is closed); Ctrl+F starting from the selection or
+  the word at the caret; `3 of 17` in place of a bare count; every match tinted in the text
+  (one theme color per frontend), and the box tinted when nothing matches (Kate); search and
+  replace limited to the selection (Alt+L in VS Code, "Selection only" in Kate); Replace /
+  Replace All as buttons beside the replace box; every match turned into a cursor (Alt+Enter
+  in VS Code — multi-cursor is already there); and from Kate's power bar, escape sequences in
+  both rows and `\1` capture groups in the replacement.
+
+  To decide before building: regular expressions in the first round or later; one bar (VS
+  Code: the replace row unfolds under the find row) or Kate's two (a quick bar and a power
+  bar); where it sits (top right over the text like VS Code; along the bottom like Kate and
+  today's TUI); and whether the workspace search panel's boxes get the same text box and
+  toggles at the same time, so the two stop disagreeing.
+
+### Selection and editing
+
+- **Select all occurrences; expand / shrink selection** (N, S). Ctrl+D adds the next
+  occurrence, nothing takes them all at once; and nothing grows the selection step by step
+  (word → string → bracket pair → block). `brackets.zig` is enough for a first version; the
+  server's `selectionRange` can refine it later.
+- **A typed bracket or quote wraps the selection** (N, S). Today typing `(` `[` `{` `"` `'` or
+  a backtick over selected text replaces it with an empty pair (`cmdInsertChar`); the usual
+  behavior is to put the pair around the selection.
+- **Small commands that are not among the 179** (N, S each). `select_line`; open a line above /
+  below without splitting the current one; scroll the view a line without moving the caret
+  (Ctrl+Up / Ctrl+Down); Backspace inside leading spaces removing one indent level instead of
+  one space; a typed `}` on a blank indented line stepping back one level; and
+  `toggle_word_wrap` — that one is Lua-sized already (`zide.get("word_wrap")` and `zide.set`
+  both exist; untested). Join / sort / case are under *Editing* above.
+- **Bookmarks** (N, S–M). Mark a line, next / previous mark, the list in the pick-list, kept
+  per workspace. The breakpoint store is the pattern (marks need the same "follow edits" work
+  listed under *Debugging and tasks*); a bookmark icon already ships in `src/icons/svg`.
+- **Macros: record and replay** (N, M). Every action already runs through a named command, so
+  a recording is a list of (command, argument) pairs; replay once or N times, and offer to save
+  one as a Lua command.
+- **Clipboard history** (N, S). Keep the last twenty copies; a pick-list (Ctrl+Shift+V
+  elsewhere) pastes an older one.
+
+### What the editor shows
+
+- **Editor display aids** (N, S each; one theme field and both painters per aid). None exist
+  (`theme.zig` has no field for any of them): indent guides in the text (the file tree has
+  guides, the editor does not), visible whitespace (all / trailing only / inside the
+  selection), a column ruler, a background for the caret's line (only its line number changes
+  color today), and the selection's size in the status bar (`3 lines, 120 chars`).
+- **Sticky scroll and breadcrumbs** (N, M). Keep the enclosing `fn` / `struct` header lines
+  pinned at the top of the pane while scrolling, and a `folder › file › symbol` strip. Both can
+  be fed by the document symbols Ctrl+F12 already fetches; sticky scroll also works from
+  brackets and indentation alone.
+- **Outline panel** (N, M). Document symbols exist only as a pick-list. A docked tree of the
+  file's symbols that follows the caret is a natural second user of the dock model (step 2 of
+  *Rearrangeable panels*).
+- **Color swatches** (N, S). A small filled square beside `#rrggbb` text — ZIDE's own theme
+  files are made of them.
+
+### Tabs and files
+
+- **Tab management** (N, S). The tab menu has two entries (Move to New Window, Close Tab): add
+  Close Others / Close to the Right / Close All / Close Saved, Copy Path and Reveal in Tree.
+  Middle-click does not close a tab (no middle-button handling anywhere). Ctrl+Tab walks the
+  tabs in bar order (`nextDoc` / `prevDoc`), not most-recently-used. And nothing handles more
+  tabs than fit: the GUI bar is a plain row with no scrolling and the TUI bar stops at the
+  terminal's edge, so the active tab can be out of sight — scroll the bar to keep it visible
+  and add an "open files" pick-list.
+- **File commands that are missing** (N, S each). `save_all` (only save-all-and-quit exists);
+  `revert_file` — drop unsaved edits and reload from disk (`reloadFromDisk` is there for the
+  external-change guard; `reopen_with_encoding` is today's workaround); choosing the language
+  of the current document (an untitled or extension-less file cannot be given one); line
+  endings — show LF / CRLF in the status bar beside the encoding, and a command to convert
+  (today only an `.editorconfig` changes them, at save); indentation — detect tabs or spaces
+  and the width when a file opens, and convert between them; and trimming trailing spaces /
+  ending with a newline as plain settings (they need an `.editorconfig` file today).
+- **Open at a line from the command line** (N, S). `zide src/main.zig:120` (or `:120:8`) is
+  taken as a file with that literal name. Read a trailing `:line[:col]` when the path as typed
+  does not exist — it is how compilers and search tools name a place.
+- **Images and binary files** (N, M). A binary file lands in the encoding picker. A read-only
+  image preview tab and a simple hex view would answer "what is this file" without leaving
+  ZIDE. Low priority.
+
+### Desktop behavior
+
+- **Delete to the Recycle Bin** (N, S). The file tree's Delete is permanent (`deleteFile` /
+  `deleteTree` in `filetree.zig`) — the one loss with no way back. Windows: `SHFileOperationW`
+  with `FOF_ALLOWUNDO`; Linux: the XDG trash folder. Keep a permanent Shift+Delete, and have
+  the confirm text say which of the two is about to happen.
+- **Remember the window** (N, S). The GUI always opens at 900×600; save the size, position and
+  maximized state on exit, for the extra windows too.
+- **Command palette rows that explain themselves** (N, S). Both frontends list bare command
+  names. Every command already registers a description, and the keybind map knows its key (it
+  needs a command → key lookup; `keybind.zig` only has key → command): show
+  `name — description   key`, match on the description as well, recently used first.
+- **Menus for what already exists** (N, S). The GUI menu bar is File / Edit / View /
+  Preferences / Help. Quick open, workspace search, symbols, references, rename, format, back /
+  forward, Problems, tasks, Git Changes, Review and the whole debugger are reachable only from
+  the palette. **Go**, **Run** (tasks and debugger) and **Tools** menus that call the existing
+  commands and show their keys are the cheapest discoverability win.
+- **One running ZIDE** (N, M). A second `zide file.zig` (a double-click in Explorer, another
+  tool's "open in editor") always starts another instance. Hand the path to the running window
+  (a named pipe on Windows, a socket elsewhere), with `--new-window` to opt out — what makes
+  ZIDE usable as the system's default editor for a file type.
+- **Fullscreen and a distraction-free view** (N, S). F11 fullscreen (one SDL call) and a toggle
+  hiding the tree, tabs and status bar.
+
+### Build, run and debug
+
+On hold since 2026-11-12, except *Zig tasks out of the box* — see the note at the top of this
+section.
+
+- **Zig tasks out of the box** (L, S). No task ships: `examples/tasks.lua` is commented text to
+  copy. A bundled extension (like `snippets-zig.lua`) registering "Zig build", "Zig build test"
+  and "Zig build run" with the `zig` problem matcher when the workspace root has a `build.zig`.
+  Keys for build / run belong to the hotkey pass (`run_task`, the debugger and `rename_symbol`
+  have no default key at all today).
+- **Debugger reach** (N, S–M). Click the gutter to set or clear a breakpoint (the frontends
+  never call `toggle_breakpoint`); run to the caret; `evaluate` — rest the pointer on a
+  variable while stopped to see its value, and a console line for expressions (the request is
+  not in `dap_session.zig`'s command list; watches, on the debugger's deferred list, need it
+  too); and a build step before launch (`register_debug_config{ …, pre_task = "Zig build" }`)
+  so a session never starts on a stale executable.
+- **Project settings file** (N, M; after the trust prompt under *Safety and trust*). Tasks,
+  debug configurations and language settings live only in the global `init.lua`. A
+  `.zide/init.lua` in the workspace root, run after the global one once the folder is trusted,
+  gives each project its own build / run / debug setup.
+- **Clickable locations in terminal output** (N, M). Ctrl+click on `src/main.zig:120:8` in a
+  terminal pane or the terminal panel opens that place — compile errors land in a terminal as
+  often as in Task Output. Goes with the GUI terminal selection work under *Terminal gaps*.
+
+### Git (low priority — lazygit covers it)
+
+- **Blame for the caret's line, and undoing one change** (N, S–M). Author · date · summary of
+  the line's last commit in the status bar (`git blame --porcelain -L`); and from a gutter
+  mark, show the old text or put it back (the buffer-versus-index comparison behind the marks
+  already has the old lines).
 
 ---
 

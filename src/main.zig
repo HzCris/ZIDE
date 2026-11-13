@@ -157,7 +157,7 @@ const welcome_text =
     \\//   Ctrl+Shift+PgUp/PgDn                 move line
     \\//
     \\// Terminal & code intelligence
-    \\//   Ctrl+`            toggle terminal    Ctrl+Shift+`     terminal in split
+    \\//   Ctrl+`            toggle terminal    Ctrl+Shift+`     terminal panel (docked)
     \\//   Ctrl+Alt+`        detach terminal to its own window (GUI)
     \\//   Ctrl+Alt+Q        close terminal     (or type exit, then press any key)
     \\//   Ctrl+B            toggle file tree   Ctrl+Space       completion (LSP)

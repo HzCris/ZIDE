@@ -659,8 +659,11 @@ pub const State = struct {
 /// folder opens, and a repository's `.git/config` can name an fsmonitor
 /// hook that `git status` would execute (an extracted archive, a USB
 /// copy). Clean/smudge filters need a workspace-trust prompt instead.
+/// `diff.suppressBlankEmpty=false` because the diff parser (unidiff.zig)
+/// counts on every line of a hunk carrying its prefix, and a user's Git
+/// config can ask for unchanged blank lines without one.
 pub fn commandArgv(a: Allocator, cwd: []const u8, args: []const []const u8) ![]const []const u8 {
-    const base = [_][]const u8{ "git", "--no-pager", "--literal-pathspecs", "--no-optional-locks", "-c", "color.ui=false", "-c", "core.quotepath=false", "-c", "core.fsmonitor=false", "-C" };
+    const base = [_][]const u8{ "git", "--no-pager", "--literal-pathspecs", "--no-optional-locks", "-c", "color.ui=false", "-c", "core.quotepath=false", "-c", "core.fsmonitor=false", "-c", "diff.suppressBlankEmpty=false", "-C" };
     const argv = try a.alloc([]const u8, base.len + 1 + args.len);
     @memcpy(argv[0..base.len], &base);
     argv[base.len] = cwd;
@@ -730,10 +733,14 @@ test "Git commands disable a repository's fsmonitor hook" {
     const argv = try commandArgv(t.allocator, "/repo", &.{ "status", "--porcelain=v1" });
     defer t.allocator.free(argv);
     var fsmonitor_off = false;
+    var blank_lines_prefixed = false;
     for (argv[0 .. argv.len - 1], argv[1..]) |flag, value| {
-        if (std.mem.eql(u8, flag, "-c") and std.mem.eql(u8, value, "core.fsmonitor=false")) fsmonitor_off = true;
+        if (!std.mem.eql(u8, flag, "-c")) continue;
+        if (std.mem.eql(u8, value, "core.fsmonitor=false")) fsmonitor_off = true;
+        if (std.mem.eql(u8, value, "diff.suppressBlankEmpty=false")) blank_lines_prefixed = true;
     }
     try t.expect(fsmonitor_off);
+    try t.expect(blank_lines_prefixed);
     try t.expectEqualStrings("git", argv[0]);
     for ([_][]const u8{ "--no-pager", "--literal-pathspecs", "--no-optional-locks" }) |flag| {
         var found = false;

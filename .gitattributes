@@ -1,1 +1,5 @@
 *.sh text eol=lf
+# zig fmt writes LF and `zig fmt --check` flags CRLF: keep Zig sources LF
+# on every platform, whatever core.autocrlf says.
+*.zig text eol=lf
+*.zon text eol=lf

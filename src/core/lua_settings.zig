@@ -982,6 +982,39 @@ fn luaSet(state: ?*zlua.LuaState) callconv(.c) c_int {
         // GUI: true = a click only selects a snippet (its preview stays
         // put); a double-click or Enter inserts it.
         editor.snippets_double_click = lua.toBoolean(2);
+    } else if (std.mem.eql(u8, key_str, "terminal_panel_side")) {
+        // zide.set("terminal_panel_side", "left") / "right" / "bottom"
+        const val = lua.toString(2) catch return 0;
+        const val_str: []const u8 = val;
+        if (std.meta.stringToEnum(Editor.DockEdge, val_str)) |edge| {
+            editor.terminal_panel_side = edge;
+        } else {
+            std.log.warn("zide.set: terminal_panel_side must be \"left\", \"right\" or \"bottom\", got '{s}'", .{val_str});
+        }
+    } else if (std.mem.eql(u8, key_str, "terminal_panel_width")) {
+        const val = lua.toInteger(2) catch return 0;
+        const lim = Editor.terminal_panel_limits;
+        if (val >= @as(i64, @intFromFloat(lim.min_width)) and val <= @as(i64, @intFromFloat(lim.max_width))) {
+            editor.terminal_panel_width = @floatFromInt(val);
+        }
+    } else if (std.mem.eql(u8, key_str, "terminal_panel_height")) {
+        const val = lua.toInteger(2) catch return 0;
+        const lim = Editor.terminal_panel_limits;
+        if (val >= @as(i64, @intFromFloat(lim.min_height)) and val <= @as(i64, @intFromFloat(lim.max_height))) {
+            editor.terminal_panel_height = @floatFromInt(val);
+        }
+    } else if (std.mem.eql(u8, key_str, "tui_terminal_panel_width")) {
+        const val = lua.toInteger(2) catch return 0;
+        const lim = Editor.terminal_panel_limits;
+        if (val >= lim.tui_min_width and val <= lim.tui_max_width) {
+            editor.tui_terminal_panel_width = @intCast(val);
+        }
+    } else if (std.mem.eql(u8, key_str, "tui_terminal_panel_height")) {
+        const val = lua.toInteger(2) catch return 0;
+        const lim = Editor.terminal_panel_limits;
+        if (val >= lim.tui_min_height and val <= lim.tui_max_height) {
+            editor.tui_terminal_panel_height = @intCast(val);
+        }
     } else if (std.mem.eql(u8, key_str, "filetree_font_size")) {
         const val = lua.toInteger(2) catch return 0;
         if (val >= 0 and val <= 32) {
@@ -1246,6 +1279,21 @@ fn luaGet(state: ?*zlua.LuaState) callconv(.c) c_int {
         return 1;
     } else if (std.mem.eql(u8, key_str, "snippets_double_click")) {
         lua.pushBoolean(editor.snippets_double_click);
+        return 1;
+    } else if (std.mem.eql(u8, key_str, "terminal_panel_side")) {
+        _ = lua.pushString(@tagName(editor.terminal_panel_side));
+        return 1;
+    } else if (std.mem.eql(u8, key_str, "terminal_panel_width")) {
+        lua.pushInteger(@intFromFloat(editor.terminal_panel_width));
+        return 1;
+    } else if (std.mem.eql(u8, key_str, "terminal_panel_height")) {
+        lua.pushInteger(@intFromFloat(editor.terminal_panel_height));
+        return 1;
+    } else if (std.mem.eql(u8, key_str, "tui_terminal_panel_width")) {
+        lua.pushInteger(@intCast(editor.tui_terminal_panel_width));
+        return 1;
+    } else if (std.mem.eql(u8, key_str, "tui_terminal_panel_height")) {
+        lua.pushInteger(@intCast(editor.tui_terminal_panel_height));
         return 1;
     } else if (std.mem.eql(u8, key_str, "filetree_font_size")) {
         lua.pushInteger(@intFromFloat(editor.filetree_font_size));
@@ -1808,6 +1856,7 @@ pub const zig_snippets = @embedFile("../extensions/snippets-zig.lua");
 const shipped_snippet_hashes = [_]u64{
     0xfdc1db773038343c, // v1 (2026-09-22): nine triggers, no groups or notes
     0xf43f4a6d0749008d, // v2 (2026-10-15): 54 skeletons in groups with notes, for the Snippets panel
+    0xdd96a42084a1bb3a, // v3 (2026-11-12): "Make a struct value" names the type Point, as "Struct with fields" does
 };
 
 /// Wyhash of `text` with CRLF read as LF, so a checkout or an editor that

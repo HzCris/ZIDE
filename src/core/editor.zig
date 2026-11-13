@@ -208,8 +208,9 @@ pub const Editor = struct {
     /// `active_pane` is a live leaf of its layout; I4 `active_doc_idx`
     /// mirrors the active window's active editor pane; I5 every `.editor`
     /// index in every window is `< documents.items.len`; I6 a terminal index
-    /// is shown by at most one live pane across all windows (terminals are
-    /// moved, never copied); I7 window ids are monotonic and never reused.
+    /// is shown by at most one live pane across all windows, or by the
+    /// terminal panel (`terminal_panel`), never both (terminals are moved,
+    /// never copied); I7 window ids are monotonic and never reused.
     windows: std.ArrayList(*EditorWindow) = .empty,
     /// Index into `windows` of the window that has keyboard focus.
     active_window: usize = 0,
@@ -430,6 +431,23 @@ pub const Editor = struct {
     snippets_filter: [snippet_panel_mod.max_filter]u8 = undefined,
     snippets_filter_len: usize = 0,
 
+    /// The terminal panel: one shell docked at an edge of the primary
+    /// window (left, right or bottom) like the file tree, instead of in a
+    /// split pane — a full-height column for a chat-style CLI, remembered
+    /// across runs. `terminal_panel` is the index into `terminals` of the
+    /// shell it shows (null = empty; the panel then hides itself), the
+    /// focused flag makes it the keyboard owner (`.terminal_panel`), the
+    /// sizes are the GUI width (left/right) and height (bottom) in pixels
+    /// and the TUI twins in cells.
+    terminal_panel: ?usize = null,
+    terminal_panel_visible: bool = false,
+    terminal_panel_focused: bool = false,
+    terminal_panel_side: DockEdge = .bottom,
+    terminal_panel_width: f32 = 420,
+    terminal_panel_height: f32 = 240,
+    tui_terminal_panel_width: u16 = 60,
+    tui_terminal_panel_height: u16 = 12,
+
     pub const EncodingChoice = struct { path: []u8, encoding: text_file.TextEncoding };
     pub const EncodingAction = enum { choose, open, reopen, save };
 
@@ -472,6 +490,23 @@ pub const Editor = struct {
     };
 
     pub const FiletreeSide = enum { left, right };
+    /// Where a docked panel sits. The file tree and the Snippets panel
+    /// take left/right only (FiletreeSide); the terminal panel any edge.
+    pub const DockEdge = enum { left, right, bottom };
+    /// The docked panels `movePanel` places.
+    pub const DockPanel = enum { filetree, snippets, terminal };
+    /// Size limits of the terminal panel: the settings, the Settings dialog
+    /// and the GUI edge drag all clamp to these (pixels; TUI: cells).
+    pub const terminal_panel_limits = struct {
+        pub const min_width: f32 = 160;
+        pub const max_width: f32 = 1600;
+        pub const min_height: f32 = 80;
+        pub const max_height: f32 = 1200;
+        pub const tui_min_width: u16 = 20;
+        pub const tui_max_width: u16 = 200;
+        pub const tui_min_height: u16 = 3;
+        pub const tui_max_height: u16 = 60;
+    };
 
     pub const FiletreePromptKind = enum { create, rename, delete_confirm };
 
@@ -781,20 +816,23 @@ pub const Editor = struct {
     // takeKeyboardFocus sets one; every way a pane takes focus clears both,
     // and normalizeKeyboardFocus repairs direct writes once per tick.
 
-    /// Who gets keys and text in normal mode.
-    pub const KeyboardOwner = enum { editor, terminal, filetree, snippets, search };
+    /// Who gets keys and text in normal mode. `.terminal` is a focused
+    /// terminal pane, `.terminal_panel` the docked terminal panel's shell.
+    pub const KeyboardOwner = enum { editor, terminal, filetree, snippets, search, terminal_panel };
     /// What takeKeyboardFocus hands the keyboard to: the focused pane
-    /// (editor or terminal, whichever it is) or one of the side panels.
-    pub const FocusTarget = enum { pane, filetree, snippets, search };
+    /// (editor or terminal, whichever it is) or one of the docked panels.
+    pub const FocusTarget = enum { pane, filetree, snippets, search, terminal_panel };
 
-    /// Pure read. The side panels live in the primary window and own the
+    /// Pure read. The docked panels live in the primary window and own the
     /// keyboard only while it is focused (the tree before the Snippets
-    /// panel before the search panel); otherwise the focused pane does.
+    /// panel before the search panel before the terminal panel); otherwise
+    /// the focused pane does.
     pub fn keyboardOwner(self: *const Editor) KeyboardOwner {
         if (self.active_window == 0) {
             if (self.filetree_focused) return .filetree;
             if (self.snippets_focused) return .snippets;
             if (self.search_focused) return .search;
+            if (self.terminal_panel_focused) return .terminal_panel;
         }
         return if (self.activePaneIsTerminal()) .terminal else .editor;
     }
@@ -811,9 +849,12 @@ pub const Editor = struct {
             self.filetree_visible = true;
             if (self.ensureFiletree() == null) return false;
         }
+        // An empty terminal panel has nothing to type into.
+        if (target == .terminal_panel and self.terminal_panel == null) return false;
         self.filetree_focused = false;
         self.snippets_focused = false;
         self.search_focused = false;
+        self.terminal_panel_focused = false;
         switch (target) {
             .pane => return true,
             .filetree => self.filetree_focused = true,
@@ -824,6 +865,10 @@ pub const Editor = struct {
             .search => {
                 self.search_visible = true;
                 self.search_focused = true;
+            },
+            .terminal_panel => {
+                self.terminal_panel_visible = true;
+                self.terminal_panel_focused = true;
             },
         }
         self.clearCompletionItems();
@@ -840,16 +885,28 @@ pub const Editor = struct {
             self.filetree_focused = false;
             self.snippets_focused = false;
             self.search_focused = false;
+            self.terminal_panel_focused = false;
             return;
         }
         if (!self.filetree_visible or self.filetree == null) self.filetree_focused = false;
         if (!self.snippets_visible) self.snippets_focused = false;
         if (!self.search_visible) self.search_focused = false;
+        // An empty panel has nothing to type into: it hides, unfocused.
+        if (self.terminal_panel) |idx| {
+            if (idx >= self.terminals.items.len) self.terminal_panel = null;
+        }
+        if (self.terminal_panel == null) self.terminal_panel_visible = false;
+        if (!self.terminal_panel_visible) self.terminal_panel_focused = false;
         if (self.filetree_focused) {
             self.snippets_focused = false;
             self.search_focused = false;
+            self.terminal_panel_focused = false;
         }
-        if (self.snippets_focused) self.search_focused = false;
+        if (self.snippets_focused) {
+            self.search_focused = false;
+            self.terminal_panel_focused = false;
+        }
+        if (self.search_focused) self.terminal_panel_focused = false;
     }
 
     /// The editing chords a focused side panel takes over (panelAction).
@@ -865,7 +922,8 @@ pub const Editor = struct {
         if (self.mode != .normal) return false;
         const chord = std.meta.stringToEnum(PanelChord, action) orelse return false;
         switch (self.keyboardOwner()) {
-            .editor, .terminal => return false,
+            // A shell gets its chords as bytes (Ctrl+C is the interrupt).
+            .editor, .terminal, .terminal_panel => return false,
             .filetree => switch (chord) {
                 .copy => self.filetreeClipCapture(false),
                 .cut => self.filetreeClipCapture(true),
@@ -1642,6 +1700,51 @@ pub const Editor = struct {
     /// file tree.
     pub fn snippetsSide(self: *const Editor) FiletreeSide {
         return self.snippets_side orelse (if (self.filetree_side == .left) .right else .left);
+    }
+
+    /// Dock `panel` at `edge` — the palette's `move_*` commands (the TUI's
+    /// only way) and the GUI context menus. The file tree and the Snippets
+    /// panel take left or right; the terminal panel any edge. The side
+    /// persists to init.lua and the status bar says where the panel went.
+    pub fn movePanel(self: *Editor, panel: DockPanel, edge: DockEdge) void {
+        const lua_settings = @import("lua_settings.zig");
+        switch (panel) {
+            .filetree, .snippets => {
+                const side: FiletreeSide = switch (edge) {
+                    .left => .left,
+                    .right => .right,
+                    .bottom => {
+                        self.status_message = if (panel == .filetree)
+                            "The file tree docks left or right"
+                        else
+                            "The Snippets panel docks left or right";
+                        return;
+                    },
+                };
+                if (panel == .filetree) {
+                    self.filetree_side = side;
+                    lua_settings.writeStringSettingToFile("filetree_side", @tagName(side)) catch {};
+                } else {
+                    self.snippets_side = side;
+                    lua_settings.writeStringSettingToFile("snippets_side", @tagName(side)) catch {};
+                }
+            },
+            .terminal => {
+                self.terminal_panel_side = edge;
+                lua_settings.writeStringSettingToFile("terminal_panel_side", @tagName(edge)) catch {};
+            },
+        }
+        const name: []const u8 = switch (panel) {
+            .filetree => "File tree",
+            .snippets => "Snippets panel",
+            .terminal => "Terminal panel",
+        };
+        const where: []const u8 = switch (edge) {
+            .left => "on the left",
+            .right => "on the right",
+            .bottom => "at the bottom",
+        };
+        self.status_message = std.fmt.bufPrint(&self.status_buf, "{s} docked {s}", .{ name, where }) catch "";
     }
 
     /// `snippet_panel.sync`'s view of which languages the editor knows.
@@ -2917,6 +3020,31 @@ pub const Editor = struct {
             self.openTerminalRight();
             return true;
         }
+        // The terminal panel and the panel moves
+        if (std.mem.eql(u8, action, "toggle_terminal_panel")) {
+            self.toggleTerminalPanel();
+            return true;
+        }
+        if (std.mem.eql(u8, action, "hide_terminal_panel")) {
+            self.hideTerminalPanel();
+            return true;
+        }
+        if (std.mem.eql(u8, action, "close_terminal_panel")) {
+            if (self.terminal_panel) |idx| self.closeTerminal(idx) else self.status_message = "The terminal panel has no shell";
+            return true;
+        }
+        if (std.mem.eql(u8, action, "dock_terminal")) {
+            self.dockTerminal();
+            return true;
+        }
+        if (std.mem.eql(u8, action, "undock_terminal")) {
+            self.undockTerminal();
+            return true;
+        }
+        if (panelMoveAction(action)) |move| {
+            self.movePanel(move.panel, move.edge);
+            return true;
+        }
         // LSP actions
         if (std.mem.eql(u8, action, "lsp_completion")) {
             self.triggerCompletion();
@@ -2949,6 +3077,26 @@ pub const Editor = struct {
         }
         // Fall back to command registry
         return self.commands.execute(self, action, null);
+    }
+
+    const PanelMove = struct { panel: DockPanel, edge: DockEdge };
+
+    /// `move_<panel>_<edge>` actions: move_filetree_left/right,
+    /// move_snippets_left/right, move_terminal_panel_left/right/bottom.
+    fn panelMoveAction(action: []const u8) ?PanelMove {
+        const moves = [_]struct { name: []const u8, move: PanelMove }{
+            .{ .name = "move_filetree_left", .move = .{ .panel = .filetree, .edge = .left } },
+            .{ .name = "move_filetree_right", .move = .{ .panel = .filetree, .edge = .right } },
+            .{ .name = "move_snippets_left", .move = .{ .panel = .snippets, .edge = .left } },
+            .{ .name = "move_snippets_right", .move = .{ .panel = .snippets, .edge = .right } },
+            .{ .name = "move_terminal_panel_left", .move = .{ .panel = .terminal, .edge = .left } },
+            .{ .name = "move_terminal_panel_right", .move = .{ .panel = .terminal, .edge = .right } },
+            .{ .name = "move_terminal_panel_bottom", .move = .{ .panel = .terminal, .edge = .bottom } },
+        };
+        for (moves) |m| {
+            if (std.mem.eql(u8, action, m.name)) return m.move;
+        }
+        return null;
     }
 
     /// Number of open documents.
@@ -3751,7 +3899,15 @@ pub const Editor = struct {
     }
 
     /// Close the currently focused pane. If it's the last pane, does nothing.
+    /// While the terminal panel has the keyboard it closes the panel's shell
+    /// instead (the panel hides) and leaves the panes alone.
     pub fn closePaneAction(self: *Editor) void {
+        // Ctrl+Alt+Q / Ctrl+F4 pressed in the terminal panel means the
+        // panel: never the split, or the other shell, behind it.
+        if (self.keyboardOwner() == .terminal_panel) {
+            if (self.terminal_panel) |idx| self.closeTerminal(idx);
+            return;
+        }
         const win = self.activeWindow();
         // A terminal pane closes first, split or not: closeTerminal turns
         // the main window's sole pane back into an editor pane and closes
@@ -4052,9 +4208,23 @@ pub const Editor = struct {
         }
     }
 
-    /// Move the focused terminal pane into its own window (Ctrl+Alt+`).
+    /// Move the focused terminal into its own window (Ctrl+Alt+`): the
+    /// terminal panel's shell while the panel has the keyboard (the panel
+    /// is empty afterwards and hides), else the focused terminal pane.
     /// Without window support (TUI, -Dgpu) a second terminal opens at the side.
     pub fn detachTerminal(self: *Editor) void {
+        if (self.keyboardOwner() == .terminal_panel) {
+            const term_idx = self.terminal_panel orelse return;
+            _ = self.newWindow(.{ .terminal = term_idx }) catch |err| {
+                if (err == error.Unsupported) self.openTerminalRight();
+                return;
+            };
+            // The shell moved: it is never shown twice (invariant I6).
+            self.terminal_panel = null;
+            self.terminal_panel_visible = false;
+            self.terminal_panel_focused = false;
+            return;
+        }
         if (!self.activePaneIsTerminal()) {
             self.status_message = "Focus a terminal pane to detach it";
             return;
@@ -4068,8 +4238,9 @@ pub const Editor = struct {
     pub fn terminalPassthroughAction(self: *Editor, combo: []const u8) ?[]const u8 {
         const action = self.lookupKeybind(combo) orelse return null;
         const allowed = [_][]const u8{
-            "toggle_terminal",     "close_terminal",  "close_pane",      "detach_terminal",
-            "open_terminal_right", "focus_next_pane", "focus_prev_pane", "close_window",
+            "toggle_terminal",       "close_terminal",  "close_pane",      "detach_terminal",
+            "open_terminal_right",   "focus_next_pane", "focus_prev_pane", "close_window",
+            "toggle_terminal_panel",
         };
         for (allowed) |a| {
             if (std.mem.eql(u8, action, a)) return action;
@@ -4210,6 +4381,17 @@ pub const Editor = struct {
     }
 
     fn openTerminalSplit(self: *Editor, direction: @import("layout.zig").SplitDirection) void {
+        const term_idx = self.spawnShell() orelse return;
+        const win = self.activeWindow();
+        const new_pane = win.layout.splitPane(win.active_pane, direction, .{ .terminal = term_idx }) catch return;
+        win.active_pane = new_pane;
+        _ = self.takeKeyboardFocus(.pane);
+    }
+
+    /// Start the user's shell in a new terminal slot and return its index
+    /// (null, with a status message, when it could not start). The caller
+    /// shows it in a pane or in the terminal panel.
+    fn spawnShell(self: *Editor) ?usize {
         const builtin = @import("builtin");
         const command = if (builtin.os.tag == .windows)
             "powershell.exe"
@@ -4218,21 +4400,28 @@ pub const Editor = struct {
         const term = terminal_mod.Terminal.init(self.allocator, self.io, 80, 24, command) catch |err| {
             std.log.err("Failed to open terminal: {}", .{err});
             self.status_message = "Failed to open terminal (see zide.log)";
-            return;
+            return null;
         };
         term.wake_fn = self.terminal_wake_fn;
-        self.terminals.append(self.allocator, term) catch return;
-        const term_idx = self.terminals.items.len - 1;
-        const win = self.activeWindow();
-        const new_pane = win.layout.splitPane(win.active_pane, direction, .{ .terminal = term_idx }) catch return;
-        win.active_pane = new_pane;
-        _ = self.takeKeyboardFocus(.pane);
+        self.terminals.append(self.allocator, term) catch {
+            term.deinit();
+            return null;
+        };
+        return self.terminals.items.len - 1;
     }
 
     /// Close a terminal by index: stop PTY, close its pane, focus a neighbor.
     /// If it's the last live pane, convert it to an editor instead of closing.
+    /// The terminal panel's shell empties the panel, which hides.
     pub fn closeTerminal(self: *Editor, term_idx: usize) void {
         if (term_idx >= self.terminals.items.len) return;
+        if (self.terminal_panel == term_idx) {
+            self.terminal_panel = null;
+            self.terminal_panel_visible = false;
+            if (self.terminal_panel_focused) _ = self.takeKeyboardFocus(.pane);
+            self.destroyTerminal(term_idx);
+            return;
+        }
         // Find the pane showing this terminal (at most one across all
         // windows — invariant I6)
         outer: for (self.windows.items, 0..) |win, w| {
@@ -4289,6 +4478,12 @@ pub const Editor = struct {
 
     /// Toggle terminal: focus existing terminal, or open one. If already in terminal, go back.
     pub fn toggleTerminal(self: *Editor) void {
+        // From the terminal panel, Ctrl+` goes back to the editor like it
+        // does from a terminal pane (the panel stays open).
+        if (self.keyboardOwner() == .terminal_panel) {
+            _ = self.takeKeyboardFocus(.pane);
+            return;
+        }
         // The focused pane is a terminal but a side panel has the keyboard:
         // hand it to that terminal rather than leave it or open another.
         if (self.activePaneIsTerminal() and self.keyboardOwner() != .terminal) {
@@ -4320,14 +4515,111 @@ pub const Editor = struct {
         self.openTerminal();
     }
 
-    /// Close the active pane's terminal (if it is one).
+    /// Close the terminal that has the keyboard: the terminal panel's shell
+    /// while the panel is focused, else the active pane's terminal (if it
+    /// is one).
     pub fn closeActiveTerminal(self: *Editor) void {
+        if (self.keyboardOwner() == .terminal_panel) {
+            if (self.terminal_panel) |idx| self.closeTerminal(idx);
+            return;
+        }
         if (self.activePaneTerminalIdx()) |idx| {
             self.closeTerminal(idx);
         } else {
             // From the palette or the View menu with an editor pane focused.
             self.status_message = "Close terminal: focus a terminal pane first (Ctrl+Alt+Q closes any pane)";
         }
+    }
+
+    // ---- The terminal panel ----
+
+    /// The shell the terminal panel shows, or null: no shell in the panel
+    /// (`terminal_panel == null`), or a slot without one (tests fake
+    /// terminals with null slots; the frontends then draw an empty band).
+    pub fn terminalPanelTerminal(self: *const Editor) ?*terminal_mod.Terminal {
+        const idx = self.terminal_panel orelse return null;
+        if (idx >= self.terminals.items.len) return null;
+        return self.terminals.items[idx];
+    }
+
+    /// Ctrl+Shift+`: hidden or empty → show the panel with a shell (a new
+    /// one when it has none) and focus it; shown but something else owns
+    /// the keyboard → focus it; focused → back to the editor pane (the
+    /// panel stays, its shell keeps running; `hide_terminal_panel` hides).
+    pub fn toggleTerminalPanel(self: *Editor) void {
+        if (self.keyboardOwner() == .terminal_panel) {
+            _ = self.takeKeyboardFocus(.pane);
+            return;
+        }
+        if (self.terminal_panel == null) {
+            self.terminal_panel = self.spawnShell() orelse return;
+        }
+        _ = self.takeKeyboardFocus(.terminal_panel);
+    }
+
+    /// Hide the terminal panel (its shell keeps running; the toggle brings
+    /// it back). The keyboard goes back to the pane when the panel had it.
+    pub fn hideTerminalPanel(self: *Editor) void {
+        if (!self.terminal_panel_visible) return;
+        if (self.terminal_panel_focused) _ = self.takeKeyboardFocus(.pane);
+        self.terminal_panel_visible = false;
+        self.terminal_panel_focused = false;
+    }
+
+    /// Move the focused terminal pane into the terminal panel (its shell
+    /// moves, never copied — invariant I6). The pane goes the way
+    /// movePaneToNewWindow sends one off: a split closes, the main window's
+    /// sole pane turns into a fresh document, a secondary window's sole
+    /// pane closes the window. Refused while the panel already has a shell.
+    pub fn dockTerminal(self: *Editor) void {
+        const term_idx = self.activePaneTerminalIdx() orelse {
+            self.status_message = "Focus a terminal pane to dock it (Ctrl+Shift+` opens a shell in the panel)";
+            return;
+        };
+        if (self.terminal_panel != null) {
+            self.status_message = "The terminal panel already has a shell — close it first";
+            return;
+        }
+        const src_idx = self.active_window;
+        const src = self.activeWindow();
+        const src_pane = src.active_pane;
+        self.cancelSnippets();
+        if (src.layout.paneCount() > 1) {
+            if (src.layout.closePane(src_pane)) |sibling| src.active_pane = sibling;
+            ensureValidActivePaneIn(src);
+        } else if (src_idx == 0) {
+            const fresh = self.appendUntitled(0) orelse return;
+            src.layout.panes.items[src_pane].content = .{ .editor = fresh };
+        } else {
+            // closeWindow stops every terminal the window still shows: the
+            // moved one must not be among them.
+            src.layout.panes.items[src_pane].content = .{ .editor = @min(self.active_doc_idx, self.documents.items.len - 1) };
+            self.requestCloseWindow(src_idx);
+        }
+        self.active_doc_idx = self.windowDocIdx(self.active_window);
+        self.terminal_panel = term_idx;
+        _ = self.takeKeyboardFocus(.terminal_panel);
+    }
+
+    /// Move the terminal panel's shell into a split pane of the focused
+    /// window (beside the active pane: side by side from a side panel,
+    /// below from the bottom one). The panel is empty afterwards and hides.
+    pub fn undockTerminal(self: *Editor) void {
+        const term_idx = self.terminal_panel orelse {
+            self.status_message = "The terminal panel has no shell to undock";
+            return;
+        };
+        const direction: @import("layout.zig").SplitDirection = if (self.terminal_panel_side == .bottom) .vertical else .horizontal;
+        const win = self.activeWindow();
+        const new_pane = win.layout.splitPane(win.active_pane, direction, .{ .terminal = term_idx }) catch {
+            self.status_message = "Cannot split the pane any further";
+            return;
+        };
+        self.terminal_panel = null;
+        self.terminal_panel_visible = false;
+        self.terminal_panel_focused = false;
+        win.active_pane = new_pane;
+        _ = self.takeKeyboardFocus(.pane);
     }
 
     // ---- Language / syntax theme operations ----
@@ -5445,11 +5737,30 @@ pub const Editor = struct {
                 break;
             }
         }
-        if (replace == null) try self.snippets.items.ensureUnusedCapacity(self.allocator, 1);
+        // Another file's definition under this name is kept behind the new
+        // one instead of freed: removing the new one (deleting your copy of
+        // a bundled snippet) then shows it again, as a reload would.
+        var keep: ?*snippets_mod.Definition = null;
+        errdefer if (keep) |node| self.allocator.destroy(node);
+        if (replace) |i| {
+            if (!std.mem.eql(u8, self.snippets.items.items[i].source, def.source)) keep = try self.allocator.create(snippets_mod.Definition);
+        } else try self.snippets.items.ensureUnusedCapacity(self.allocator, 1);
         try self.commands.registerSnippet(def.command, def.description);
         if (replace) |i| {
-            self.snippets.items.items[i].deinit(self.allocator);
-            self.snippets.items.items[i] = def;
+            const old = &self.snippets.items.items[i];
+            if (keep) |node| {
+                // What this file registered earlier, further back, is superseded.
+                old.dropReplaced(self.allocator, def.source);
+                node.* = old.*;
+                def.replaced = node;
+            } else {
+                // The same file again (an edit): what stood behind the old
+                // definition stands behind the new one.
+                def.replaced = old.replaced;
+                old.replaced = null;
+                old.deinit(self.allocator);
+            }
+            old.* = def;
         } else self.snippets.items.appendAssumeCapacity(def);
         self.snippets.revision += 1;
         return def.command;
@@ -5460,26 +5771,54 @@ pub const Editor = struct {
         var i = self.snippets.items.items.len;
         while (i > 0) {
             i -= 1;
-            if (!self.snippets.items.items[i].from_extension) continue;
-            var def = self.snippets.items.orderedRemove(i);
-            self.commands.removeSnippet(def.command);
-            def.deinit(self.allocator);
+            const def = &self.snippets.items.items[i];
+            // Extension definitions kept behind another go too; one from
+            // init.lua or the Lua runtime, which a reload does not register
+            // again, takes its slot back.
+            def.dropReplaced(self.allocator, null);
+            if (def.from_extension) _ = self.takeSnippetAt(i);
         }
         self.snippets.revision += 1;
     }
 
     /// Drop the snippet registered as `command`, palette entry included;
-    /// false when there is none.
+    /// false when there is none. A definition it had replaced (another
+    /// file's, under the same name) is back in its place afterwards.
     pub fn removeSnippet(self: *Editor, command: []const u8) bool {
         for (self.snippets.items.items, 0..) |*def, i| {
             if (!std.mem.eql(u8, def.command, command)) continue;
             self.cancelSnippets();
-            var removed = self.snippets.items.orderedRemove(i);
-            self.commands.removeSnippet(removed.command);
-            removed.deinit(self.allocator);
+            _ = self.takeSnippetAt(i);
             self.snippets.revision += 1;
             return true;
         }
+        return false;
+    }
+
+    /// Take the definition at `i` out of the registry. The one it had
+    /// replaced (see Definition.replaced) gets the slot and the palette
+    /// command back; true when that happened.
+    fn takeSnippetAt(self: *Editor, i: usize) bool {
+        const slot = &self.snippets.items.items[i];
+        const behind = slot.replaced;
+        slot.replaced = null;
+        if (behind) |node| {
+            // The palette entry borrows its name from the definition: point
+            // it at the one coming back before the other is freed.
+            if (self.commands.registerSnippet(node.command, node.description)) |_| {
+                slot.deinit(self.allocator);
+                slot.* = node.*;
+                self.allocator.destroy(node);
+                return true;
+            } else |_| {
+                // Out of memory: both go.
+                node.deinit(self.allocator);
+                self.allocator.destroy(node);
+            }
+        }
+        self.commands.removeSnippet(slot.command);
+        var removed = self.snippets.items.orderedRemove(i);
+        removed.deinit(self.allocator);
         return false;
     }
 
@@ -5514,16 +5853,23 @@ pub const Editor = struct {
             return;
         }
         // The selection may sit in a shared scratch buffer: prepare it now.
-        const body = snippet_form_mod.prepareBody(self.allocator, selection) catch {
+        const plain = snippet_form_mod.prepareBody(self.allocator, selection) catch {
             self.status_message = "Save as snippet: out of memory";
             return;
         };
-        defer self.allocator.free(body);
-        if (body.len == 0) {
+        defer self.allocator.free(plain);
+        if (plain.len == 0) {
             // Only blanks and line breaks were selected.
             self.status_message = "Save as snippet: select the code first";
             return;
         }
+        // A body is a template (`$1` is a blank, `\$` a dollar): escape the
+        // selection so the snippet inserts it exactly as it was selected.
+        const body = snippets_mod.escapeLiteral(self.allocator, plain) catch {
+            self.status_message = "Save as snippet: out of memory";
+            return;
+        };
+        defer self.allocator.free(body);
         if (body.len >= snippet_form_mod.max_body) {
             self.status_message = "Save as snippet: the selection is too long (8 KiB max)";
             return;
@@ -5728,7 +6074,8 @@ pub const Editor = struct {
     }
 
     /// `y` to the question: the block leaves my-snippets.lua and the
-    /// snippet leaves the registry and the panel.
+    /// snippet leaves the registry and the panel (where a snippet it had
+    /// replaced, the bundled one it was a copy of, shows again).
     pub fn applySnippetDelete(self: *Editor) void {
         if (self.mode != .snippet_delete_confirm) return;
         var cmd_buf: [512]u8 = undefined;
@@ -5777,10 +6124,20 @@ pub const Editor = struct {
             if (open_doc) |idx| self.documents.items[idx].reloadFromDisk(self.io) catch {};
         }
         _ = self.removeSnippet(command);
-        self.status_message = if (removal.removed > 0)
-            std.fmt.bufPrint(&self.status_buf, "Deleted from my-snippets.lua: {s}", .{name}) catch "Deleted from my-snippets.lua"
+        if (removal.removed == 0) {
+            self.status_message = std.fmt.bufPrint(&self.status_buf, "my-snippets.lua had no block for {s}: removed from the panel only", .{name}) catch "my-snippets.lua had no block for it: removed from the panel only";
+            return;
+        }
+        // A copy of another file's snippet (a bundled one) uncovers the
+        // original: say so, or the row that is still there looks undeleted.
+        const original = self.snippets.command(command) orelse {
+            self.status_message = std.fmt.bufPrint(&self.status_buf, "Deleted from my-snippets.lua: {s}", .{name}) catch "Deleted from my-snippets.lua";
+            return;
+        };
+        self.status_message = if (original.source.len > 0)
+            std.fmt.bufPrint(&self.status_buf, "Deleted from my-snippets.lua: {s} (the one from {s} is back)", .{ name, original.source }) catch "Deleted from my-snippets.lua (the snippet it replaced is back)"
         else
-            std.fmt.bufPrint(&self.status_buf, "my-snippets.lua had no block for {s}: removed from the panel only", .{name}) catch "my-snippets.lua had no block for it: removed from the panel only";
+            std.fmt.bufPrint(&self.status_buf, "Deleted from my-snippets.lua: {s} (the snippet it replaced is back)", .{name}) catch "Deleted from my-snippets.lua (the snippet it replaced is back)";
     }
 
     /// F2 / the context menu on the panel's selected row: a snippet of
@@ -6867,6 +7224,211 @@ test "keyboard focus: a focused panel outranks a terminal pane" {
     editor.splitActive(.horizontal);
     try t.expectEqual(Editor.KeyboardOwner.editor, editor.keyboardOwner());
     try t.expectEqual(panes + 1, editor.activeLayout().paneCount());
+}
+
+test "terminal panel: dock a pane's shell, focus cycle, undock, close" {
+    const t = std.testing;
+    var editor = try Editor.init(t.allocator, t.io);
+    defer editor.deinit();
+    try editor.keybinds.loadDefaults();
+
+    // Nothing docked: the panel cannot take the keyboard, undocking and
+    // docking from an editor pane explain themselves.
+    try t.expect(!editor.takeKeyboardFocus(.terminal_panel));
+    try t.expect(!editor.terminal_panel_visible);
+    try t.expect(editor.execAction("undock_terminal"));
+    try t.expectEqualStrings("The terminal panel has no shell to undock", editor.status_message);
+    try t.expect(editor.execAction("dock_terminal"));
+    try t.expect(std.mem.indexOf(u8, editor.status_message, "Focus a terminal pane") != null);
+
+    // A terminal split below the document (fake slot: no shell), docked:
+    // the split closes, the panel shows it and owns the keyboard.
+    try editor.terminals.append(t.allocator, null);
+    const win = editor.windows.items[0];
+    const term_pane = try win.layout.splitPane(0, .vertical, .{ .terminal = 0 });
+    win.active_pane = term_pane;
+    try t.expectEqual(Editor.KeyboardOwner.terminal, editor.keyboardOwner());
+    try t.expect(editor.execAction("dock_terminal"));
+    try t.expectEqual(@as(?usize, 0), editor.terminal_panel);
+    try t.expect(editor.terminal_panel_visible);
+    try t.expectEqual(Editor.KeyboardOwner.terminal_panel, editor.keyboardOwner());
+    try t.expectEqual(@as(usize, 1), win.layout.paneCount());
+    try t.expect(!editor.activePaneIsTerminal());
+    // Invariant I6: the shell is shown by the panel only.
+    for (win.layout.panes.items) |pane| try t.expect(pane.content != .terminal);
+
+    // Docking again needs another terminal pane; a second shell cannot
+    // share the panel.
+    try editor.terminals.append(t.allocator, null);
+    const second = try win.layout.splitPane(win.active_pane, .horizontal, .{ .terminal = 1 });
+    win.active_pane = second;
+    _ = editor.takeKeyboardFocus(.pane);
+    try t.expect(editor.execAction("dock_terminal"));
+    try t.expect(std.mem.indexOf(u8, editor.status_message, "already has a shell") != null);
+    try t.expectEqual(@as(usize, 2), win.layout.paneCount());
+    try t.expectEqual(@as(?usize, 0), editor.terminal_panel);
+
+    // The toggle: focused panel → back to the pane; from the pane → the
+    // panel again (no new shell). Ctrl+` from the panel also goes back.
+    try t.expect(editor.takeKeyboardFocus(.terminal_panel));
+    try t.expect(editor.execAction("toggle_terminal_panel"));
+    try t.expectEqual(Editor.KeyboardOwner.terminal, editor.keyboardOwner()); // pane `second`
+    try t.expect(editor.execAction("toggle_terminal_panel"));
+    try t.expectEqual(Editor.KeyboardOwner.terminal_panel, editor.keyboardOwner());
+    try t.expectEqual(@as(usize, 2), editor.terminals.items.len);
+    try t.expect(editor.execAction("toggle_terminal"));
+    try t.expectEqual(Editor.KeyboardOwner.terminal, editor.keyboardOwner());
+    try t.expectEqual(@as(usize, 2), win.layout.paneCount());
+
+    // The panel's chords are the shell's (no panel clipboard); the toggle
+    // chord passes through a focused terminal.
+    try t.expect(editor.takeKeyboardFocus(.terminal_panel));
+    try t.expect(!editor.panelAction("copy"));
+    try t.expectEqualStrings("toggle_terminal_panel", editor.terminalPassthroughAction("ctrl+shift+`").?);
+
+    // Hiding keeps the shell and releases the keyboard; a focused panel
+    // whose flag survives a hide is repaired by normalizeKeyboardFocus.
+    try t.expect(editor.execAction("hide_terminal_panel"));
+    try t.expect(!editor.terminal_panel_visible);
+    try t.expectEqual(@as(?usize, 0), editor.terminal_panel);
+    try t.expectEqual(Editor.KeyboardOwner.terminal, editor.keyboardOwner());
+    editor.terminal_panel_focused = true;
+    editor.normalizeKeyboardFocus();
+    try t.expect(!editor.terminal_panel_focused);
+    // The toggle shows it again, with the same shell.
+    try t.expect(editor.execAction("toggle_terminal_panel"));
+    try t.expect(editor.terminal_panel_visible);
+    try t.expectEqual(@as(?usize, 0), editor.terminal_panel);
+
+    // Undock from the bottom: a split below the active pane shows the
+    // shell, the panel is empty and hidden.
+    editor.terminal_panel_side = .bottom;
+    try t.expect(editor.execAction("undock_terminal"));
+    try t.expect(editor.terminal_panel == null);
+    try t.expect(!editor.terminal_panel_visible);
+    try t.expectEqual(@as(usize, 3), win.layout.paneCount());
+    try t.expectEqual(@as(?usize, 0), editor.activePaneTerminalIdx());
+    try t.expectEqual(Editor.KeyboardOwner.terminal, editor.keyboardOwner());
+
+    // Dock it back and close it from the panel: the slot is freed, the
+    // panel hides, the keyboard returns to the pane.
+    try t.expect(editor.execAction("dock_terminal"));
+    try t.expectEqual(@as(?usize, 0), editor.terminal_panel);
+    try t.expect(editor.execAction("close_terminal"));
+    try t.expect(editor.terminal_panel == null);
+    try t.expect(!editor.terminal_panel_visible);
+    try t.expect(editor.terminals.items[0] == null);
+    try t.expect(editor.keyboardOwner() != .terminal_panel);
+
+    // A lone terminal pane in the main window leaves a fresh document
+    // behind when docked.
+    const docs_before = editor.documents.items.len;
+    while (win.layout.paneCount() > 1) _ = win.layout.closePane(win.layout.firstLeafPane(0).?);
+    const only = win.layout.firstLeafPane(0).?;
+    win.layout.panes.items[only].content = .{ .terminal = 1 };
+    win.active_pane = only;
+    try t.expect(editor.execAction("dock_terminal"));
+    try t.expectEqual(@as(?usize, 1), editor.terminal_panel);
+    try t.expectEqual(docs_before + 1, editor.documents.items.len);
+    try t.expect(win.layout.panes.items[only].content == .editor);
+}
+
+test "terminal panel: close_pane and detach_terminal act on the panel that has the keyboard" {
+    const t = std.testing;
+    var editor = try Editor.init(t.allocator, t.io);
+    defer editor.deinit();
+    try editor.keybinds.loadDefaults();
+    editor.multi_window_supported = true;
+    const win = editor.windows.items[0];
+
+    // The panel holds a (fake) shell; an editor split sits behind it.
+    try editor.terminals.append(t.allocator, null);
+    editor.terminal_panel = 0;
+    editor.splitActive(.horizontal);
+    try t.expectEqual(@as(usize, 2), win.layout.paneCount());
+    try t.expect(editor.takeKeyboardFocus(.terminal_panel));
+    // Both close chords come back from a focused terminal as close_pane
+    // and end the panel's shell: the split behind it stays.
+    for ([_][]const u8{ "ctrl+alt+q", "ctrl+f4" }) |chord| {
+        try t.expectEqualStrings("close_pane", editor.terminalPassthroughAction(chord).?);
+    }
+    try t.expect(editor.execAction("close_pane"));
+    try t.expectEqual(@as(usize, 2), win.layout.paneCount());
+    try t.expect(editor.terminal_panel == null);
+    try t.expect(!editor.terminal_panel_visible);
+    try t.expectEqual(Editor.KeyboardOwner.editor, editor.keyboardOwner());
+
+    // A terminal PANE behind the focused panel keeps its shell and its
+    // pane; only the panel's shell goes.
+    try editor.terminals.append(t.allocator, null); // slot 1: the pane's
+    try editor.terminals.append(t.allocator, null); // slot 2: the panel's
+    const term_pane = try win.layout.splitPane(win.active_pane, .vertical, .{ .terminal = 1 });
+    win.active_pane = term_pane;
+    editor.terminal_panel = 2;
+    try t.expect(editor.takeKeyboardFocus(.terminal_panel));
+    try t.expect(editor.execAction("close_pane"));
+    try t.expectEqual(@as(usize, 3), win.layout.paneCount());
+    try t.expect(editor.terminal_panel == null);
+    try t.expectEqual(@as(?usize, 1), editor.activePaneTerminalIdx());
+    try t.expectEqual(Editor.KeyboardOwner.terminal, editor.keyboardOwner());
+
+    // With the keyboard back in a pane the chord closes that pane, as before.
+    try t.expect(editor.execAction("close_pane"));
+    try t.expectEqual(@as(usize, 2), win.layout.paneCount());
+    for (win.layout.panes.items) |pane| try t.expect(pane.content != .terminal);
+
+    // detach_terminal from the panel moves the panel's shell into its own
+    // window, not the terminal pane behind the panel.
+    try editor.terminals.append(t.allocator, null); // slot 3: a pane's
+    try editor.terminals.append(t.allocator, null); // slot 4: the panel's
+    const behind = try win.layout.splitPane(win.active_pane, .vertical, .{ .terminal = 3 });
+    win.active_pane = behind;
+    editor.terminal_panel = 4;
+    try t.expect(editor.takeKeyboardFocus(.terminal_panel));
+    try t.expect(editor.execAction("detach_terminal"));
+    try t.expectEqual(@as(usize, 2), editor.windows.items.len);
+    try t.expectEqual(@as(usize, 1), editor.active_window);
+    try t.expectEqual(@as(?usize, 4), editor.activePaneTerminalIdx());
+    try t.expect(editor.terminal_panel == null);
+    try t.expect(!editor.terminal_panel_visible);
+    try t.expect(!editor.terminal_panel_focused);
+    // The pane behind the panel still shows its own shell.
+    try t.expectEqual(@as(usize, 3), win.layout.paneCount());
+    try t.expect(win.layout.panes.items[behind].content == .terminal);
+    try t.expectEqual(@as(usize, 3), win.layout.panes.items[behind].content.terminal);
+}
+
+test "terminal panel: move_* commands dock the panels and refuse the bottom for the side-only ones" {
+    const t = std.testing;
+    var editor = try Editor.init(t.allocator, t.io);
+    defer editor.deinit();
+    try t.expectEqual(Editor.DockEdge.bottom, editor.terminal_panel_side);
+    try t.expect(editor.execAction("move_terminal_panel_right"));
+    try t.expectEqual(Editor.DockEdge.right, editor.terminal_panel_side);
+    try t.expectEqualStrings("Terminal panel docked on the right", editor.status_message);
+    try t.expect(editor.execAction("move_terminal_panel_left"));
+    try t.expectEqual(Editor.DockEdge.left, editor.terminal_panel_side);
+    try t.expect(editor.execAction("move_terminal_panel_bottom"));
+    try t.expectEqual(Editor.DockEdge.bottom, editor.terminal_panel_side);
+    try t.expect(editor.execAction("move_filetree_right"));
+    try t.expectEqual(Editor.FiletreeSide.right, editor.filetree_side);
+    try t.expectEqualStrings("File tree docked on the right", editor.status_message);
+    try t.expect(editor.execAction("move_filetree_left"));
+    try t.expectEqual(Editor.FiletreeSide.left, editor.filetree_side);
+    try t.expect(editor.snippets_side == null);
+    try t.expect(editor.execAction("move_snippets_left"));
+    try t.expectEqual(@as(?Editor.FiletreeSide, .left), editor.snippets_side);
+    try t.expect(editor.execAction("move_snippets_right"));
+    try t.expectEqual(@as(?Editor.FiletreeSide, .right), editor.snippets_side);
+    editor.movePanel(.filetree, .bottom);
+    try t.expectEqualStrings("The file tree docks left or right", editor.status_message);
+    try t.expectEqual(Editor.FiletreeSide.left, editor.filetree_side);
+    editor.movePanel(.snippets, .bottom);
+    try t.expectEqualStrings("The Snippets panel docks left or right", editor.status_message);
+    // Every move is a palette command.
+    for ([_][]const u8{ "move_terminal_panel_bottom", "move_filetree_left", "move_snippets_right", "toggle_terminal_panel", "hide_terminal_panel", "dock_terminal", "undock_terminal" }) |name| {
+        try t.expect(editor.commands.get(name) != null);
+    }
 }
 
 test "keyboard focus: windows, hidden panels and failed trees never own it" {

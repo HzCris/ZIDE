@@ -112,12 +112,18 @@ fn hasMarkerLine(body: []const u8) bool {
 }
 
 /// The smallest long-bracket level 0..=16 whose closer (`]`, that many
-/// `=`, `]`) the body does not contain, or null when every level does.
+/// `=`, `]`) the body neither contains nor completes at its end, or null
+/// when no level is free. A body ending in `]` and that many `=` would
+/// close the string one character early, with the closer's own first `]`
+/// (`list[i]` at level 0 reads `[[list[i]]]`).
 pub fn bracketLevel(body: []const u8) ?u8 {
     var level: u8 = 0;
     while (level <= 16) : (level += 1) {
         var buf: [18]u8 = undefined;
-        if (std.mem.indexOf(u8, body, bracket(&buf, level, ']')) == null) return level;
+        const closer = bracket(&buf, level, ']');
+        if (std.mem.indexOf(u8, body, closer) != null) continue;
+        if (std.mem.endsWith(u8, body, closer[0 .. closer.len - 1])) continue;
+        return level;
     }
     return null;
 }
@@ -304,6 +310,15 @@ test "my-snippets.lua: the long bracket level avoids the body's closers, and fal
     const block = try renderBlock(t.allocator, "snippet.zig.~index", testSpec("a[b[i]]"));
     defer t.allocator.free(block);
     try t.expect(std.mem.indexOf(u8, block, "body = [=[\na[b[i]]]=],") != null);
+    // A body ending in `]` (and that level's `=`s) would close the string
+    // one character early there: the next free level is taken.
+    try t.expectEqual(@as(?u8, 1), bracketLevel("list[i]"));
+    try t.expectEqual(@as(?u8, 1), bracketLevel("]"));
+    try t.expectEqual(@as(?u8, 0), bracketLevel("x ]="));
+    try t.expectEqual(@as(?u8, 2), bracketLevel("x ]] y ]="));
+    const ends = try renderBlock(t.allocator, "snippet.zig.~index", testSpec("#[derive(Debug)]"));
+    defer t.allocator.free(ends);
+    try t.expect(std.mem.indexOf(u8, ends, "body = [=[\n#[derive(Debug)]]=],") != null);
     // Every level taken: a plain quoted string instead.
     var all: std.ArrayList(u8) = .empty;
     defer all.deinit(t.allocator);

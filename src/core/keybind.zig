@@ -317,9 +317,11 @@ pub const KeybindMap = struct {
         try self.set("f9", "review_next_change");
         try self.set("shift+f9", "review_prev_change");
         try self.set("ctrl+f9", "review_toggle_view");
-        // Terminal
+        // Terminal. Ctrl+Shift+` is the docked terminal panel (full height
+        // at a side, or a strip at the bottom); the side-by-side split it
+        // used to make stays in the palette as open_terminal_right.
         try self.set("ctrl+`", "toggle_terminal");
-        try self.set("ctrl+shift+`", "open_terminal_right");
+        try self.set("ctrl+shift+`", "toggle_terminal_panel");
         try self.set("ctrl+alt+`", "detach_terminal");
         // Side panels
         try self.set("ctrl+b", "toggle_filetree");
@@ -384,6 +386,7 @@ test "keybind defaults" {
     try std.testing.expectEqualStrings("open_in_new_window", kb.get("ctrl+shift+n").?);
     try std.testing.expectEqualStrings("open_in_new_window", kb.get("ctrl+alt+n").?);
     try std.testing.expectEqualStrings("detach_terminal", kb.get("ctrl+alt+`").?);
+    try std.testing.expectEqualStrings("toggle_terminal_panel", kb.get("ctrl+shift+`").?);
     // Ctrl+Shift+Z is redo, not the shift-stripped Ctrl+Z fallback
     try std.testing.expectEqualStrings("redo", kb.get("ctrl+shift+z").?);
     // The completion chord as either frontend spells it (a terminal may

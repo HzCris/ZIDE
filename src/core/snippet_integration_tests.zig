@@ -125,6 +125,18 @@ test "my-snippets.lua: a rendered block loads in Lua and registers the same snip
     defer t.allocator.free(file);
     const found = (try snippet_file.findBlock(file, "snippet.zig.trk")).?;
     try t.expectEqualStrings(block, file[found.start..found.end]);
+    // Bodies ending in `]` (an index, an attribute, a list) once closed the
+    // long string one character early: the file then failed to load and
+    // every snippet in it was gone at the next start.
+    for ([_][]const u8{ "const x = list[i]", "#[derive(Debug)]", "values = [1, 2, 3]", "a]] b]=", "]", "x ]] y ]=] z]==" }) |ends| {
+        const ends_spec: snippets.Spec = .{ .language = "zig", .description = "Ends", .group = "Mine", .prefix = "ends", .notes = "", .body = ends };
+        const ends_block = try snippet_file.renderBlock(t.allocator, "snippet.zig.ends", ends_spec);
+        defer t.allocator.free(ends_block);
+        const ends_blockz = try t.allocator.dupeZ(u8, ends_block);
+        defer t.allocator.free(ends_blockz);
+        try lua.doString(ends_blockz);
+        try t.expectEqualStrings(ends, editor.snippets.command("snippet.zig.ends").?.body);
+    }
 }
 
 test "save selection as snippet: refusals, prefill, the file and the registry" {
@@ -216,6 +228,67 @@ test "save selection as snippet: refusals, prefill, the file and the registry" {
     try t.expect(!editor.removeSnippet("snippet.zig.~my-loop"));
 }
 
+test "save selection as snippet: the selection is escaped, so the snippet inserts it exactly as selected" {
+    var tmp = t.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(t.io, ".", t.allocator);
+    defer t.allocator.free(root);
+    lua_settings.test_config_dir = root;
+    defer lua_settings.test_config_dir = null;
+    var editor = try Editor.init(t.allocator, t.io);
+    defer editor.deinit();
+    editor.lsp_enabled = false;
+    const doc = editor.activeDoc();
+    doc.language = editor.findLanguage("zig");
+    // A Zig multi-line string, `$1`, an environment variable, a template
+    // literal and a Windows path. A body is a template, so unescaped the
+    // `\\` came back as `\`, `$1` became a blank and `$HOME` refused Save.
+    const selected = "const text =\n    \\\\Hello $1\n    \\\\$HOME and ${name}\n;\nconst dir = \"C:\\\\tools\\\\\";";
+    try doc.loadText(selected);
+    _ = editor.execCommand("select_all", null);
+    editor.startSnippetSave();
+    try t.expectEqual(Editor.Mode.snippet_form, editor.mode);
+    const form = &editor.snippet_form;
+    // The Body field holds template text: the dollars carry a backslash.
+    try t.expect(std.mem.indexOf(u8, form.text(.body), "Hello \\$1\n") != null);
+    try t.expect(std.mem.indexOf(u8, form.text(.body), "\\$HOME and \\${name}") != null);
+    form.set(.name, "Escaped");
+    try t.expect(editor.submitSnippetForm());
+    try t.expectEqual(Editor.Mode.normal, editor.mode);
+    {
+        const def = editor.snippets.command("snippet.zig.~escaped").?;
+        try t.expectEqualStrings(selected, def.template.text);
+        try t.expectEqual(@as(usize, 0), def.template.stops.len);
+    }
+    // Inserted over the selection it came from, the document is unchanged.
+    _ = editor.execCommand("select_all", null);
+    editor.insertSnippetCommand("snippet.zig.~escaped");
+    try t.expectEqualStrings(selected, doc.buffer.slice(0, doc.buffer.byteLen()));
+    // The file gives the same snippet back at the next start.
+    const path = try std.fs.path.join(t.allocator, &.{ root, "extensions", snippet_file.file_name });
+    defer t.allocator.free(path);
+    {
+        const text = try snippet_file.read(t.allocator, t.io, path);
+        defer t.allocator.free(text);
+        const textz = try t.allocator.dupeZ(u8, text);
+        defer t.allocator.free(textz);
+        var lua = try Lua.init(t.allocator);
+        defer lua.deinit();
+        lua.openLibs();
+        var second = try Editor.init(t.allocator, t.io);
+        defer second.deinit();
+        lua_settings.registerApi(lua, &second);
+        try lua.doString(textz);
+        try t.expectEqualStrings(selected, second.snippets.command("snippet.zig.~escaped").?.template.text);
+    }
+    // F2 shows the body as saved: editing does not escape it a second time.
+    editor.startSnippetEdit(indexOfCommand(&editor, "snippet.zig.~escaped").?);
+    try t.expectEqual(Editor.Mode.snippet_form, editor.mode);
+    try t.expectEqualStrings(editor.snippets.command("snippet.zig.~escaped").?.body, form.text(.body));
+    try t.expect(editor.submitSnippetForm());
+    try t.expectEqualStrings(selected, editor.snippets.command("snippet.zig.~escaped").?.template.text);
+}
+
 test "snippet edit, copy and delete: blocks rewrite in place, a rename moves the marker, a hand-edited file is opened instead" {
     var tmp = t.tmpDir(.{});
     defer tmp.cleanup();
@@ -277,9 +350,16 @@ test "snippet edit, copy and delete: blocks rewrite in place, a rename moves the
     try t.expect(snippet_file.isMine(copied));
     try t.expectEqualStrings("mine($0)", copied.body);
     try t.expectEqual(@as(usize, 2), editor.snippets.items.items.len);
+    // Editing the copy keeps the bundled one behind it.
+    editor.startSnippetEdit(indexOfCommand(&editor, "snippet.zig.~bundled").?);
+    editor.snippet_form.setRaw(.body, "mine(${1:again})");
+    try t.expect(editor.submitSnippetForm());
+    try t.expectEqualStrings("mine(${1:again})", editor.snippets.command("snippet.zig.~bundled").?.body);
+    try t.expectEqual(@as(usize, 2), editor.snippets.items.items.len);
 
     // Delete: only mine can go, the question names it, cancel keeps it,
-    // y removes the block and the definition.
+    // y removes the block and the definition, and the bundled snippet the
+    // copy had replaced is back in its row, as after a reload.
     _ = try editor.registerSnippet(.{ .language = "zig", .description = "Theirs", .body = "t" });
     editor.startSnippetDelete(indexOfCommand(&editor, "snippet.zig.~theirs").?);
     try t.expectEqual(Editor.Mode.normal, editor.mode);
@@ -292,25 +372,50 @@ test "snippet edit, copy and delete: blocks rewrite in place, a rename moves the
     try t.expectEqual(Editor.Mode.normal, editor.mode);
     try t.expect(editor.snippet_delete_target == null);
     try t.expect(editor.snippets.command("snippet.zig.~bundled") != null);
-    editor.startSnippetDelete(indexOfCommand(&editor, "snippet.zig.~bundled").?);
+    const bundled_index = indexOfCommand(&editor, "snippet.zig.~bundled").?;
+    editor.startSnippetDelete(bundled_index);
     editor.applySnippetDelete();
     try t.expectEqual(Editor.Mode.normal, editor.mode);
-    try t.expectEqualStrings("Deleted from my-snippets.lua: Bundled", editor.status_message);
-    try t.expect(editor.snippets.command("snippet.zig.~bundled") == null);
+    try t.expectEqualStrings("Deleted from my-snippets.lua: Bundled (the one from snippets-zig.lua is back)", editor.status_message);
     try t.expect(editor.snippet_delete_target == null);
     t.allocator.free(text);
     text = try snippet_file.read(t.allocator, t.io, path);
     try t.expectEqual(@as(usize, 0), std.mem.count(u8, text, "~bundled"));
     try t.expectEqual(@as(usize, 1), std.mem.count(u8, text, "\n-- zide:snippet "));
+    {
+        const back = editor.snippets.command("snippet.zig.~bundled").?;
+        try t.expect(!snippet_file.isMine(back));
+        try t.expectEqualStrings("snippets-zig.lua", back.source);
+        try t.expectEqualStrings("bundled($0)", back.body);
+        try t.expect(back.replaced == null);
+        try t.expectEqual(bundled_index, indexOfCommand(&editor, "snippet.zig.~bundled").?);
+        try t.expectEqual(@as(usize, 3), editor.snippets.items.items.len);
+        // The palette command is the bundled one's again.
+        try t.expectEqualStrings("Bundled", editor.commands.get("snippet.zig.~bundled").?.description);
+        try t.expect(editor.execCommand("snippet.zig.~bundled", null));
+        try t.expect(std.mem.indexOf(u8, doc.buffer.slice(0, doc.buffer.byteLen()), "bundled()") != null);
+        // It is not mine, so Delete refuses it.
+        editor.startSnippetDelete(bundled_index);
+        try t.expectEqual(Editor.Mode.normal, editor.mode);
+        try t.expect(std.mem.indexOf(u8, editor.status_message, "Only snippets in my-snippets.lua") != null);
+    }
 
     // The panel's selected row drives F2 / Delete: a group header says so,
-    // an item of mine opens for editing.
+    // a bundled item opens for copying, an item of mine for editing.
     editor.snippet_panel.selected = 0;
-    _ = editor.syncSnippetPanel();
+    var panel = editor.syncSnippetPanel();
     editor.snippetPanelEdit();
     try t.expectEqualStrings("Select a snippet first", editor.status_message);
     try t.expectEqual(Editor.Mode.normal, editor.mode);
-    editor.snippet_panel.selected = 1;
+    editor.snippet_panel.selected = 1; // "Bundled", alone in the first group
+    editor.snippetPanelEdit();
+    try t.expectEqual(Editor.Mode.snippet_form, editor.mode);
+    try t.expectEqual(snippet_form.Kind.copy, editor.snippet_form.kind);
+    editor.cancelSnippetForm();
+    try t.expectEqualStrings("Mine", panel.groups.items[1].name);
+    panel.toggle(t.allocator, 1); // open my group
+    panel = editor.syncSnippetPanel();
+    editor.snippet_panel.selected = panel.groups.items[1].row + 1;
     editor.snippetPanelEdit();
     try t.expectEqual(Editor.Mode.snippet_form, editor.mode);
     try t.expectEqual(snippet_form.Kind.edit, editor.snippet_form.kind);
@@ -329,6 +434,68 @@ test "snippet edit, copy and delete: blocks rewrite in place, a rename moves the
     try t.expectEqual(Editor.Mode.normal, editor.mode);
     try t.expect(std.mem.indexOf(u8, editor.status_message, "no longer has a block") != null);
     try t.expect((try editor.findDocument(path)) != null);
+}
+
+test "snippets: a definition another file replaced comes back when the newer one goes" {
+    var editor = try Editor.init(t.allocator, t.io);
+    defer editor.deinit();
+    editor.lsp_enabled = false;
+    editor.activeDoc().language = editor.findLanguage("zig");
+    const name = "snippet.zig.~same";
+    const Layer = struct {
+        fn add(ed: *Editor, file: ?[]const u8, body: []const u8) !void {
+            ed.loading_extensions = file != null;
+            ed.loading_extension_name = file;
+            defer {
+                ed.loading_extensions = false;
+                ed.loading_extension_name = null;
+            }
+            _ = try ed.registerSnippet(.{ .language = "zig", .description = "Same", .body = body });
+        }
+    };
+    // init.lua's, then two extension files under the same name: one row,
+    // showing the last one registered.
+    try Layer.add(&editor, null, "from init");
+    try Layer.add(&editor, "a.lua", "from a");
+    try Layer.add(&editor, "b.lua", "from b");
+    // a.lua once more: its earlier definition, further back, is superseded.
+    try Layer.add(&editor, "a.lua", "from a, again");
+    try t.expectEqual(@as(usize, 1), editor.snippets.items.items.len);
+    try t.expectEqualStrings("from a, again", editor.snippets.command(name).?.body);
+    // Removing uncovers one definition at a time; the palette command follows.
+    try t.expect(editor.removeSnippet(name));
+    try t.expectEqualStrings("from b", editor.snippets.command(name).?.body);
+    try t.expectEqualStrings("b.lua", editor.snippets.command(name).?.source);
+    try t.expect(editor.commands.get(name).?.snippet);
+    try t.expect(editor.removeSnippet(name));
+    try t.expectEqualStrings("from init", editor.snippets.command(name).?.body);
+    try t.expect(editor.execCommand(name, null));
+    try t.expectEqualStrings("from init", editor.activeDoc().buffer.slice(0, editor.activeDoc().buffer.byteLen()));
+    try t.expect(editor.removeSnippet(name));
+    try t.expect(editor.snippets.command(name) == null);
+    try t.expect(editor.commands.get(name) == null);
+    try t.expect(!editor.removeSnippet(name));
+    try t.expectEqual(@as(usize, 0), editor.snippets.items.items.len);
+
+    // A reload drops every extension definition, shown or kept behind, and
+    // uncovers the one it does not register again (init.lua's).
+    try Layer.add(&editor, null, "from init");
+    try Layer.add(&editor, "a.lua", "from a");
+    try Layer.add(&editor, "b.lua", "from b");
+    editor.dropExtensionSnippets();
+    try t.expectEqual(@as(usize, 1), editor.snippets.items.items.len);
+    try t.expectEqualStrings("from init", editor.snippets.command(name).?.body);
+    try t.expect(editor.snippets.command(name).?.replaced == null);
+    try t.expect(editor.commands.get(name).?.snippet);
+    // init.lua's on top of an extension's: the reload leaves it alone and
+    // frees the extension's behind it.
+    try Layer.add(&editor, "a.lua", "from a");
+    try Layer.add(&editor, null, "from init, later");
+    try t.expect(editor.snippets.command(name).?.replaced != null);
+    editor.dropExtensionSnippets();
+    try t.expectEqualStrings("from init, later", editor.snippets.command(name).?.body);
+    try t.expect(editor.snippets.command(name).?.replaced == null);
+    try t.expectEqual(@as(usize, 1), editor.snippets.items.items.len);
 }
 
 test "snippets integration: Lua reads group, notes and an optional prefix raw and reports type errors" {
@@ -595,7 +762,7 @@ const check_globals =
     \\const done = true;
     \\const maybe: ?i32 = null;
     \\const text: []const u8 = "hi";
-    \\const Pair = struct { x: i32, y: i32 };
+    \\const Point = struct { x: i32, y: i32 };
     \\const Color = enum { red, green };
     \\const color: Color = .red;
     \\fn doSomething() anyerror!void {}

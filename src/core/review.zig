@@ -281,7 +281,8 @@ pub const State = struct {
         const job: u64 = if (@import("builtin").is_test and test_no_spawn) 0 else try editor.jobs.start(.{ .argv = argv, .strict_output = true, .output_limit = reader_output_limit });
         self.clearFetch(editor);
         self.fetch = .{ .job = job, .path = owned_path, .old_path = owned_old, .change = change, .target_line = target_line, .reason = reason };
-        if (reason != .refresh) report(editor, "reading {s}…", .{std.fs.path.basename(path)});
+        // `path` may have belonged to the fetch just cleared: name the copy.
+        if (reason != .refresh) report(editor, "reading {s}…", .{std.fs.path.basename(owned_path)});
     }
     /// The open reader document, if any.
     fn readerDoc(self: *State, editor: *Editor) ?*@import("document.zig").Document {
@@ -305,18 +306,25 @@ pub const State = struct {
         const a = editor.allocator;
         const result = try job.snapshot(a, false);
         defer result.deinit(a);
-        defer self.clearFetch(editor);
+        // This fetch is finished: it leaves the slot now and is released on
+        // the way out, so a fetch started below (the classic fallback) stays.
+        self.fetch = null;
+        defer {
+            editor.jobs.remove(fetch.job);
+            fetch.deinit(a);
+        }
         const name = std.fs.path.basename(fetch.path);
         const open = fetch.reason != .refresh;
         // A failed background rebuild keeps the old view, marked stale, and
         // stops retrying; only a user-initiated read reports and falls back.
         if (result.failure) |err| {
             if (!open) return self.staleReader(editor);
-            if (err == error.StreamTooLong and fetch.reason == .open) {
-                report(editor, "{s} is too large to read here; showing the classic diff", .{name});
-                self.openClassic(editor, fetch.path, fetch.old_path, fetch.change);
-            } else report(editor, "{s}: {s}", .{ name, @errorName(err) });
-            return;
+            if (err != error.StreamTooLong) return report(editor, "{s}: {s}", .{ name, @errorName(err) });
+            if (fetch.reason == .classic) return report(editor, "{s}: the diff is too large to show here", .{name});
+            // The reader wants the whole file; the classic diff only the
+            // changed parts, which is usually far less.
+            self.startFetch(editor, fetch.path, fetch.old_path, fetch.change, null, .classic) catch |start_err| return report(editor, "{s}: {s}", .{ name, @errorName(start_err) });
+            return report(editor, "{s} is too large to read here; showing the classic diff", .{name});
         }
         if (!(result.code == 0 or (fetch.change == '?' and result.code == 1))) {
             if (!open) return self.staleReader(editor);
@@ -895,6 +903,19 @@ fn testWrite(dir: std.Io.Dir, io: std.Io, name: []const u8, data: []const u8) !v
     try dir.writeFile(io, .{ .sub_path = name, .data = data });
 }
 
+/// A finished job whose output ran over its limit (`error.StreamTooLong`),
+/// the way a diff larger than `reader_output_limit` ends.
+fn testOverflowJob(editor: *Editor) !u64 {
+    const line = "echo aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    const argv: []const []const u8 = if (@import("builtin").os.tag == .windows) &.{ "cmd", "/c", line } else &.{ "sh", "-c", line };
+    const id = try editor.jobs.start(.{ .argv = argv, .strict_output = true, .output_limit = 4 });
+    for (0..2000) |_| {
+        if (editor.jobs.get(id).?.isDone()) return id;
+        try std.Io.sleep(editor.io, .fromMilliseconds(5), .awake);
+    }
+    return error.TestJobNeverFinished;
+}
+
 test "name-status parser keeps rename pairs source-first and rejects truncated or escaping paths" {
     const t = std.testing;
     var files = try parseNameStatus(t.allocator, "M\x00a.zig\x00R096\x00old.zig\x00new.zig\x00A\x00b.txt\x00D\x00gone.zig\x00");
@@ -1101,4 +1122,31 @@ test "verdicts are refused for conflicts and unsaved edits, and stand when stagi
     try t.expectEqual(@as(usize, 2), editor.review.counts().approved);
     // The active document's row is found by its repository-relative path.
     try t.expectEqual(@as(?usize, 0), editor.review.activeFileIndex(&editor));
+}
+
+test "a file too large for the reader falls back to the classic diff, and that fetch survives" {
+    const t = std.testing;
+    var editor = try Editor.init(t.allocator, t.io);
+    defer editor.deinit();
+    editor.lsp_enabled = false;
+    editor.git.root = try t.allocator.dupe(u8, "/repository");
+    editor.review.tick(&editor, 0);
+    test_no_spawn = true;
+    defer test_no_spawn = false;
+    // A reader fetch whose diff ran over the limit.
+    const job = try testOverflowJob(&editor);
+    editor.review.fetch = .{ .job = job, .path = try t.allocator.dupe(u8, "data/a-huge-generated-file.json"), .old_path = null, .change = 'M', .target_line = null, .reason = .open };
+    try editor.review.pollFetch(&editor);
+    // The classic fetch it started is still there (it was once cancelled on
+    // the way out), the finished job is gone, and the status line names the
+    // file (it once printed the freed path).
+    try t.expectEqual(FetchReason.classic, editor.review.fetch.?.reason);
+    try t.expectEqualStrings("data/a-huge-generated-file.json", editor.review.fetch.?.path);
+    try t.expect(editor.jobs.get(job) == null);
+    try t.expectEqualStrings("Review: a-huge-generated-file.json is too large to read here; showing the classic diff", editor.status_message);
+    // The classic diff over the limit as well: said plainly, nothing pending.
+    editor.review.fetch.?.job = try testOverflowJob(&editor);
+    try editor.review.pollFetch(&editor);
+    try t.expect(editor.review.fetch == null);
+    try t.expectEqualStrings("Review: a-huge-generated-file.json: the diff is too large to show here", editor.status_message);
 }

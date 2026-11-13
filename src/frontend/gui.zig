@@ -528,6 +528,22 @@ pub fn frame(editor: *Editor, g: *GuiState) bool {
     } else {
         snippetsBandGone();
     }
+    if (editor.terminal_panel_visible and editor.terminal_panel != null) {
+        const lim = Editor.terminal_panel_limits;
+        const edge = editor.terminal_panel_side;
+        const hid = if (edge == .bottom)
+            handleBandResizeAt(&terminal_panel_band, .bottom, &editor.terminal_panel_height, lim.min_height, lim.max_height, "terminal_panel_height")
+        else
+            handleBandResizeAt(&terminal_panel_band, edge, &editor.terminal_panel_width, lim.min_width, lim.max_width, "terminal_panel_width");
+        if (hid) {
+            editor.hideTerminalPanel();
+            editor.status_message = "Terminal panel hidden — Ctrl+Shift+` shows it again";
+        } else if (terminal_panel_band.resizing) {
+            bandDragHint(editor, terminal_panel_band.hide_pending, "Release to hide the terminal panel");
+        }
+    } else {
+        terminal_panel_band.reset();
+    }
 
     // OS file drops staged by the SDL backend between frames.
     processFileDrops(editor);
@@ -635,11 +651,12 @@ fn dispatchGlobalKeys(editor: *Editor) void {
             continue;
         }
 
-        // A terminal pane that owns the keyboard gets every other chord;
-        // handleTerminalKeyEvents hands the pane/window management ones
-        // back (terminalPassthroughAction). A side panel focused over a
-        // terminal owns the keyboard instead, so its chords run here.
-        if (editor.keyboardOwner() == .terminal) continue;
+        // A terminal pane (or the terminal panel) that owns the keyboard
+        // gets every other chord; handleTerminalKeyEvents hands the
+        // pane/window management ones back (terminalPassthroughAction). A
+        // side panel focused over a terminal owns the keyboard instead, so
+        // its chords run here.
+        if (editor.keyboardOwner() == .terminal or editor.keyboardOwner() == .terminal_panel) continue;
 
         // Keybinds only in normal mode (not during find/replace/palette)
         if (guiMode(editor) != .normal) continue;
@@ -731,6 +748,11 @@ fn searchTakesKeys(editor: *const Editor) bool {
 /// Key and text events go to the focused terminal pane.
 fn terminalTakesKeys(editor: *const Editor) bool {
     return guiMode(editor) == .normal and editor.keyboardOwner() == .terminal;
+}
+
+/// Key and text events go to the terminal panel's shell.
+fn terminalPanelTakesKeys(editor: *const Editor) bool {
+    return guiMode(editor) == .normal and editor.keyboardOwner() == .terminal_panel;
 }
 
 /// Key and text events go to the focused editor pane: modal prompts live
@@ -878,6 +900,11 @@ fn menuBar(editor: *Editor) void {
                 execGuiAction(editor, "toggle_snippets");
                 m.close();
             }
+            if (dvui.menuItemLabel(@src(), "Terminal Panel   Ctrl+Shift+`", .{}, .{ .expand = .horizontal }) != null) {
+                // Like Ctrl+Shift+`: the panel lives in the primary window.
+                execGuiAction(editor, "toggle_terminal_panel");
+                m.close();
+            }
             if (dvui.menuItemLabel(@src(), "Reveal in Tree", .{}, .{ .expand = .horizontal }) != null) {
                 _ = editor.execCommand("filetree_reveal", null);
                 m.close();
@@ -920,6 +947,10 @@ fn menuBar(editor: *Editor) void {
             }
             if (dvui.menuItemLabel(@src(), "Detach Terminal  Ctrl+Alt+`", .{}, .{ .expand = .horizontal }) != null) {
                 _ = editor.execAction("detach_terminal");
+                m.close();
+            }
+            if (dvui.menuItemLabel(@src(), "Dock Terminal in Panel", .{}, .{ .expand = .horizontal }) != null) {
+                _ = editor.execAction("dock_terminal");
                 m.close();
             }
         }
@@ -1414,8 +1445,13 @@ fn statusBar(editor: *Editor) void {
         var review_buf: [48]u8 = undefined;
         const review_segment = if (term_active) "" else editor.review.statusSegment(editor, &review_buf);
         const review_sep: []const u8 = if (review_segment.len > 0) " | " else "";
+        // The terminal panel owning the keyboard (primary window only) says
+        // so too: typing is not going to the document.
+        const panel_active = cur_win == 0 and editor.keyboardOwner() == .terminal_panel;
         const pos_str: []const u8 = if (term_active)
             "Terminal"
+        else if (panel_active)
+            "Terminal panel"
         else if (cursor_count > 1)
             std.fmt.bufPrint(&pos_buf, "{d} cursors | Ln {d}, Col {d} | {s}{s}{s}", .{ cursor_count, pos.line + 1, pos.col + 1, lang_name, review_sep, review_segment }) catch "?"
         else
@@ -1508,13 +1544,15 @@ fn statusBar(editor: *Editor) void {
 }
 
 /// Editor area of the current window: the split-pane tree, plus (primary
-/// window only, side_panels) the docked file tree, Snippets panel and
-/// search panel.
+/// window only, side_panels) the docked file tree, Snippets panel,
+/// terminal panel and search panel.
 fn editorArea(editor: *Editor, side_panels: bool) void {
     // --- Editor area (expand=.both, LAST child) ---
-    // The file tree and the Snippets panel dock left or right of the split
-    // tree as fixed-width siblings in an hbox; the splits expand into the
-    // rest. The docked search panel (when shown) sits below them all as a
+    // The file tree, the Snippets panel and a side-docked terminal panel
+    // dock left or right of the split tree as fixed-size siblings in an
+    // hbox; the splits expand into the rest, above a bottom-docked
+    // terminal panel (a fixed-height strip between the side bands). The
+    // docked search panel (when shown) sits below them all as a
     // fixed-height strip.
     {
         var main_col = dvui.box(@src(), .{ .dir = .vertical }, .{ .expand = .both });
@@ -1522,14 +1560,25 @@ fn editorArea(editor: *Editor, side_panels: bool) void {
         {
             var content_row = dvui.box(@src(), .{ .dir = .horizontal }, .{ .expand = .both });
             defer content_row.deinit();
+            const row_rect = content_row.data().contentRect();
             const tree = side_panels and editor.filetree_visible and editor.ensureFiletree() != null;
-            const snippets_w: f32 = if (side_panels) snippetsBandWidth(editor, content_row.data().contentRect().w, tree) else 0;
+            const snippets_w: f32 = if (side_panels) snippetsBandWidth(editor, row_rect.w, tree) else 0;
             const snippets_side = editor.snippetsSide();
+            const tp_edge = editor.terminal_panel_side;
+            const tp_size: f32 = if (side_panels) terminalPanelBandSize(editor, row_rect, tree, snippets_w) else 0;
             // Call order is the left-to-right order: on a shared side the
-            // tree is the outermost band.
+            // tree is the outermost band, then the Snippets panel, then
+            // the terminal panel.
             if (tree and editor.filetree_side == .left) filetreePanel(editor);
             if (snippets_w > 0 and snippets_side == .left) snippetsPanel(editor, snippets_w);
-            renderPanes(editor);
+            if (tp_size > 0 and tp_edge == .left) terminalPanel(editor, tp_size, .left);
+            {
+                var center_col = dvui.box(@src(), .{ .dir = .vertical }, .{ .expand = .both });
+                defer center_col.deinit();
+                renderPanes(editor);
+                if (tp_size > 0 and tp_edge == .bottom) terminalPanel(editor, tp_size, .bottom);
+            }
+            if (tp_size > 0 and tp_edge == .right) terminalPanel(editor, tp_size, .right);
             if (snippets_w > 0 and snippets_side == .right) snippetsPanel(editor, snippets_w);
             if (tree and editor.filetree_side == .right) filetreePanel(editor);
         }
@@ -1670,6 +1719,7 @@ fn runDeferred(editor: *Editor) void {
 fn isPrimaryPanelAction(action: []const u8) bool {
     return std.mem.eql(u8, action, "toggle_filetree") or
         std.mem.eql(u8, action, "toggle_snippets") or
+        std.mem.eql(u8, action, "toggle_terminal_panel") or
         std.mem.eql(u8, action, "filetree_reveal") or
         std.mem.eql(u8, action, "find_in_files");
 }
@@ -2359,11 +2409,17 @@ fn filetreePanel(editor: *Editor) void {
 /// from frame() with the previous frame's rect so it always sees events
 /// before the panes.
 fn handleBandResize(band: *BandResize, side: Editor.FiletreeSide, width: *f32, min: f32, max: f32, setting: []const u8) bool {
+    return handleBandResizeAt(band, if (side == .left) .left else .right, width, min, max, setting);
+}
+
+/// handleBandResize for a band docked at any edge: `size` is the width of
+/// a left/right band (its editor-facing edge is vertical) or the height of
+/// a bottom band (its top edge).
+fn handleBandResizeAt(band: *BandResize, edge: Editor.DockEdge, size: *f32, min: f32, max: f32, setting: []const u8) bool {
     if (!build_options.has_gui) return false;
     const prect = band.rect orelse return false;
     const scale = band.scale;
     if (scale <= 0) return false;
-    const edge_x = if (side == .left) prect.x + prect.w else prect.x;
     const grab: f32 = 4 * scale;
     var hide = false;
 
@@ -2374,31 +2430,39 @@ fn handleBandResize(band: *BandResize, side: Editor.FiletreeSide, width: *f32, m
         // Same subwindow rule as handleFiletreeMouse: a press on a
         // floating window overlapping the edge band must not grab it.
         if (me.floating_win != dvui.subwindowCurrentId()) continue;
-        const near_edge = me.p.x >= edge_x - grab and me.p.x <= edge_x + grab and
-            me.p.y >= prect.y and me.p.y <= prect.y + prect.h;
+        const near_edge = switch (edge) {
+            .left, .right => blk: {
+                const edge_x = if (edge == .left) prect.x + prect.w else prect.x;
+                break :blk me.p.x >= edge_x - grab and me.p.x <= edge_x + grab and
+                    me.p.y >= prect.y and me.p.y <= prect.y + prect.h;
+            },
+            .bottom => me.p.y >= prect.y - grab and me.p.y <= prect.y + grab and
+                me.p.x >= prect.x and me.p.x <= prect.x + prect.w,
+        };
 
         switch (me.action) {
             .position => {
-                if (near_edge or band.resizing) dvui.cursorSet(.arrow_w_e);
+                if (near_edge or band.resizing) dvui.cursorSet(if (edge == .bottom) .arrow_n_s else .arrow_w_e);
             },
             .press => {
                 if (me.button == .left and near_edge) {
                     e.handled = true;
                     band.resizing = true;
-                    band.start_width = width.*;
+                    band.start_width = size.*;
                     band.hide_pending = false;
                 }
             },
             .motion => {
                 if (band.resizing) {
                     e.handled = true;
-                    const w_phys = if (side == .left)
-                        me.p.x - prect.x
-                    else
-                        (prect.x + prect.w) - me.p.x;
-                    const w = w_phys / scale;
-                    band.hide_pending = w < min / 2;
-                    width.* = std.math.clamp(w, min, max);
+                    const phys = switch (edge) {
+                        .left => me.p.x - prect.x,
+                        .right => (prect.x + prect.w) - me.p.x,
+                        .bottom => (prect.y + prect.h) - me.p.y,
+                    };
+                    const s = phys / scale;
+                    band.hide_pending = s < min / 2;
+                    size.* = std.math.clamp(s, min, max);
                 }
             },
             .release => {
@@ -2407,13 +2471,13 @@ fn handleBandResize(band: *BandResize, side: Editor.FiletreeSide, width: *f32, m
                     band.resizing = false;
                     if (band.hide_pending) {
                         band.hide_pending = false;
-                        width.* = band.start_width;
+                        size.* = band.start_width;
                         hide = true;
                         continue;
                     }
-                    // Persist the chosen width
+                    // Persist the chosen size
                     var buf: [32]u8 = undefined;
-                    const num = std.fmt.bufPrint(&buf, "{d}", .{@as(i64, @intFromFloat(width.*))}) catch "";
+                    const num = std.fmt.bufPrint(&buf, "{d}", .{@as(i64, @intFromFloat(size.*))}) catch "";
                     if (num.len > 0) lua_settings.writeSettingToFile(setting, num) catch {};
                 }
             },
@@ -5751,31 +5815,8 @@ fn terminalPane(editor: *Editor, pane_id: u8, term_idx: usize) void {
     const area = rs.r;
 
     // Get monospace font metrics (same as editorPane)
-    const font = dvui.Font.theme(.mono);
-    const lh = font.lineHeight();
-    const line_height: f32 = lh * scale;
-    if (line_height <= 0) return;
-    const cell_w = font.textSize("M").w * scale;
-    if (cell_w <= 0) return;
-
-    // Calculate visible cols/rows and resize terminal if needed
-    const visible_cols: u16 = @intFromFloat(@max(1.0, area.w / cell_w));
-    const visible_rows: u16 = @intFromFloat(@max(1.0, area.h / line_height));
-
-    if (visible_cols != term.cols or visible_rows != term.rows) {
-        // dvui lays a new window (or a fresh split) out over two frames:
-        // expanding widgets get their min size first and the real rect on
-        // the next frame. Resizing on that first measurement shrank the grid
-        // to one row and dropped the shell's screen (a detached terminal
-        // came up blank) — a new size is applied once it repeats.
-        if (visible_cols == term.pending_cols and visible_rows == term.pending_rows) {
-            term.resizeGrid(visible_cols, visible_rows);
-        } else {
-            term.pending_cols = visible_cols;
-            term.pending_rows = visible_rows;
-            dvui.refresh(null, @src(), null);
-        }
-    }
+    const metrics = terminalCellMetrics(scale) orelse return;
+    fitTerminalGrid(term, area, metrics);
 
     // Handle mouse clicks — focus this pane when clicked.
     // Gated to normal mode so clicks meant for a modal (settings dialog,
@@ -5805,8 +5846,62 @@ fn terminalPane(editor: *Editor, pane_id: u8, term_idx: usize) void {
     // while someone declares a text-input region.
     if (is_active_pane and terminalTakesKeys(editor)) {
         dvui.wantTextInput(area.toNatural());
-        if (handleTerminalKeyEvents(editor, term, wd)) return; // terminal was freed
+        if (handleTerminalKeyEvents(editor, term, wd, .terminal)) return; // terminal was freed
     }
+
+    // Only while typing goes here (a side panel focused over the terminal
+    // owns the keyboard) does the caret show.
+    drawTerminalGrid(term, area, metrics, is_active_pane and editor.keyboardOwner() == .terminal);
+
+    // Active pane indicator (same as editor)
+    if (is_active_pane and (winLayout(editor, cur_win).paneCount() > 1 or editor.windows.items.len > 1)) {
+        const focus_color: dvui.Color = .{ .r = 0x35, .g = 0x84, .b = 0xe4, .a = 0xFF };
+        const border_w: f32 = 2 * scale;
+        (dvui.Rect.Physical{ .x = area.x, .y = area.y, .w = border_w, .h = area.h }).fill(.{}, .{ .color = focus_color, .fade = 0.6 });
+    }
+}
+
+/// The monospace cell of a terminal grid at `scale`: the theme's mono
+/// font, its line height and the advance of "M" (physical pixels). Null
+/// when the font reports no size (nothing can be drawn).
+const TerminalCellMetrics = struct { font: dvui.Font, line_height: f32, cell_w: f32, scale: f32 };
+fn terminalCellMetrics(scale: f32) ?TerminalCellMetrics {
+    const font = dvui.Font.theme(.mono);
+    const line_height: f32 = font.lineHeight() * scale;
+    if (line_height <= 0) return null;
+    const cell_w = font.textSize("M").w * scale;
+    if (cell_w <= 0) return null;
+    return .{ .font = font, .line_height = line_height, .cell_w = cell_w, .scale = scale };
+}
+
+/// Resize the shell's grid to the cells that fit `area` — once the size
+/// repeats: dvui lays a new window (or a fresh split, or a fresh band) out
+/// over two frames, expanding widgets get their min size first and the
+/// real rect on the next frame. Resizing on that first measurement shrank
+/// the grid to one row and dropped the shell's screen (a detached terminal
+/// came up blank).
+fn fitTerminalGrid(term: *terminal_mod.Terminal, area: dvui.Rect.Physical, m: TerminalCellMetrics) void {
+    const visible_cols: u16 = @intFromFloat(@max(1.0, area.w / m.cell_w));
+    const visible_rows: u16 = @intFromFloat(@max(1.0, area.h / m.line_height));
+    if (visible_cols != term.cols or visible_rows != term.rows) {
+        if (visible_cols == term.pending_cols and visible_rows == term.pending_rows) {
+            term.resizeGrid(visible_cols, visible_rows);
+        } else {
+            term.pending_cols = visible_cols;
+            term.pending_rows = visible_rows;
+            dvui.refresh(null, @src(), null);
+        }
+    }
+}
+
+/// Draw a shell's cell grid into `area` (clipped to it): backgrounds, the
+/// text as same-color spans, underlines, the caret when `show_cursor`,
+/// and the exit message once the program has ended.
+fn drawTerminalGrid(term: *terminal_mod.Terminal, area: dvui.Rect.Physical, m: TerminalCellMetrics, show_cursor: bool) void {
+    const font = m.font;
+    const scale = m.scale;
+    const line_height = m.line_height;
+    const cell_w = m.cell_w;
 
     // Clip to terminal area
     const old_clip = dvui.clip(area);
@@ -5922,9 +6017,8 @@ fn terminalPane(editor: *Editor, pane_id: u8, term_idx: usize) void {
     }
 
     // Draw cursor — measure text prefix up to cursor column for accurate
-    // positioning. Only while typing goes here (a side panel focused over
-    // the terminal owns the keyboard).
-    if (is_active_pane and editor.keyboardOwner() == .terminal and t_cursor_visible and !t_exited) {
+    // positioning.
+    if (show_cursor and t_cursor_visible and !t_exited) {
         var prefix_buf: [512]u8 = undefined;
         var prefix_len: usize = 0;
         for (0..@as(usize, t_cursor_col)) |c| {
@@ -5967,12 +6061,182 @@ fn terminalPane(editor: *Editor, pane_id: u8, term_idx: usize) void {
             .color = .{ .r = 0x88, .g = 0x88, .b = 0x88, .a = 0xFF },
         }) catch {};
     }
+}
 
-    // Active pane indicator (same as editor)
-    if (is_active_pane and (winLayout(editor, cur_win).paneCount() > 1 or editor.windows.items.len > 1)) {
-        const focus_color: dvui.Color = .{ .r = 0x35, .g = 0x84, .b = 0xe4, .a = 0xFF };
-        const border_w: f32 = 2 * scale;
-        (dvui.Rect.Physical{ .x = area.x, .y = area.y, .w = border_w, .h = area.h }).fill(.{}, .{ .color = focus_color, .fade = 0.6 });
+// ===========================================================================
+// Terminal panel: one shell docked at an edge of the primary window
+// ===========================================================================
+
+/// The terminal panel's band (see BandResize): its editor-facing edge
+/// resizes it, like the tree's.
+var terminal_panel_band: BandResize = .{};
+
+/// The terminal panel's size this frame: its width at a side, its height
+/// at the bottom (logical px), or 0 when hidden — also when it would leave
+/// the panes less than 240 px beside the side bands, or less than half the
+/// rows under it: then it hides itself, says so, and lets go of the
+/// keyboard (the shell keeps running; Ctrl+Shift+` brings it back).
+fn terminalPanelBandSize(editor: *Editor, row: dvui.Rect, tree_shown: bool, snippets_w: f32) f32 {
+    if (!editor.terminal_panel_visible or editor.terminal_panel == null) return 0;
+    if (row.w <= 0 or row.h <= 0) {
+        terminal_panel_band.reset();
+        return 0;
+    }
+    const lim = Editor.terminal_panel_limits;
+    const size: f32 = switch (editor.terminal_panel_side) {
+        .bottom => blk: {
+            const h = @min(std.math.clamp(editor.terminal_panel_height, lim.min_height, lim.max_height), row.h / 2);
+            break :blk if (h >= lim.min_height) h else 0;
+        },
+        .left, .right => blk: {
+            const tree_w: f32 = if (tree_shown) std.math.clamp(editor.filetree_width, 120, 600) else 0;
+            const w = @min(std.math.clamp(editor.terminal_panel_width, lim.min_width, lim.max_width), row.w - tree_w - snippets_w - 240);
+            break :blk if (w >= lim.min_width) w else 0;
+        },
+    };
+    if (size > 0) return size;
+    terminal_panel_band.reset();
+    editor.hideTerminalPanel();
+    editor.status_message = "Terminal panel: no room beside the editor — enlarge the window, then Ctrl+Shift+`";
+    return 0;
+}
+
+/// The terminal panel band: a header ("Terminal", bold while it has the
+/// keyboard, with the way out) over the shell's grid, sized to the band.
+/// A click gives the shell the keyboard; typing reaches it through the
+/// same path as a terminal pane's (handleTerminalKeyEvents); a right
+/// click offers the other edges, undocking, hiding and closing.
+fn terminalPanel(editor: *Editor, size: f32, edge: Editor.DockEdge) void {
+    if (!build_options.has_gui) return;
+    var pbox = dvui.box(@src(), .{ .dir = .vertical }, .{
+        .expand = if (edge == .bottom) .horizontal else .vertical,
+        .min_size_content = if (edge == .bottom) .{ .h = size } else .{ .w = size },
+        .background = true,
+        .style = .window,
+        .name = "terminal_panel",
+        .tag = "terminal_panel",
+    });
+    defer pbox.deinit();
+
+    const wd = pbox.data();
+    const rs = wd.contentRectScale();
+    const scale = rs.s;
+    const area = rs.r;
+    terminal_panel_band.rect = area;
+    terminal_panel_band.scale = scale;
+    if (area.w <= 0 or area.h <= 0) return;
+
+    const font = dvui.Font.theme(.body);
+    const header_h = @ceil(font.lineHeight() * scale + 6 * scale);
+    const line_w = @max(1.0, 1 * scale);
+    const grid_area: dvui.Rect.Physical = .{
+        .x = area.x + 2 * scale,
+        .y = area.y + header_h,
+        .w = @max(0, area.w - 4 * scale),
+        .h = @max(0, area.h - header_h - 2 * scale),
+    };
+    const focused = editor.keyboardOwner() == .terminal_panel;
+
+    // A press anywhere on the band gives the shell the keyboard (the
+    // press's .focus event too, else the editor pane behind stays deaf).
+    // Not under a modal: a click meant for a dialog must not refocus.
+    if (guiMode(editor) == .normal) {
+        for (dvui.events()) |*e| {
+            if (e.handled or e.evt != .mouse) continue;
+            const me = e.evt.mouse;
+            if (me.floating_win != dvui.subwindowCurrentId()) continue;
+            if (!area.contains(me.p)) continue;
+            switch (me.action) {
+                .focus => e.handle(@src(), wd),
+                .press => {
+                    // A right press takes the keyboard too but stays
+                    // unhandled: the panel's ContextWidget opens the menu on
+                    // it (as the Snippets panel's).
+                    if (me.button == .left) e.handle(@src(), wd);
+                    dvui.focusWidget(wd.id, null, e.num);
+                    _ = editor.takeKeyboardFocus(.terminal_panel);
+                },
+                else => {},
+            }
+        }
+    }
+
+    const term = editor.terminalPanelTerminal();
+    if (term) |t| {
+        if (terminalCellMetrics(scale)) |m| fitTerminalGrid(t, grid_area, m);
+    }
+    if (terminalPanelTakesKeys(editor)) {
+        dvui.wantTextInput(grid_area.toNatural());
+        if (handleTerminalKeyEvents(editor, term, wd, .terminal_panel)) return; // the shell was closed
+    }
+
+    const header_fg = toDvui(editor.theme.overlay_fg);
+    const dim = toDvui(editor.theme.overlay_dim);
+    const border = toDvui(editor.theme.panel_border);
+    {
+        const prev_clip = dvui.clip(area);
+        defer dvui.clipSet(prev_clip);
+
+        // Header, bold while it has the keyboard; the hint says the way out.
+        fillBar(area, 0, header_h, toDvui(editor.theme.gutter_bg));
+        const header_line: dvui.Rect.Physical = .{ .x = area.x, .y = area.y + header_h - line_w, .w = area.w, .h = line_w };
+        header_line.fill(.{}, .{ .color = border, .fade = 1.0 });
+        const title: []const u8 = if (focused) "Terminal — Ctrl+` back to the editor" else "Terminal — Ctrl+Shift+` focuses";
+        const title_font = if (focused) dvui.Font.theme(.heading) else font;
+        const title_fit = fitOverlayText(title_font, title, area.w - 16 * scale, scale);
+        renderOverlayText(title_font, title_fit, area.x + 8 * scale, area.y + 2 * scale, rs, if (focused) header_fg else dim);
+
+        if (term) |t| {
+            if (terminalCellMetrics(scale)) |m| drawTerminalGrid(t, grid_area, m, focused);
+        }
+    }
+
+    // Separator on the edge facing the panes.
+    const sep_rect: dvui.Rect.Physical = switch (edge) {
+        .left => .{ .x = area.x + area.w - line_w, .y = area.y, .w = line_w, .h = area.h },
+        .right => .{ .x = area.x, .y = area.y, .w = line_w, .h = area.h },
+        .bottom => .{ .x = area.x, .y = area.y, .w = area.w, .h = line_w },
+    };
+    sep_rect.fill(.{}, .{ .color = border, .fade = 1.0 });
+
+    terminalPanelContextMenu(editor, area);
+}
+
+/// Right-click menu of the terminal panel: the two other edges, undock
+/// into a split, hide, close the shell. The moves persist (Editor.movePanel).
+fn terminalPanelContextMenu(editor: *Editor, area: dvui.Rect.Physical) void {
+    const ctext = dvui.context(@src(), .{ .rect = area }, .{});
+    defer ctext.deinit();
+
+    if (ctext.activePoint()) |cp| {
+        var fw = dvui.floatingMenu(@src(), .{ .from = dvui.Rect.Natural.fromPoint(cp) }, .{});
+        defer fw.deinit();
+        const edge = editor.terminal_panel_side;
+        if (edge != .left and dvui.menuItemLabel(@src(), "Move Terminal to Left", .{}, .{ .expand = .horizontal, .tag = "terminal_panel_menu_left" }) != null) {
+            editor.movePanel(.terminal, .left);
+            fw.close();
+        }
+        if (edge != .right and dvui.menuItemLabel(@src(), "Move Terminal to Right", .{}, .{ .expand = .horizontal, .tag = "terminal_panel_menu_right" }) != null) {
+            editor.movePanel(.terminal, .right);
+            fw.close();
+        }
+        if (edge != .bottom and dvui.menuItemLabel(@src(), "Move Terminal to Bottom", .{}, .{ .expand = .horizontal, .tag = "terminal_panel_menu_bottom" }) != null) {
+            editor.movePanel(.terminal, .bottom);
+            fw.close();
+        }
+        // These change the layout: after the panes finished (DeferredQueue).
+        if (dvui.menuItemLabel(@src(), "Undock into a Split", .{}, .{ .expand = .horizontal }) != null) {
+            deferRun(editor, .action, "undock_terminal");
+            fw.close();
+        }
+        if (dvui.menuItemLabel(@src(), "Hide Panel", .{}, .{ .expand = .horizontal }) != null) {
+            deferRun(editor, .action, "hide_terminal_panel");
+            fw.close();
+        }
+        if (dvui.menuItemLabel(@src(), "Close Terminal", .{}, .{ .expand = .horizontal }) != null) {
+            deferRun(editor, .action, "close_terminal_panel");
+            fw.close();
+        }
     }
 }
 
@@ -5980,9 +6244,13 @@ fn terminalPane(editor: *Editor, pane_id: u8, term_idx: usize) void {
 /// (terminalTakesKeys). Printable characters come from `.text` events only,
 /// so the OS keyboard layout decides what a key types (Shift+7 on a German
 /// layout is `/`; AltGr and dead keys work); key events carry the special
-/// keys and the Ctrl/Alt chords. Returns true if the terminal was closed
-/// and the caller must stop using `term`.
-fn handleTerminalKeyEvents(editor: *Editor, term: *terminal_mod.Terminal, wd: *dvui.WidgetData) bool {
+/// keys and the Ctrl/Alt chords. `owner` is who `term` is for: the focused
+/// terminal pane (`.terminal`) or the terminal panel (`.terminal_panel`);
+/// the events are taken only while that owner has the keyboard. A null
+/// `maybe_term` (a slot without a shell) keeps the chords and swallows the
+/// rest. Returns true if the terminal was closed and the caller must stop
+/// using the terminal.
+fn handleTerminalKeyEvents(editor: *Editor, maybe_term: ?*terminal_mod.Terminal, wd: *dvui.WidgetData, owner: Editor.KeyboardOwner) bool {
     if (!build_options.has_gui) return false;
 
     const events = dvui.events();
@@ -5992,7 +6260,7 @@ fn handleTerminalKeyEvents(editor: *Editor, term: *terminal_mod.Terminal, wd: *d
     var closing = false;
     for (events, 0..) |*e, i| {
         if (e.handled) continue;
-        if (!terminalTakesKeys(editor)) break;
+        if (guiMode(editor) != .normal or editor.keyboardOwner() != owner) break;
 
         switch (e.evt) {
             .key => |key| {
@@ -6010,6 +6278,10 @@ fn handleTerminalKeyEvents(editor: *Editor, term: *terminal_mod.Terminal, wd: *d
                         continue;
                     }
                 }
+                const term = maybe_term orelse {
+                    e.handle(@src(), wd); // nothing to type into
+                    continue;
+                };
                 if (term.exited) {
                     e.handle(@src(), wd);
                     if (!closing) {
@@ -6050,6 +6322,7 @@ fn handleTerminalKeyEvents(editor: *Editor, term: *terminal_mod.Terminal, wd: *d
                     // characters come as key events.
                     if (val.selected or !isTypedText(val.txt)) continue;
                     e.handle(@src(), wd);
+                    const term = maybe_term orelse continue;
                     if (term.exited) {
                         if (!closing) {
                             closing = true;
@@ -7854,6 +8127,11 @@ const settings_defs = [_]SettingDef{
     .{ .key = "snippets_width", .label = "Snippets Panel Width (GUI)", .kind = .number, .desc = "Panel width in pixels (120-600)", .min = 120, .max = 600 },
     .{ .key = "tui_snippets_width", .label = "Snippets Panel Width (TUI)", .kind = .number, .desc = "Panel width in columns (16-80)", .min = 16, .max = 80 },
     .{ .key = "snippets_double_click", .label = "Snippets Insert on Double-Click", .kind = .boolean, .desc = "A click only selects a snippet and keeps its preview; a double-click (or Enter) inserts it" },
+    .{ .key = "terminal_panel_side", .label = "Terminal Panel Side", .kind = .enum_choice, .desc = "Dock the terminal panel (Ctrl+Shift+`) at the left, right or bottom", .choices = &.{ "bottom", "left", "right" } },
+    .{ .key = "terminal_panel_width", .label = "Terminal Panel Width (GUI)", .kind = .number, .desc = "Width in pixels when docked at a side (160-1600)", .min = 160, .max = 1600 },
+    .{ .key = "terminal_panel_height", .label = "Terminal Panel Height (GUI)", .kind = .number, .desc = "Height in pixels when docked at the bottom (80-1200)", .min = 80, .max = 1200 },
+    .{ .key = "tui_terminal_panel_width", .label = "Terminal Panel Width (TUI)", .kind = .number, .desc = "Width in columns when docked at a side (20-200)", .min = 20, .max = 200 },
+    .{ .key = "tui_terminal_panel_height", .label = "Terminal Panel Height (TUI)", .kind = .number, .desc = "Height in rows when docked at the bottom (3-60)", .min = 3, .max = 60 },
     .{ .key = "filetree_root", .label = "File Tree Root", .kind = .text, .desc = "Starting directory — empty = current dir (Enter applies)" },
 };
 
@@ -8015,6 +8293,9 @@ fn settingsDialog(editor: *Editor) void {
                         const pick = def.choices[choice];
                         editor.snippets_side = if (std.mem.eql(u8, pick, "auto")) null else if (std.mem.eql(u8, pick, "right")) Editor.FiletreeSide.right else Editor.FiletreeSide.left;
                         lua_settings.writeStringSettingToFile(def.key, pick) catch {};
+                    } else if (std.mem.eql(u8, def.key, "terminal_panel_side")) {
+                        // movePanel persists to init.lua itself
+                        if (std.meta.stringToEnum(Editor.DockEdge, def.choices[choice])) |edge| editor.movePanel(.terminal, edge);
                     }
                 }
             },
@@ -8135,6 +8416,10 @@ fn getSettingNumber(editor: *const Editor, key: []const u8) i64 {
     if (std.mem.eql(u8, key, "filetree_icon_scale")) return @intCast(editor.filetree_icon_scale);
     if (std.mem.eql(u8, key, "snippets_width")) return @intFromFloat(editor.snippets_width);
     if (std.mem.eql(u8, key, "tui_snippets_width")) return @intCast(editor.tui_snippets_width);
+    if (std.mem.eql(u8, key, "terminal_panel_width")) return @intFromFloat(editor.terminal_panel_width);
+    if (std.mem.eql(u8, key, "terminal_panel_height")) return @intFromFloat(editor.terminal_panel_height);
+    if (std.mem.eql(u8, key, "tui_terminal_panel_width")) return @intCast(editor.tui_terminal_panel_width);
+    if (std.mem.eql(u8, key, "tui_terminal_panel_height")) return @intCast(editor.tui_terminal_panel_height);
     return 0;
 }
 
@@ -8177,6 +8462,22 @@ fn applySettingNumber(editor: *Editor, key: []const u8, val: i64) void {
     if (std.mem.eql(u8, key, "snippets_width")) {
         if (val >= 120 and val <= 600) editor.snippets_width = @floatFromInt(val);
     }
+    if (std.mem.eql(u8, key, "terminal_panel_width")) {
+        const lim = Editor.terminal_panel_limits;
+        if (val >= @as(i64, @intFromFloat(lim.min_width)) and val <= @as(i64, @intFromFloat(lim.max_width))) editor.terminal_panel_width = @floatFromInt(val);
+    }
+    if (std.mem.eql(u8, key, "terminal_panel_height")) {
+        const lim = Editor.terminal_panel_limits;
+        if (val >= @as(i64, @intFromFloat(lim.min_height)) and val <= @as(i64, @intFromFloat(lim.max_height))) editor.terminal_panel_height = @floatFromInt(val);
+    }
+    if (std.mem.eql(u8, key, "tui_terminal_panel_width")) {
+        const lim = Editor.terminal_panel_limits;
+        if (val >= lim.tui_min_width and val <= lim.tui_max_width) editor.tui_terminal_panel_width = @intCast(val);
+    }
+    if (std.mem.eql(u8, key, "tui_terminal_panel_height")) {
+        const lim = Editor.terminal_panel_limits;
+        if (val >= lim.tui_min_height and val <= lim.tui_max_height) editor.tui_terminal_panel_height = @intCast(val);
+    }
     if (std.mem.eql(u8, key, "tui_snippets_width")) {
         if (val >= 16 and val <= 80) editor.tui_snippets_width = @intCast(val);
     }
@@ -8186,6 +8487,7 @@ fn getSettingEnum(editor: *const Editor, key: []const u8) []const u8 {
     if (std.mem.eql(u8, key, "theme")) return editor.theme_name;
     if (std.mem.eql(u8, key, "filetree_side")) return @tagName(editor.filetree_side);
     if (std.mem.eql(u8, key, "snippets_side")) return if (editor.snippets_side) |side| @tagName(side) else "auto";
+    if (std.mem.eql(u8, key, "terminal_panel_side")) return @tagName(editor.terminal_panel_side);
     return "";
 }
 
@@ -10054,6 +10356,121 @@ test "GUI snippets panel: dragging the band edge resizes it, and a shared side k
     try t.expect(!editor.snippets_visible and !editor.snippets_focused);
     try t.expect(std.mem.indexOf(u8, editor.status_message, "no room") != null);
     try t.expectEqual(Editor.KeyboardOwner.editor, editor.keyboardOwner());
+}
+
+test "GUI terminal panel: a strip at the bottom or a column at a side, a click focuses it, its edge resizes and hides it" {
+    if (!build_options.has_gui) return error.SkipZigTest;
+    const t = std.testing;
+    var ui = try dvui.testing.init(.{ .window_size = .{ .w = 900, .h = 600 } });
+    defer ui.deinit();
+    var editor = try Editor.init(t.allocator, t.io);
+    defer editor.deinit();
+    try editor.keybinds.loadDefaults();
+    var g = try GuiState.init(t.allocator);
+    defer g.deinit();
+    defer win_ui = undefined;
+    applyWindowFonts(ui.window, &g, &editor);
+    try snippetsTestSetup(&editor);
+    terminal_panel_band = .{};
+    var ms: u64 = 0;
+    for (0..2) |_| try snippetsTestFrame(ui.window, &editor, &g, &ms);
+    try t.expect(terminal_panel_band.rect == null);
+
+    // A docked slot (fake: no shell) at the default edge, the bottom:
+    // terminal_panel_height tall, the full width of the pane area.
+    try editor.terminals.append(t.allocator, null);
+    editor.terminal_panel = 0;
+    try t.expect(editor.takeKeyboardFocus(.terminal_panel));
+    for (0..3) |_| try snippetsTestFrame(ui.window, &editor, &g, &ms);
+    var rect = terminal_panel_band.rect orelse return error.TestUnexpectedResult;
+    const scale = terminal_panel_band.scale;
+    try t.expectApproxEqAbs(@as(f32, 240), rect.h / scale, 1);
+    try t.expect(rect.w / scale > 800);
+    try t.expect(rect.y / scale > 200);
+    try t.expectEqual(Editor.KeyboardOwner.terminal_panel, editor.keyboardOwner());
+
+    // Ctrl+` goes back to the editor (the panel stays); a click on the
+    // band gives it the keyboard again.
+    try dvui.testing.pressKey(.grave, .lcontrol);
+    for (0..2) |_| try snippetsTestFrame(ui.window, &editor, &g, &ms);
+    try t.expectEqual(Editor.KeyboardOwner.editor, editor.keyboardOwner());
+    try t.expect(editor.terminal_panel_visible);
+    _ = try ui.window.addEventMouseMotion(.{ .pt = .{ .x = rect.x + rect.w / 2, .y = rect.y + rect.h / 2 } });
+    _ = try ui.window.addEventMouseButton(.left, .press);
+    _ = try ui.window.addEventMouseButton(.left, .release);
+    for (0..2) |_| try snippetsTestFrame(ui.window, &editor, &g, &ms);
+    try t.expectEqual(Editor.KeyboardOwner.terminal_panel, editor.keyboardOwner());
+
+    // Dragging its top edge 20 px up makes it 260 tall (the init.lua
+    // write fails harmlessly in tests; the band never takes more than
+    // half the pane area, so a bigger drag would be capped on screen).
+    const mid_x = rect.x + rect.w / 2;
+    _ = try ui.window.addEventMouseMotion(.{ .pt = .{ .x = mid_x, .y = rect.y } });
+    _ = try ui.window.addEventMouseButton(.left, .press);
+    try snippetsTestFrame(ui.window, &editor, &g, &ms);
+    try t.expect(terminal_panel_band.resizing);
+    _ = try ui.window.addEventMouseMotion(.{ .pt = .{ .x = mid_x, .y = rect.y - 20 * scale } });
+    _ = try ui.window.addEventMouseButton(.left, .release);
+    for (0..2) |_| try snippetsTestFrame(ui.window, &editor, &g, &ms);
+    try t.expect(!terminal_panel_band.resizing);
+    try t.expectApproxEqAbs(@as(f32, 260), editor.terminal_panel_height, 1);
+    rect = terminal_panel_band.rect orelse return error.TestUnexpectedResult;
+    try t.expectApproxEqAbs(@as(f32, 260), rect.h / scale, 1);
+
+    // On the right: terminal_panel_width wide at the window's right edge,
+    // full height; on the left, at the left edge.
+    try t.expect(editor.execAction("move_terminal_panel_right"));
+    for (0..3) |_| try snippetsTestFrame(ui.window, &editor, &g, &ms);
+    rect = terminal_panel_band.rect orelse return error.TestUnexpectedResult;
+    try t.expectApproxEqAbs(@as(f32, 420), rect.w / scale, 1);
+    try t.expect(rect.h / scale > 400);
+    try t.expectApproxEqAbs(@as(f32, 900), (rect.x + rect.w) / scale, 2);
+    try t.expect(editor.execAction("move_terminal_panel_left"));
+    for (0..3) |_| try snippetsTestFrame(ui.window, &editor, &g, &ms);
+    rect = terminal_panel_band.rect orelse return error.TestUnexpectedResult;
+    try t.expectApproxEqAbs(@as(f32, 0), rect.x / scale, 2);
+    // Beside the tree on the same side, the tree stays outermost.
+    var tmp = t.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(t.io, ".", t.allocator);
+    defer t.allocator.free(root);
+    editor.filetree_git_colors = false;
+    try t.expect(editor.setFiletreeRoot(root));
+    editor.filetree_auto_reveal = false;
+    for (0..2) |_| try snippetsTestFrame(ui.window, &editor, &g, &ms);
+    const tree = filetree_band.rect orelse return error.TestUnexpectedResult;
+    rect = terminal_panel_band.rect orelse return error.TestUnexpectedResult;
+    try t.expect(tree.x + tree.w <= rect.x + 1);
+    editor.filetree_visible = false;
+
+    // Back at the bottom, dragging the edge well past the minimum hides
+    // the panel on release: the height is kept, the shell stays docked,
+    // the keyboard goes back to the pane, and the toggle shows it again.
+    try t.expect(editor.execAction("move_terminal_panel_bottom"));
+    for (0..3) |_| try snippetsTestFrame(ui.window, &editor, &g, &ms);
+    rect = terminal_panel_band.rect orelse return error.TestUnexpectedResult;
+    _ = try ui.window.addEventMouseMotion(.{ .pt = .{ .x = mid_x, .y = rect.y } });
+    _ = try ui.window.addEventMouseButton(.left, .press);
+    try snippetsTestFrame(ui.window, &editor, &g, &ms);
+    _ = try ui.window.addEventMouseMotion(.{ .pt = .{ .x = mid_x, .y = rect.y + rect.h - 10 * scale } });
+    try snippetsTestFrame(ui.window, &editor, &g, &ms);
+    try t.expect(terminal_panel_band.hide_pending);
+    try t.expectEqualStrings("Release to hide the terminal panel", editor.status_message);
+    _ = try ui.window.addEventMouseButton(.left, .release);
+    for (0..2) |_| try snippetsTestFrame(ui.window, &editor, &g, &ms);
+    try t.expect(!editor.terminal_panel_visible);
+    try t.expect(terminal_panel_band.rect == null);
+    try t.expectApproxEqAbs(@as(f32, 260), editor.terminal_panel_height, 1);
+    try t.expectEqual(@as(?usize, 0), editor.terminal_panel);
+    try t.expectEqual(Editor.KeyboardOwner.editor, editor.keyboardOwner());
+    try t.expect(std.mem.indexOf(u8, editor.status_message, "Ctrl+Shift+`") != null);
+    const ctrl_shift: dvui.enums.Mod = @enumFromInt(@intFromEnum(dvui.enums.Mod.lcontrol) | @intFromEnum(dvui.enums.Mod.lshift));
+    try dvui.testing.pressKey(.grave, ctrl_shift);
+    for (0..3) |_| try snippetsTestFrame(ui.window, &editor, &g, &ms);
+    try t.expect(editor.terminal_panel_visible);
+    try t.expect(terminal_panel_band.rect != null);
+    try t.expectEqual(Editor.KeyboardOwner.terminal_panel, editor.keyboardOwner());
+    try t.expectEqual(@as(usize, 1), editor.terminals.items.len);
 }
 
 test "GUI snippets panel: snippets_double_click — a click selects, a double-click inserts once" {

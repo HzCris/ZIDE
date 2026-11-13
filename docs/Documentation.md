@@ -99,9 +99,9 @@ Reloading extensions cancels their tasks, disconnects their active debug session
 | Ctrl+F12 | Go to a symbol in this file (picker) |
 | Ctrl+T | Search symbols across the workspace (picker) |
 | Ctrl+Shift+Space | Signature help for the call at the caret |
-| Ctrl+` | Open a new terminal in a bottom split; from a terminal pane, back to the editor |
-| Ctrl+Shift+` | Open terminal (side-by-side split) |
-| Ctrl+Alt+` | Detach the focused terminal into its own OS window (GUI; TUI: second terminal at the side) |
+| Ctrl+` | Open a new terminal in a bottom split; from a terminal pane (or the terminal panel), back to the editor |
+| Ctrl+Shift+` | The terminal panel: a shell docked at the bottom, left or right edge (remembered side and size); focus it, or from it back to the editor — see *Embedded Terminal* |
+| Ctrl+Alt+` | Detach the focused terminal — a terminal pane, or the terminal panel's shell — into its own OS window (GUI; TUI: second terminal at the side) |
 | Ctrl+B | Toggle file tree side panel |
 | Ctrl+Alt+B | Toggle the Snippets side panel — syntax skeletons by plain name; click a row to select it, click the highlighted one to insert it — see *Snippets* |
 | Ctrl+Alt+S | Save the selection as a snippet — a small form (name, folder, trigger, language, notes) writes it to `extensions/my-snippets.lua` and the panel shows it — see *Snippets* |
@@ -124,7 +124,7 @@ Reloading extensions cancels their tasks, disconnects their active debug session
 | Ctrl+Shift+Home/End | Select to file start/end |
 | Ctrl+W | Close tab (prompts if unsaved) |
 | Ctrl+Shift+T | Reopen the most recently closed file |
-| Ctrl+Alt+Q | Close pane (also closes the focused terminal pane) |
+| Ctrl+Alt+Q | Close pane (also closes the focused terminal pane; in the terminal panel it closes the panel's shell and leaves the panes alone) |
 | Ctrl+Tab / Ctrl+Shift+Tab | Next / previous document tab |
 | Ctrl+PageDown / Ctrl+PageUp | Next / previous document tab |
 | Alt+Right / Alt+Left | Focus next / previous split pane |
@@ -237,6 +237,7 @@ Windows terminals commonly intercept Alt combos (Windows Terminal binds Alt+arro
     - Appearance: `theme` ("dark"), `tui_theme` ("terminal"), `gutter_min_digits` (3, 1–10, both frontends), `secondary_window_chrome` (true; GUI: menu bar + status bar in extra windows, false = bare pane containers), `page_size` (accepted but overwritten by the viewport height every frame, so it has no lasting effect)
     - File tree: `filetree_visible` (true), `filetree_side` ("left"/"right"), `filetree_width` (240 GUI px, 120–600), `tui_filetree_width` (30 columns, 16–80), `filetree_root` (starting directory, "" = cwd; stored unvalidated from Lua — the Settings dialog checks it), `filetree_git_colors` (true; off = no tree Git colors, Changes and gutters remain available), `filetree_auto_reveal` (true, read by the GUI), `tui_filetree_icons` (false), `filetree_font_size` (0 = theme font, 0–32), `filetree_icon_scale` (90, 50–200)
     - Snippets panel: `snippets_visible` (false; at runtime hiding it also returns the keyboard to the pane), `snippets_side` ("auto"/"left"/"right"; auto docks opposite the file tree), `snippets_width` (260 GUI px, 120–600), `tui_snippets_width` (32 columns, 16–80), `snippets_double_click` (false; GUI: true makes a click only select a snippet and keep its preview — a double-click or Enter inserts it). All five have rows in the Settings dialog
+    - Terminal panel: `terminal_panel_side` ("bottom"/"left"/"right"), `terminal_panel_width` (420 GUI px, 160–1600; used at a side), `terminal_panel_height` (240 GUI px, 80–1200; used at the bottom), `tui_terminal_panel_width` (60 columns, 20–200), `tui_terminal_panel_height` (12 rows, 3–60). All five have rows in the Settings dialog
   - `zide.set("mono_font_path", "/path/to/font.ttf")` — use a custom monospace font (GUI only; read once at startup, so a change needs a restart, and a bad path falls back to the bundled font with a logged warning; pick a Nerd Font to keep box-drawing/powerline glyphs and tree icons)
   - `zide.set("mono_font_size", 14)` — override the default monospace font size (GUI only, applies live)
   - `zide.set("tui_theme", name)` — switch TUI theme ("terminal", "dark", "light", "high_contrast")
@@ -277,7 +278,8 @@ Cross-frontend gaps are tracked in [TODO.md](TODO.md) (verified backlog: navigat
 
 - DVUI + SDL3 window with editor pane
 - Text editing through the shared editor commands — undo/redo, clipboard, word motion, indentation and auto-indent behave as described under *TUI — Implemented Features*
-- Keyboard focus follows the core rule (see *Keyboard focus* under Command System): clicking an editor or terminal pane takes the keyboard back from the file tree, the Snippets panel or the search panel, and an editor pane that becomes the owner (Escape out of a panel, Ctrl+backtick, F6, a split, startup) takes input focus by itself — no click needed before typing
+- Keyboard focus follows the core rule (see *Keyboard focus* under Command System): clicking an editor or terminal pane takes the keyboard back from the file tree, the Snippets panel, the search panel or the terminal panel, and an editor pane that becomes the owner (Escape out of a panel, Ctrl+backtick, F6, a split, startup) takes input focus by itself — no click needed before typing
+- Terminal panel (Ctrl+Shift+`, View > Terminal Panel): one shell docked at the bottom, left or right edge of the main window, inward of the file tree and Snippets bands; a header that turns bold while it has the keyboard, the shell's grid under it; drag its editor-facing edge to resize or hide it; right-click for Move to Left / Right / Bottom, Undock into a Split, Hide Panel and Close Terminal; View > Dock Terminal in Panel moves the focused terminal pane into it — see *The terminal panel* under Embedded Terminal
 - Syntax highlighting (Zig built-in, extensible via Lua — see Syntax Highlighting section)
 - Matching-bracket highlight (an outline in the caret color around the bracket at the caret and its partner) and smart Enter between bracket pairs — as described under *TUI — Implemented Features*
 - TODO comment highlighting: `TODO`/`FIXME`/`XXX`/`HACK`/`BUG`/`NOTE` inside comments get the `todo` syntax color; `next_todo` command (palette) jumps to the next marker with wrap-around
@@ -1042,9 +1044,9 @@ All editing actions go through named commands in `CommandRegistry`. Commands can
 
 Key combos for `zide.bind` / `zide.unbind` accept any case and modifier order (`Ctrl+Shift+K` = `shift+ctrl+k`; `control` works for `ctrl`). Key name aliases: `pageup`/`pgup` → `page_up`, `pagedown`/`pgdn` → `page_down`, `esc` → `escape`, `return` → `enter`, `del` → `delete`, `ins` → `insert`, `\` → `backslash`, plus `space` and the dvui-style punctuation names `slash`, `period`, `semicolon`, `comma`, `minus`, `equal`, `grave`, `apostrophe`, `left_bracket`, `right_bracket`. Both frontends deliver letters, digits, F1–F12, the named keys (arrows, `home`, `end`, `page_up`, `page_down`, `insert`, `delete`, `tab`, `enter`, `escape`, `backspace`, `space`, `backslash`) and the punctuation `[ ] ; ' , . / - =` plus backtick (`grave`), so `ctrl+1` or `ctrl+insert` work in the GUI and the TUI alike; Ctrl+Space (`ctrl+space`) works in the TUI too. `zide.bind` logs one warning for a key or modifier that can never fire and one when the command is not registered (yet); the binding still stands, so an extension may register the command later.
 
-**Keyboard focus.** In normal mode exactly one of the focused editor pane, the focused terminal pane, the file tree, the Snippets panel and the search panel owns the keyboard (when flags disagree, the tree wins, then the Snippets panel). The side panels live in the main window and can own the keyboard only while that window is focused. Clicking any pane, clicking a tab, splitting, F6 / Shift+F6, switching windows and `toggle_terminal` (Ctrl+backtick) give the keyboard back to the pane; `toggle_terminal` with a panel focused over a terminal pane focuses that terminal instead of opening another. While a panel owns the keyboard, clipboard, select-all and word-delete chords never touch the document behind it: in the search panel the keys bound to copy and cut take the whole focused field, paste appends the clipboard's first line and Ctrl+Backspace deletes the previous word, while Ctrl+A and Ctrl+Delete do nothing; in the file tree the keys bound to copy, cut and paste drive the file clipboard; the Snippets panel swallows them all. The Edit menu's Cut/Copy/Paste/Select All follow the same rule.
+**Keyboard focus.** In normal mode exactly one of the focused editor pane, the focused terminal pane, the file tree, the Snippets panel, the search panel and the terminal panel owns the keyboard (when flags disagree, the tree wins, then the Snippets panel, then the search panel). The docked panels live in the main window and can own the keyboard only while that window is focused. Clicking any pane, clicking a tab, splitting, F6 / Shift+F6, switching windows and `toggle_terminal` (Ctrl+backtick) give the keyboard back to the pane; `toggle_terminal` with a panel focused over a terminal pane focuses that terminal instead of opening another, and from the terminal panel it goes back to the editor. While a panel owns the keyboard, clipboard, select-all and word-delete chords never touch the document behind it: in the search panel the keys bound to copy and cut take the whole focused field, paste appends the clipboard's first line and Ctrl+Backspace deletes the previous word, while Ctrl+A and Ctrl+Delete do nothing; in the file tree the keys bound to copy, cut and paste drive the file clipboard; the Snippets panel swallows them all; the terminal panel's shell gets them as bytes like a terminal pane (Ctrl+C is the interrupt). The Edit menu's Cut/Copy/Paste/Select All follow the same rule.
 
-About 167 registered commands; every one is listed in the command palette and bindable with `zide.bind`. The tables below are the complete set (names as the code registers them, 2026-10-17). "Default key" is the shipped binding; **hard-wired** means the frontends dispatch that plain key themselves, so it is not in the keybind map — the command can still be bound to a chord of your own. `theme_*`, `gui_theme_*` and `tui_theme_*` re-apply `themes/syntax-theme.lua` and the `syn_theme_<lang>.lua` files on top of the new palette (the editor-color override files `gui-theme.lua` / `tui-theme.lua` are not re-run until the next launch).
+About 179 registered commands; every one is listed in the command palette and bindable with `zide.bind`. The tables below are the complete set (names as the code registers them, 2026-11-12). "Default key" is the shipped binding; **hard-wired** means the frontends dispatch that plain key themselves, so it is not in the keybind map — the command can still be bound to a chord of your own. `theme_*`, `gui_theme_*` and `tui_theme_*` re-apply `themes/syntax-theme.lua` and the `syn_theme_<lang>.lua` files on top of the new palette (the editor-color override files `gui-theme.lua` / `tui-theme.lua` are not re-run until the next launch).
 
 **Files, tabs and projects**
 
@@ -1123,12 +1125,17 @@ About 167 registered commands; every one is listed in the command palette and bi
 | Command | Default key | What it does |
 | --- | --- | --- |
 | `split_vertical` / `split_horizontal` | Alt+\ / Alt+Shift+\, also Ctrl+\ / Ctrl+Shift+\ | Split the pane side by side / top-bottom |
-| `close_pane` | Ctrl+Alt+Q, also Ctrl+F4 | Close the current pane (also a terminal pane) |
+| `close_pane` | Ctrl+Alt+Q, also Ctrl+F4 | Close the current pane (also a terminal pane); while the terminal panel has the keyboard, close the panel's shell instead |
 | `focus_next_pane` / `focus_prev_pane` | Alt+Right / Alt+Left, also F6 / Shift+F6 | Move focus between panes |
-| `toggle_terminal` | Ctrl+` | Open a terminal below, or go back from a terminal to the editor |
-| `open_terminal_right` | Ctrl+Shift+` | Open a terminal in a split to the right |
-| `close_terminal` | — | Close the focused terminal pane |
-| `detach_terminal` | Ctrl+Alt+` | Move the focused terminal into its own window (TUI: side split) |
+| `toggle_terminal` | Ctrl+` | Open a terminal below, or go back from a terminal (pane or panel) to the editor |
+| `open_terminal_right` | — | Open a terminal in a split to the right |
+| `close_terminal` | — | Close the focused terminal: a pane, or the terminal panel's shell while the panel has the keyboard |
+| `detach_terminal` | Ctrl+Alt+` | Move the focused terminal (a pane, or the terminal panel's shell) into its own window (TUI: side split) |
+| `toggle_terminal_panel` | Ctrl+Shift+` | The terminal panel: open a shell docked at the side or bottom and focus it, focus it, or go back to the editor |
+| `hide_terminal_panel` / `close_terminal_panel` | — | Hide the terminal panel (its shell keeps running) / end its shell and hide it |
+| `dock_terminal` / `undock_terminal` | — | Move the focused terminal pane into the panel / the panel's shell into a split pane |
+| `move_terminal_panel_left` / `_right` / `_bottom` | — | Dock the terminal panel at that edge (persisted) |
+| `move_filetree_left` / `_right`, `move_snippets_left` / `_right` | — | Dock the file tree / the Snippets panel at that side (persisted; the TUI's way to move them) |
 
 **File tree**
 
@@ -1181,8 +1188,6 @@ About 167 registered commands; every one is listed in the command palette and bi
 | `review` | Ctrl+F8 | The Review view: changed files with verdicts, progress and baseline |
 | `review_approve` / `review_needs_work` | — (A / W inside the view) | Give or take back a verdict on the selected row, else on the active file |
 | `review_next_file` / `review_prev_file` | F8 / Shift+F8 | Read the next / previous changed file in the review reader |
-| F9 / Shift+F9 | Next / previous change inside the review reader |
-| Ctrl+F9 | Review reader ↔ classic diff of the same file |
 | `review_set_baseline` / `review_follow_head` | — (P / U in the Review view) | Pin the current commit as the baseline / compare with the last commit again |
 | `review_open_reader` | Enter in the Review view | Read the selected changed file in the reader (else the active file's) |
 | `review_next_change` / `review_prev_change` | F9 / Shift+F9 | Move between changes inside the reader (on a listed real file: open its reader) |
@@ -1248,7 +1253,8 @@ see *The Shipped Extension: snippets-zig.lua* under the Extension System.
   over the panel's F2 in the GUI).
 - It docks **left or right** with the same rules as the file tree: `snippets_side` (default
   `"auto"` = opposite the tree; on a shared side the tree sits outside) and `snippets_width`;
-  right-click the panel to move it, drag its edge to resize — both persist to init.lua — and
+  right-click the panel to move it (or `move_snippets_left` / `move_snippets_right` in the
+  palette, the TUI's way), drag its edge to resize — both persist to init.lua — and
   drag the edge well past the minimum width to hide it (the status bar says so before you
   let go; the width is kept, and Ctrl+Alt+B brings the panel back). `zide.set("snippets_visible",
   true)` opens it on every launch; Ctrl+Alt+B never writes settings. When the window has no
@@ -1286,9 +1292,12 @@ see *The Shipped Extension: snippets-zig.lua* under the Extension System.
   - **Language**: the document's language, or `*` for every file.
   - **Notes**: the plain-language explanation the preview shows.
   - **Body**: the selection, with its line endings normalized and the indentation every line
-    shares removed (a first line that started mid-line does not count). In the GUI you can
-    edit it right there — add blanks like `${1:text}` and `$0`; a hint under the box repeats
-    the syntax. The TUI saves the selection as it is (open my-snippets.lua to add blanks).
+    shares removed (a first line that started mid-line does not count). A `$` in the
+    selection gets a backslash in front (`\$`), and so does a backslash right before `$`, `}`
+    or another backslash, so the snippet inserts exactly what you selected instead of
+    reading `$1` or `${name}` in your code as a blank. In the GUI you can edit it right
+    there — add blanks like `${1:text}` and `$0`; a hint under the box repeats the syntax.
+    The TUI saves the selection as it is (open my-snippets.lua to add blanks).
 - Save checks the same rules as `zide.register_snippet` (the message appears in the form),
   writes the snippet into `~/.config/zide/extensions/my-snippets.lua` and registers it at
   once: the status bar says "Saved to my-snippets.lua: <name>" and, when the panel is open,
@@ -1304,8 +1313,11 @@ see *The Shipped Extension: snippets-zig.lua* under the Extension System.
   then removes the block and the snippet. Both work only for snippets in your file; on a
   bundled snippet F2 (or "Copy to My Snippets…") opens the form filled with its code and
   notes and saves a copy into your file: keep the name and your copy replaces the bundled one
-  in the panel, since your file loads last. If a block was edited by hand so that the panel
-  can no longer find its marker lines, Edit opens the file for you instead of guessing.
+  in the panel, since your file loads last. Delete that copy (or give it another name) and
+  the bundled snippet is back in its row at once — the status bar says "(the one from
+  snippets-zig.lua is back)", so the row that stays is not a failed delete. If a block was
+  edited by hand so that the panel can no longer find its marker lines, Edit opens the file
+  for you instead of guessing.
 
 ### Using them with Tab
 
@@ -1385,10 +1397,44 @@ extension file, so a snippet saved from the panel wins over a bundled one with t
 
 ZIDE includes a built-in terminal emulator that integrates with the split pane system — in both frontends (in the TUI, the shell's grid renders as cells and the reader thread wakes the event loop via `terminal_wake_fn`, the same pattern the LSP uses).
 
+### Two kinds of terminal
+
+A shell can sit in two places. Both run the same shell and take keys the same way; they differ in where they live and in how you move them — which is why the panel's right-click menu does nothing on a Ctrl+` terminal.
+
+| | Terminal **pane** | Terminal **panel** |
+|---|---|---|
+| Key | Ctrl+` | Ctrl+Shift+` |
+| Command | `toggle_terminal` — or `open_terminal_right` from the palette, for one at the side | `toggle_terminal_panel` (View > Terminal Panel) |
+| Where it is | One of the split panes, like a document pane, in any window | Docked at an edge of the main window — bottom, left or right — outside the panes |
+| How many | As many as you open: every Ctrl+` pressed in the editor opens another one | One |
+| How to recognise it | No title row. Status bar: *Terminal* (TUI: `[TERMINAL]`) | A title row that starts with "Terminal —". Status bar: *Terminal panel* (TUI: `[TERMINAL PANEL]`) |
+| Right-click (GUI) | No menu | Move Terminal to Left / Right / Bottom, Undock into a Split, Hide Panel, Close Terminal |
+| Moving it | It follows the splits. View > Dock Terminal in Panel (`dock_terminal`) makes it the panel's shell, unless the panel already has one; Ctrl+Alt+` gives it its own window | The menu above, or `move_terminal_panel_left` / `_right` / `_bottom` in the palette; `undock_terminal` turns it into a pane |
+| Size (GUI) | Drag the divider between the panes | Drag the panel's editor-facing edge |
+| Out of the way | Only by closing it | `hide_terminal_panel`, or drag its edge well past the minimum — the shell keeps running |
+| Back to the editor | Ctrl+` | The same key, or Ctrl+Shift+` |
+| Back into it | Click it, or F6 / Shift+F6 (next / previous pane) — Ctrl+` opens another terminal instead | Ctrl+Shift+`, or click it |
+
+**Why there are two.** The pane came first: a terminal for a few commands, placed among the code like any other split. The panel was added for one long-running program — a chat-style CLI such as Claude Code — that keeps its place at the side of the window whatever the splits do, and can be hidden without ending. To put a Ctrl+` terminal at the left or right edge: focus it, choose View > Dock Terminal in Panel, then right-click it and pick the edge.
+
+Two rough edges are on the list in `docs/TODO.md` (*Two kinds of terminal*, 2026-11-12): Ctrl+` should go back to the terminal you just left instead of opening another, and a terminal pane should get a right-click menu of its own.
+
 ### Opening and closing a terminal
-- **Ctrl+`** (backtick): from an editor pane opens a **new** terminal in a bottom split (even when one already exists); from a terminal pane it returns to the editor; with the file tree or search panel focused over a terminal pane it focuses that terminal instead
+- **Ctrl+`** (backtick): from an editor pane opens a **new** terminal in a bottom split (even when one already exists); from a terminal pane (or the terminal panel) it returns to the editor; with the file tree or search panel focused over a terminal pane it focuses that terminal instead
 - **Closing**: Ctrl+Alt+Q or Ctrl+F4 (`close_pane`) closes the focused terminal — also when it is the window's only pane, which then shows your document again; `close_terminal` in the palette (and View > Close Terminal in the GUI) does the same; and once the shell has ended (`exit`), the next key you press in the pane closes it
 - Shell: PowerShell on Windows; on Linux/macOS `$SHELL` when it names an executable, else `/bin/bash`, else `/bin/sh`, started with `TERM=xterm-256color` (and `COLORTERM=truecolor` unless already set)
+
+### The terminal panel (Ctrl+Shift+`)
+
+A second home for a shell, beside the split panes: one terminal **docked at an edge of the main window** like the file tree — the bottom (default), or the left or right as a full-height column. The point is a chat-style CLI (Claude Code, any LLM CLI) that stays put at the side while Ctrl+` terminals come and go below your code. Built 2026-10-18 as step 1 of the rearrangeable-panels item in `docs/TODO.md`.
+
+- **Ctrl+Shift+`** (`toggle_terminal_panel`, View > Terminal Panel) cycles like Ctrl+B does for the file tree: hidden or empty → shown with a shell (a new one when the panel has none) and focused → (from the editor) focus the panel → (from the panel) back to the editor, the panel staying open. Ctrl+` from the panel goes back to the editor too. A click on the panel focuses it; the header says which of the two keys goes back
+- **Where it docks**: `terminal_panel_side` (`"bottom"`, `"left"`, `"right"`). Change it with `move_terminal_panel_left` / `_right` / `_bottom` in the palette (both frontends), the panel's right-click menu (GUI), or the Settings dialog; every way persists to init.lua and the status bar says where it went. At a side the panel sits inward of the file tree and the Snippets panel and is `terminal_panel_width` px wide (TUI: `tui_terminal_panel_width` columns); at the bottom it is a strip between the side bands, `terminal_panel_height` px tall (TUI: `tui_terminal_panel_height` rows)
+- **Resizing (GUI)**: drag its editor-facing edge (the top edge at the bottom); the size persists on release. Drag well past the minimum to hide it — the status bar says so before you let go; the size is kept and the shell keeps running (Ctrl+Shift+` brings it back). The panel never takes more than half the pane area at the bottom, and at a side it keeps the panes 240 px (TUI: 40 columns) beside all the bands; with no room it hides itself and says so
+- **Moving a shell in and out**: `dock_terminal` (View > Dock Terminal in Panel) moves the **focused terminal pane** into the panel — start Claude Code with Ctrl+`, then dock it; the split closes behind it (a lone terminal pane in the main window leaves a fresh document; in a secondary window the window closes). `undock_terminal` (the panel menu's *Undock into a Split*) moves the panel's shell into a split beside the active pane (below it from the bottom). The panel holds one shell: dock refuses while it has one (close or undock first). Ctrl+Alt+` (`detach_terminal`) pressed in the panel moves its shell into its own OS window instead (GUI; the panel is empty afterwards and hides — in the TUI a second terminal opens at the side and the panel keeps its shell)
+- **Hiding and closing**: `hide_terminal_panel` (the menu's *Hide Panel*) hides it with the shell running; `close_terminal_panel` (the menu's *Close Terminal*), or `close_terminal` / `close_pane` (Ctrl+Alt+Q, Ctrl+F4) while the panel has the keyboard, ends the shell, and the panel hides — the split panes, and a terminal pane behind the panel, are left alone. Once the shell has ended (`exit`), the next key closes it as in a pane
+- **Typing** goes to the shell exactly as in a terminal pane: the management chords (Ctrl+`, Ctrl+Shift+`, Ctrl+Alt+Q, F6, …) stay with ZIDE, everything else — Ctrl+C included — reaches the program; a paste goes to it too. The status bar says *Terminal panel* (TUI: `[TERMINAL PANEL]`) while it has the keyboard, and the GUI header turns bold
+- The panel is not restored across runs (a shell cannot be), only its side and size are. Not yet: several shells in the panel (tabs), docking the file tree / Snippets / search panels at the bottom, and dragging a panel header to another edge — see the TODO entry
 
 ### Terminal Features
 - Full ANSI/VT escape sequence support (colors, cursor movement, erase, scroll regions, alternate screen buffer). DCS/SOS/PM/APC payloads (neovim's terminfo queries, kitty graphics), private-marker sequences such as `CSI > 4;2 m` and colon sub-parameters (undercurl `4:3`) never garble the screen, and an ESC inside an unfinished sequence starts a new one. RI/IND/NEL and cursor moves respect the scroll region; shrinking the pane keeps the cursor line visible
@@ -1403,19 +1449,23 @@ ZIDE includes a built-in terminal emulator that integrates with the split pane s
 ### Terminal Commands
 | Command | Keybind | Description |
 |---------|---------|-------------|
-| `toggle_terminal` | `Ctrl+\`` | New bottom terminal; from a terminal, back to the editor |
-| `open_terminal_right` | `Ctrl+Shift+\`` | Open a terminal in a side-by-side split |
-| `close_terminal` | — | Close the focused terminal pane (View > Close Terminal in the GUI; `close_pane`, Ctrl+Alt+Q / Ctrl+F4, closes a focused terminal too) |
-| `detach_terminal` | `Ctrl+Alt+\`` | Move the focused terminal into its own OS window (GUI; TUI: a second terminal at the side) |
+| `toggle_terminal` | `Ctrl+\`` | New bottom terminal; from a terminal (pane or panel), back to the editor |
+| `open_terminal_right` | — | Open a terminal in a side-by-side split (its old key, Ctrl+Shift+`, is the terminal panel's now) |
+| `close_terminal` | — | Close the focused terminal pane, or the terminal panel's shell while the panel has the keyboard (View > Close Terminal in the GUI; `close_pane`, Ctrl+Alt+Q / Ctrl+F4, closes a focused terminal too) |
+| `detach_terminal` | `Ctrl+Alt+\`` | Move the focused terminal — a pane, or the panel's shell while the panel has the keyboard — into its own OS window (GUI; TUI: a second terminal at the side) |
+| `toggle_terminal_panel` | `Ctrl+Shift+\`` | The terminal panel: open / focus / back to the editor (see above) |
+| `hide_terminal_panel`, `close_terminal_panel` | — | Hide the panel (shell keeps running) / end its shell |
+| `dock_terminal`, `undock_terminal` | — | Focused terminal pane → panel / panel's shell → split pane |
+| `move_terminal_panel_left` / `_right` / `_bottom` | — | Dock the panel at that edge (persisted) |
 
-While a terminal pane is focused, typing goes to the shell — only the pane / window / terminal management chords are let through (toggle, close, detach, focus next/prev pane, close window, open terminal right), in both frontends. In a TUI terminal pane Ctrl+Shift+` also returns to the editor (the hard-wired toggle ignores Shift), and Ctrl+Tab reaches the shell — switch tabs from an editor pane there; the GUI's hard-wired Ctrl+Tab switches tabs even over a terminal. A detached terminal window shows just the shell (plus menu/status bar per `secondary_window_chrome`); closing that window ends the shell, and `toggle_terminal` inside it reports "No editor pane in this window" instead of jumping to another window. On Linux, closing a terminal gives the shell ~500 ms after SIGHUP before it is killed, so a stubborn child cannot hang the editor.
+While a terminal pane (or the terminal panel) is focused, typing goes to the shell — only the pane / window / terminal management chords are let through (toggle, close, detach, focus next/prev pane, close window, open terminal right, the terminal panel toggle), in both frontends. In a TUI terminal pane Ctrl+Tab reaches the shell — switch tabs from an editor pane there; the GUI's hard-wired Ctrl+Tab switches tabs even over a terminal. A detached terminal window shows just the shell (plus menu/status bar per `secondary_window_chrome`); closing that window ends the shell, and `toggle_terminal` inside it reports "No editor pane in this window" instead of jumping to another window. On Linux, closing a terminal gives the shell ~500 ms after SIGHUP before it is killed, so a stubborn child cannot hang the editor.
 
 ### Architecture
 - **`src/core/pty.zig`** — Cross-platform PTY abstraction (ConPTY on Windows, posix on Linux). The POSIX PTY descriptors are close-on-exec, so language servers, git and tasks never inherit them, and closing a terminal always returns, even while another process (a disowned job, `setsid`) still holds the PTY; on Windows a thread-pool wait on the shell process detects its exit
   - Windows gotcha: the shell must be spawned with `STARTF_USESTDHANDLES` + NULL std handles, or CreateProcess's std-handle duplication overrides the pseudoconsole attachment and the terminal stays blank (bit us when the GUI started releasing its console)
 - **`src/core/ansi.zig`** — VT/ANSI escape sequence state machine parser
 - **`src/core/terminal.zig`** — Terminal emulator (cell grid, reader thread, key encoding)
-- Terminal panes use the same split pane layout system as editor panes — they can be placed anywhere (horizontal or vertical splits)
+- Terminal panes use the same split pane layout system as editor panes — they can be placed anywhere (horizontal or vertical splits); the terminal panel is the one place a shell lives outside the split tree (`Editor.terminal_panel` indexes `terminals`; invariant I6: a terminal is shown by one pane or by the panel, never both)
 - Background reader thread reads PTY output and updates a mutex-protected cell grid; the main thread reads the grid each frame for rendering
 
 ## File Tree
@@ -1424,7 +1474,7 @@ A toggleable side panel for browsing and managing the project directory, backed 
 
 ### Basics
 - **Ctrl+B** (`toggle_filetree`) cycles: hidden → shown + focused → (from the editor) focus the tree → (from the tree) hidden. Together with Escape this gives a full keyboard round-trip between editor and tree.
-- Docks **left or right** (`filetree_side` setting, default left); width via `filetree_width` (GUI px) / `tui_filetree_width` (TUI columns) — in the GUI drag its editor-facing edge to resize it, or drag the edge well past the minimum width to hide it (the status bar says so before you let go; the width is kept, and Ctrl+B brings the tree back). The Snippets panel docks the same way (default: the other side; on a shared side the tree sits outside) — see *Snippets*.
+- Docks **left or right** (`filetree_side` setting, default left; `move_filetree_left` / `move_filetree_right` in the palette change it from either frontend, the GUI context menu too — all persist); width via `filetree_width` (GUI px) / `tui_filetree_width` (TUI columns) — in the GUI drag its editor-facing edge to resize it, or drag the edge well past the minimum width to hide it (the status bar says so before you let go; the width is kept, and Ctrl+B brings the tree back). The Snippets panel docks the same way (default: the other side; on a shared side the tree sits outside) — see *Snippets*; the terminal panel sits inward of both — see *Embedded Terminal*.
 - Starts **visible** by default — to launch with it closed, uncheck "File Tree Visible" in the settings dialog (persists to init.lua) or `zide.set("filetree_visible", false)` (at runtime that also returns the keyboard to the pane); Ctrl+B at runtime never writes settings.
 - Root = current directory by default, or the folder given on the command line (`zide path/to/project` — see *Hybrid Launch*). Change it in the Settings dialog ("File Tree Root" — type a path, Enter applies; a bad path keeps the previous root and shows why) or `zide.set("filetree_root", "/path")`; "" resets to cwd. At runtime `zide.set("filetree_root", …)` clears the file clipboard and a pending move and rebuilds the tree on the next frame. **Backspace / u** (or `filetree_root_up`) re-roots at the parent directory to climb the hierarchy.
 - The panel header shows a clickable **up-button** (level-up icon in the GUI, `^` in the TUI) plus the full root path, truncated from the left (`...\Zig\ZIDE`) so the tail stays readable — click it to go up one folder.

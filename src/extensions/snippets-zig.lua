@@ -141,7 +141,7 @@ add("Struct with fields", nil,
   "const ${1:Point} = struct {\n\t${2:x}: ${3:i32},\n\t${4:y}: ${5:i32},\n\t$0\n};",
   "Fields are name: type, one per line, each ending with a comma. Give a field a default with = value after its type.")
 add("Make a struct value", nil,
-  "const ${1:point} = ${2:Pair}{ .${3:x} = ${4:0}, .${5:y} = ${6:0} };",
+  "const ${1:point} = ${2:Point}{ .${3:x} = ${4:0}, .${5:y} = ${6:0} };",
   "Fills every field of a struct type by name. Read a field with point.x, and change one with point.x = 5 when point is a var.")
 add("Enum", "enum",
   "const ${1:Name} = enum {\n\t${2:member},\n\t$0\n};",
