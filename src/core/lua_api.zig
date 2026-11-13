@@ -19,6 +19,7 @@ const Document = @import("document.zig").Document;
 const Buffer = @import("buffer.zig").Buffer;
 const cursor_mod = @import("cursor.zig");
 const text_input = @import("text_input.zig");
+const status_mod = @import("status_message.zig");
 const lua_settings = @import("lua_settings.zig");
 const lsp_mod = @import("lsp.zig");
 const filetree_mod = @import("filetree.zig");
@@ -112,7 +113,7 @@ fn reportLuaError(editor: *Editor, lua: *Lua, what: []const u8) void {
     // warn, not err: extension bugs are user-script problems the editor
     // survives (and err-level logs fail `zig build test`).
     std.log.warn("Lua {s} failed: {s}", .{ what, err_msg });
-    setStatusText(editor, "Extension error: ", err_msg);
+    setStatusError(editor, "Extension error: ", err_msg);
     lua.pop(1);
 }
 
@@ -126,6 +127,12 @@ pub fn setStatusText(editor: *Editor, prefix: []const u8, text: []const u8) void
     @memcpy(buf[0..p], prefix[0..p]);
     const body = statusText(buf[p..], text);
     editor.status_message = buf[0 .. p + body.len];
+}
+
+/// setStatusText for a failure: the message gets the error color.
+pub fn setStatusError(editor: *Editor, prefix: []const u8, text: []const u8) void {
+    setStatusText(editor, prefix, text);
+    editor.setStatus(.err, editor.status_message);
 }
 
 /// Copy `text` into `out` as one line of valid UTF-8 and return the filled
@@ -286,7 +293,7 @@ pub fn deinitLua(editor: *Editor) void {
 /// handlers. Lua-side globals persist across reloads (harmless).
 pub fn reloadExtensions(editor: *Editor) void {
     const lua = editor.lua orelse {
-        editor.status_message = "Extensions: no Lua state available";
+        editor.setStatus(.err, "Extensions: no Lua state available");
         return;
     };
     cleanupLuaRefs(editor);
@@ -460,15 +467,27 @@ fn luaExec(state: ?*zlua.LuaState) callconv(.c) c_int {
     return 1;
 }
 
-/// zide.status(msg) — show a transient message in the status bar. Long
-/// messages are cut at a character boundary (the bar holds 128 bytes);
-/// malformed UTF-8 shows as U+FFFD and control characters as spaces.
+/// zide.status(msg [, level]) — show a transient message in the status
+/// bar. Long messages are cut at a character boundary (the bar holds 128
+/// bytes); malformed UTF-8 shows as U+FFFD and control characters as
+/// spaces. `level` is "note" (the default), "warning" or "error" — the
+/// color of the message while it is highlighted — or "quiet" for plain text
+/// that is never highlighted.
 fn luaStatus(state: ?*zlua.LuaState) callconv(.c) c_int {
     var lua: *Lua = @ptrCast(@alignCast(state orelse return 0));
     const editor = lua_settings.getEditor(state) orelse return 0;
     const msg_z = lua.toString(1) catch return 0;
+    var level: status_mod.Level = .note;
+    if (lua.typeOf(2) == .string) {
+        const name: []const u8 = lua.toString(2) catch "";
+        level = status_mod.Level.parse(name) orelse blk: {
+            std.log.warn("zide.status: level must be \"note\", \"warning\", \"error\" or \"quiet\", got '{s}'", .{name});
+            break :blk .note;
+        };
+    }
     // Copied: the Lua string is GC-owned and dies with the callback.
     setStatusText(editor, "", msg_z);
+    editor.setStatus(level, editor.status_message);
     return 0;
 }
 
@@ -1468,7 +1487,7 @@ test "buffer API: set_line keeps caret columns and secondary cursors" {
         \\  if n > 0 then
         \\    zide.set_line(line, s)
         \\  else
-        \\    zide.status("No checkbox on this line")
+        \\    zide.status("No checkbox on this line", "warning")
         \\  end
         \\end)
     );
@@ -1519,6 +1538,57 @@ test "zide.status and extension errors are cut on a character boundary" {
     try testing.expect(std.mem.startsWith(u8, editor.status_message, "Extension error: "));
     try testing.expect(std.unicode.utf8ValidateSlice(editor.status_message));
     try testing.expect(editor.status_message.len <= editor.status_buf.len);
+}
+
+test "zide.status takes a level; extension errors are errors; status_message_seconds is a setting" {
+    testing.log_level = .err; // the unknown level and the Lua error warn
+    defer testing.log_level = .warn;
+    var lua = try Lua.init(testing.allocator);
+    defer lua.deinit();
+    lua.openLibs();
+    var editor = try Editor.init(testing.allocator, testing.io);
+    defer editor.deinit();
+    lua_settings.registerApi(lua, &editor);
+    const s = std.time.ns_per_s;
+
+    try lua.doString("zide.status('lint: 3 problems', 'warning')");
+    var view = editor.statusView(1 * s);
+    try testing.expectEqualStrings("lint: 3 problems", view.text);
+    try testing.expectEqual(status_mod.Level.warning, view.level);
+    try lua.doString("zide.status('zig is not on PATH', 'error')");
+    try testing.expectEqual(status_mod.Level.err, editor.statusView(2 * s).level);
+    // No level, or one that does not exist: a plain note (the text still shows).
+    try lua.doString("zide.status('formatted')");
+    try testing.expectEqual(status_mod.Level.note, editor.statusView(3 * s).level);
+    try lua.doString("zide.status('loud one', 'loud')");
+    view = editor.statusView(4 * s);
+    try testing.expectEqualStrings("loud one", view.text);
+    try testing.expectEqual(status_mod.Level.note, view.level);
+    // A script that raises is reported as an error.
+    try lua.doString("zide.command('boom', '', function() error('kaput') end)");
+    try testing.expect(editor.execCommand("boom", null));
+    view = editor.statusView(5 * s);
+    try testing.expect(std.mem.startsWith(u8, view.text, "Extension error: "));
+    try testing.expectEqual(status_mod.Level.err, view.level);
+
+    // The highlight time: 0-30 seconds, 0 switches it off.
+    try lua.doString("assert(zide.get('status_message_seconds') == 4)");
+    try lua.doString("zide.set('status_message_seconds', 9)");
+    try testing.expectEqual(@as(u8, 9), editor.status_message_seconds);
+    try lua.doString("zide.set('status_message_seconds', 31)");
+    try testing.expectEqual(@as(u8, 9), editor.status_message_seconds);
+    try lua.doString("zide.set('status_message_seconds', 0)");
+    try lua.doString("assert(zide.get('status_message_seconds') == 0)");
+    try lua.doString("zide.status('plain')");
+    try testing.expect(!editor.statusView(6 * s).fresh);
+    // "quiet" is never highlighted, whatever the setting says.
+    try lua.doString("zide.set('status_message_seconds', 4)");
+    try lua.doString("zide.status('saved on main', 'quiet')");
+    view = editor.statusView(7 * s);
+    try testing.expectEqualStrings("saved on main", view.text);
+    try testing.expect(!view.fresh);
+    try lua.doString("zide.status('saved on main')");
+    try testing.expect(editor.statusView(8 * s).fresh);
 }
 
 test "zide.run executes a tool and returns code/stdout" {

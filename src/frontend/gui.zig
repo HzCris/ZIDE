@@ -9,6 +9,7 @@ const LayoutNode = @import("../core/layout.zig").LayoutNode;
 const Layout = @import("../core/layout.zig").Layout;
 const ThemeColor = @import("../core/theme.zig").ThemeColor;
 const theme_mod = @import("../core/theme.zig");
+const status_mod = @import("../core/status_message.zig");
 const syntax = @import("../core/syntax.zig");
 const search_mod = @import("../core/search.zig");
 const brackets = @import("../core/brackets.zig");
@@ -1224,7 +1225,7 @@ fn applyTabBarActions(editor: *Editor, acts: TabBarActions) void {
         if (editor.docIndexForId(id)) |idx| _ = editor.requestCloseDoc(idx);
     } else if (acts.new_window) |id| {
         if (!editor.multi_window_supported) {
-            editor.status_message = "This build has no extra windows (SDL3 renderer backend needed)";
+            editor.setStatus(.warning, "This build has no extra windows (SDL3 renderer backend needed)");
         } else if (editor.docIndexForId(id)) |idx| editor.showDocInNewWindow(idx);
     }
 }
@@ -1341,7 +1342,7 @@ fn tabDrop(editor: *Editor, doc_idx: usize, p: dvui.Point.Physical) void {
         _ = c.SDL_GetGlobalMouseState(&gx, &gy);
         tabDropAt(editor, doc_idx, gx, gy);
     } else {
-        editor.status_message = "This build has no extra windows (SDL3 renderer backend needed)";
+        editor.setStatus(.warning, "This build has no extra windows (SDL3 renderer backend needed)");
     }
 }
 
@@ -1352,7 +1353,7 @@ fn tabDropAt(editor: *Editor, doc_idx: usize, gx: f32, gy: f32) void {
     editor.status_message = "";
     if (doc_idx >= editor.documents.items.len) return;
     if (!editor.multi_window_supported) {
-        editor.status_message = "This build has no extra windows (SDL3 renderer backend needed)";
+        editor.setStatus(.warning, "This build has no extra windows (SDL3 renderer backend needed)");
         return;
     }
     if (comptime dvui.Backend.support_child_os_wins) {
@@ -1480,17 +1481,23 @@ fn statusBar(editor: *Editor) void {
         // Center: transient status message ("Saved", "Cannot open: ...",
         // file-tree results) takes priority over the line diagnostic —
         // previously these were never rendered in normal mode at all.
+        // A new one is a highlighted block for a few seconds (drawn last,
+        // over the rest of the bar), then plain text clipped to its slot.
+        const message = editor.statusView(std.Io.Clock.now(.awake, editor.io).nanoseconds);
+        const message_block: ?dvui.Rect.Physical = if (message.fresh) statusBlockRect(status_font, sscale, sarea, center_x, message.text) else null;
         const line_diag = if (term_active) null else worstDiagnosticOnLine(doc, pos.line);
-        if (editor.status_message.len > 0) {
-            const prev_clip = dvui.clip(center_clip);
-            defer dvui.clipSet(prev_clip);
-            dvui.renderText(.{
-                .font = status_font,
-                .text = editor.status_message,
-                .rs = srs,
-                .p = .{ .x = center_x, .y = sarea.y },
-                .color = status_text_color,
-            }) catch {};
+        if (message.text.len > 0) {
+            if (!message.fresh) {
+                const prev_clip = dvui.clip(center_clip);
+                defer dvui.clipSet(prev_clip);
+                dvui.renderText(.{
+                    .font = status_font,
+                    .text = message.text,
+                    .rs = srs,
+                    .p = .{ .x = center_x, .y = sarea.y },
+                    .color = status_text_color,
+                }) catch {};
+            }
         } else if (line_diag) |diag| {
             const diag_color = diagnosticColor(diag.severity);
             const prefix: []const u8 = switch (diag.severity) {
@@ -1524,6 +1531,8 @@ fn statusBar(editor: *Editor) void {
             for (dvui.events()) |*e| {
                 if (e.handled or e.evt != .mouse) continue;
                 const me = e.evt.mouse;
+                // Not through a message block that covers the label.
+                if (message_block) |block| if (block.contains(me.p)) continue;
                 if (me.action == .press and me.button == .left and enc_rect.contains(me.p)) {
                     e.handle(@src(), swd);
                     // The picker acts on this window's document; switching
@@ -1540,7 +1549,44 @@ fn statusBar(editor: *Editor) void {
                 .color = status_text_color,
             }) catch {};
         }
+
+        if (message_block) |block| drawStatusBlock(editor, status_font, srs, block, message);
     }
+}
+
+/// Where a new status message's block goes. It starts in the message slot
+/// (`slot_x`, where the plain text is drawn afterwards) and moves left over
+/// the rest of the bar when the text needs the room; never wider than `bar`.
+fn statusBlockRect(font: dvui.Font, scale: f32, bar: dvui.Rect.Physical, slot_x: f32, text: []const u8) dvui.Rect.Physical {
+    const pad = status_block_pad * scale;
+    const w = @min(bar.w, font.textSize(text).w * scale + pad * 2);
+    const x = @max(bar.x, @min(slot_x - pad, bar.x + bar.w - w));
+    return .{ .x = x, .y = bar.y - scale, .w = w, .h = bar.h + scale * 2 };
+}
+
+/// Blank space either side of a status message block's text (natural pixels).
+const status_block_pad: f32 = 8;
+
+/// The highlighted block of a new status message, in its level's colors; a
+/// text too wide even for the whole bar ends in "…".
+fn drawStatusBlock(editor: *Editor, font: dvui.Font, rs: dvui.RectScale, block: dvui.Rect.Physical, message: status_mod.View) void {
+    const pair = theme_mod.statusBlock(&editor.theme, message.level);
+    const rad = 4 * rs.s;
+    block.fill(.{ .x = rad, .y = rad, .w = rad, .h = rad }, .{ .color = toDvui(pair.bg), .fade = 1.0 });
+    const pad = status_block_pad * rs.s;
+    const room = block.w - pad * 2;
+    var buf: [status_mod.Flash.capacity + 3]u8 = undefined;
+    var text = message.text;
+    if (font.textSize(text).w * rs.s > room + 0.5) {
+        const ellipsis = "…";
+        const fit = fitOverlayText(font, text, room - font.textSize(ellipsis).w * rs.s, rs.s);
+        @memcpy(buf[0..fit.len], fit);
+        @memcpy(buf[fit.len..][0..ellipsis.len], ellipsis);
+        text = buf[0 .. fit.len + ellipsis.len];
+    }
+    const prev_clip = dvui.clip(block);
+    defer dvui.clipSet(prev_clip);
+    renderOverlayText(font, text, block.x + pad, block.y + rs.s, rs, toDvui(pair.fg));
 }
 
 /// Editor area of the current window: the split-pane tree, plus (primary
@@ -1695,7 +1741,7 @@ var deferred: DeferredQueue = .{};
 /// Queue `name` for frame()'s end (see DeferredQueue); a full queue drops
 /// it and says so rather than run it under the split widgets.
 fn deferRun(editor: *Editor, kind: DeferredQueue.Kind, name: []const u8) void {
-    if (!deferred.push(kind, name)) lua_api.setStatusText(editor, "Not run (too many at once): ", name);
+    if (!deferred.push(kind, name)) lua_api.setStatusError(editor, "Not run (too many at once): ", name);
 }
 
 /// Drain the deferred queue (after every window rendered) and draw its
@@ -2952,7 +2998,7 @@ fn handleFiletreeMouse(editor: *Editor, ft: *FileTree, wd: *dvui.WidgetData, m: 
 
         switch (me.action) {
             .press => {
-                editor.status_message = "";
+                editor.dismissStatus();
                 filetree_search_active = false;
                 const row = filetreeRowAt(ft, rows_y, line_height, me.p.y);
                 if (me.button == .right) {
@@ -3091,7 +3137,7 @@ fn handleFiletreeKeys(editor: *Editor, ft: *FileTree, wd: *dvui.WidgetData, visi
             .key => |key| {
                 if (key.action != .down and key.action != .repeat) continue;
                 // Keep the "press p" hint visible while a move is pending
-                if (editor.filetree_move_src == null) editor.status_message = "";
+                if (editor.filetree_move_src == null) editor.dismissStatus();
                 if (hasCommandMod(key.mod)) continue;
                 if (filetree_search_active) {
                     switch (key.code) {
@@ -3261,9 +3307,11 @@ fn handleFiletreeKeys(editor: *Editor, ft: *FileTree, wd: *dvui.WidgetData, visi
 
 /// Status message + dvui toast — for errors the user must actually see
 /// (the status bar alone was easy to miss in the first smoke test).
+/// A failure: in the status bar and as a toast. `args` must not point into
+/// `editor.status_buf` (the message is formatted there).
 fn guiNotify(editor: *Editor, comptime fmt: []const u8, args: anytype) void {
     const msg = std.fmt.bufPrint(&editor.status_buf, fmt, args) catch return;
-    editor.status_message = msg;
+    editor.setStatus(.err, msg);
     dvui.toast(@src(), .{ .message = msg });
 }
 
@@ -3487,7 +3535,7 @@ fn snippetsBandWidth(editor: *Editor, row_w: f32, tree_shown: bool) f32 {
     if (editor.keyboardOwner() == .snippets) filetree_release_focus = true;
     editor.snippets_visible = false;
     editor.snippets_focused = false;
-    editor.status_message = "Snippets panel: no room beside the editor — widen the window, then Ctrl+Alt+B";
+    editor.setStatus(.warning, "Snippets panel: no room beside the editor — widen the window, then Ctrl+Alt+B");
     return 0;
 }
 
@@ -4195,7 +4243,7 @@ fn handleSnippetsMouse(editor: *Editor, wd: *dvui.WidgetData, m: SnippetsMetrics
                 if (!repeat) snippets_last_click_inserted = false;
                 // A refused insert explains itself in the status bar: the
                 // second press must not wipe that.
-                if (!repeat) editor.status_message = "";
+                if (!repeat) editor.dismissStatus();
                 const is_item = if (row_idx) |r| (if (panel.rowAt(r)) |row| row.kind == .item else false) else false;
                 if (is_item and guiMode(editor) == .normal) {
                     panel.selected = row_idx.?;
@@ -6097,7 +6145,7 @@ fn terminalPanelBandSize(editor: *Editor, row: dvui.Rect, tree_shown: bool, snip
     if (size > 0) return size;
     terminal_panel_band.reset();
     editor.hideTerminalPanel();
-    editor.status_message = "Terminal panel: no room beside the editor — enlarge the window, then Ctrl+Shift+`";
+    editor.setStatus(.warning, "Terminal panel: no room beside the editor — enlarge the window, then Ctrl+Shift+`");
     return 0;
 }
 
@@ -6497,7 +6545,7 @@ fn handleMouseEvents(editor: *Editor, pane_id: u8, wd: *dvui.WidgetData, area: d
                 dvui.focusWidget(wd.id, null, e.num);
             },
             .press => {
-                editor.status_message = "";
+                editor.dismissStatus();
                 if (me.button == .right) {
                     // Right-click: focus the pane and move the cursor to the
                     // click point — unless it lands inside the current
@@ -6932,9 +6980,10 @@ fn handleGuiKeyEvents(editor: *Editor, wd: *dvui.WidgetData) bool {
                     continue;
 
                 // Any real key press un-pins scroll (cursor tracking resumes)
-                // and drops the previous transient status message
+                // and drops the previous transient status message (a new
+                // one keeps its time on the bar: dismissStatus)
                 win_ui.scroll_pinned = false;
-                editor.status_message = "";
+                editor.dismissStatus();
 
                 // Ctrl/Alt shortcuts handled by the early event loop in frame()
                 if (key.mod.control() or key.mod.alt()) continue;
@@ -7087,7 +7136,7 @@ fn completionKeepsOnKey(editor: *Editor, key: dvui.Event.Key) bool {
 /// Execute an action with GUI-specific overrides (native file dialogs).
 fn execGuiAction(editor: *Editor, action: []const u8) void {
     // New action — drop the previous transient status message
-    editor.status_message = "";
+    editor.dismissStatus();
     // The file tree, Snippets and search panels live in the primary
     // window: bring it forward when their actions run from a secondary one.
     if (editor.active_window != 0 and isPrimaryPanelAction(action)) {
@@ -7212,7 +7261,10 @@ fn openFolderDialog(editor: *Editor) void {
     const path = dvui.dialogNativeFolderSelect(editor.allocator, .{ .title = "Open Folder" }) catch return;
     if (path) |p| {
         defer editor.allocator.free(p);
-        if (!editor.openProject(p)) guiNotify(editor, "{s}", .{editor.status_message});
+        // The reason is already in the status bar, and it lives in
+        // status_buf: toast it as it is (guiNotify would format the buffer
+        // into itself).
+        if (!editor.openProject(p)) dvui.toast(@src(), .{ .message = editor.status_message });
     }
 }
 
@@ -8103,6 +8155,7 @@ const settings_defs = [_]SettingDef{
     .{ .key = "review_stage_on_approve", .label = "Review: Approve Stages", .kind = .boolean, .desc = "Approving a changed file in the Review view also stages it (git add)" },
     .{ .key = "auto_save", .label = "Auto Save", .kind = .boolean, .desc = "Auto-save dirty documents periodically" },
     .{ .key = "auto_save_interval_ms", .label = "Auto Save Interval (ms)", .kind = .number, .desc = "Delay before auto-save (500-300000)", .min = 500, .max = 300000 },
+    .{ .key = "status_message_seconds", .label = "Message Highlight (s)", .kind = .number, .desc = "Seconds a new status-bar message stays highlighted, 0 = off (0-30)", .min = 0, .max = 30 },
     .{ .key = "gutter_min_digits", .label = "Gutter Min Digits", .kind = .number, .desc = "Minimum width of line number gutter (1-10)", .min = 1, .max = 10 },
     .{ .key = "completion_min_chars", .label = "Completion Min Chars", .kind = .number, .desc = "Identifier characters typed before the popup opens by itself (1-8)", .min = 1, .max = 8 },
     .{ .key = "page_size", .label = "Page Size", .kind = .number, .desc = "Lines to scroll on Page Up/Down (5-200)", .min = 5, .max = 200 },
@@ -8201,8 +8254,8 @@ fn settingsDialog(editor: *Editor) void {
                 if (renderer_settings.save(editor.allocator, editor.io, p, mode)) |_| {
                     editor.renderer_preference = mode;
                     editor.status_message = "Renderer preference saved; restart ZIDE to apply";
-                } else |_| editor.status_message = "Could not save renderer preference";
-            } else editor.status_message = "Could not find renderer configuration path";
+                } else |_| editor.setStatus(.err, "Could not save renderer preference");
+            } else editor.setStatus(.err, "Could not find renderer configuration path");
         }
         if (editor.renderer_preference != editor.renderer_active) {
             dvui.labelNoFmt(@src(), "Restart required. Existing and new windows keep the current renderer.", .{}, .{ .color_text = desc_color });
@@ -8406,6 +8459,7 @@ fn applySettingBool(editor: *Editor, key: []const u8, val: bool) void {
 fn getSettingNumber(editor: *const Editor, key: []const u8) i64 {
     if (std.mem.eql(u8, key, "tab_width")) return @intCast(editor.tab_width);
     if (std.mem.eql(u8, key, "auto_save_interval_ms")) return @intCast(editor.auto_save_interval_ms);
+    if (std.mem.eql(u8, key, "status_message_seconds")) return @intCast(editor.status_message_seconds);
     if (std.mem.eql(u8, key, "gutter_min_digits")) return @intCast(editor.gutter_min_digits);
     if (std.mem.eql(u8, key, "completion_min_chars")) return @intCast(editor.completion_min_chars);
     if (std.mem.eql(u8, key, "page_size")) return @intCast(editor.page_size);
@@ -8429,6 +8483,9 @@ fn applySettingNumber(editor: *Editor, key: []const u8, val: i64) void {
     }
     if (std.mem.eql(u8, key, "auto_save_interval_ms")) {
         if (val >= 500 and val <= 300000) editor.auto_save_interval_ms = @intCast(val);
+    }
+    if (std.mem.eql(u8, key, "status_message_seconds")) {
+        if (val >= 0 and val <= 30) editor.status_message_seconds = @intCast(val);
     }
     if (std.mem.eql(u8, key, "gutter_min_digits")) {
         if (val >= 1 and val <= 10) editor.gutter_min_digits = @intCast(val);
@@ -11489,4 +11546,88 @@ test "gui vertical motion: the sticky x holds only where the last move left the 
     try t.expect(vm.target(1, 7, 3, 10) == null); // no record for that cursor
     vm.remember(VerticalMotion.max_cursors, 5, 1); // past the table: ignored
     try t.expect(vm.target(1, 7, VerticalMotion.max_cursors, 5) == null);
+}
+
+test "GUI status messages: a new one is a filled block in its level's colors, moved left when the text needs the room" {
+    if (!build_options.has_gui) return error.SkipZigTest;
+    const t = std.testing;
+    var ui = try dvui.testing.init(.{ .window_size = .{ .w = 900, .h = 600 } });
+    defer ui.deinit();
+    var editor = try Editor.init(t.allocator, t.io);
+    defer editor.deinit();
+    var g = try GuiState.init(t.allocator);
+    defer g.deinit();
+    defer win_ui = undefined;
+    applyWindowFonts(ui.window, &g, &editor);
+    try snippetsTestSetup(&editor);
+    var ms: u64 = 0;
+
+    // Where the block goes. With room: its text starts in the message slot,
+    // where the plain text is drawn once the highlight is over.
+    const font = dvui.Font.theme(.body);
+    const text = "Save failed: AccessDenied";
+    const text_w = font.textSize(text).w;
+    const block_w = text_w + status_block_pad * 2;
+    var bar: dvui.Rect.Physical = .{ .x = 10, .y = 100, .w = block_w + 400, .h = 20 };
+    var block = statusBlockRect(font, 1, bar, 110, text);
+    try t.expectApproxEqAbs(110 - status_block_pad, block.x, 0.01);
+    try t.expectApproxEqAbs(block_w, block.w, 0.01);
+    try t.expectApproxEqAbs(@as(f32, 99), block.y, 0.01);
+    try t.expectApproxEqAbs(@as(f32, 22), block.h, 0.01);
+    // Not enough room right of the slot: it moves left and ends with the bar.
+    bar.w = block_w + 50;
+    block = statusBlockRect(font, 1, bar, 110, text);
+    try t.expectApproxEqAbs(bar.x + 50, block.x, 0.01);
+    try t.expectApproxEqAbs(block_w, block.w, 0.01);
+    // Wider than the bar: the whole bar (the text is cut with an ellipsis).
+    bar.w = block_w - 30;
+    block = statusBlockRect(font, 1, bar, 110, text);
+    try t.expectApproxEqAbs(bar.x, block.x, 0.01);
+    try t.expectApproxEqAbs(bar.w, block.w, 0.01);
+    // Padding and height follow the scale.
+    bar.w = block_w * 2 + 400;
+    block = statusBlockRect(font, 2, bar, 110, text);
+    try t.expectApproxEqAbs(110 - status_block_pad * 2, block.x, 0.01);
+    try t.expectApproxEqAbs(block_w * 2, block.w, 0.01);
+    try t.expectApproxEqAbs(@as(f32, 98), block.y, 0.01);
+
+    // Drawn in the window: the frame loop is told when the highlight ends.
+    for (0..2) |_| try snippetsTestFrame(ui.window, &editor, &g, &ms);
+    editor.setStatus(.err, text);
+    try snippetsTestFrame(ui.window, &editor, &g, &ms);
+    try t.expect(editor.status_flash.active);
+    try t.expectEqual(status_mod.Level.err, editor.status_flash.level);
+    try t.expect(editor.deadlines.next_status != null);
+    try t.expectEqualStrings(text, editor.status_message);
+    try snippetFormTestCapture(&editor, &g, &ms, "status_message_error.png");
+
+    // A command through its key (Ctrl+Alt+B, the Snippets panel) dismisses
+    // the message; the block keeps its time.
+    const ctrl_alt: dvui.enums.Mod = @enumFromInt(@intFromEnum(dvui.enums.Mod.lcontrol) | @intFromEnum(dvui.enums.Mod.lalt));
+    try dvui.testing.pressKey(.b, ctrl_alt);
+    try snippetsTestFrame(ui.window, &editor, &g, &ms);
+    try t.expect(editor.snippets_visible);
+    try t.expectEqualStrings("", editor.status_message);
+    try t.expect(editor.status_flash.active);
+    try snippetsTestFrame(ui.window, &editor, &g, &ms);
+    try t.expect(editor.status_flash.active);
+    try t.expect(editor.deadlines.next_status != null);
+    // Its time is up (aged by hand): the next frame drops it.
+    editor.status_flash.shown_ns.? -= 5 * std.time.ns_per_s;
+    try snippetsTestFrame(ui.window, &editor, &g, &ms);
+    try t.expect(!editor.status_flash.active);
+    try t.expectEqual(@as(?i128, null), editor.deadlines.next_status);
+
+    // ZIDE_CAPTURE_DIR=<dir>: pictures of the other levels and of a
+    // message longer than the bar (status_message_*.png).
+    editor.setStatus(.warning, "Read-only document");
+    try snippetFormTestCapture(&editor, &g, &ms, "status_message_warning.png");
+    editor.status_message = "Saved untitled";
+    try snippetFormTestCapture(&editor, &g, &ms, "status_message_note.png");
+    editor.setStatus(.warning, "Moved 3 items — 2 skipped (last a-rather-long-file-name-for-a-status-bar.zig: name already exists in the target)");
+    try snippetFormTestCapture(&editor, &g, &ms, "status_message_long.png");
+    editor.status_message = "Saved untitled";
+    try snippetsTestFrame(ui.window, &editor, &g, &ms);
+    editor.status_flash.shown_ns.? -= 5 * std.time.ns_per_s;
+    try snippetFormTestCapture(&editor, &g, &ms, "status_message_settled.png");
 }

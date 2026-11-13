@@ -27,6 +27,7 @@ pub const snippet_panel_mod = @import("snippet_panel.zig");
 pub const snippet_form_mod = @import("snippet_form.zig");
 pub const snippet_file = @import("snippet_file.zig");
 const nav_history = @import("nav_history.zig");
+pub const status_mod = @import("status_message.zig");
 const picker_mod = @import("picker.zig");
 const WalkIgnore = @import("walk_ignore.zig").WalkIgnore;
 const zlua = @import("zlua");
@@ -43,10 +44,17 @@ pub const Editor = struct {
 
     /// Whether the editor should keep running.
     running: bool = true,
-    /// Status bar message (transient).
+    /// Status bar message (transient). Assign it for a plain note; setStatus
+    /// gives a warning or an error its level; dismissStatus is the "user
+    /// moved on" clear, while `= ""` takes the message off the bar at once.
     status_message: []const u8 = "",
     /// Buffer for formatted status messages.
     status_buf: [128]u8 = undefined,
+    /// What the status bars show in the message slot (statusView).
+    status_flash: status_mod.Flash = .{},
+    /// Seconds a new message stays highlighted in the status bar; 0 = never
+    /// (plain text that goes at the next key press or click, as it used to).
+    status_message_seconds: u8 = 4,
 
     /// Internal clipboard (used when system clipboard unavailable).
     clipboard: []const u8 = "",
@@ -808,6 +816,34 @@ pub const Editor = struct {
         return null;
     }
 
+    // ---- Status messages ----
+
+    /// Show `msg` as a warning (refused, nothing to do) or an error
+    /// (something failed): its own color while it is highlighted — or as
+    /// `.quiet` progress / background chatter, which is never highlighted.
+    /// `msg` follows the rules of a direct `status_message` assignment.
+    pub fn setStatus(self: *Editor, level: status_mod.Level, msg: []const u8) void {
+        self.status_message = msg;
+        self.status_flash.mark(level, msg);
+    }
+
+    /// The user moved on (a key, a click, the next action): the message
+    /// goes, but one that is still highlighted — or was never drawn — keeps
+    /// its time on the bar. `status_message = ""` removes it at once instead.
+    pub fn dismissStatus(self: *Editor) void {
+        self.status_flash.dismiss(&self.status_message);
+    }
+
+    /// The status bar's message slot at `now` (awake clock, ns). Called by
+    /// the painters every frame; the frame loops wake up again when the
+    /// highlight ends.
+    pub fn statusView(self: *Editor, now: i128) status_mod.View {
+        const hold = @as(i128, self.status_message_seconds) * std.time.ns_per_s;
+        const view = self.status_flash.view(&self.status_message, now, hold);
+        self.deadlines.next_status = if (view.remaining_ns) |left| now + left else null;
+        return view;
+    }
+
     // ---- Keyboard focus (normal mode) ----
     //
     // In normal mode exactly one of the file tree, the search panel, the
@@ -1563,19 +1599,19 @@ pub const Editor = struct {
         defer self.allocator.free(path);
         const opened = self.navOpen(path) catch {
             const msg = std.fmt.bufPrint(&self.status_buf, "Cannot open {s}", .{path}) catch "Cannot open result";
-            self.status_message = msg;
+            self.setStatus(.err, msg);
             return false;
         };
         if (sp.generation != generation or opened.file_path == null or !self.pathsEqual(opened.file_path.?, path)) {
-            self.status_message = "Search changed; select a result again";
+            self.setStatus(.warning, "Search changed; select a result again");
             return false;
         }
         const id = opened.id;
         const m = (sp.refreshedMatch(old, opened) catch {
-            self.status_message = "Cannot refresh search results";
+            self.setStatus(.err, "Cannot refresh search results");
             return false;
         }) orelse {
-            self.status_message = "Match no longer exists; file results refreshed";
+            self.setStatus(.warning, "Match no longer exists; file results refreshed");
             return false;
         };
         const idx = self.docIndexForId(id) orelse return false;
@@ -1585,7 +1621,7 @@ pub const Editor = struct {
         const end_off = start_off + m.len;
         const cursor = @import("cursor.zig");
         if (cursor.floorBoundary(&doc.buffer, start_off) != start_off or cursor.floorBoundary(&doc.buffer, end_off) != end_off) {
-            self.status_message = "Match is not a complete character";
+            self.setStatus(.warning, "Match is not a complete character");
             return false;
         }
         doc.cursors.clearSecondary();
@@ -1603,7 +1639,7 @@ pub const Editor = struct {
         const sp = &self.search;
         const count = sp.matches.items.len;
         if (count == 0) {
-            self.status_message = "No search results (Ctrl+Shift+F to search)";
+            self.setStatus(.warning, "No search results (Ctrl+Shift+F to search)");
             return;
         }
         if (forward) {
@@ -1619,9 +1655,9 @@ pub const Editor = struct {
     pub fn searchArmReplace(self: *Editor) void {
         self.search.confirm_armed = false;
         if (!self.search.criteriaCurrent()) {
-            self.status_message = "Run search after changing its criteria";
+            self.setStatus(.warning, "Run search after changing its criteria");
         } else if (self.search.searching) {
-            self.status_message = "Wait for search to finish before replacing";
+            self.setStatus(.warning, "Wait for search to finish before replacing");
         } else if (self.search.matches.items.len > 0) self.search.confirm_armed = true;
     }
 
@@ -1636,7 +1672,7 @@ pub const Editor = struct {
         self.search.start(self);
         const noun: []const u8 = if (scope == .open_only) "open doc(s)" else "file(s)";
         const msg = std.fmt.bufPrint(&self.status_buf, "Replaced {d} match(es) in {d} {s}; {d} failed", .{ res.count, res.files, noun, res.failed }) catch "Replace done";
-        self.status_message = msg;
+        if (res.failed > 0) self.setStatus(.err, msg) else self.status_message = msg;
     }
 
     /// Free the workspace snapshot (paths, matches, root).
@@ -1658,7 +1694,7 @@ pub const Editor = struct {
             const root = self.filetree_root orelse ".";
             self.filetree = filetree_mod.FileTree.init(self.allocator, self.io, root) catch |err| {
                 const msg = std.fmt.bufPrint(&self.status_buf, "File tree: cannot open '{s}': {s}", .{ root, @errorName(err) }) catch "File tree: open failed";
-                self.status_message = msg;
+                self.setStatus(.err, msg);
                 self.filetree_visible = false;
                 self.filetree_focused = false;
                 return null;
@@ -1714,10 +1750,10 @@ pub const Editor = struct {
                     .left => .left,
                     .right => .right,
                     .bottom => {
-                        self.status_message = if (panel == .filetree)
+                        self.setStatus(.warning, if (panel == .filetree)
                             "The file tree docks left or right"
                         else
-                            "The Snippets panel docks left or right";
+                            "The Snippets panel docks left or right");
                         return;
                     },
                 };
@@ -1809,22 +1845,22 @@ pub const Editor = struct {
         if (self.mode != .normal or index >= self.snippets.items.items.len) return;
         if (self.active_window != 0) self.focusWindow(0);
         if (self.activePaneIsTerminal()) {
-            self.status_message = "Snippets insert into an editor pane: focus one first";
+            self.setStatus(.warning, "Snippets insert into an editor pane: focus one first");
             return;
         }
         const doc = self.activeDoc();
         if (doc.readonly) {
-            self.status_message = if (doc.reader != null) "Read-only review view — Enter opens the real file" else "Read-only document";
+            self.setStatus(.warning, if (doc.reader != null) "Read-only review view — Enter opens the real file" else "Read-only document");
             return;
         }
         if (doc.cursors.count() != 1) {
-            self.status_message = "Snippets require a single cursor";
+            self.setStatus(.warning, "Snippets require a single cursor");
             return;
         }
         const def = &self.snippets.items.items[index];
         if (doc.file_path == null and doc.language == null and !std.mem.eql(u8, def.language, "*")) {
             const lang = self.findLanguageByName(def.language) orelse {
-                self.status_message = std.fmt.bufPrint(&self.status_buf, "No language named '{s}' is registered", .{def.language}) catch "The snippet's language is not registered";
+                self.setStatus(.warning, std.fmt.bufPrint(&self.status_buf, "No language named '{s}' is registered", .{def.language}) catch "The snippet's language is not registered");
                 return;
             };
             self.setDocLanguage(doc, lang);
@@ -1840,7 +1876,7 @@ pub const Editor = struct {
         const paths = ft.selectionRelPaths(self.allocator) catch return;
         if (paths.len == 0) {
             self.allocator.free(paths);
-            self.status_message = "File tree: nothing selected";
+            self.setStatus(.warning, "File tree: nothing selected");
             return;
         }
         self.cancelFiletreeMove();
@@ -1877,7 +1913,7 @@ pub const Editor = struct {
     pub fn applyFiletreeMove(self: *Editor) void {
         const ft = self.ensureFiletree() orelse return;
         const src = self.filetree_move_src orelse {
-            self.status_message = "File tree: nothing marked — press x on an entry first";
+            self.setStatus(.warning, "File tree: nothing marked — press x on an entry first");
             return;
         };
         const dest_idx = ft.opTargetDir();
@@ -1920,19 +1956,19 @@ pub const Editor = struct {
     pub fn filetreeMoveTo(self: *Editor, src_rel: []const u8, dest_idx: u32) void {
         const ft = self.ensureFiletree() orelse return;
         const src_idx = ft.findByPath(src_rel) orelse {
-            self.status_message = "Move failed: entry no longer exists";
+            self.setStatus(.err, "Move failed: entry no longer exists");
             self.cancelFiletreeMove();
             return;
         };
         const new_rel = ft.moveEntry(self.allocator, src_idx, dest_idx) catch |err| {
-            self.status_message = switch (err) {
+            self.setStatus(if (err == error.InvalidMove) .warning else .err, switch (err) {
                 error.InvalidMove => "Move: invalid target (same place, or inside the moved entry)",
                 error.PathAlreadyExists => "Move failed: that name already exists in the target",
                 else => blk: {
                     const msg = std.fmt.bufPrint(&self.status_buf, "Move failed: {s}", .{@errorName(err)}) catch "Move failed";
                     break :blk msg;
                 },
-            };
+            });
             return; // keep the mark — the user can pick another target
         };
         defer self.allocator.free(new_rel);
@@ -1969,7 +2005,7 @@ pub const Editor = struct {
         const paths = ft.selectionRelPaths(self.allocator) catch return;
         if (paths.len == 0) {
             self.allocator.free(paths);
-            self.status_message = "File tree: nothing selected";
+            self.setStatus(.warning, "File tree: nothing selected");
             return;
         }
         self.filetreeClipClear();
@@ -2007,7 +2043,7 @@ pub const Editor = struct {
     pub fn filetreePaste(self: *Editor) void {
         const ft = self.ensureFiletree() orelse return;
         if (self.filetree_clip_paths.items.len == 0) {
-            self.status_message = "File clipboard is empty — Ctrl+C/X in the tree first";
+            self.setStatus(.warning, "File clipboard is empty — Ctrl+C/X in the tree first");
             return;
         }
         const dest_idx = ft.opTargetDir();
@@ -2051,7 +2087,7 @@ pub const Editor = struct {
         const ft = self.ensureFiletree() orelse return;
         const new_rel = ft.importAbsPath(self.allocator, abs, dest_idx) catch |err| {
             const msg = std.fmt.bufPrint(&self.status_buf, "Import failed — {s}: {s}", .{ std.fs.path.basename(abs), fileOpSkipReason(err) }) catch "Import failed";
-            self.status_message = msg;
+            self.setStatus(.err, msg);
             return;
         };
         defer self.allocator.free(new_rel);
@@ -2116,7 +2152,7 @@ pub const Editor = struct {
         // keyboard back if it had it (tree Backspace into an unreadable parent).
         if (had_keyboard and self.filetree != null) _ = self.takeKeyboardFocus(.filetree);
         @memcpy(self.status_buf[0..fail_len], fail_buf[0..fail_len]);
-        self.status_message = self.status_buf[0..fail_len];
+        self.setStatus(.err, self.status_buf[0..fail_len]);
         return false;
     }
 
@@ -2126,7 +2162,7 @@ pub const Editor = struct {
     pub fn filetreeRootUp(self: *Editor) void {
         const ft = self.ensureFiletree() orelse return;
         const parent = std.fs.path.dirname(ft.root_path) orelse {
-            self.status_message = "File tree: already at the filesystem root";
+            self.setStatus(.warning, "File tree: already at the filesystem root");
             return;
         };
         // Copy out — setFiletreeRoot deinits the tree `parent` points into
@@ -2165,7 +2201,7 @@ pub const Editor = struct {
             },
             .rename, .delete_confirm => {
                 const sel = ft.selectedNodeIdx() orelse {
-                    self.status_message = "File tree: nothing selected";
+                    self.setStatus(.warning, "File tree: nothing selected");
                     return;
                 };
                 if (sel == 0) return;
@@ -2221,7 +2257,7 @@ pub const Editor = struct {
             },
             .rename => {
                 const idx = ft.findByPath(target) orelse {
-                    self.status_message = "Rename failed: entry no longer exists";
+                    self.setStatus(.err, "Rename failed: entry no longer exists");
                     return;
                 };
                 const new_rel = ft.renameEntry(self.allocator, idx, input) catch |err| {
@@ -2268,7 +2304,7 @@ pub const Editor = struct {
                     return;
                 }
                 const idx = ft.findByPath(target) orelse {
-                    self.status_message = "Delete failed: entry no longer exists";
+                    self.setStatus(.err, "Delete failed: entry no longer exists");
                     return;
                 };
                 ft.deleteEntry(idx) catch |err| {
@@ -2285,7 +2321,7 @@ pub const Editor = struct {
 
     fn filetreeOpError(self: *Editor, op: []const u8, err: anyerror) void {
         const msg = std.fmt.bufPrint(&self.status_buf, "{s} failed: {s}", .{ op, @errorName(err) }) catch "File operation failed";
-        self.status_message = msg;
+        self.setStatus(.err, msg);
     }
 
     /// Human-readable reason for a skipped bulk file operation.
@@ -2327,7 +2363,8 @@ pub const Editor = struct {
             std.fmt.bufPrint(&self.status_buf, "{s} {d} item{s} — skipped {s}: {s}", .{ verb, ok, plural, skip.name(), skip.reason }) catch verb
         else
             std.fmt.bufPrint(&self.status_buf, "{s} {d} item{s} — {d} skipped (last {s}: {s})", .{ verb, ok, plural, failed, skip.name(), skip.reason }) catch verb;
-        self.status_message = msg;
+        // Some skipped is a warning; nothing done at all is an error.
+        self.setStatus(if (failed == 0) .note else if (ok == 0) .err else .warning, msg);
     }
 
     /// After a rename on disk, point open documents at the new path —
@@ -2390,7 +2427,7 @@ pub const Editor = struct {
         const id = self.confirm_close_doc;
         self.confirm_close_doc = null;
         const idx = (if (id) |target| self.docIndexForId(target) else null) orelse {
-            self.status_message = "Close cancelled (the document is gone)";
+            self.setStatus(.warning, "Close cancelled (the document is gone)");
             return .kept;
         };
         switch (choice) {
@@ -2573,7 +2610,7 @@ pub const Editor = struct {
                 return true;
             }
         }
-        self.status_message = if (dir == .back) "Nothing to go back to" else "Nothing to go forward to";
+        self.setStatus(.warning, if (dir == .back) "Nothing to go back to" else "Nothing to go forward to");
         return false;
     }
 
@@ -2638,7 +2675,7 @@ pub const Editor = struct {
             self.recordNavPoint();
             const doc = self.openOrFocus(entry.path) catch |err| {
                 if (err != error.EncodingRequired and err != error.BinaryFile) {
-                    self.status_message = std.fmt.bufPrint(&self.status_buf, "Cannot reopen {s}: {s}", .{ std.fs.path.basename(entry.path), @errorName(err) }) catch "Cannot reopen closed tab";
+                    self.setStatus(.err, std.fmt.bufPrint(&self.status_buf, "Cannot reopen {s}: {s}", .{ std.fs.path.basename(entry.path), @errorName(err) }) catch "Cannot reopen closed tab");
                 }
                 return false;
             };
@@ -2647,7 +2684,7 @@ pub const Editor = struct {
             doc.cursors.primary().gotoPos(&doc.buffer, line, entry.col);
             return true;
         }
-        self.status_message = "No closed tabs to reopen";
+        self.setStatus(.warning, "No closed tabs to reopen");
         return false;
     }
 
@@ -2735,7 +2772,7 @@ pub const Editor = struct {
         const owned = self.allocator.dupe(u8, path) catch return;
         defer self.allocator.free(owned);
         const doc = self.navOpen(owned) catch |err| {
-            self.status_message = std.fmt.bufPrint(&self.status_buf, "Cannot open {s}: {s}", .{ std.fs.path.basename(owned), @errorName(err) }) catch "Cannot open location";
+            self.setStatus(.err, std.fmt.bufPrint(&self.status_buf, "Cannot open {s}: {s}", .{ std.fs.path.basename(owned), @errorName(err) }) catch "Cannot open location");
             return;
         };
         doc.gotoLine(line +| 1);
@@ -2827,7 +2864,7 @@ pub const Editor = struct {
     pub fn startRecentProjects(self: *Editor) void {
         self.ensureRecentProjects();
         if (self.recent_projects.items.len == 0) {
-            self.status_message = "No recent projects yet";
+            self.setStatus(.warning, "No recent projects yet");
             return;
         }
         self.recent_selected = 0;
@@ -2857,7 +2894,7 @@ pub const Editor = struct {
         const ft = self.ensureFiletree() orelse return;
         const target = ft.opTargetDir();
         if (target == 0) {
-            self.status_message = "File tree: that folder is already the root";
+            self.setStatus(.warning, "File tree: that folder is already the root");
             return;
         }
         const abs = ft.absPathAlloc(self.allocator, target) catch return;
@@ -3030,7 +3067,7 @@ pub const Editor = struct {
             return true;
         }
         if (std.mem.eql(u8, action, "close_terminal_panel")) {
-            if (self.terminal_panel) |idx| self.closeTerminal(idx) else self.status_message = "The terminal panel has no shell";
+            if (self.terminal_panel) |idx| self.closeTerminal(idx) else self.setStatus(.warning, "The terminal panel has no shell");
             return true;
         }
         if (std.mem.eql(u8, action, "dock_terminal")) {
@@ -3165,7 +3202,7 @@ pub const Editor = struct {
                 doc.external_changed = true;
                 doc.history.saved_revision = null;
                 doc.dirty = true;
-                self.status_message = "Cannot check file on disk (buffer kept; saving will ask)";
+                self.setStatus(.err, "Cannot check file on disk (buffer kept; saving will ask)");
                 continue;
             };
             const stamp = current orelse {
@@ -3173,14 +3210,14 @@ pub const Editor = struct {
                 doc.history.saved_revision = null;
                 doc.dirty = true;
                 const msg = std.fmt.bufPrint(&self.status_buf, "{s}: file deleted on disk (buffer kept)", .{doc.display_name}) catch "File deleted on disk (buffer kept)";
-                self.status_message = msg;
+                self.setStatus(.warning, msg);
                 continue;
             };
             if (std.meta.eql(stamp, recorded)) continue;
             if (doc.dirty) {
                 doc.external_changed = true;
                 const msg = std.fmt.bufPrint(&self.status_buf, "{s} changed on disk — saving will ask", .{doc.display_name}) catch "File changed on disk";
-                self.status_message = msg;
+                self.setStatus(.warning, msg);
             } else {
                 doc.reloadFromDisk(self.io) catch {
                     doc.external_changed = true;
@@ -3229,7 +3266,7 @@ pub const Editor = struct {
                 c.offset = @import("cursor.zig").floorBoundary(&doc.buffer, start);
                 c.clearSelection();
             }
-            self.status_message = "No matches found";
+            self.setStatus(.warning, "No matches found");
         }
     }
     pub fn replaceOne(self: *Editor) void {
@@ -3240,12 +3277,12 @@ pub const Editor = struct {
             const content = doc.buffer.slice(0, doc.buffer.byteLen());
             if (r.end - r.start == needle.len and search_mod.findInText(content, needle, self.find_case_sensitive, self.find_whole_word, r.start) == r.start) {
                 doc.beginEdit() catch {
-                    self.status_message = "Replace failed";
+                    self.setStatus(.err, "Replace failed");
                     return;
                 };
                 defer doc.endEdit();
                 doc.replaceRange(r.start, r.end, self.replace_buf[0..self.replace_buf_len]) catch {
-                    self.status_message = "Replace failed";
+                    self.setStatus(.err, "Replace failed");
                     return;
                 };
                 self.findNext();
@@ -3256,7 +3293,7 @@ pub const Editor = struct {
     }
     pub fn replaceAll(self: *Editor) void {
         const n = search_mod.replaceAllInDoc(self.activeDoc(), self.find_buf[0..self.find_buf_len], self.replace_buf[0..self.replace_buf_len], self.find_case_sensitive, self.find_whole_word) catch {
-            self.status_message = "Replace failed; document unchanged";
+            self.setStatus(.err, "Replace failed; document unchanged");
             return;
         };
         self.status_message = std.fmt.bufPrint(&self.status_buf, "Replaced {d} occurrence(s)", .{n}) catch "Replaced all";
@@ -3334,7 +3371,7 @@ pub const Editor = struct {
         if (self.encoding_action == .open) {
             const path = self.encoding_path orelse return;
             _ = self.openFileWithEncoding(path, format.encoding, false) catch |err| {
-                self.status_message = std.fmt.bufPrint(&self.status_buf, "Cannot decode: {s}", .{@errorName(err)}) catch "Cannot decode";
+                self.setStatus(.err, std.fmt.bufPrint(&self.status_buf, "Cannot decode: {s}", .{@errorName(err)}) catch "Cannot decode");
                 return;
             };
             self.cancelEncoding();
@@ -3353,7 +3390,7 @@ pub const Editor = struct {
             }
         } else {
             if (self.documents.items[di].file_path == null) {
-                self.status_message = "Save the untitled document before reopening";
+                self.setStatus(.warning, "Save the untitled document before reopening");
                 return;
             }
             self.reopen_encoding = format.encoding;
@@ -3369,7 +3406,7 @@ pub const Editor = struct {
         const enc = self.reopen_encoding orelse return;
         const doc = &self.documents.items[idx];
         doc.reloadWithEncoding(self.io, enc) catch |err| {
-            self.status_message = std.fmt.bufPrint(&self.status_buf, "Reload failed: {s}", .{@errorName(err)}) catch "Reload failed";
+            self.setStatus(.err, std.fmt.bufPrint(&self.status_buf, "Reload failed: {s}", .{@errorName(err)}) catch "Reload failed");
             self.cancelEncoding();
             return;
         };
@@ -3471,26 +3508,26 @@ pub const Editor = struct {
         self.setMode(.normal);
         self.switchToDoc(self.docIndexForId(id) orelse return);
         switch (result) {
-            .formatting => self.status_message = "Formatting before save",
+            .formatting => self.setStatus(.quiet, "Formatting before save"),
             .conflict => {
                 self.save_destination_conflict = false;
                 self.confirm_overwrite_doc = id;
                 self.setMode(.confirm_overwrite);
-                self.status_message = "File changed on disk; save cancelled";
+                self.setStatus(.warning, "File changed on disk; save cancelled");
             },
             .destination_exists => {
                 self.confirm_overwrite_doc = id;
                 self.save_destination_conflict = true;
                 self.setMode(.confirm_overwrite);
-                self.status_message = "Save As destination exists; confirm overwrite";
+                self.setStatus(.warning, "Save As destination exists; confirm overwrite");
             },
-            .needs_path => self.status_message = "Use Save As for the untitled document, then quit again",
+            .needs_path => self.setStatus(.warning, "Use Save As for the untitled document, then quit again"),
             .failed => |err| if (err != error.ReadOnlyDocument) {
-                self.status_message = std.fmt.bufPrint(&self.status_buf, "Save failed: {s}", .{@errorName(err)}) catch "Save failed";
+                self.setStatus(.err, std.fmt.bufPrint(&self.status_buf, "Save failed: {s}", .{@errorName(err)}) catch "Save failed");
             },
             .unrepresentable => {
                 self.setMode(.confirm_encoding);
-                self.status_message = "Text cannot be represented in Windows-1252";
+                self.setStatus(.err, "Text cannot be represented in Windows-1252");
             },
             .saved => {},
         }
@@ -3505,7 +3542,7 @@ pub const Editor = struct {
         // A read-only document (the review reader, a server's stderr) has
         // nothing of the user's to save; Save As would write synthesized text.
         if (doc.readonly) {
-            self.status_message = if (doc.reader != null) "Read-only review view — Enter opens the real file" else "Read-only document";
+            self.setStatus(.warning, if (doc.reader != null) "Read-only review view — Enter opens the real file" else "Read-only document");
             return .{ .failed = error.ReadOnlyDocument };
         }
         const same_path = options.path == null or (doc.file_path != null and self.pathsEqual(doc.file_path.?, options.path.?));
@@ -3517,7 +3554,7 @@ pub const Editor = struct {
                 const other_id = self.documents.items[other].id;
                 self.cancelEncoding();
                 if (self.docIndexForId(other_id)) |current| self.switchToDoc(current);
-                self.status_message = "Destination is already open; save its document instead";
+                self.setStatus(.warning, "Destination is already open; save its document instead");
                 return .{ .failed = error.DestinationOpen };
             };
             if (!same_path) {
@@ -3589,6 +3626,8 @@ pub const Editor = struct {
             std.fmt.bufPrint(&self.status_buf, "Saved {s} unformatted ({s})", .{ doc.display_name, why }) catch "Saved unformatted"
         else
             std.fmt.bufPrint(&self.status_buf, "Saved {s}", .{doc.display_name}) catch "Saved";
+        // Saved, but not the way it was asked for.
+        if (editorconfig_skipped != null or unformatted != null) self.setStatus(.warning, self.status_message);
         self.lspDidSave(doc);
         const saved_version = doc.buffer.version;
         self.forgetRecovery(id);
@@ -3602,7 +3641,7 @@ pub const Editor = struct {
                 self.finishReopen();
             } else {
                 self.cancelEncoding();
-                self.status_message = "Document changed during save; reopen cancelled";
+                self.setStatus(.warning, "Document changed during save; reopen cancelled");
             }
         }
         if (self.close_after_save_id == id) {
@@ -3635,7 +3674,7 @@ pub const Editor = struct {
     pub fn saveAllAndQuit(self: *Editor) void {
         self.setMode(.normal);
         const ids = self.dirtyDocumentIds() catch {
-            self.status_message = "Save failed: out of memory";
+            self.setStatus(.err, "Save failed: out of memory");
             return;
         };
         defer self.allocator.free(ids);
@@ -3644,7 +3683,7 @@ pub const Editor = struct {
             const idx = self.docIndexForId(id) orelse continue;
             if (self.saveBlocker(idx)) |blocker| {
                 self.holdSave(id, .{}) catch {
-                    self.status_message = "Save failed: out of memory";
+                    self.setStatus(.err, "Save failed: out of memory");
                     return;
                 };
                 self.showSaveBlocker(id, blocker);
@@ -3666,7 +3705,7 @@ pub const Editor = struct {
             }
         }
         // Save hooks can create new dirty content; never discard it on exit.
-        if (!self.hasUnsavedChanges()) self.running = false else self.status_message = "Unsaved changes remain; quit cancelled";
+        if (!self.hasUnsavedChanges()) self.running = false else self.setStatus(.warning, "Unsaved changes remain; quit cancelled");
     }
 
     pub const OverwriteChoice = enum { overwrite, reload, cancel };
@@ -3680,7 +3719,7 @@ pub const Editor = struct {
         self.confirm_overwrite_doc = null;
         const id = self.pending_save_id orelse blk: {
             const idx = (if (target) |doc_id| self.docIndexForId(doc_id) else null) orelse {
-                self.status_message = "Save cancelled (the document was closed)";
+                self.setStatus(.warning, "Save cancelled (the document was closed)");
                 return;
             };
             break :blk self.documents.items[idx].id;
@@ -3701,7 +3740,7 @@ pub const Editor = struct {
                 self.cancelEncoding();
                 doc.reloadFromDisk(self.io) catch |err| {
                     const msg = std.fmt.bufPrint(&self.status_buf, "Reload failed: {s}", .{@errorName(err)}) catch "Reload failed";
-                    self.status_message = msg;
+                    self.setStatus(.err, msg);
                     return;
                 };
                 const msg = std.fmt.bufPrint(&self.status_buf, "Reloaded {s} from disk", .{doc.display_name}) catch "Reloaded";
@@ -3709,7 +3748,7 @@ pub const Editor = struct {
             },
             .cancel => {
                 self.cancelEncoding();
-                self.status_message = "Save cancelled";
+                self.setStatus(.warning, "Save cancelled");
             },
         }
     }
@@ -3740,9 +3779,10 @@ pub const Editor = struct {
         }
         if (saved > 0) {
             self.noteFileSaved(false, null);
-            self.status_message = std.fmt.bufPrint(&self.status_buf, "Auto-saved {d} file(s)", .{saved}) catch "Auto-saved";
+            // Comes by itself, every few seconds: never a highlighted block.
+            self.setStatus(.quiet, std.fmt.bufPrint(&self.status_buf, "Auto-saved {d} file(s)", .{saved}) catch "Auto-saved");
         }
-        if (failed > 0) self.status_message = std.fmt.bufPrint(&self.status_buf, "Auto-save: {d} saved, {d} failed (encoding, conflict or I/O)", .{ saved, failed }) catch "Auto-save failed";
+        if (failed > 0) self.setStatus(.err, std.fmt.bufPrint(&self.status_buf, "Auto-save: {d} saved, {d} failed (encoding, conflict or I/O)", .{ saved, failed }) catch "Auto-save failed");
         return saved;
     }
 
@@ -3779,7 +3819,7 @@ pub const Editor = struct {
         }
 
         self.saveSessionTo(path) catch {
-            self.status_message = "Session save failed";
+            self.setStatus(.err, "Session save failed");
         };
     }
 
@@ -3931,7 +3971,7 @@ pub const Editor = struct {
             }
             // Common confusion: panes are splits, not tabs. Say so instead
             // of silently doing nothing.
-            self.status_message = "No split panes open — Ctrl+W closes the current tab";
+            self.setStatus(.warning, "No split panes open — Ctrl+W closes the current tab");
             return;
         }
         const closed_pane = win.active_pane;
@@ -4078,7 +4118,7 @@ pub const Editor = struct {
     pub fn newWindow(self: *Editor, content: PaneContent) WindowError!usize {
         if (!self.multi_window_supported) return error.Unsupported;
         if (self.windows.items.len - 1 >= self.max_secondary_windows) {
-            self.status_message = std.fmt.bufPrint(&self.status_buf, "Window limit reached ({d} extra windows)", .{self.max_secondary_windows}) catch "Window limit reached";
+            self.setStatus(.warning, std.fmt.bufPrint(&self.status_buf, "Window limit reached ({d} extra windows)", .{self.max_secondary_windows}) catch "Window limit reached");
             return error.TooManyWindows;
         }
         const win = try self.allocator.create(EditorWindow);
@@ -4226,7 +4266,7 @@ pub const Editor = struct {
             return;
         }
         if (!self.activePaneIsTerminal()) {
-            self.status_message = "Focus a terminal pane to detach it";
+            self.setStatus(.warning, "Focus a terminal pane to detach it");
             return;
         }
         self.movePaneToNewWindow();
@@ -4399,7 +4439,7 @@ pub const Editor = struct {
             posixShell(self.io, if (std.c.getenv("SHELL")) |shell| std.mem.span(shell) else null);
         const term = terminal_mod.Terminal.init(self.allocator, self.io, 80, 24, command) catch |err| {
             std.log.err("Failed to open terminal: {}", .{err});
-            self.status_message = "Failed to open terminal (see zide.log)";
+            self.setStatus(.err, "Failed to open terminal (see zide.log)");
             return null;
         };
         term.wake_fn = self.terminal_wake_fn;
@@ -4507,7 +4547,7 @@ pub const Editor = struct {
                 }
             }
             // A terminal-only window (a detached terminal): nothing to go back to here.
-            self.status_message = "No editor pane in this window";
+            self.setStatus(.warning, "No editor pane in this window");
             return;
         }
 
@@ -4527,7 +4567,7 @@ pub const Editor = struct {
             self.closeTerminal(idx);
         } else {
             // From the palette or the View menu with an editor pane focused.
-            self.status_message = "Close terminal: focus a terminal pane first (Ctrl+Alt+Q closes any pane)";
+            self.setStatus(.warning, "Close terminal: focus a terminal pane first (Ctrl+Alt+Q closes any pane)");
         }
     }
 
@@ -4573,11 +4613,11 @@ pub const Editor = struct {
     /// pane closes the window. Refused while the panel already has a shell.
     pub fn dockTerminal(self: *Editor) void {
         const term_idx = self.activePaneTerminalIdx() orelse {
-            self.status_message = "Focus a terminal pane to dock it (Ctrl+Shift+` opens a shell in the panel)";
+            self.setStatus(.warning, "Focus a terminal pane to dock it (Ctrl+Shift+` opens a shell in the panel)");
             return;
         };
         if (self.terminal_panel != null) {
-            self.status_message = "The terminal panel already has a shell — close it first";
+            self.setStatus(.warning, "The terminal panel already has a shell — close it first");
             return;
         }
         const src_idx = self.active_window;
@@ -4606,13 +4646,13 @@ pub const Editor = struct {
     /// below from the bottom one). The panel is empty afterwards and hides.
     pub fn undockTerminal(self: *Editor) void {
         const term_idx = self.terminal_panel orelse {
-            self.status_message = "The terminal panel has no shell to undock";
+            self.setStatus(.warning, "The terminal panel has no shell to undock");
             return;
         };
         const direction: @import("layout.zig").SplitDirection = if (self.terminal_panel_side == .bottom) .vertical else .horizontal;
         const win = self.activeWindow();
         const new_pane = win.layout.splitPane(win.active_pane, direction, .{ .terminal = term_idx }) catch {
-            self.status_message = "Cannot split the pane any further";
+            self.setStatus(.warning, "Cannot split the pane any further");
             return;
         };
         self.terminal_panel = null;
@@ -4755,11 +4795,11 @@ pub const Editor = struct {
 
     pub fn startRecovery(self: *Editor) void {
         const base = @import("lua_settings.zig").getConfigDir() orelse {
-            self.status_message = "Recovery unavailable: no configuration directory";
+            self.setStatus(.err, "Recovery unavailable: no configuration directory");
             return;
         };
         self.startRecoveryAt(base, self.filetree_root orelse ".") catch |err| {
-            self.status_message = std.fmt.bufPrint(&self.status_buf, "Recovery unavailable: {s}", .{@errorName(err)}) catch "Recovery unavailable";
+            self.setStatus(.err, std.fmt.bufPrint(&self.status_buf, "Recovery unavailable: {s}", .{@errorName(err)}) catch "Recovery unavailable");
             std.log.err("Recovery startup: {s}", .{@errorName(err)});
         };
     }
@@ -4785,7 +4825,7 @@ pub const Editor = struct {
     fn reportRecoveryError(self: *Editor) void {
         if (self.recovery) |*recovery| if (recovery.failure) |err| {
             if (self.recovery_reported_error == null or self.recovery_reported_error.? != err) {
-                self.status_message = std.fmt.bufPrint(&self.status_buf, "Recovery: {s}; earlier snapshots retained", .{@errorName(err)}) catch "Recovery snapshot failed";
+                self.setStatus(.err, std.fmt.bufPrint(&self.status_buf, "Recovery: {s}; earlier snapshots retained", .{@errorName(err)}) catch "Recovery snapshot failed");
                 std.log.err("Recovery: {s}; earlier snapshots retained", .{@errorName(err)});
                 self.recovery_reported_error = err;
             }
@@ -4829,7 +4869,7 @@ pub const Editor = struct {
             self.setMode(.recovery_picker);
             return;
         };
-        self.status_message = "No recovery snapshots for this workspace";
+        self.setStatus(.warning, "No recovery snapshots for this workspace");
     }
 
     pub fn resolveRecovery(self: *Editor, choice: enum { recover, discard, later }) void {
@@ -5070,7 +5110,7 @@ pub const Editor = struct {
         client.start(cfg, root) catch |err| {
             cfg.failed = true;
             std.log.warn("LSP[{s}] failed to start for {s} ({s}) — argv[0]: {s}", .{ cfg.displayName(), first_lang, @errorName(err), if (cfg.argv.len > 0) cfg.argv[0] else "" });
-            self.status_message = std.fmt.bufPrint(&self.status_buf, "LSP for {s}: cannot start {s} ({s}) — see zide.log", .{ first_lang, cfg.displayName(), @errorName(err) }) catch "LSP server failed to start — see zide.log";
+            self.setStatus(.err, std.fmt.bufPrint(&self.status_buf, "LSP for {s}: cannot start {s} ({s}) — see zide.log", .{ first_lang, cfg.displayName(), @errorName(err) }) catch "LSP server failed to start — see zide.log");
             client.deinit();
             self.allocator.destroy(client);
             return null;
@@ -5191,7 +5231,7 @@ pub const Editor = struct {
             }
             const reason = if (client.peer) |peer| peer.errorState() orelse error.ServerExited else error.ServerExited;
             std.log.warn("LSP[{s}]: {s} — run lsp_restart to bring it back", .{ client.name(), @errorName(reason) });
-            self.status_message = std.fmt.bufPrint(&self.status_buf, "LSP {s}: {s} — run lsp_restart", .{ client.name(), @errorName(reason) }) catch "LSP server exited — run lsp_restart";
+            self.setStatus(.err, std.fmt.bufPrint(&self.status_buf, "LSP {s}: {s} — run lsp_restart", .{ client.name(), @errorName(reason) }) catch "LSP server exited — run lsp_restart");
             if (client.config) |*dead_cfg| {
                 for (self.lsp_configs.items) |*cfg| {
                     if (cfg.eql(dead_cfg)) cfg.failed = true;
@@ -5391,7 +5431,7 @@ pub const Editor = struct {
         self.lsp_too_large.put(self.allocator, doc.id, doc.lsp_version) catch return;
         if (!first) return;
         std.log.warn("LSP: {s} ({d} bytes) does not fit one message; not sent to the language server", .{ doc.display_name, doc.buffer.byteLen() });
-        self.status_message = std.fmt.bufPrint(&self.status_buf, "LSP: {s} is too large for the language server", .{doc.display_name}) catch "LSP: document too large for the language server";
+        self.setStatus(.warning, std.fmt.bufPrint(&self.status_buf, "LSP: {s} is too large for the language server", .{doc.display_name}) catch "LSP: document too large for the language server");
     }
 
     /// Whether a full-text didOpen/didChange of `doc` would exceed
@@ -5693,22 +5733,22 @@ pub const Editor = struct {
                 .replace => |r| r,
                 .insert_replace => |r| blk: {
                     const insert = completionByteRange(doc, r.insert, offset, encoding) catch {
-                        self.status_message = "Invalid completion range";
+                        self.setStatus(.err, "Invalid completion range");
                         return;
                     };
                     const replace = completionByteRange(doc, r.replace, offset, encoding) catch {
-                        self.status_message = "Invalid completion range";
+                        self.setStatus(.err, "Invalid completion range");
                         return;
                     };
                     if (insert.start != replace.start or insert.end > replace.end) {
-                        self.status_message = "Invalid completion range";
+                        self.setStatus(.err, "Invalid completion range");
                         return;
                     }
                     break :blk r.replace;
                 },
             };
             const bytes = completionByteRange(doc, range, offset, encoding) catch {
-                self.status_message = "Invalid completion range";
+                self.setStatus(.err, "Invalid completion range");
                 return;
             };
             start = bytes.start;
@@ -5717,12 +5757,12 @@ pub const Editor = struct {
             while (start > 0 and isIdentChar(doc.buffer.byteAt(start - 1) orelse 0)) start -= 1;
         }
         doc.beginEdit() catch {
-            self.status_message = "Completion failed: out of memory";
+            self.setStatus(.err, "Completion failed: out of memory");
             return;
         };
         defer doc.endEdit();
         doc.replaceRange(start, end, item.insert_text orelse item.label) catch {
-            self.status_message = "Completion failed: out of memory";
+            self.setStatus(.err, "Completion failed: out of memory");
         };
     }
 
@@ -5835,43 +5875,43 @@ pub const Editor = struct {
     pub fn startSnippetSave(self: *Editor) void {
         if (self.mode != .normal) return;
         if (self.activePaneIsTerminal()) {
-            self.status_message = "Save as snippet: focus an editor pane with a selection first";
+            self.setStatus(.warning, "Save as snippet: focus an editor pane with a selection first");
             return;
         }
         const doc = self.activeDoc();
         if (doc.cursors.count() != 1) {
-            self.status_message = "Save as snippet: needs a single cursor";
+            self.setStatus(.warning, "Save as snippet: needs a single cursor");
             return;
         }
         const selection = doc.selectedText() orelse "";
         if (selection.len == 0) {
-            self.status_message = "Save as snippet: select the code first";
+            self.setStatus(.warning, "Save as snippet: select the code first");
             return;
         }
         if (!std.unicode.utf8ValidateSlice(selection)) {
-            self.status_message = "Save as snippet: the selection is not valid UTF-8";
+            self.setStatus(.warning, "Save as snippet: the selection is not valid UTF-8");
             return;
         }
         // The selection may sit in a shared scratch buffer: prepare it now.
         const plain = snippet_form_mod.prepareBody(self.allocator, selection) catch {
-            self.status_message = "Save as snippet: out of memory";
+            self.setStatus(.err, "Save as snippet: out of memory");
             return;
         };
         defer self.allocator.free(plain);
         if (plain.len == 0) {
             // Only blanks and line breaks were selected.
-            self.status_message = "Save as snippet: select the code first";
+            self.setStatus(.warning, "Save as snippet: select the code first");
             return;
         }
         // A body is a template (`$1` is a blank, `\$` a dollar): escape the
         // selection so the snippet inserts it exactly as it was selected.
         const body = snippets_mod.escapeLiteral(self.allocator, plain) catch {
-            self.status_message = "Save as snippet: out of memory";
+            self.setStatus(.err, "Save as snippet: out of memory");
             return;
         };
         defer self.allocator.free(body);
         if (body.len >= snippet_form_mod.max_body) {
-            self.status_message = "Save as snippet: the selection is too long (8 KiB max)";
+            self.setStatus(.warning, "Save as snippet: the selection is too long (8 KiB max)");
             return;
         }
         const form = &self.snippet_form;
@@ -5995,7 +6035,7 @@ pub const Editor = struct {
         self.loading_extension_name = null;
         const command = registered catch |err| {
             // Written, so it is live after a reload; say what went wrong now.
-            self.status_message = snippets_mod.errorMessage(err);
+            self.setStatus(.err, snippets_mod.errorMessage(err));
             self.setMode(.normal);
             return true;
         };
@@ -6032,7 +6072,7 @@ pub const Editor = struct {
         const def = &self.snippets.items.items[def_index];
         self.fillSnippetFormFrom(def);
         self.snippet_form.editing = self.allocator.dupe(u8, def.command) catch {
-            self.status_message = "Edit snippet: out of memory";
+            self.setStatus(.err, "Edit snippet: out of memory");
             return;
         };
         self.openSnippetForm(.edit);
@@ -6052,12 +6092,12 @@ pub const Editor = struct {
         if (self.mode != .normal or def_index >= self.snippets.items.items.len) return;
         const def = &self.snippets.items.items[def_index];
         if (!snippet_file.isMine(def)) {
-            self.status_message = "Only snippets in my-snippets.lua can be deleted here (F2 copies one there)";
+            self.setStatus(.warning, "Only snippets in my-snippets.lua can be deleted here (F2 copies one there)");
             return;
         }
         self.freeSnippetDeleteTarget();
         self.snippet_delete_target = self.allocator.dupe(u8, def.command) catch {
-            self.status_message = "Delete snippet: out of memory";
+            self.setStatus(.err, "Delete snippet: out of memory");
             return;
         };
         self.setMode(.snippet_delete_confirm);
@@ -6096,36 +6136,36 @@ pub const Editor = struct {
         };
         var path_buf: [512]u8 = undefined;
         const path = mySnippetsPath(&path_buf) orelse {
-            self.status_message = "No config directory (HOME / USERPROFILE is not set)";
+            self.setStatus(.err, "No config directory (HOME / USERPROFILE is not set)");
             return;
         };
         const open_doc: ?usize = self.findDocument(path) catch null;
         if (open_doc) |idx| {
             if (self.documents.items[idx].dirty) {
-                self.status_message = "my-snippets.lua has unsaved changes in a tab: save or close it first";
+                self.setStatus(.warning, "my-snippets.lua has unsaved changes in a tab: save or close it first");
                 return;
             }
         }
         const text = snippet_file.read(self.allocator, self.io, path) catch |err| {
-            self.status_message = std.fmt.bufPrint(&self.status_buf, "Cannot read my-snippets.lua: {s}", .{@errorName(err)}) catch "Cannot read my-snippets.lua";
+            self.setStatus(.err, std.fmt.bufPrint(&self.status_buf, "Cannot read my-snippets.lua: {s}", .{@errorName(err)}) catch "Cannot read my-snippets.lua");
             return;
         };
         defer self.allocator.free(text);
         const removal = snippet_file.remove(self.allocator, text, command) catch {
-            self.status_message = "Delete snippet: out of memory";
+            self.setStatus(.err, "Delete snippet: out of memory");
             return;
         };
         defer self.allocator.free(removal.text);
         if (removal.removed > 0) {
             snippet_file.write(self.allocator, self.io, path, removal.text) catch |err| {
-                self.status_message = std.fmt.bufPrint(&self.status_buf, "Cannot write my-snippets.lua: {s}", .{@errorName(err)}) catch "Cannot write my-snippets.lua";
+                self.setStatus(.err, std.fmt.bufPrint(&self.status_buf, "Cannot write my-snippets.lua: {s}", .{@errorName(err)}) catch "Cannot write my-snippets.lua");
                 return;
             };
             if (open_doc) |idx| self.documents.items[idx].reloadFromDisk(self.io) catch {};
         }
         _ = self.removeSnippet(command);
         if (removal.removed == 0) {
-            self.status_message = std.fmt.bufPrint(&self.status_buf, "my-snippets.lua had no block for {s}: removed from the panel only", .{name}) catch "my-snippets.lua had no block for it: removed from the panel only";
+            self.setStatus(.warning, std.fmt.bufPrint(&self.status_buf, "my-snippets.lua had no block for {s}: removed from the panel only", .{name}) catch "my-snippets.lua had no block for it: removed from the panel only");
             return;
         }
         // A copy of another file's snippet (a bundled one) uncovers the
@@ -6134,10 +6174,11 @@ pub const Editor = struct {
             self.status_message = std.fmt.bufPrint(&self.status_buf, "Deleted from my-snippets.lua: {s}", .{name}) catch "Deleted from my-snippets.lua";
             return;
         };
+        // Short: this one used to lose its ending in a narrow status bar.
         self.status_message = if (original.source.len > 0)
-            std.fmt.bufPrint(&self.status_buf, "Deleted from my-snippets.lua: {s} (the one from {s} is back)", .{ name, original.source }) catch "Deleted from my-snippets.lua (the snippet it replaced is back)"
+            std.fmt.bufPrint(&self.status_buf, "Deleted {s} — the one from {s} is back", .{ name, original.source }) catch "Deleted — the snippet it replaced is back"
         else
-            std.fmt.bufPrint(&self.status_buf, "Deleted from my-snippets.lua: {s} (the snippet it replaced is back)", .{name}) catch "Deleted from my-snippets.lua (the snippet it replaced is back)";
+            std.fmt.bufPrint(&self.status_buf, "Deleted {s} — the snippet it replaced is back", .{name}) catch "Deleted — the snippet it replaced is back";
     }
 
     /// F2 / the context menu on the panel's selected row: a snippet of
@@ -6160,7 +6201,7 @@ pub const Editor = struct {
         if (panel.rowAt(panel.selected)) |row| {
             if (row.kind == .item and row.def < self.snippets.items.items.len) return row.def;
         }
-        self.status_message = "Select a snippet first";
+        self.setStatus(.warning, "Select a snippet first");
         return null;
     }
 
@@ -6169,7 +6210,7 @@ pub const Editor = struct {
     fn snippetFormOpenFileInstead(self: *Editor, path: []const u8, message: []const u8) void {
         self.cancelSnippetForm();
         _ = self.openOrFocus(path) catch null;
-        self.status_message = message;
+        self.setStatus(.warning, message);
     }
 
     /// Put the panel's selection on the snippet registered as `command`,
@@ -6226,7 +6267,7 @@ pub const Editor = struct {
     fn insertSnippetDefinition(self: *Editor, def: *const snippets_mod.Definition, start: usize, end: usize) void {
         const doc = self.activeDoc();
         doc.insertSnippet(&def.template, start, end, self.useTabsFor(doc), self.indentWidthFor(doc)) catch |err| {
-            self.status_message = snippets_mod.errorMessage(err);
+            self.setStatus(.err, snippets_mod.errorMessage(err));
             return;
         };
         self.clearCompletionItems();
@@ -6241,11 +6282,11 @@ pub const Editor = struct {
         const def = self.snippets.command(name) orelse return;
         const doc = self.activeDoc();
         if (doc.cursors.count() != 1) {
-            self.status_message = "Snippets require a single cursor";
+            self.setStatus(.warning, "Snippets require a single cursor");
             return;
         }
         if (!def.matchesLanguage(if (doc.language) |l| l.name else null)) {
-            self.status_message = "Snippet language does not match this document";
+            self.setStatus(.warning, "Snippet language does not match this document");
             return;
         }
         const cursor = doc.cursors.primaryConst();
@@ -6258,16 +6299,16 @@ pub const Editor = struct {
         if (!self.editorOwnsInput()) return false;
         const doc = self.activeDoc();
         if (doc.cursors.count() != 1) {
-            if (explicit) self.status_message = "Snippets require a single cursor";
+            if (explicit) self.setStatus(.warning, "Snippets require a single cursor");
             return false;
         }
         const c = doc.cursors.primaryConst();
         if (c.hasSelection()) {
-            if (explicit) self.status_message = "Snippet expansion requires an unselected trigger";
+            if (explicit) self.setStatus(.warning, "Snippet expansion requires an unselected trigger");
             return false;
         }
         const start = snippets_mod.triggerStart(&doc.buffer, c.offset) orelse {
-            if (explicit) self.status_message = "No matching snippet trigger";
+            if (explicit) self.setStatus(.warning, "No matching snippet trigger");
             return false;
         };
         // Compare directly against the buffer: no scratch allocation or truncated trigger.
@@ -6285,7 +6326,7 @@ pub const Editor = struct {
             if (std.mem.eql(u8, def.language, "*")) global = def else specific = def;
         }
         const def = specific orelse global orelse {
-            if (explicit) self.status_message = "No matching snippet trigger";
+            if (explicit) self.setStatus(.warning, "No matching snippet trigger");
             return false;
         };
         self.insertSnippetDefinition(def, start, c.offset);
@@ -9161,4 +9202,63 @@ test "command palette: matching ignores case, a space reads as an underscore, Ta
     try t.expect(editor.paletteSelectedName() == null);
     editor.paletteComplete();
     try t.expectEqualStrings(junk, editor.palette_buf[0..editor.palette_buf_len]);
+}
+
+test "status messages: a new one is highlighted for status_message_seconds, keeps that time through key presses, and carries its level" {
+    const t = std.testing;
+    var editor = try Editor.init(t.allocator, t.io);
+    defer editor.deinit();
+    editor.lsp_enabled = false;
+    const s = std.time.ns_per_s;
+
+    // A plain assignment is a note; the frame loop is told when it settles.
+    editor.status_message = "Saved a.zig";
+    var view = editor.statusView(100 * s);
+    try t.expect(view.fresh);
+    try t.expectEqual(status_mod.Level.note, view.level);
+    try t.expectEqualStrings("Saved a.zig", view.text);
+    try t.expectEqual(@as(?i128, 104 * s), editor.deadlines.next_status);
+    try t.expect(editor.deadlines.waitMicros(103 * s) <= 1_000_000);
+
+    // Typing on: the message is gone for the rest of the editor, the bar
+    // keeps it until its four seconds are over.
+    editor.dismissStatus();
+    try t.expectEqualStrings("", editor.status_message);
+    view = editor.statusView(102 * s);
+    try t.expect(view.fresh);
+    try t.expectEqualStrings("Saved a.zig", view.text);
+    editor.deadlines.tick(&editor, 104 * s);
+    try t.expectEqual(@as(?i128, null), editor.deadlines.next_status);
+    view = editor.statusView(104 * s);
+    try t.expect(!view.fresh);
+    try t.expectEqualStrings("", view.text);
+    try t.expectEqual(@as(?i128, null), editor.deadlines.next_status);
+
+    // Refusals are warnings, failures errors; the next plain message is a note.
+    try t.expect(editor.execAction("navigate_back"));
+    try t.expectEqualStrings("Nothing to go back to", editor.status_message);
+    try t.expectEqual(status_mod.Level.warning, editor.statusView(200 * s).level);
+    editor.setStatus(.err, "Save failed: AccessDenied");
+    view = editor.statusView(201 * s);
+    try t.expectEqual(status_mod.Level.err, view.level);
+    try t.expect(view.fresh);
+    editor.status_message = "Saved a.zig";
+    try t.expectEqual(status_mod.Level.note, editor.statusView(202 * s).level);
+
+    // A direct clear takes the block away at once (a hint that stopped
+    // being true), unlike dismissStatus.
+    editor.status_message = "";
+    view = editor.statusView(203 * s);
+    try t.expect(!view.fresh);
+    try t.expectEqualStrings("", view.text);
+
+    // status_message_seconds = 0: never highlighted, plain until dismissed.
+    editor.status_message_seconds = 0;
+    editor.setStatus(.warning, "Read-only document");
+    view = editor.statusView(300 * s);
+    try t.expect(!view.fresh);
+    try t.expectEqualStrings("Read-only document", view.text);
+    try t.expectEqual(@as(?i128, null), editor.deadlines.next_status);
+    editor.dismissStatus();
+    try t.expectEqualStrings("", editor.statusView(301 * s).text);
 }

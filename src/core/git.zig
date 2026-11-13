@@ -192,6 +192,21 @@ pub const State = struct {
         if (rendered.ptr != &self.message) @memcpy(self.message[0..rendered.len], rendered);
         editor.status_message = self.status();
     }
+    /// `report` for a step on the way ("Staging saved files…"): never highlighted.
+    fn progress(self: *State, editor: *Editor, message: []const u8) void {
+        self.report(editor, message);
+        editor.setStatus(.quiet, editor.status_message);
+    }
+    /// `report` for a refusal (nothing was done).
+    fn warn(self: *State, editor: *Editor, message: []const u8) void {
+        self.report(editor, message);
+        editor.setStatus(.warning, editor.status_message);
+    }
+    /// `report` for a failure.
+    fn fail(self: *State, editor: *Editor, message: []const u8) void {
+        self.report(editor, message);
+        editor.setStatus(.err, editor.status_message);
+    }
     /// Start a git job (strict output: over 4 MiB fails rather than truncates).
     pub fn command(self: *State, editor: *Editor, cwd: []const u8, args: []const []const u8) !u64 {
         _ = self;
@@ -201,7 +216,7 @@ pub const State = struct {
     }
     pub fn tick(self: *State, editor: *Editor, now: i128) void {
         if (!self.enabled) return;
-        self.service(editor, now) catch |err| self.report(editor, @errorName(err));
+        self.service(editor, now) catch |err| self.fail(editor, @errorName(err));
     }
     fn service(self: *State, editor: *Editor, now: i128) !void {
         const raw: []const u8 = if (editor.filetree) |ft| ft.root_path else editor.filetree_root orelse ".";
@@ -275,7 +290,11 @@ pub const State = struct {
         };
         if (result.failure) |err| return err;
         if (result.code != 0) {
-            self.report(editor, if (self.meta_kind == .root) "Workspace is not a repository, or Git is unavailable" else "Status lookup failed; refresh to retry");
+            if (self.meta_kind == .root) {
+                self.warn(editor, "Workspace is not a repository, or Git is unavailable");
+            } else {
+                self.fail(editor, "Status lookup failed; refresh to retry");
+            }
             // A failed index lookup must not restart a subprocess each frame.
             if (self.meta_kind == .index) {
                 editor.allocator.free(self.root.?);
@@ -324,7 +343,7 @@ pub const State = struct {
     }
 
     pub fn previewChange(self: *State, editor: *Editor, selected: usize, staged: bool) void {
-        self.startPreview(editor, selected, staged) catch |err| self.report(editor, @errorName(err));
+        self.startPreview(editor, selected, staged) catch |err| self.fail(editor, @errorName(err));
     }
     fn startPreview(self: *State, editor: *Editor, selected: usize, staged: bool) !void {
         if (selected >= self.changes.items.len) return;
@@ -335,7 +354,7 @@ pub const State = struct {
     /// commit or `HEAD`), for the review reader; untracked files diff
     /// against the null device.
     pub fn previewAgainst(self: *State, editor: *Editor, path: []const u8, old_path: ?[]const u8, untracked: bool, base: ?[]const u8) void {
-        self.startPreviewOf(editor, path, old_path, untracked, false, base, false) catch |err| self.report(editor, @errorName(err));
+        self.startPreviewOf(editor, path, old_path, untracked, false, base, false) catch |err| self.fail(editor, @errorName(err));
     }
     fn startPreviewOf(self: *State, editor: *Editor, rel: []const u8, old_path: ?[]const u8, untracked: bool, staged: bool, base: ?[]const u8, conflict: bool) !void {
         const path = try editor.allocator.dupe(u8, rel);
@@ -409,7 +428,7 @@ pub const State = struct {
     }
 
     pub fn stage(self: *State, editor: *Editor, index: usize, unstage: bool) void {
-        self.beginMutation(editor, index, unstage) catch |err| self.report(editor, @errorName(err));
+        self.beginMutation(editor, index, unstage) catch |err| self.fail(editor, @errorName(err));
     }
     fn beginMutation(self: *State, editor: *Editor, index: usize, unstage: bool) !void {
         if (self.mutation != null) return error.GitOperationInProgress;
@@ -434,7 +453,7 @@ pub const State = struct {
             editor.setMode(.git_stage_prompt);
         } else self.startMutation(editor) catch |err| {
             self.cancelMutation(editor);
-            self.report(editor, @errorName(err));
+            self.fail(editor, @errorName(err));
         };
     }
     /// Also the leave-hook of `.git_stage_prompt` (Editor.setMode), so it
@@ -462,7 +481,7 @@ pub const State = struct {
             defer editor.allocator.free(rel);
             if (!identity.equalKeys(rel, pending.path) and !(pending.old_path != null and identity.equalKeys(rel, pending.old_path.?))) {
                 self.cancelMutation(editor);
-                self.report(editor, "File moved during save; refresh Changes and select it again");
+                self.warn(editor, "File moved during save; refresh Changes and select it again");
                 return;
             }
             if (!doc.dirty) {
@@ -478,7 +497,7 @@ pub const State = struct {
                     };
                     if (editor.documents.items[saved].dirty) {
                         self.cancelMutation(editor);
-                        self.report(editor, "Save hook changed the buffer; staging cancelled");
+                        self.warn(editor, "Save hook changed the buffer; staging cancelled");
                         return;
                     }
                     pending.waiting = false;
@@ -493,7 +512,7 @@ pub const State = struct {
         }
         if (self.mutation != null) self.startMutation(editor) catch |err| {
             self.cancelMutation(editor);
-            self.report(editor, @errorName(err));
+            self.fail(editor, @errorName(err));
         };
     }
     fn startMutation(self: *State, editor: *Editor) !void {
@@ -505,7 +524,7 @@ pub const State = struct {
         try args.append(editor.allocator, pending.path);
         if (pending.include_old) if (pending.old_path) |old| try args.append(editor.allocator, old);
         self.mutation_job = try self.command(editor, self.root.?, args.items);
-        self.report(editor, if (pending.unstage) "Unstaging selected files…" else "Staging saved files…");
+        self.progress(editor, if (pending.unstage) "Unstaging selected files…" else "Staging saved files…");
     }
     fn pollMutation(self: *State, editor: *Editor) !void {
         const id = self.mutation_job orelse return;
@@ -519,14 +538,14 @@ pub const State = struct {
             self.mutation.?.deinit(editor.allocator);
             self.mutation = null;
         }
-        if (result.failure) |err| self.report(editor, @errorName(err)) else if (result.code == 0) {
+        if (result.failure) |err| self.fail(editor, @errorName(err)) else if (result.code == 0) {
             self.report(editor, if (self.mutation.?.unstage) "Selected files unstaged" else "Selected saved files staged");
         } else {
             var clean: std.ArrayList(u8) = .empty;
             defer clean.deinit(editor.allocator);
             var filter: output.Sanitizer = .{};
             try filter.feed(editor.allocator, &clean, result.stderr, true);
-            self.report(editor, if (clean.items.len > 0) clean.items[0..@min(clean.items.len, 480)] else "Index operation failed");
+            self.fail(editor, if (clean.items.len > 0) clean.items[0..@min(clean.items.len, 480)] else "Index operation failed");
         }
         self.index_epoch +%= 1;
         self.refresh_requested = true;

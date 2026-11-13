@@ -38,7 +38,7 @@ fn registerTask(state: ?*zlua.LuaState) callconv(.c) c_int {
     const lua: *Lua = @ptrCast(@alignCast(state orelse return 0));
     const editor = settings.getEditor(state) orelse return 0;
     register(lua, editor) catch |err| {
-        editor.status_message = std.fmt.bufPrint(&editor.status_buf, "register_task: {s}", .{@errorName(err)}) catch "Invalid task registration";
+        editor.setStatus(.err, std.fmt.bufPrint(&editor.status_buf, "register_task: {s}", .{@errorName(err)}) catch "Invalid task registration");
         lua.pushNil();
         _ = lua.pushString(@errorName(err));
         return 2;

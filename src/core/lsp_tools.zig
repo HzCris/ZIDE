@@ -92,7 +92,7 @@ pub const State = struct {
         const doc = editor.navOpen(jump.path) catch |err| {
             // The encoding picker the open raised says what to do next.
             if (err != error.EncodingRequired and err != error.BinaryFile) {
-                editor.status_message = std.fmt.bufPrint(&editor.status_buf, "Go to definition: {s}", .{@errorName(err)}) catch "Go to definition failed";
+                editor.setStatus(.err, std.fmt.bufPrint(&editor.status_buf, "Go to definition: {s}", .{@errorName(err)}) catch "Go to definition failed");
             }
             return;
         };
@@ -144,7 +144,7 @@ pub const State = struct {
         self.symbol_query_len = @min(query.len, self.symbol_query.len);
         @memcpy(self.symbol_query[0..self.symbol_query_len], query[0..self.symbol_query_len]);
         self.startForDoc(editor, editor.activeDoc(), .workspace_symbol) catch |err| {
-            editor.status_message = std.fmt.bufPrint(&editor.status_buf, "LSP: {s}", .{@errorName(err)}) catch "LSP request failed";
+            editor.setStatus(.err, std.fmt.bufPrint(&editor.status_buf, "LSP: {s}", .{@errorName(err)}) catch "LSP request failed");
         };
     }
 
@@ -399,7 +399,7 @@ pub const State = struct {
 
     pub fn start(self: *State, editor: *Editor, method: lsp.RequestMethod) void {
         self.startForDoc(editor, editor.activeDoc(), method) catch |err| {
-            editor.status_message = std.fmt.bufPrint(&editor.status_buf, "LSP: {s}", .{@errorName(err)}) catch "LSP request failed";
+            editor.setStatus(.err, std.fmt.bufPrint(&editor.status_buf, "LSP: {s}", .{@errorName(err)}) catch "LSP request failed");
         };
     }
 
@@ -461,7 +461,7 @@ pub const State = struct {
         };
         _ = try client.request(name, params, request);
         if (isFormatting(method)) self.formatting = request;
-        if (!self.quiet) editor.status_message = "Waiting for language server";
+        if (!self.quiet) editor.setStatus(.quiet, "Waiting for language server");
     }
 
     pub fn maybeFormatSave(self: *State, editor: *Editor, doc: *Document, options: Editor.SaveOptions) !bool {
@@ -491,7 +491,7 @@ pub const State = struct {
 
     pub fn submitRename(self: *State, editor: *Editor) void {
         self.sendRename(editor) catch |err| {
-            editor.status_message = std.fmt.bufPrint(&editor.status_buf, "Rename: {s}", .{@errorName(err)}) catch "Rename failed";
+            editor.setStatus(.err, std.fmt.bufPrint(&editor.status_buf, "Rename: {s}", .{@errorName(err)}) catch "Rename failed");
         };
     }
     fn sendRename(self: *State, editor: *Editor) !void {
@@ -514,7 +514,7 @@ pub const State = struct {
         _ = try client.request("textDocument/rename", params, request);
         self.rename_context = null;
         editor.setMode(.normal);
-        editor.status_message = "Preparing rename preview";
+        editor.setStatus(.quiet, "Preparing rename preview");
     }
 
     pub fn response(self: *State, editor: *Editor, client: *lsp.LspClient, request: lsp.Request, json: []const u8) void {
@@ -536,7 +536,7 @@ pub const State = struct {
         switch (request.method) {
             .hover => {
                 if (result == .null) {
-                    editor.status_message = "No hover information";
+                    editor.setStatus(.warning, "No hover information");
                     return;
                 }
                 if (doc.id != editor.activeDoc().id or doc.cursors.primary().offset != request.cursor.?) return;
@@ -572,7 +572,7 @@ pub const State = struct {
             },
             .rename => {
                 if (result == .null) {
-                    editor.status_message = "No rename edits";
+                    editor.setStatus(.warning, "No rename edits");
                     return;
                 }
                 try self.makePreview(editor, result, client.position_encoding);
@@ -580,7 +580,7 @@ pub const State = struct {
             .references => {
                 self.clearReferences(editor.allocator);
                 if (result == .null) {
-                    editor.status_message = "No references found";
+                    editor.setStatus(.warning, "No references found");
                     return;
                 }
                 if (result != .array) return error.InvalidResponse;
@@ -612,7 +612,7 @@ pub const State = struct {
                     };
                 }
                 if (self.references.items.len == 0) {
-                    editor.status_message = "No references found";
+                    editor.setStatus(.warning, "No references found");
                     return;
                 }
                 editor.status_message = std.fmt.bufPrint(&editor.status_buf, "References to {s}: {d}", .{ self.referencesSymbol(), self.references.items.len }) catch "References found";
@@ -621,7 +621,7 @@ pub const State = struct {
             .document_symbol => {
                 self.clearSymbols(editor.allocator);
                 if (result == .null) {
-                    editor.status_message = "No symbols";
+                    editor.setStatus(.warning, "No symbols");
                     return;
                 }
                 if (result != .array) return error.InvalidResponse;
@@ -631,7 +631,7 @@ pub const State = struct {
                 editor.picker.begin(title, pickSymbol, null, "No symbols");
                 for (result.array.items) |item| try self.addDocumentSymbol(editor, client, path, item, "");
                 if (self.symbols.items.len == 0) {
-                    editor.status_message = "No symbols";
+                    editor.setStatus(.warning, "No symbols");
                     return;
                 }
                 editor.status_message = "";
@@ -641,7 +641,7 @@ pub const State = struct {
                 if (doc.id != editor.activeDoc().id) return;
                 if (result == .null) {
                     editor.clearSignature();
-                    if (!self.quiet) editor.status_message = "No signature help here";
+                    if (!self.quiet) editor.setStatus(.warning, "No signature help here");
                     return;
                 }
                 if (result != .object) return error.InvalidResponse;
@@ -738,7 +738,7 @@ pub const State = struct {
             self.clearSave(editor.allocator);
         }
         if (saving or request.method == .hover or request.method == .prepare_rename or request.method == .rename or request.method == .references or request.method == .document_symbol or isFormatting(request.method))
-            editor.status_message = std.fmt.bufPrint(&editor.status_buf, "{s}: {s}", .{ if (saving) "Save aborted" else "LSP request failed", reason }) catch "LSP request failed";
+            editor.setStatus(.err, std.fmt.bufPrint(&editor.status_buf, "{s}: {s}", .{ if (saving) "Save aborted" else "LSP request failed", reason }) catch "LSP request failed");
     }
 
     fn makePreview(self: *State, editor: *Editor, value: std.json.Value, encoding: workspace.Encoding) !void {
@@ -798,7 +798,11 @@ pub const State = struct {
         // This is the `.workspace_preview` leave hook (Editor.setMode calls
         // it), and clientStopped calls it in any mode: never setMode here.
         if (editor.mode == .workspace_preview) editor.mode = .normal;
-        editor.status_message = if (applied) "Workspace edits applied; review and save the dirty files" else std.fmt.bufPrint(&editor.status_buf, "Workspace edit: {s}", .{reason}) catch "Workspace edit cancelled";
+        if (applied) {
+            editor.status_message = "Workspace edits applied; review and save the dirty files";
+        } else {
+            editor.setStatus(.warning, std.fmt.bufPrint(&editor.status_buf, "Workspace edit: {s}", .{reason}) catch "Workspace edit cancelled");
+        }
     }
 
     pub fn clientStopped(self: *State, editor: *Editor, client: *lsp.LspClient) void {

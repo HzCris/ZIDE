@@ -369,7 +369,7 @@ fn reportOpenFailure(editor: *Editor, path: []const u8, err: anyerror) void {
     const msg = std.fmt.bufPrint(&buf, "Cannot open {s}: {s}", .{ path, @errorName(err) }) catch
         std.fmt.bufPrint(&buf, "Cannot open {s}: {s}", .{ std.fs.path.basename(path), @errorName(err) }) catch
         "Cannot open a command-line file";
-    lua_api.setStatusText(editor, "", msg);
+    lua_api.setStatusError(editor, "", msg);
 }
 
 extern "kernel32" fn GetConsoleProcessList(lpdwProcessList: [*]u32, dwProcessCount: u32) callconv(.winapi) u32;
@@ -454,7 +454,7 @@ fn runGui(allocator: std.mem.Allocator, io: std.Io, lua: *zlua.Lua, cli_files: [
     editor.startDebugWorkspace();
     editor.startReviewWorkspace();
     // A broken init.lua / extension outranks the startup chatter above.
-    if (load_error.len > 0) lua_api.setStatusText(&editor, "", load_error);
+    if (load_error.len > 0) lua_api.setStatusError(&editor, "", load_error);
 
     // Per-window GUI state (mono font bytes, per-window pane/drop state).
     // Declared before the dvui window so it outlives every window's font
@@ -582,7 +582,7 @@ fn runTui(allocator: std.mem.Allocator, io: std.Io, lua: *zlua.Lua, cli_files: [
     editor.startDebugWorkspace();
     editor.startReviewWorkspace();
     // A broken init.lua / extension outranks the startup chatter above.
-    if (load_error.len > 0) lua_api.setStatusText(&editor, "", load_error);
+    if (load_error.len > 0) lua_api.setStatusError(&editor, "", load_error);
     try tui.run(allocator, &editor);
 
     // Record the session for the next bare launch (no-op unless enabled).
@@ -711,6 +711,7 @@ comptime {
     _ = @import("core/file_operations.zig");
     _ = @import("core/file_uri.zig");
     _ = @import("core/deadlines.zig");
+    _ = @import("core/status_message.zig");
     _ = @import("core/renderer_settings.zig");
     _ = @import("core/jobs.zig");
     _ = @import("core/protocol.zig");

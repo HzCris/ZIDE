@@ -187,6 +187,7 @@ Windows terminals commonly intercept Alt combos (Windows Terminal binds Alt+arro
 - Line numbers with active line highlight
 - Visual-row cursor movement with word wrap (Up/Down navigate wrapped rows, not logical lines, and keep their column through shorter lines)
 - Status bar: filename with ` [+]` when dirty (`*` marks dirty tabs in the tab bar), `Ln X, Col Y | language | encoding`, an `N cursors |` prefix with several cursors, ` [TERMINAL]` for terminal panes
+- Status messages: a new one is a highlighted block in the middle of the status row for a few seconds — cyan-ish for a note, yellow for a warning, red for an error — and may cover the whole row when it is long; it keeps its time while you type, then settles into plain text until the next key press or click (see *Status messages* under Shared / Core)
 - Tab bar when multiple documents open
 - Selection highlighting
 - Word wrap (word-boundary aware, configurable)
@@ -234,7 +235,7 @@ Windows terminals commonly intercept Alt combos (Windows Terminal binds Alt+arro
     - Saving: `auto_save` (false), `auto_save_interval_ms` (5000, 500–300000), `format_on_save` (false), `editorconfig` (true), `recovery` (true), `session_persistence` (false)
     - Languages: `lsp_enabled` (true; off = no language servers, running ones stop on the next frame), `syntax_highlighting` (true; off = plain-text look), `completion_auto` (true; off = the completion popup only opens on Ctrl+Space), `completion_min_chars` (1, 1–8; identifier characters typed before the popup opens by itself), `signature_help_auto` (true; off = signature help only on Ctrl+Shift+Space)
     - Review: `review_stage_on_approve` (true; approving a changed file also stages it — off = verdicts never touch git)
-    - Appearance: `theme` ("dark"), `tui_theme` ("terminal"), `gutter_min_digits` (3, 1–10, both frontends), `secondary_window_chrome` (true; GUI: menu bar + status bar in extra windows, false = bare pane containers), `page_size` (accepted but overwritten by the viewport height every frame, so it has no lasting effect)
+    - Appearance: `theme` ("dark"), `tui_theme` ("terminal"), `gutter_min_digits` (3, 1–10, both frontends), `status_message_seconds` (4, 0–30; how long a new status-bar message stays highlighted, 0 = never — see *Status messages*), `secondary_window_chrome` (true; GUI: menu bar + status bar in extra windows, false = bare pane containers), `page_size` (accepted but overwritten by the viewport height every frame, so it has no lasting effect)
     - File tree: `filetree_visible` (true), `filetree_side` ("left"/"right"), `filetree_width` (240 GUI px, 120–600), `tui_filetree_width` (30 columns, 16–80), `filetree_root` (starting directory, "" = cwd; stored unvalidated from Lua — the Settings dialog checks it), `filetree_git_colors` (true; off = no tree Git colors, Changes and gutters remain available), `filetree_auto_reveal` (true, read by the GUI), `tui_filetree_icons` (false), `filetree_font_size` (0 = theme font, 0–32), `filetree_icon_scale` (90, 50–200)
     - Snippets panel: `snippets_visible` (false; at runtime hiding it also returns the keyboard to the pane), `snippets_side` ("auto"/"left"/"right"; auto docks opposite the file tree), `snippets_width` (260 GUI px, 120–600), `tui_snippets_width` (32 columns, 16–80), `snippets_double_click` (false; GUI: true makes a click only select a snippet and keep its preview — a double-click or Enter inserts it). All five have rows in the Settings dialog
     - Terminal panel: `terminal_panel_side` ("bottom"/"left"/"right"), `terminal_panel_width` (420 GUI px, 160–1600; used at a side), `terminal_panel_height` (240 GUI px, 80–1200; used at the bottom), `tui_terminal_panel_width` (60 columns, 20–200), `tui_terminal_panel_height` (12 rows, 3–60). All five have rows in the Settings dialog
@@ -262,7 +263,7 @@ Windows terminals commonly intercept Alt combos (Windows Terminal binds Alt+arro
   - "terminal" mode (default): uses ANSI indices, respects terminal color scheme
   - Named themes use direct RGB colors for a consistent look
   - Custom overrides via `~/.config/zide/themes/tui-theme.lua` (auto-created with commented defaults on first run)
-  - 34 named TUI color fields across editor, gutter and wrap/tilde markers, tab bar, status bar, Git status, review reader rows (`tui_color_review_added_bg`, `tui_color_review_modified_bg`, `tui_color_review_ghost_bg`, `tui_color_review_ghost_fg`, `tui_color_review_marker_fg`), and overlay panels — the auto-created tui-theme.lua template lists them (the four `tui_color_git_*` fields are described under *File Tree → Git status colors*)
+  - 40 named TUI color fields across editor, gutter and wrap/tilde markers, tab bar, status bar, new status messages (`tui_color_status_note_bg` / `_fg`, `tui_color_status_warning_bg` / `_fg`, `tui_color_status_error_bg` / `_fg` — see *Status messages*), Git status, review reader rows (`tui_color_review_added_bg`, `tui_color_review_modified_bg`, `tui_color_review_ghost_bg`, `tui_color_review_ghost_fg`, `tui_color_review_marker_fg`), and overlay panels — the auto-created tui-theme.lua template lists them (the four `tui_color_git_*` fields are described under *File Tree → Git status colors*)
 
 ### TUI — Not Yet Implemented
 - Bracketed paste on Windows: vaxis's Windows reader forwards no paste markers, so a paste made by the terminal arrives as typed keys
@@ -293,6 +294,7 @@ Cross-frontend gaps are tracked in [TODO.md](TODO.md) (verified backlog: navigat
 - New document (Ctrl+N)
 - Tab switching: Ctrl+Tab / Ctrl+Shift+Tab (hard-wired — active even during prompts, not remappable in the GUI), Ctrl+PageDown / Ctrl+PageUp, and View > Next/Prev Tab
 - Status bar (filename, dirty marker, Ln/Col, detected language)
+- Status messages: a new one is a filled, rounded block after the line / column block for a few seconds — blue for a note, amber for a warning, red for an error (dark theme) — and moves left over the rest of the bar when it is long; it keeps its time while you type, then settles into plain text in the same place until the next key press or click (see *Status messages* under Shared / Core)
 - Line numbers with active line highlight in gutter
 - Go to line (Ctrl+G, overlay input; drops secondary cursors and the selection)
 - Find with incremental search, wrap-around, and status feedback (Ctrl+F)
@@ -341,7 +343,7 @@ Cross-frontend gaps are tracked in [TODO.md](TODO.md) (verified backlog: navigat
   - `zide.set("theme", "dark")` / `"light"` / `"high_contrast"` — switch preset
   - `zide.set("color_*", "#RRGGBB")` or `"#RRGGBBAA"` — override individual colors
   - Custom overrides via `~/.config/zide/themes/gui-theme.lua`
-  - 28 named editor color fields: text, selection, cursor, gutter_bg, gutter_text, gutter_text_active, gutter_separator, wrap_marker, tilde, overlay_bg, overlay_fg, overlay_dim, overlay_warn, overlay_selection, overlay_hint, bool_true, bool_false (both currently unused by any renderer), status_bg, status_fg, plus git_added, git_modified, git_deleted, git_untracked (see *File Tree → Git status colors*) and review_added_bg, review_modified_bg, review_ghost_bg, review_ghost_fg, review_marker_fg (see *Reading a change*)
+  - 35 named editor color fields: text, selection, cursor, gutter_bg, gutter_text, gutter_text_active, gutter_separator, panel_border, wrap_marker, tilde, overlay_bg, overlay_fg, overlay_dim, overlay_warn, overlay_selection, overlay_hint, bool_true, bool_false (both currently unused by any renderer), status_bg, status_fg, status_note_bg, status_note_fg, status_warning_bg, status_warning_fg, status_error_bg, status_error_fg (a new status message's block and text, per level — see *Status messages*), plus git_added, git_modified, git_deleted, git_untracked (see *File Tree → Git status colors*) and review_added_bg, review_modified_bg, review_ghost_bg, review_ghost_fg, review_marker_fg (see *Reading a change*)
   - Any `color_*` override makes the active theme `"custom"`: `zide.get("theme")` reports that, the Settings dropdown shows "dark", and the GUI chrome (menus, tabs) falls back to the dark style. Theme switches re-apply only the syntax override files — `gui-theme.lua` / `tui-theme.lua` overrides return at the next launch
 - Menu bar reorganized:
   - File: New, Open File, Open Folder, Recent Projects (submenu), Save, Save As, Close Tab, Reopen Closed Tab, Exit
@@ -593,7 +595,7 @@ zide.on("save", function(path) zide.status("zig file saved") end, { language = "
 | `zide.register_snippet{...}` | Register a snippet for the Snippets panel and the palette, Tab-expandable when it has a `prefix` — see the *Snippets* section. Returns the command name (`snippet.<language>.<prefix>`, or `snippet.<language>.~<slug>` for one without a prefix), or `nil, message`; it never raises. |
 | `zide.on(event, fn [, opts])` | Hook an event. Events: `"open"` (file opened into a tab), `"save"` (file written — fires per document on auto-save too). `fn(path, language)` gets the file path (or nil) and the document's language name (or nil for plain text); handlers that only declare `path` keep working. `opts.language = "zig"` fires the handler only for documents of that language (case-insensitive). Nested event firing is capped at 8 levels. |
 | `zide.exec(name)` → bool | Run any action or command by name — the same names keybinds use (`"save"`, `"undo"`, `"toggle_filetree"`, other Lua commands, …). Returns whether the name was recognized. |
-| `zide.status(msg)` | Show a transient message in the status bar (both frontends): at most 128 bytes, cut at a character boundary; malformed bytes show as U+FFFD, control characters as spaces. |
+| `zide.status(msg [, level])` | Show a transient message in the status bar (both frontends): at most 128 bytes, cut at a character boundary; malformed bytes show as U+FFFD, control characters as spaces. `level` is `"note"` (the default), `"warning"` or `"error"` — the color of the message while it is highlighted — or `"quiet"` for plain text that is never highlighted (see *Status messages*); another word logs a warning and shows a note. |
 
 In the GUI, a command chosen in the palette (like a terminal pane's pass-through chord) runs at the end of the frame, after every pane has drawn, so a Lua command that splits or closes panes is safe there. `open` and `save` handlers that fire from inside a pane — a quick-open commit, Save in the close-tab prompt — must still not split or close panes.
 
@@ -1015,6 +1017,60 @@ Explicit encoding choices are remembered by file path for the current session. W
 
 Find/replace, workspace search, quick open, command palette, and filename prompts accept Unicode text and remove complete code points on Backspace; keys that carry no text (arrows, Home/End, F-keys) are never typed into a prompt. Matching is literal; existing case-insensitive matching folds ASCII letters, and whole-word matching treats ASCII letters, digits, underscores and every non-ASCII character as word characters. Replace One accepts an empty replacement to delete a match. Replace All is one undoable transaction per open document and preserves every cursor and selection in undo/redo.
 
+### Status messages
+
+Everything ZIDE has to tell you in passing — "Saved main.zig", "No matches found", "Save
+failed: AccessDenied" — goes to the message slot of the status bar, in both frontends.
+
+- **A new message is highlighted**: a filled block in a contrasting color, for
+  `status_message_seconds` (4 by default). After that it settles into plain status-bar text
+  and stays until your next key press or click, as messages always did.
+- **It keeps its time while you type.** A key press, a click or the next command no longer
+  wipes a message you have not had the chance to read: the block stays its few seconds and
+  then goes. A newer message replaces it at once.
+- **Three levels, three colors**: a *note* (it worked, or it is only information), a
+  *warning* (refused, or nothing to do: "Read-only document", "No matches found", "Nothing to
+  go back to") and an *error* (something failed: "Save failed: …", "Cannot open …", a language
+  server that died, an extension that raised).
+- **Never cut short while it is new.** In the GUI the block starts where messages always
+  were, after the line / column block, and moves left over the rest of the bar when the text
+  needs the room; in the TUI it is centered and may cover the whole row. Only a message wider
+  than the bar itself ends in "…". Settled, it is clipped to its slot again (GUI: up to the
+  file name; TUI: half the row).
+- A terminal pane or the terminal panel with the keyboard shows the block too (the TUI's
+  ` [TERMINAL]` row used to show no messages at all); in the TUI's Find row the search
+  messages stay where they were, at the right end of that row.
+- Hints that describe a state, not an event — "Release to hide the file tree" while you drag
+  a panel edge, "Drop outside the tab bar to open in a new window" while you drag a tab —
+  leave the moment they stop being true.
+- **Chatter stays quiet.** Messages that come by themselves or last only a moment —
+  "Auto-saved 2 file(s)", "Waiting for language server", "Formatting before save", the review
+  list's "reading main.zig…" — are plain text from the start and never a block, so nothing
+  flashes at you while you type. What replaces them (the answer, or a failure) is highlighted
+  as usual.
+
+Settings and colors:
+
+- `zide.set("status_message_seconds", 4)` — 0 to 30, also in the Settings dialog as *Message
+  Highlight (s)*. 0 switches the highlight off: plain text that goes at the next key press or
+  click, as before.
+- Colors, per level, the block and its text: `status_note_bg` / `status_note_fg`,
+  `status_warning_bg` / `status_warning_fg`, `status_error_bg` / `status_error_fg` — set them
+  with `zide.set("color_status_error_bg", "#e06c75")` (GUI) or
+  `zide.set("tui_color_status_error_bg", "#ff5f5f")` (TUI). Every preset has its own set; the
+  TUI's "terminal" preset uses your terminal's cyan, yellow and red. A `gui-theme.lua` /
+  `tui-theme.lua` created before these fields existed does not list them, but the lines work
+  there all the same.
+- From Lua: `zide.status("lint: 3 problems", "warning")` — the second argument is `"note"`
+  (the default), `"warning"`, `"error"` or `"quiet"` (plain text, never highlighted: for a
+  script that reports on every save or on a timer).
+
+In the code: assign `editor.status_message` for a note, call `editor.setStatus(.warning, …)` /
+`editor.setStatus(.err, …)` / `editor.setStatus(.quiet, …)` for the others,
+`editor.dismissStatus()` where input moves on (the message keeps its time) and
+`status_message = ""` where a message stops being true (it goes at once). The painters ask `editor.statusView(now)` each frame; `status_message.zig` has
+the rules and their tests.
+
 ### Welcome Screen
 
 Starting ZIDE without file arguments opens a scratch buffer containing the full
@@ -1314,8 +1370,8 @@ see *The Shipped Extension: snippets-zig.lua* under the Extension System.
   bundled snippet F2 (or "Copy to My Snippets…") opens the form filled with its code and
   notes and saves a copy into your file: keep the name and your copy replaces the bundled one
   in the panel, since your file loads last. Delete that copy (or give it another name) and
-  the bundled snippet is back in its row at once — the status bar says "(the one from
-  snippets-zig.lua is back)", so the row that stays is not a failed delete. If a block was
+  the bundled snippet is back in its row at once — the status bar says "Deleted <name> — the
+  one from snippets-zig.lua is back", so the row that stays is not a failed delete. If a block was
   edited by hand so that the panel can no longer find its marker lines, Edit opens the file
   for you instead of guessing.
 

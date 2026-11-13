@@ -294,7 +294,7 @@ pub const State = struct {
         const total = self.rowCount(editor);
         const path = self.change_path orelse return if (self.selected < total) self.selected else null;
         if (self.change_row < total and self.sameChange(self.pathAt(editor, self.change_row).?)) return self.change_row;
-        editor.status_message = std.fmt.bufPrint(&editor.status_buf, "{s}: {s} is no longer listed; nothing done", .{ self.viewName(), std.fs.path.basename(path) }) catch "The selected file is no longer listed; nothing done";
+        editor.setStatus(.warning, std.fmt.bufPrint(&editor.status_buf, "{s}: {s} is no longer listed; nothing done", .{ self.viewName(), std.fs.path.basename(path) }) catch "The selected file is no longer listed; nothing done");
         self.captureChange(editor);
         return null;
     }
@@ -302,7 +302,7 @@ pub const State = struct {
     fn openReviewFile(self: *State, editor: *Editor, index: usize) void {
         const file = editor.review.files.items[index];
         if (file.change == 'D') {
-            editor.status_message = "Review: deleted file — D shows the diff";
+            editor.setStatus(.warning, "Review: deleted file — D shows the diff");
             return;
         }
         const root = editor.review.root orelse return;
@@ -331,7 +331,7 @@ pub const State = struct {
             .tasks => {
                 editor.setMode(.normal);
                 _ = editor.tasks.request(editor, editor.tasks.configs.items[self.selected].options.name) catch |err| {
-                    editor.status_message = std.fmt.bufPrint(&editor.status_buf, "Task: {s}", .{@errorName(err)}) catch "Task failed";
+                    editor.setStatus(.err, std.fmt.bufPrint(&editor.status_buf, "Task: {s}", .{@errorName(err)}) catch "Task failed");
                     return;
                 };
                 if (editor.mode == .normal) self.show(editor, .task_output);
@@ -341,7 +341,7 @@ pub const State = struct {
                 var buf: [1]u8 = undefined;
                 // The run's own matcher (Lua or zig) finds the location.
                 const found = tasks.locate(editor, run, self.row(editor, self.selected, &buf)) orelse {
-                    editor.status_message = "No file location on this line";
+                    editor.setStatus(.warning, "No file location on this line");
                     return;
                 };
                 defer editor.allocator.free(found.path);
@@ -363,7 +363,7 @@ pub const State = struct {
         self.refresh(editor);
         const total = self.problem_indices.items.len;
         if (total == 0) {
-            editor.status_message = "No matching problems";
+            editor.setStatus(.warning, "No matching problems");
             return;
         }
         self.selected = if (!self.problem_opened) (if (next) 0 else total - 1) else if (next) (self.selected + 1) % total else (self.selected + total - 1) % total;

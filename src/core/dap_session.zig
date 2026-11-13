@@ -139,7 +139,7 @@ pub const Session = struct {
             peer.deinit();
         }
         self.peer = null;
-        editor.status_message = std.fmt.bufPrint(&editor.status_buf, "Debugger: {s}", .{reason}) catch "Debugger failed";
+        editor.setStatus(.err, std.fmt.bufPrint(&editor.status_buf, "Debugger: {s}", .{reason}) catch "Debugger failed");
     }
     fn send(self: *Session, bytes: []const u8) !void {
         if (self.peer) |peer| return peer.send(bytes);
@@ -260,7 +260,7 @@ pub const Session = struct {
     }
     fn requestFailed(self: *Session, editor: *Editor, info: Request, reason: []const u8) void {
         self.note(reason);
-        editor.status_message = std.fmt.bufPrint(&editor.status_buf, "Debug {s}: {s}", .{ @tagName(info.command), reason }) catch "Debug request failed";
+        editor.setStatus(.err, std.fmt.bufPrint(&editor.status_buf, "Debug {s}: {s}", .{ @tagName(info.command), reason }) catch "Debug request failed");
         if (info.command == .initialize or info.command == .launch or info.command == .attach or info.command == .configurationDone or info.command == .disconnect) {
             self.fail(editor, reason);
         } else if (info.command == .variables) {
@@ -560,7 +560,7 @@ pub const Session = struct {
     fn sourceUnavailable(self: *Session, editor: *Editor, path: []const u8, err: anyerror) void {
         var buf: [1024]u8 = undefined;
         self.note(std.fmt.bufPrint(&buf, "Source unavailable: {s} ({s})", .{ path, @errorName(err) }) catch "Source unavailable (path too long)");
-        editor.status_message = std.fmt.bufPrint(&editor.status_buf, "Debug: source unavailable: {s} ({s})", .{ std.fs.path.basename(path), @errorName(err) }) catch "Debug: source unavailable";
+        editor.setStatus(.err, std.fmt.bufPrint(&editor.status_buf, "Debug: source unavailable: {s} ({s})", .{ std.fs.path.basename(path), @errorName(err) }) catch "Debug: source unavailable");
     }
     pub fn control(self: *Session, command: Command) !void {
         if (command == .pause) {

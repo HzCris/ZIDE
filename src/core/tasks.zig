@@ -213,7 +213,7 @@ pub const State = struct {
         self.startJob(editor, run) catch |err| {
             run.status = .failed;
             run.error_name = @errorName(err);
-            editor.status_message = std.fmt.bufPrint(&editor.status_buf, "Task failed: {s}", .{@errorName(err)}) catch "Task failed";
+            editor.setStatus(.err, std.fmt.bufPrint(&editor.status_buf, "Task failed: {s}", .{@errorName(err)}) catch "Task failed");
         };
     }
     fn startJob(_: *State, editor: *Editor, run: *Run) !void {
@@ -271,7 +271,7 @@ pub const State = struct {
                 .saved => {
                     if (editor.docIndexForId(doc_id)) |saved| if (editor.documents.items[saved].dirty) {
                         self.cancel(editor, id);
-                        editor.status_message = "Task cancelled: a save hook changed the document";
+                        editor.setStatus(.warning, "Task cancelled: a save hook changed the document");
                         return;
                     };
                     self.waiting_save = false;
@@ -339,7 +339,11 @@ pub const State = struct {
                 run.status = if (snapshot.cancelled) .cancelled else if (snapshot.failure != null or snapshot.code != 0) .failed else .succeeded;
                 editor.jobs.remove(run.job.?);
                 run.job = null;
-                editor.status_message = std.fmt.bufPrint(&editor.status_buf, "Task {s}: {s}", .{ run.config.options.name, @tagName(run.status) }) catch "Task finished";
+                editor.setStatus(switch (run.status) {
+                    .failed => .err,
+                    .cancelled => .warning,
+                    else => .note,
+                }, std.fmt.bufPrint(&editor.status_buf, "Task {s}: {s}", .{ run.config.options.name, @tagName(run.status) }) catch "Task finished");
             }
         }
     }
@@ -374,7 +378,7 @@ pub fn noteMatcherError(editor: *Editor, run: *Run, message: []const u8) void {
     if (run.matcher_error != null) return;
     const text = message[0..@import("text_input.zig").floor(message, 256)];
     run.matcher_error = editor.allocator.dupe(u8, text) catch return;
-    editor.status_message = std.fmt.bufPrint(&editor.status_buf, "Task {s}: problem matcher failed (see Task Output)", .{run.config.options.name}) catch "Task problem matcher failed (see Task Output)";
+    editor.setStatus(.err, std.fmt.bufPrint(&editor.status_buf, "Task {s}: problem matcher failed (see Task Output)", .{run.config.options.name}) catch "Task problem matcher failed (see Task Output)");
 }
 
 pub const Location = struct { path: []const u8, line: u32, col: u32, severity: lsp.DiagnosticSeverity, message: []const u8 };

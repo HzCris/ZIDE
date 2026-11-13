@@ -123,7 +123,7 @@ pub const CommandRegistry = struct {
         const doc = editor.activeDoc();
         if (!doc.edit_refused) return;
         doc.edit_refused = false;
-        editor.status_message = if (doc.reader != null) "Read-only review view — Enter opens the real file" else "Read-only document";
+        editor.setStatus(.warning, if (doc.reader != null) "Read-only review view — Enter opens the real file" else "Read-only document");
     }
 
     pub fn registerSnippet(self: *CommandRegistry, name: []const u8, description: []const u8) !void {
@@ -556,7 +556,7 @@ fn cmdInsertChar(editor: *Editor, args: ?[]const u8) void {
     // Multi-cursor: simple insert at all cursors, skip auto-close complexity
     if (doc.cursors.count() > 1) {
         doc.insertAtAllCursors(text) catch {
-            editor.status_message = "Edit failed: out of memory";
+            editor.setStatus(.err, "Edit failed: out of memory");
         };
         return;
     }
@@ -595,38 +595,38 @@ fn cmdInsertChar(editor: *Editor, args: ?[]const u8) void {
             }
         }
         doc.beginEdit() catch {
-            editor.status_message = "Edit failed: out of memory";
+            editor.setStatus(.err, "Edit failed: out of memory");
             return;
         };
         defer doc.endEdit();
         doc.insertAtCursor(&.{ text[0], close }) catch {
-            editor.status_message = "Edit failed: out of memory";
+            editor.setStatus(.err, "Edit failed: out of memory");
             return;
         };
         doc.cursors.primary().moveLeft(&doc.buffer);
         return;
     }
     doc.insertAtCursor(text) catch {
-        editor.status_message = "Edit failed: out of memory";
+        editor.setStatus(.err, "Edit failed: out of memory");
     };
 }
 
 fn cmdDeleteForward(editor: *Editor, _: ?[]const u8) void {
     editor.activeDoc().deleteCharacterAll(false) catch {
-        editor.status_message = "Edit failed: out of memory";
+        editor.setStatus(.err, "Edit failed: out of memory");
     };
 }
 
 fn cmdDeleteBackward(editor: *Editor, _: ?[]const u8) void {
     editor.activeDoc().deleteCharacterAll(true) catch {
-        editor.status_message = "Edit failed: out of memory";
+        editor.setStatus(.err, "Edit failed: out of memory");
     };
 }
 
 fn cmdInsertNewline(editor: *Editor, _: ?[]const u8) void {
     if (editor.activeDoc().reader != null) return review_reader.activateRow(editor, editor.activeDoc());
     editor.activeDoc().insertAtAllCursors(editor.activeDoc().lineEnding()) catch {
-        editor.status_message = "Edit failed: out of memory";
+        editor.setStatus(.err, "Edit failed: out of memory");
     };
 }
 
@@ -792,7 +792,7 @@ fn deleteSelections(allocator: Allocator, doc: *Document) !void {
 
 fn cmdCopy(editor: *Editor, _: ?[]const u8) void {
     const text = (copiedTextAlloc(editor.allocator, editor.activeDoc()) catch {
-        editor.status_message = "Copy failed: out of memory";
+        editor.setStatus(.err, "Copy failed: out of memory");
         return;
     }) orelse return;
     defer editor.allocator.free(text);
@@ -802,13 +802,13 @@ fn cmdCopy(editor: *Editor, _: ?[]const u8) void {
 fn cmdCut(editor: *Editor, _: ?[]const u8) void {
     const doc = editor.activeDoc();
     const text = (copiedTextAlloc(editor.allocator, doc) catch {
-        editor.status_message = "Cut failed: out of memory";
+        editor.setStatus(.err, "Cut failed: out of memory");
         return;
     }) orelse return;
     defer editor.allocator.free(text);
     editor.setClipboard(text);
     deleteSelections(editor.allocator, doc) catch {
-        editor.status_message = "Edit failed: out of memory";
+        editor.setStatus(.err, "Edit failed: out of memory");
     };
 }
 
@@ -820,20 +820,20 @@ fn cmdPaste(editor: *Editor, _: ?[]const u8) void {
     // landed verbatim in LF files (mixed endings on save), and LF text in
     // CRLF files.
     const converted = withLineEnding(editor.allocator, clip, doc.lineEnding()) catch {
-        editor.status_message = "Edit failed: out of memory";
+        editor.setStatus(.err, "Edit failed: out of memory");
         return;
     };
     defer if (converted) |owned| editor.allocator.free(owned);
     const text = converted orelse clip;
     if (doc.cursors.count() > 1) {
         const distributed = pasteDistributed(editor.allocator, doc, text) catch {
-            editor.status_message = "Edit failed: out of memory";
+            editor.setStatus(.err, "Edit failed: out of memory");
             return;
         };
         if (distributed) return;
     }
     doc.insertAtAllCursors(text) catch {
-        editor.status_message = "Edit failed: out of memory";
+        editor.setStatus(.err, "Edit failed: out of memory");
     };
 }
 
@@ -979,13 +979,13 @@ fn cmdDuplicateLine(editor: *Editor, _: ?[]const u8) void {
 
 fn cmdMoveLineUp(editor: *Editor, _: ?[]const u8) void {
     editor.activeDoc().moveLineUp() catch {
-        editor.status_message = "Edit failed: out of memory";
+        editor.setStatus(.err, "Edit failed: out of memory");
     };
 }
 
 fn cmdMoveLineDown(editor: *Editor, _: ?[]const u8) void {
     editor.activeDoc().moveLineDown() catch {
-        editor.status_message = "Edit failed: out of memory";
+        editor.setStatus(.err, "Edit failed: out of memory");
     };
 }
 
@@ -1016,7 +1016,7 @@ fn cmdRecover(editor: *Editor, _: ?[]const u8) void {
 fn cmdRunTask(editor: *Editor, args: ?[]const u8) void {
     if (args) |name| {
         _ = editor.tasks.request(editor, name) catch |err| {
-            editor.status_message = std.fmt.bufPrint(&editor.status_buf, "Task: {s}", .{@errorName(err)}) catch "Task failed";
+            editor.setStatus(.err, std.fmt.bufPrint(&editor.status_buf, "Task: {s}", .{@errorName(err)}) catch "Task failed");
             return;
         };
         if (editor.mode == .normal) editor.tool_panel.show(editor, .task_output);
@@ -1053,7 +1053,7 @@ fn cmdDebug(editor: *Editor, _: ?[]const u8) void {
 }
 fn cmdDebugStart(editor: *Editor, args: ?[]const u8) void {
     if (args) |name| editor.dap.start(editor, name) catch |err| {
-        editor.status_message = std.fmt.bufPrint(&editor.status_buf, "Debug: {s}", .{@errorName(err)}) catch "Debug launch failed";
+        editor.setStatus(.err, std.fmt.bufPrint(&editor.status_buf, "Debug: {s}", .{@errorName(err)}) catch "Debug launch failed");
     } else editor.dap.show(editor, .configurations);
 }
 fn cmdBreakpoint(editor: *Editor, _: ?[]const u8) void {
@@ -1102,7 +1102,7 @@ fn reviewVerdict(editor: *Editor, status: @import("review.zig").Status) void {
         return;
     }
     const index = editor.review.activeFileIndex(editor) orelse {
-        editor.status_message = if (editor.activeDoc().file_path == null) "Review: save the file first" else "Review: not a changed file";
+        editor.setStatus(.warning, if (editor.activeDoc().file_path == null) "Review: save the file first" else "Review: not a changed file");
         return;
     };
     editor.review.verdict(editor, index, status);
@@ -1134,7 +1134,7 @@ fn reviewRowForReader(editor: *Editor) ?usize {
 }
 fn cmdReviewOpenReader(editor: *Editor, _: ?[]const u8) void {
     const index = reviewRowForReader(editor) orelse {
-        editor.status_message = "Review: not a changed file — Ctrl+F8 lists them";
+        editor.setStatus(.warning, "Review: not a changed file — Ctrl+F8 lists them");
         return;
     };
     editor.review.openReader(editor, index, null);
@@ -1142,7 +1142,7 @@ fn cmdReviewOpenReader(editor: *Editor, _: ?[]const u8) void {
 fn reviewStepChange(editor: *Editor, forward: bool) void {
     const doc = editor.activeDoc();
     if (doc.reader != null) {
-        if (!review_reader.stepChange(doc, forward)) editor.status_message = if (forward) "No more changes here — F8 opens the next file" else "No earlier changes here — Shift+F8 opens the previous file";
+        if (!review_reader.stepChange(doc, forward)) editor.setStatus(.warning, if (forward) "No more changes here — F8 opens the next file" else "No earlier changes here — Shift+F8 opens the previous file");
         return;
     }
     cmdReviewOpenReader(editor, null);
@@ -1155,14 +1155,14 @@ fn cmdReviewPrevChange(editor: *Editor, _: ?[]const u8) void {
 }
 fn cmdReviewExpandAll(editor: *Editor, _: ?[]const u8) void {
     if (editor.activeDoc().reader == null) {
-        editor.status_message = "Review: not a review reader tab";
+        editor.setStatus(.warning, "Review: not a review reader tab");
         return;
     }
     review_reader.setAllExpanded(editor, editor.activeDoc(), true);
 }
 fn cmdReviewCollapseAll(editor: *Editor, _: ?[]const u8) void {
     if (editor.activeDoc().reader == null) {
-        editor.status_message = "Review: not a review reader tab";
+        editor.setStatus(.warning, "Review: not a review reader tab");
         return;
     }
     review_reader.setAllExpanded(editor, editor.activeDoc(), false);
@@ -1174,7 +1174,7 @@ fn cmdReviewToggleView(editor: *Editor, _: ?[]const u8) void {
     if (doc.reader) |info| {
         if (info.classic) {
             const index = editor.review.fileIndexFor(info.rel_path) orelse {
-                editor.status_message = "Review: that file is no longer listed";
+                editor.setStatus(.warning, "Review: that file is no longer listed");
                 return;
             };
             editor.review.openReader(editor, index, review_reader.realLineAt(info.real_line, doc.cursorPos().line));
@@ -1218,7 +1218,7 @@ fn cmdLspStderr(editor: *Editor, _: ?[]const u8) void {
         text.print(editor.allocator, "== {s} ==\n{s}\n", .{ client.name(), if (captured.len > 0) captured else "(nothing on stderr)" }) catch return;
     }
     if (!any) {
-        editor.status_message = "No language server is running";
+        editor.setStatus(.warning, "No language server is running");
         return;
     }
     const doc = editor.newDocument() catch return;
@@ -1229,14 +1229,14 @@ fn cmdLspStderr(editor: *Editor, _: ?[]const u8) void {
 
 fn cmdOpenLog(editor: *Editor, _: ?[]const u8) void {
     const dir = lua_settings.getConfigDir() orelse {
-        editor.status_message = "No config directory";
+        editor.setStatus(.err, "No config directory");
         return;
     };
     var buf: [std.fs.max_path_bytes]u8 = undefined;
     const path = std.fmt.bufPrint(&buf, "{s}/zide.log", .{dir}) catch return;
     editor.recordNavPoint();
     _ = editor.openFile(path) catch |err| {
-        editor.status_message = std.fmt.bufPrint(&editor.status_buf, "Cannot open zide.log: {s}", .{@errorName(err)}) catch "Cannot open zide.log";
+        editor.setStatus(.err, std.fmt.bufPrint(&editor.status_buf, "Cannot open zide.log: {s}", .{@errorName(err)}) catch "Cannot open zide.log");
     };
 }
 
@@ -1336,7 +1336,7 @@ test "open_documentation prefers docs/Documentation.md and still finds a root-le
 
 fn cmdReferences(editor: *Editor, _: ?[]const u8) void {
     if (editor.lsp_tools.references.items.len == 0) {
-        editor.status_message = "No references yet: run lsp_references on a symbol";
+        editor.setStatus(.warning, "No references yet: run lsp_references on a symbol");
         return;
     }
     editor.tool_panel.show(editor, .references);
@@ -1364,12 +1364,12 @@ fn cmdIndent(editor: *Editor, _: ?[]const u8) void {
     const unit = indentUnit(editor, doc, &buf);
     if (selectionIsLineWise(doc)) {
         indentLines(editor.allocator, doc, unit) catch {
-            editor.status_message = "Edit failed: out of memory";
+            editor.setStatus(.err, "Edit failed: out of memory");
         };
         return;
     }
     doc.insertAtAllCursors(unit) catch {
-        editor.status_message = "Edit failed: out of memory";
+        editor.setStatus(.err, "Edit failed: out of memory");
     };
 }
 
@@ -1380,7 +1380,7 @@ fn cmdDedent(editor: *Editor, _: ?[]const u8) void {
     const width = editor.indentWidthFor(doc);
     if (doc.cursors.count() > 1 or selectionIsLineWise(doc)) {
         dedentLines(editor.allocator, doc, width) catch {
-            editor.status_message = "Edit failed: out of memory";
+            editor.setStatus(.err, "Edit failed: out of memory");
         };
         return;
     }
@@ -1547,7 +1547,7 @@ fn dedentLines(allocator: Allocator, doc: *Document, width: usize) !void {
 fn cmdToggleComment(editor: *Editor, _: ?[]const u8) void {
     const doc = editor.activeDoc();
     const lang = doc.language orelse {
-        editor.status_message = "Comment toggle: no language detected for this file";
+        editor.setStatus(.warning, "Comment toggle: no language detected for this file");
         return;
     };
     // Prefer line comments; fall back to wrapping each line in block
@@ -1558,10 +1558,10 @@ fn cmdToggleComment(editor: *Editor, _: ?[]const u8) void {
         if (lang.block_comment_end) |be| {
             doc.toggleComment(bs, be) catch {};
         } else {
-            editor.status_message = "Comment toggle: language has no comment syntax";
+            editor.setStatus(.warning, "Comment toggle: language has no comment syntax");
         }
     } else {
-        editor.status_message = "Comment toggle: language has no comment syntax";
+        editor.setStatus(.warning, "Comment toggle: language has no comment syntax");
     }
 }
 
@@ -1595,7 +1595,7 @@ fn cmdFiletreeRefresh(editor: *Editor, _: ?[]const u8) void {
     const ft = editor.ensureFiletree() orelse return;
     ft.refresh() catch |err| {
         const msg = std.fmt.bufPrint(&editor.status_buf, "File tree refresh failed: {s}", .{@errorName(err)}) catch "Refresh failed";
-        editor.status_message = msg;
+        editor.setStatus(.err, msg);
         return;
     };
     ft.gitRefresh();
@@ -1614,7 +1614,7 @@ fn cmdFiletreeReveal(editor: *Editor, _: ?[]const u8) void {
     _ = editor.ensureFiletree() orelse return;
     const doc = editor.activeDoc();
     const path = doc.file_path orelse {
-        editor.status_message = "Reveal: current tab has no file on disk";
+        editor.setStatus(.warning, "Reveal: current tab has no file on disk");
         return;
     };
     editor.filetree_visible = true;
@@ -1623,7 +1623,7 @@ fn cmdFiletreeReveal(editor: *Editor, _: ?[]const u8) void {
         // search panel too, and in the primary window).
         _ = editor.takeKeyboardFocus(.filetree);
     } else {
-        editor.status_message = "Reveal: file not found under the tree root";
+        editor.setStatus(.warning, "Reveal: file not found under the tree root");
     }
 }
 
@@ -1648,7 +1648,7 @@ fn cmdToggleTuiIcons(editor: *Editor, _: ?[]const u8) void {
 fn filetreeSelectedAbs(editor: *Editor) ?[]u8 {
     const ft = editor.ensureFiletree() orelse return null;
     const idx = ft.selectedNodeIdx() orelse {
-        editor.status_message = "File tree: nothing selected";
+        editor.setStatus(.warning, "File tree: nothing selected");
         return null;
     };
     return ft.absPathAlloc(editor.allocator, idx) catch null;
@@ -1664,7 +1664,7 @@ fn filetreeCopyPathsToClipboard(editor: *Editor, absolute: bool) void {
         editor.allocator.free(paths);
     }
     if (paths.len == 0) {
-        editor.status_message = "File tree: nothing selected";
+        editor.setStatus(.warning, "File tree: nothing selected");
         return;
     }
     var out: std.ArrayList(u8) = .empty;
@@ -1735,7 +1735,7 @@ fn cmdFiletreeRevealExplorer(editor: *Editor, _: ?[]const u8) void {
         if (@intFromPtr(rc) > 32) {
             editor.status_message = "Opened in Explorer";
         } else {
-            editor.status_message = "Could not open Explorer";
+            editor.setStatus(.err, "Could not open Explorer");
         }
         return;
     }
@@ -1760,14 +1760,18 @@ fn cmdFiletreeRevealExplorer(editor: *Editor, _: ?[]const u8) void {
         .stdout = .ignore,
         .stderr = .ignore,
     }) catch {
-        editor.status_message = "Could not open the system file manager";
+        editor.setStatus(.err, "Could not open the system file manager");
         return;
     };
     const term = child.wait(editor.io) catch {
-        editor.status_message = "Could not open the system file manager";
+        editor.setStatus(.err, "Could not open the system file manager");
         return;
     };
-    editor.status_message = if (term == .exited and term.exited == 0) "Opened in file manager" else "The system file manager reported an error";
+    if (term == .exited and term.exited == 0) {
+        editor.status_message = "Opened in file manager";
+    } else {
+        editor.setStatus(.err, "The system file manager reported an error");
+    }
 }
 
 extern "shell32" fn ShellExecuteW(
@@ -1785,7 +1789,7 @@ fn cmdNextTodo(editor: *Editor, _: ?[]const u8) void {
     const doc = editor.activeDoc();
     const content = doc.buffer.slice(0, doc.buffer.byteLen());
     if (content.len == 0) {
-        editor.status_message = "No TODO markers found";
+        editor.setStatus(.warning, "No TODO markers found");
         return;
     }
     const c = doc.cursors.primary();
@@ -1804,7 +1808,7 @@ fn cmdNextTodo(editor: *Editor, _: ?[]const u8) void {
         c.preferred_col = doc.buffer.offsetToPos(pos).col;
         editor.status_message = if (wrapped) "TODO search wrapped" else "";
     } else {
-        editor.status_message = "No TODO markers found";
+        editor.setStatus(.warning, "No TODO markers found");
     }
 }
 
@@ -1926,7 +1930,7 @@ fn cmdOpenDocumentation(editor: *Editor, _: ?[]const u8) void {
         _ = editor.openFile(path) catch {};
         return;
     }
-    editor.status_message = "Documentation.md not found";
+    editor.setStatus(.err, "Documentation.md not found");
 }
 
 // --- Auto-indent newline ---
@@ -1939,7 +1943,7 @@ fn cmdInsertNewlineAuto(editor: *Editor, _: ?[]const u8) void {
     // Multi-cursor: just insert plain newline (auto-indent per cursor is complex)
     if (doc.cursors.count() > 1) {
         doc.insertAtAllCursors(doc.lineEnding()) catch {
-            editor.status_message = "Edit failed: out of memory";
+            editor.setStatus(.err, "Edit failed: out of memory");
         };
         return;
     }
@@ -2054,11 +2058,11 @@ fn cmdGotoMatchingBracket(editor: *Editor, _: ?[]const u8) void {
     const doc = editor.activeDoc();
     const caret = doc.cursors.primary().offset;
     const here = brackets.bracketAt(&doc.buffer, caret) orelse {
-        editor.status_message = "No bracket at the cursor";
+        editor.setStatus(.warning, "No bracket at the cursor");
         return;
     };
     const pair = brackets.matchFor(&doc.buffer, here) orelse {
-        editor.status_message = "No matching bracket";
+        editor.setStatus(.warning, "No matching bracket");
         return;
     };
     const target = if (here == pair.open) pair.close else pair.open;

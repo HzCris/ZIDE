@@ -177,7 +177,7 @@ fn noteLoadFailure(lua: *Lua, path: []const u8, label: []const u8, msg: []const 
     std.log.warn("Error loading {s}: {s}", .{ path, msg });
     var line_buf: [256]u8 = undefined;
     last_load_error_len = lua_api.statusText(&last_load_error_buf, loadErrorLine(&line_buf, label, msg)).len;
-    if (getEditor(@ptrCast(lua))) |editor| lua_api.setStatusText(editor, "", lastLoadError());
+    if (getEditor(@ptrCast(lua))) |editor| lua_api.setStatusError(editor, "", lastLoadError());
 }
 
 /// Status line for a load error: the first line of `msg`, starting at the
@@ -275,6 +275,14 @@ fn createGuiThemeTemplate(path: [:0]const u8) void {
         \\-- zide.set("color_status_bg", "#1e1e1e")       -- Status bar background
         \\-- zide.set("color_status_fg", "#e1e1e6")       -- Status bar text
         \\
+        \\-- === A new status message (highlighted for a few seconds) ===
+        \\-- zide.set("color_status_note_bg", "#61afef")    -- Note: the block
+        \\-- zide.set("color_status_note_fg", "#10141a")    -- Note: its text
+        \\-- zide.set("color_status_warning_bg", "#e5c07b") -- Warning (refused, nothing to do): the block
+        \\-- zide.set("color_status_warning_fg", "#1e180a") -- Warning: its text
+        \\-- zide.set("color_status_error_bg", "#e06c75")   -- Error (something failed): the block
+        \\-- zide.set("color_status_error_fg", "#210c0e")   -- Error: its text
+        \\
     ) catch {};
 }
 
@@ -326,6 +334,14 @@ fn createTuiThemeTemplate(path: [:0]const u8) void {
         \\-- === Status bar ===
         \\-- zide.set("tui_color_status_bg", "#326098")      -- Status bar background
         \\-- zide.set("tui_color_status_fg", "#ffffff")      -- Status bar text
+        \\
+        \\-- === A new status message (highlighted for a few seconds) ===
+        \\-- zide.set("tui_color_status_note_bg", "#87d7ff")    -- Note: the block
+        \\-- zide.set("tui_color_status_note_fg", "#000000")    -- Note: its text
+        \\-- zide.set("tui_color_status_warning_bg", "#ffaf00") -- Warning (refused, nothing to do): the block
+        \\-- zide.set("tui_color_status_warning_fg", "#000000") -- Warning: its text
+        \\-- zide.set("tui_color_status_error_bg", "#ff5f5f")   -- Error (something failed): the block
+        \\-- zide.set("tui_color_status_error_fg", "#000000")   -- Error: its text
         \\
         \\-- === Overlay panels (find, palette, go-to-line) ===
         \\-- zide.set("tui_color_overlay_bg", "#282830")     -- Panel background
@@ -842,7 +858,7 @@ pub fn getFieldRaw(lua: *Lua, index: i32, key: [:0]const u8) zlua.LuaType {
 }
 
 /// zide.set(key, value)
-/// Supported keys: "tab_width", "use_tabs", "word_wrap", "auto_close_brackets", "completion_auto", "completion_min_chars", "signature_help_auto", "review_stage_on_approve", "page_size"
+/// Supported keys: "tab_width", "use_tabs", "word_wrap", "auto_close_brackets", "completion_auto", "completion_min_chars", "signature_help_auto", "review_stage_on_approve", "page_size", "status_message_seconds"
 fn luaSet(state: ?*zlua.LuaState) callconv(.c) c_int {
     var lua: *Lua = @ptrCast(@alignCast(state orelse return 0));
     const editor = getEditor(state) orelse return 0;
@@ -892,6 +908,12 @@ fn luaSet(state: ?*zlua.LuaState) callconv(.c) c_int {
         const val = lua.toInteger(2) catch return 0;
         if (val >= 500 and val <= 300000) {
             editor.auto_save_interval_ms = @intCast(val);
+        }
+    } else if (std.mem.eql(u8, key_str, "status_message_seconds")) {
+        // Seconds a new status-bar message stays highlighted; 0 = never.
+        const val = lua.toInteger(2) catch return 0;
+        if (val >= 0 and val <= 30) {
+            editor.status_message_seconds = @intCast(val);
         }
     } else if (std.mem.eql(u8, key_str, "gutter_min_digits")) {
         const val = lua.toInteger(2) catch return 0;
@@ -1213,6 +1235,9 @@ fn luaGet(state: ?*zlua.LuaState) callconv(.c) c_int {
         return 1;
     } else if (std.mem.eql(u8, key_str, "auto_save_interval_ms")) {
         lua.pushInteger(@intCast(editor.auto_save_interval_ms));
+        return 1;
+    } else if (std.mem.eql(u8, key_str, "status_message_seconds")) {
+        lua.pushInteger(@intCast(editor.status_message_seconds));
         return 1;
     } else if (std.mem.eql(u8, key_str, "gutter_min_digits")) {
         lua.pushInteger(@intCast(editor.gutter_min_digits));
@@ -1956,7 +1981,7 @@ fn createLintExampleTemplate() void {
         \\--   if path == nil or not path:match("%.zig$") then return end
         \\--   zide.spawn({ cmd, "ast-check", path }, function(r)
         \\--     if r.error then
-        \\--       zide.status("lint-zig: " .. r.error)
+        \\--       zide.status("lint-zig: " .. r.error, "error")
         \\--       return
         \\--     end
         \\--     -- ast-check reports on stderr: file:line:col: error: message
@@ -1971,7 +1996,7 @@ fn createLintExampleTemplate() void {
         \\--     end
         \\--     zide.set_diagnostics(path, diags) -- empty table clears old findings
         \\--     if #diags > 0 then
-        \\--       zide.status(string.format("zig ast-check: %d problem(s)", #diags))
+        \\--       zide.status(string.format("zig ast-check: %d problem(s)", #diags), "warning")
         \\--     end
         \\--   end)
         \\-- end)
@@ -2120,7 +2145,7 @@ fn createMarkdownExtensionTemplate() void {
         \\  if n > 0 then
         \\    zide.set_line(line, s)
         \\  else
-        \\    zide.status("No checkbox on this line")
+        \\    zide.status("No checkbox on this line", "warning")
         \\  end
         \\end)
         \\

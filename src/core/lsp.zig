@@ -766,7 +766,7 @@ pub const LspClient = struct {
                 if (method == .initialize) {
                     // Nothing else will ever work — the sweep retires the client.
                     self.dead = true;
-                    editor.status_message = std.fmt.bufPrint(&editor.status_buf, "LSP {s} rejected initialize — see zide.log", .{self.name()}) catch "LSP initialize failed — see zide.log";
+                    editor.setStatus(.err, std.fmt.bufPrint(&editor.status_buf, "LSP {s} rejected initialize — see zide.log", .{self.name()}) catch "LSP initialize failed — see zide.log");
                 }
                 editor.lsp_tools.failed(editor, self, context, e.message);
                 return;
@@ -777,7 +777,7 @@ pub const LspClient = struct {
             .initialize => {
                 self.negotiate(json_bytes) catch {
                     self.dead = true;
-                    editor.status_message = "LSP capability or position encoding negotiation failed";
+                    editor.setStatus(.err, "LSP capability or position encoding negotiation failed");
                     return;
                 };
                 self.initialized = true;
@@ -815,7 +815,7 @@ pub const LspClient = struct {
             }
             // showMessage errors are meant for the user's eyes
             if (p.type == 1 and std.mem.eql(u8, method, "window/showMessage")) {
-                editor.status_message = std.fmt.bufPrint(&editor.status_buf, "LSP {s}: {s}", .{ self.name(), p.message }) catch "LSP error — see zide.log";
+                editor.setStatus(.err, std.fmt.bufPrint(&editor.status_buf, "LSP {s}: {s}", .{ self.name(), p.message }) catch "LSP error — see zide.log");
             }
         }
         // $/progress and anything else: ignored

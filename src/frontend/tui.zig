@@ -8,7 +8,9 @@ const lua_api = @import("../core/lua_api.zig");
 const Editor = @import("../core/editor.zig").Editor;
 const Document = @import("../core/document.zig").Document;
 const Layout = @import("../core/layout.zig").Layout;
-const TuiColor = @import("../core/theme.zig").TuiColor;
+const theme_mod = @import("../core/theme.zig");
+const TuiColor = theme_mod.TuiColor;
+const status_mod = @import("../core/status_message.zig");
 const syntax = @import("../core/syntax.zig");
 const brackets = @import("../core/brackets.zig");
 const review_reader = @import("../core/review_reader.zig");
@@ -306,14 +308,14 @@ fn pasteIntoDocument(editor: *Editor, text: []const u8) void {
     // A read-only tab (the review reader) refuses the edit: say that, not
     // "out of memory".
     if (doc.readonly) {
-        editor.status_message = if (doc.reader != null) "Read-only review view — Enter opens the real file" else "Read-only document";
+        editor.setStatus(.warning, if (doc.reader != null) "Read-only review view — Enter opens the real file" else "Read-only document");
         return;
     }
     const eol = doc.lineEnding();
     var out: std.ArrayList(u8) = .empty;
     defer out.deinit(editor.allocator);
     out.ensureTotalCapacity(editor.allocator, text.len) catch {
-        editor.status_message = "Paste failed: out of memory";
+        editor.setStatus(.err, "Paste failed: out of memory");
         return;
     };
     var i: usize = 0;
@@ -329,16 +331,16 @@ fn pasteIntoDocument(editor: *Editor, text: []const u8) void {
             else => out.append(editor.allocator, b),
         };
         ok catch {
-            editor.status_message = "Paste failed: out of memory";
+            editor.setStatus(.err, "Paste failed: out of memory");
             return;
         };
     }
     doc.insertAtAllCursors(out.items) catch {
-        editor.status_message = "Paste failed: out of memory";
+        editor.setStatus(.err, "Paste failed: out of memory");
         return;
     };
     scroll_pinned = false;
-    editor.status_message = "";
+    editor.dismissStatus();
 }
 
 /// Type `line` into the focused input as key presses (control characters
@@ -993,7 +995,7 @@ fn drawEditor(win: Window, editor: *Editor, width: u16, height: u16) void {
             if (editor.keyboardOwner() == .snippets) _ = editor.takeKeyboardFocus(.pane);
             editor.snippets_visible = false;
             editor.snippets_focused = false;
-            editor.status_message = "Snippets panel: no room beside the editor \u{2014} widen the terminal, then Ctrl+Alt+B";
+            editor.setStatus(.warning, "Snippets panel: no room beside the editor \u{2014} widen the terminal, then Ctrl+Alt+B");
         } else {
             const side = editor.snippetsSide();
             const band_x: u16 = if (side == .left) tree_left else width - (tree_w - tree_left) - snip_w;
@@ -1308,10 +1310,10 @@ fn openFiletreeFileTui(editor: *Editor, ft: *FileTree, idx: u32) void {
     const abs = ft.absPathAlloc(editor.allocator, idx) catch return;
     defer editor.allocator.free(abs);
     _ = editor.navOpen(abs) catch |err| {
-        editor.status_message = if (err == error.BinaryFile)
+        editor.setStatus(.err, if (err == error.BinaryFile)
             "Cannot open: binary file"
         else
-            "Open failed";
+            "Open failed");
     };
 }
 
@@ -1726,7 +1728,7 @@ fn handleSnippetsClick(editor: *Editor, band: SnippetsBand, row_abs: u16) void {
 /// PageDown scroll the preview; the rest drives the list as in the GUI.
 fn handleSnippetsKey(editor: *Editor, key: Key) void {
     if (key.isModifier()) return;
-    editor.status_message = "";
+    editor.dismissStatus();
     // Fresh rows first: the run loop handles every queued key before it
     // draws (and syncs) again, and a delete or a reload in between shifts
     // the registry — a stale row would point F2 or Delete at a neighbor.
@@ -1805,7 +1807,7 @@ fn terminalPanelNoRoom(editor: *Editor) void {
     if (editor.keyboardOwner() == .terminal_panel) _ = editor.takeKeyboardFocus(.pane);
     editor.terminal_panel_visible = false;
     editor.terminal_panel_focused = false;
-    editor.status_message = "Terminal panel: no room beside the editor — enlarge the window, then Ctrl+Shift+`";
+    editor.setStatus(.warning, "Terminal panel: no room beside the editor — enlarge the window, then Ctrl+Shift+`");
 }
 
 /// Draw the terminal panel band: a header row ("Terminal", bright while
@@ -2956,12 +2958,36 @@ fn drawSecondaryCursors(win: Window, doc: *Document, editor: *Editor, width: u16
     }
 }
 
+/// A new status message: a filled block in its level's colors, centered
+/// and free to cover the rest of the bar — it is there for a few seconds.
+/// One blank cell either side; a message wider than the bar ends in "…".
+fn drawStatusMessageBlock(win: Window, editor: *Editor, view: status_mod.View, width: u16) void {
+    if (width < 4) return;
+    const pair = theme_mod.statusBlock(&editor.tui_theme, view.level);
+    const style: Style = .{ .bg = toVaxis(pair.bg), .fg = toVaxis(pair.fg), .bold = true };
+    const room: usize = width - 2;
+    var text = view.text;
+    const cut = advanceCols(text, 0, 1) > room;
+    if (cut) text = text[0..fitEnd(text, 0, room - 1, 1)];
+    const block_w = advanceCols(text, 0, 1) + @intFromBool(cut) + 2;
+    var x: u16 = @intCast((width - block_w) / 2);
+    x = writeStr(win, x, 0, " ", style);
+    x = writeStr(win, x, 0, text, style);
+    if (cut) x = writeStr(win, x, 0, "…", style);
+    _ = writeStr(win, x, 0, " ", style);
+}
+
 /// Draw the status bar.
 fn drawStatusBar(win: Window, editor: *Editor, width: u16) void {
     const style: Style = .{ .bg = toVaxis(editor.tui_theme.status_bg), .fg = toVaxis(editor.tui_theme.status_fg), .bold = true };
 
     // Fill background
     win.fill(.{ .style = style });
+
+    // The message slot: a new message is a highlighted block for a few
+    // seconds (drawn last, over everything), then plain text like the rest.
+    const message = editor.statusView(std.Io.Clock.now(.awake, editor.io).nanoseconds);
+    defer if (message.fresh) drawStatusMessageBlock(win, editor, message, width);
 
     // The terminal panel has the keys: say so (the document behind it is
     // not what typing reaches).
@@ -3014,11 +3040,13 @@ fn drawStatusBar(win: Window, editor: *Editor, width: u16) void {
     // Center: transient status message ("Saved", "Cannot open: ...",
     // file-tree results) takes priority over the line diagnostic —
     // previously these were never rendered in normal mode at all.
-    if (editor.status_message.len > 0) {
-        const max_len = width / 2;
-        const msg_len: u16 = @intCast(@min(editor.status_message.len, max_len));
-        const center_x = (width -| msg_len) / 2;
-        _ = writeStr(win, center_x, 0, editor.status_message[0..msg_len], style);
+    if (message.text.len > 0) {
+        // Past its highlight: plain, in half the bar (whole characters).
+        if (!message.fresh) {
+            const shown = message.text[0..fitEnd(message.text, 0, width / 2, 1)];
+            const center_x: u16 = @intCast((width - advanceCols(shown, 0, 1)) / 2);
+            _ = writeStr(win, center_x, 0, shown, style);
+        }
         // Right side still drawn below; skip the diagnostic this frame
     } else {
         var diag_it = doc.diagIter();
@@ -3296,7 +3324,7 @@ fn handleMouse(editor: *Editor, mouse: vaxis.Mouse) void {
 fn mousePress(editor: *Editor, mouse: vaxis.Mouse) void {
     // Click: position cursor — un-pin scroll, drop old status
     scroll_pinned = false;
-    editor.status_message = "";
+    editor.dismissStatus();
     press_pane = null;
     block_drag = false;
     block_engaged = false;
@@ -3598,7 +3626,7 @@ fn runKeybindAction(editor: *Editor, action: []const u8) void {
 fn handleFiletreeKey(editor: *Editor, key: Key) void {
     if (key.isModifier()) return;
     // Keep the "press p" hint visible while a move is pending
-    if (editor.filetree_move_src == null) editor.status_message = "";
+    if (editor.filetree_move_src == null) editor.dismissStatus();
     if (tryKeybindCommand(editor, key)) return;
     // Super+letter is a desktop/OS chord, never a tree command
     if (key.mods.super) return;
@@ -3712,9 +3740,10 @@ fn handleKey(editor: *Editor, key_in: Key) void {
     }
 
     // Any key press un-pins scroll (cursor tracking resumes) and drops
-    // the previous transient status message
+    // the previous transient status message (a new one keeps its time on
+    // the bar: dismissStatus)
     scroll_pinned = false;
-    editor.status_message = "";
+    editor.dismissStatus();
 
     // Ctrl/Alt+key shortcuts — look up in keybind map.
     if (tryKeybindCommand(editor, key)) return;
@@ -4798,11 +4827,11 @@ fn reportOpenError(editor: *Editor, path: []const u8, err: anyerror) void {
     switch (err) {
         // The encoding picker took over; it names the file itself
         error.EncodingRequired => {},
-        error.BinaryFile => editor.status_message = "Not opened: binary or unsupported text encoding",
+        error.BinaryFile => editor.setStatus(.err, "Not opened: binary or unsupported text encoding"),
         else => {
             var prefix_buf: [96]u8 = undefined;
             const prefix = std.fmt.bufPrint(&prefix_buf, "Open failed ({s}): ", .{@errorName(err)}) catch "Open failed: ";
-            lua_api.setStatusText(editor, prefix, path);
+            lua_api.setStatusError(editor, prefix, path);
         },
     }
 }
@@ -6133,6 +6162,100 @@ test "TUI Open prompt reports why a file did not open" {
     try t.expectEqual(Editor.Mode.normal, editor.mode);
     try t.expect(std.mem.startsWith(u8, editor.status_message, "Open failed ("));
     try t.expect(std.mem.endsWith(u8, editor.status_message, "zide-no-such-dir/missing.txt"));
+}
+
+test "TUI status messages: a new one is a filled block that outlasts key presses, then plain text; a long one takes the whole bar" {
+    const t = std.testing;
+    var editor = try Editor.init(t.allocator, t.io);
+    defer editor.deinit();
+    editor.lsp_enabled = false;
+    editor.filetree_visible = false;
+    var screen = try testScreen(t.allocator);
+    defer screen.deinit(t.allocator);
+    const win = testWin(&screen);
+    var buf: [512]u8 = undefined;
+    const bar_y: u16 = 29;
+    const bar_bg = toVaxis(editor.tui_theme.status_bg);
+    const note = theme_mod.statusBlock(&editor.tui_theme, .note);
+    const failure = theme_mod.statusBlock(&editor.tui_theme, .err);
+
+    // 11 letters and a blank either side, centered in 100 columns.
+    editor.status_message = "Saved a.zig";
+    testFrame(win, &editor);
+    try t.expectEqualStrings(" Saved a.zig ", testCells(&screen, 43, bar_y, 13, &buf));
+    try t.expectEqual(toVaxis(note.bg), screen.readCell(43, bar_y).?.style.bg);
+    try t.expectEqual(toVaxis(note.fg), screen.readCell(44, bar_y).?.style.fg);
+    try t.expectEqual(toVaxis(note.bg), screen.readCell(55, bar_y).?.style.bg);
+    try t.expectEqual(bar_bg, screen.readCell(42, bar_y).?.style.bg);
+    try t.expectEqual(bar_bg, screen.readCell(56, bar_y).?.style.bg);
+
+    // Typing on: the letter lands in the document, the block stays.
+    testType(&editor, "x");
+    try t.expectEqualStrings("", editor.status_message);
+    try t.expectEqualStrings("x", editor.activeDoc().buffer.slice(0, 1));
+    testFrame(win, &editor);
+    try t.expectEqualStrings(" Saved a.zig ", testCells(&screen, 43, bar_y, 13, &buf));
+    try t.expectEqual(toVaxis(note.bg), screen.readCell(43, bar_y).?.style.bg);
+    try t.expect(editor.deadlines.next_status != null);
+
+    // Its time is up (aged by hand): gone, since the key press dismissed it.
+    editor.status_flash.shown_ns.? -= 5 * std.time.ns_per_s;
+    testFrame(win, &editor);
+    try t.expectEqual(bar_bg, screen.readCell(43, bar_y).?.style.bg);
+    try t.expect(std.mem.indexOf(u8, testCells(&screen, 0, bar_y, 100, &buf), "Saved") == null);
+    try t.expectEqual(@as(?i128, null), editor.deadlines.next_status);
+
+    // An error has its own colors; left alone it settles into plain text
+    // at the same column and stays until the next key press.
+    editor.setStatus(.err, "Save failed: AccessDenied");
+    testFrame(win, &editor);
+    try t.expectEqualStrings(" Save failed: AccessDenied ", testCells(&screen, 36, bar_y, 27, &buf));
+    try t.expectEqual(toVaxis(failure.bg), screen.readCell(36, bar_y).?.style.bg);
+    try t.expectEqual(toVaxis(failure.fg), screen.readCell(37, bar_y).?.style.fg);
+    editor.status_flash.shown_ns.? -= 5 * std.time.ns_per_s;
+    testFrame(win, &editor);
+    try t.expectEqualStrings("Save failed: AccessDenied", testCells(&screen, 37, bar_y, 25, &buf));
+    try t.expectEqual(bar_bg, screen.readCell(37, bar_y).?.style.bg);
+    try t.expectEqualStrings("Save failed: AccessDenied", editor.status_message);
+    testType(&editor, "y");
+    testFrame(win, &editor);
+    try t.expect(std.mem.indexOf(u8, testCells(&screen, 0, bar_y, 100, &buf), "Save failed") == null);
+
+    // Wider than the bar: the block is the whole row and ends in "…".
+    editor.status_message = "y" ** 120;
+    testFrame(win, &editor);
+    try t.expectEqual(toVaxis(note.bg), screen.readCell(0, bar_y).?.style.bg);
+    try t.expectEqual(toVaxis(note.bg), screen.readCell(99, bar_y).?.style.bg);
+    try t.expectEqualStrings(" ", screen.readCell(0, bar_y).?.char.grapheme);
+    try t.expectEqualStrings("y", screen.readCell(97, bar_y).?.char.grapheme);
+    try t.expectEqualStrings("…", screen.readCell(98, bar_y).?.char.grapheme);
+    try t.expectEqualStrings(" ", screen.readCell(99, bar_y).?.char.grapheme);
+
+    // Cells, not bytes: "é界" is three cells wide (1 + 2).
+    editor.status_message = "é界";
+    testFrame(win, &editor);
+    try t.expectEqual(bar_bg, screen.readCell(46, bar_y).?.style.bg);
+    try t.expectEqual(toVaxis(note.bg), screen.readCell(47, bar_y).?.style.bg);
+    try t.expectEqualStrings("é", screen.readCell(48, bar_y).?.char.grapheme);
+    try t.expectEqualStrings("界", screen.readCell(49, bar_y).?.char.grapheme);
+    try t.expectEqual(toVaxis(note.bg), screen.readCell(51, bar_y).?.style.bg);
+    try t.expectEqual(bar_bg, screen.readCell(52, bar_y).?.style.bg);
+
+    // `= ""` (a hint that stopped being true) removes the block at once.
+    editor.status_message = "Release to hide the file tree";
+    testFrame(win, &editor);
+    try t.expectEqual(toVaxis(note.bg), screen.readCell(40, bar_y).?.style.bg);
+    try testCaptureScreen(&screen, "status_message_tui.txt");
+    editor.status_message = "";
+    testFrame(win, &editor);
+    try t.expectEqual(bar_bg, screen.readCell(40, bar_y).?.style.bg);
+
+    // status_message_seconds = 0: plain text from the first frame.
+    editor.status_message_seconds = 0;
+    editor.status_message = "Saved a.zig";
+    testFrame(win, &editor);
+    try t.expectEqualStrings("Saved a.zig", testCells(&screen, 44, bar_y, 11, &buf));
+    try t.expectEqual(bar_bg, screen.readCell(44, bar_y).?.style.bg);
 }
 
 test "TUI snippets panel: docks beside the tree, a click selects then inserts, keys drive the list" {

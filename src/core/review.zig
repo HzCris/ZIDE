@@ -233,7 +233,7 @@ pub const State = struct {
         if (self.fetch == null and !self.reader_refetch) if (self.readerInfo(editor)) |info| if (!info.stale and std.mem.eql(u8, info.rel_path, file.path)) {
             if (review_reader.focusDoc(editor, self.reader_doc_id.?, target_line)) return;
         };
-        self.startFetch(editor, file.path, file.old_path, file.change, target_line, .open) catch |err| report(editor, "{s}: {s}", .{ std.fs.path.basename(file.path), @errorName(err) });
+        self.startFetch(editor, file.path, file.old_path, file.change, target_line, .open) catch |err| fail(editor, "{s}: {s}", .{ std.fs.path.basename(file.path), @errorName(err) });
     }
     /// The classic diff tab for row `index` of the list.
     pub fn openClassicRow(self: *State, editor: *Editor, index: usize) void {
@@ -244,13 +244,13 @@ pub const State = struct {
     /// The classic diff tab for a file (`git diff` with three context
     /// lines, painted like the reader).
     pub fn openClassic(self: *State, editor: *Editor, path: []const u8, old_path: ?[]const u8, change: u8) void {
-        self.startFetch(editor, path, old_path, change, null, .classic) catch |err| report(editor, "{s}: {s}", .{ std.fs.path.basename(path), @errorName(err) });
+        self.startFetch(editor, path, old_path, change, null, .classic) catch |err| fail(editor, "{s}: {s}", .{ std.fs.path.basename(path), @errorName(err) });
     }
     /// Rebuild the open reader in place (a marker was expanded, the file
     /// or the baseline changed): the user stays where they are.
     pub fn refetchReader(self: *State, editor: *Editor, target_line: ?u32) void {
         const info = self.readerInfo(editor) orelse return;
-        self.startFetch(editor, info.rel_path, info.old_path, info.change, target_line, .refresh) catch |err| report(editor, "{s}", .{@errorName(err)});
+        self.startFetch(editor, info.rel_path, info.old_path, info.change, target_line, .refresh) catch |err| fail(editor, "{s}", .{@errorName(err)});
     }
     fn readerInfo(self: *State, editor: *Editor) ?*review_reader.Info {
         const id = self.reader_doc_id orelse return null;
@@ -282,7 +282,7 @@ pub const State = struct {
         self.clearFetch(editor);
         self.fetch = .{ .job = job, .path = owned_path, .old_path = owned_old, .change = change, .target_line = target_line, .reason = reason };
         // `path` may have belonged to the fetch just cleared: name the copy.
-        if (reason != .refresh) report(editor, "reading {s}…", .{std.fs.path.basename(owned_path)});
+        if (reason != .refresh) progress(editor, "reading {s}…", .{std.fs.path.basename(owned_path)});
     }
     /// The open reader document, if any.
     fn readerDoc(self: *State, editor: *Editor) ?*@import("document.zig").Document {
@@ -319,17 +319,17 @@ pub const State = struct {
         // stops retrying; only a user-initiated read reports and falls back.
         if (result.failure) |err| {
             if (!open) return self.staleReader(editor);
-            if (err != error.StreamTooLong) return report(editor, "{s}: {s}", .{ name, @errorName(err) });
-            if (fetch.reason == .classic) return report(editor, "{s}: the diff is too large to show here", .{name});
+            if (err != error.StreamTooLong) return fail(editor, "{s}: {s}", .{ name, @errorName(err) });
+            if (fetch.reason == .classic) return warn(editor, "{s}: the diff is too large to show here", .{name});
             // The reader wants the whole file; the classic diff only the
             // changed parts, which is usually far less.
-            self.startFetch(editor, fetch.path, fetch.old_path, fetch.change, null, .classic) catch |start_err| return report(editor, "{s}: {s}", .{ name, @errorName(start_err) });
-            return report(editor, "{s} is too large to read here; showing the classic diff", .{name});
+            self.startFetch(editor, fetch.path, fetch.old_path, fetch.change, null, .classic) catch |start_err| return fail(editor, "{s}: {s}", .{ name, @errorName(start_err) });
+            return warn(editor, "{s} is too large to read here; showing the classic diff", .{name});
         }
         if (!(result.code == 0 or (fetch.change == '?' and result.code == 1))) {
             if (!open) return self.staleReader(editor);
             const line = std.mem.trim(u8, firstLine(result.stderr), " \r\n\t");
-            return report(editor, "{s}: {s}", .{ name, if (line.len > 0) line[0..@min(line.len, 200)] else "git diff failed" });
+            return fail(editor, "{s}: {s}", .{ name, if (line.len > 0) line[0..@min(line.len, 200)] else "git diff failed" });
         }
         if (fetch.reason == .classic) {
             try review_reader.showClassic(editor, .{ .root = self.root.?, .path = fetch.path, .old_path = fetch.old_path, .change = fetch.change }, result.stdout, true);
@@ -338,16 +338,16 @@ pub const State = struct {
         }
         var parsed = unidiff.parse(a, result.stdout) catch |err| {
             if (!open) return self.staleReader(editor);
-            return report(editor, "{s}: {s}", .{ name, @errorName(err) });
+            return fail(editor, "{s}: {s}", .{ name, @errorName(err) });
         };
         defer parsed.deinit(a);
         if (parsed.binary) {
             if (!open) return self.staleReader(editor);
-            return report(editor, "{s} is binary; listed only", .{name});
+            return warn(editor, "{s} is binary; listed only", .{name});
         }
         if (parsed.lines.len == 0) {
             if (!open) return self.staleReader(editor);
-            report(editor, "{s} has no text changes against {s}", .{ name, self.baseRef()[0..@min(self.baseRef().len, 7)] });
+            warn(editor, "{s} has no text changes against {s}", .{ name, self.baseRef()[0..@min(self.baseRef().len, 7)] });
             return;
         }
         try review_reader.show(editor, .{ .root = self.root.?, .path = fetch.path, .old_path = fetch.old_path, .change = fetch.change }, parsed, fetch.target_line, open);
@@ -390,7 +390,7 @@ pub const State = struct {
             },
             else => {
                 std.log.warn("Review record {s}: {s}; verdicts of this repository are not saved", .{ std.fs.path.basename(path), @errorName(err) });
-                report(editor, "record file {s} is unusable ({s}); verdicts are not saved", .{ std.fs.path.basename(path), @errorName(err) });
+                fail(editor, "record file {s} is unusable ({s}); verdicts are not saved", .{ std.fs.path.basename(path), @errorName(err) });
                 self.clearEntries(editor);
                 a.free(path);
                 return;
@@ -557,7 +557,7 @@ pub const State = struct {
         self.list_job = null;
         if (result.failure != null or result.code != 0) {
             self.commit_missing = true;
-            report(editor, "checkpoint {s} is not in this repository any more; comparing with the last commit", .{self.shortCommit()});
+            warn(editor, "checkpoint {s} is not in this repository any more; comparing with the last commit", .{self.shortCommit()});
             try self.rebuildHead(editor);
         } else try self.applyNameStatus(editor, result.stdout);
         if (self.list_job_restart) {
@@ -571,10 +571,10 @@ pub const State = struct {
     /// `review_set_baseline`: pin the current commit; the list then shows
     /// what changed since it, across later commits.
     pub fn pinHead(self: *State, editor: *Editor) void {
-        const root = self.root orelse return report(editor, "not a Git repository", .{});
+        const root = self.root orelse return warn(editor, "not a Git repository", .{});
         if (self.pin_job != null) return;
-        self.pin_job = editor.git.command(editor, root, &.{ "rev-parse", "--verify", "HEAD" }) catch |err| return report(editor, "{s}", .{@errorName(err)});
-        report(editor, "pinning the baseline…", .{});
+        self.pin_job = editor.git.command(editor, root, &.{ "rev-parse", "--verify", "HEAD" }) catch |err| return fail(editor, "{s}", .{@errorName(err)});
+        progress(editor, "pinning the baseline…", .{});
     }
     fn pollPin(self: *State, editor: *Editor) !void {
         const id = self.pin_job orelse return;
@@ -588,7 +588,7 @@ pub const State = struct {
         editor.jobs.remove(id);
         self.pin_job = null;
         const hash = std.mem.trimEnd(u8, result.stdout, "\r\n");
-        if (result.failure != null or result.code != 0 or !validCommit(hash)) return report(editor, "no commit to pin (unborn HEAD?)", .{});
+        if (result.failure != null or result.code != 0 or !validCommit(hash)) return warn(editor, "no commit to pin (unborn HEAD?)", .{});
         try self.pinCommit(editor, hash);
     }
     /// Make `hash` the checkpoint (also used by tests, which run no git).
@@ -606,7 +606,7 @@ pub const State = struct {
     }
     /// `review_follow_head`: back to comparing with the last commit.
     pub fn followHead(self: *State, editor: *Editor) void {
-        if (self.root == null) return report(editor, "not a Git repository", .{});
+        if (self.root == null) return warn(editor, "not a Git repository", .{});
         self.mode = .head;
         self.commit_missing = false;
         self.refresh_wanted = true;
@@ -680,16 +680,16 @@ pub const State = struct {
     /// for conflicts and for files with unsaved edits: verdicts are about
     /// what is on disk, and staging a conflict would mark it resolved.
     pub fn verdict(self: *State, editor: *Editor, index: usize, status: Status) void {
-        const root = self.root orelse return report(editor, "not a Git repository", .{});
+        const root = self.root orelse return warn(editor, "not a Git repository", .{});
         if (index >= self.files.items.len) return;
         const file = self.files.items[index];
         const name = std.fs.path.basename(file.path);
-        if (file.change == 'U') return report(editor, "resolve the conflict in {s} first", .{name});
+        if (file.change == 'U') return warn(editor, "resolve the conflict in {s} first", .{name});
         for ([_]?[]const u8{ file.path, file.old_path }) |maybe| if (maybe) |rel| {
             const absolute = std.fs.path.join(editor.allocator, &.{ root, rel }) catch return;
             defer editor.allocator.free(absolute);
             if (editor.findDocument(absolute) catch null) |doc_index| if (editor.documents.items[doc_index].dirty) {
-                return report(editor, "save {s} first", .{std.fs.path.basename(rel)});
+                return warn(editor, "save {s} first", .{std.fs.path.basename(rel)});
             };
         };
         if (self.statusOf(file.path) == status) {
@@ -697,7 +697,7 @@ pub const State = struct {
             self.save(editor);
             return report(editor, "{s} is unreviewed again", .{name});
         }
-        self.record(editor, index, status) catch |err| return report(editor, "{s}: {s}", .{ name, @errorName(err) });
+        self.record(editor, index, status) catch |err| return fail(editor, "{s}: {s}", .{ name, @errorName(err) });
         self.save(editor);
         switch (status) {
             .approved => if (self.stage_on_approve) self.stageApproved(editor, file) else report(editor, "{s} approved", .{name}),
@@ -747,9 +747,9 @@ pub const State = struct {
     /// listed file, wrapping around, from the row of the active document
     /// (the reader's own file counts).
     pub fn step(self: *State, editor: *Editor, forward: bool) void {
-        if (self.root == null) return report(editor, "not a Git repository", .{});
+        if (self.root == null) return warn(editor, "not a Git repository", .{});
         const total = self.files.items.len;
-        if (total == 0) return report(editor, "no changed files", .{});
+        if (total == 0) return warn(editor, "no changed files", .{});
         const current: ?usize = if (editor.activeDoc().reader) |info| self.fileIndexFor(info.rel_path) else self.activeFileIndex(editor);
         const start: usize = current orelse (if (forward) total - 1 else 0);
         const next = if (forward) (start + 1) % total else (start + total - 1) % total;
@@ -808,7 +808,7 @@ pub const State = struct {
         if (self.reported_error != null and self.reported_error.? == err) return;
         self.reported_error = err;
         std.log.warn("Review: {s}", .{@errorName(err)});
-        report(editor, "{s}", .{@errorName(err)});
+        fail(editor, "{s}", .{@errorName(err)});
     }
 };
 
@@ -824,6 +824,24 @@ pub fn glyph(status: Status) []const u8 {
 
 fn report(editor: *Editor, comptime fmt: []const u8, args: anytype) void {
     editor.status_message = std.fmt.bufPrint(&editor.status_buf, "Review: " ++ fmt, args) catch "Review: message too long";
+}
+
+/// `report` for a step on the way ("reading main.zig…"): never highlighted.
+fn progress(editor: *Editor, comptime fmt: []const u8, args: anytype) void {
+    report(editor, fmt, args);
+    editor.setStatus(.quiet, editor.status_message);
+}
+
+/// `report` for a refusal or a "nothing to do".
+fn warn(editor: *Editor, comptime fmt: []const u8, args: anytype) void {
+    report(editor, fmt, args);
+    editor.setStatus(.warning, editor.status_message);
+}
+
+/// `report` for a failure.
+fn fail(editor: *Editor, comptime fmt: []const u8, args: anytype) void {
+    report(editor, fmt, args);
+    editor.setStatus(.err, editor.status_message);
 }
 
 fn firstLine(text: []const u8) []const u8 {

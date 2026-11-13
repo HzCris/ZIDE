@@ -1,5 +1,6 @@
 const std = @import("std");
 const syntax = @import("syntax.zig");
+const StatusLevel = @import("status_message.zig").Level;
 
 // ---------------------------------------------------------------------------
 // ThemeColor — frontend-agnostic RGBA color
@@ -89,6 +90,14 @@ pub const EditorTheme = struct {
     // Status bar
     status_bg: ThemeColor,
     status_fg: ThemeColor,
+    // A new status message, highlighted for a few seconds: the block and
+    // its text, per level (status_message.zig)
+    status_note_bg: ThemeColor,
+    status_note_fg: ThemeColor,
+    status_warning_bg: ThemeColor,
+    status_warning_fg: ThemeColor,
+    status_error_bg: ThemeColor,
+    status_error_fg: ThemeColor,
 };
 
 // ---------------------------------------------------------------------------
@@ -152,6 +161,14 @@ pub const TuiTheme = struct {
     // Status bar
     status_bg: TuiColor,
     status_fg: TuiColor,
+    // A new status message, highlighted for a few seconds: the block and
+    // its text, per level (status_message.zig)
+    status_note_bg: TuiColor,
+    status_note_fg: TuiColor,
+    status_warning_bg: TuiColor,
+    status_warning_fg: TuiColor,
+    status_error_bg: TuiColor,
+    status_error_fg: TuiColor,
 
     // Overlays (find, palette, goto)
     overlay_bg: TuiColor,
@@ -206,6 +223,12 @@ pub const gui_dark = EditorTheme{
 
     .status_bg = .{ .r = 30, .g = 30, .b = 30 },
     .status_fg = .{ .r = 225, .g = 225, .b = 230 },
+    .status_note_bg = .{ .r = 97, .g = 175, .b = 239 },
+    .status_note_fg = .{ .r = 16, .g = 20, .b = 26 },
+    .status_warning_bg = .{ .r = 229, .g = 192, .b = 123 },
+    .status_warning_fg = .{ .r = 30, .g = 24, .b = 10 },
+    .status_error_bg = .{ .r = 224, .g = 108, .b = 117 },
+    .status_error_fg = .{ .r = 33, .g = 12, .b = 14 },
 };
 
 /// Light theme.
@@ -246,6 +269,12 @@ pub const gui_light = EditorTheme{
 
     .status_bg = .{ .r = 230, .g = 230, .b = 230 },
     .status_fg = .{ .r = 30, .g = 30, .b = 30 },
+    .status_note_bg = .{ .r = 0, .g = 100, .b = 200 },
+    .status_note_fg = .{ .r = 255, .g = 255, .b = 255 },
+    .status_warning_bg = .{ .r = 154, .g = 103, .b = 0 },
+    .status_warning_fg = .{ .r = 255, .g = 255, .b = 255 },
+    .status_error_bg = .{ .r = 200, .g = 40, .b = 40 },
+    .status_error_fg = .{ .r = 255, .g = 255, .b = 255 },
 };
 
 /// High-contrast theme.
@@ -286,6 +315,12 @@ pub const gui_high_contrast = EditorTheme{
 
     .status_bg = .{ .r = 0, .g = 0, .b = 40 },
     .status_fg = .{ .r = 255, .g = 255, .b = 255 },
+    .status_note_bg = .{ .r = 0, .g = 255, .b = 255 },
+    .status_note_fg = .{ .r = 0, .g = 0, .b = 0 },
+    .status_warning_bg = .{ .r = 255, .g = 255, .b = 0 },
+    .status_warning_fg = .{ .r = 0, .g = 0, .b = 0 },
+    .status_error_bg = .{ .r = 255, .g = 80, .b = 80 },
+    .status_error_fg = .{ .r = 0, .g = 0, .b = 0 },
 };
 
 // ---------------------------------------------------------------------------
@@ -326,6 +361,14 @@ pub const tui_terminal = TuiTheme{
 
     .status_bg = .{ .ansi = 4 }, // blue
     .status_fg = .{ .ansi = 15 }, // bright white
+    // Text on the light blocks is index 16, not 0: bold text in color 0 is
+    // drawn bright (gray) by terminals that brighten bold colors.
+    .status_note_bg = .{ .ansi = 6 }, // cyan
+    .status_note_fg = .{ .ansi = 16 }, // black
+    .status_warning_bg = .{ .ansi = 3 }, // yellow
+    .status_warning_fg = .{ .ansi = 16 }, // black
+    .status_error_bg = .{ .ansi = 1 }, // red
+    .status_error_fg = .{ .ansi = 15 }, // bright white
 
     .overlay_bg = .{ .ansi = 0 }, // black
     .overlay_fg = .{ .ansi = 14 }, // bright cyan
@@ -371,6 +414,12 @@ pub const tui_dark = TuiTheme{
 
     .status_bg = .{ .ansi = 24 }, // #005f87
     .status_fg = .{ .rgb = .{ .r = 255, .g = 255, .b = 255 } },
+    .status_note_bg = .{ .ansi = 117 }, // #87d7ff
+    .status_note_fg = .{ .rgb = .{ .r = 0, .g = 0, .b = 0 } },
+    .status_warning_bg = .{ .ansi = 214 }, // #ffaf00
+    .status_warning_fg = .{ .rgb = .{ .r = 0, .g = 0, .b = 0 } },
+    .status_error_bg = .{ .ansi = 203 }, // #ff5f5f
+    .status_error_fg = .{ .rgb = .{ .r = 0, .g = 0, .b = 0 } },
 
     .overlay_bg = .{ .ansi = 235 }, // #262626
     .overlay_fg = .{ .rgb = .{ .r = 225, .g = 225, .b = 230 } },
@@ -416,6 +465,12 @@ pub const tui_light = TuiTheme{
 
     .status_bg = .{ .ansi = 33 }, // #0087ff
     .status_fg = .{ .ansi = 231 }, // #ffffff
+    .status_note_bg = .{ .ansi = 18 }, // #000087
+    .status_note_fg = .{ .ansi = 231 }, // #ffffff
+    .status_warning_bg = .{ .ansi = 220 }, // #ffd700
+    .status_warning_fg = .{ .ansi = 16 }, // #000000
+    .status_error_bg = .{ .ansi = 160 }, // #d70000
+    .status_error_fg = .{ .ansi = 231 }, // #ffffff
 
     .overlay_bg = .{ .ansi = 255 }, // #eeeeee
     .overlay_fg = .{ .ansi = 16 }, // #000000
@@ -461,6 +516,12 @@ pub const tui_high_contrast = TuiTheme{
 
     .status_bg = .{ .ansi = 17 }, // #00005f
     .status_fg = .{ .rgb = .{ .r = 255, .g = 255, .b = 255 } },
+    .status_note_bg = .{ .ansi = 51 }, // #00ffff
+    .status_note_fg = .{ .rgb = .{ .r = 0, .g = 0, .b = 0 } },
+    .status_warning_bg = .{ .ansi = 226 }, // #ffff00
+    .status_warning_fg = .{ .rgb = .{ .r = 0, .g = 0, .b = 0 } },
+    .status_error_bg = .{ .ansi = 203 }, // #ff5f5f
+    .status_error_fg = .{ .rgb = .{ .r = 0, .g = 0, .b = 0 } },
 
     .overlay_bg = .{ .ansi = 16 }, // #000000
     .overlay_fg = .{ .rgb = .{ .r = 255, .g = 255, .b = 255 } },
@@ -503,6 +564,17 @@ pub fn tuiPreset(preset: TuiPreset) TuiTheme {
         .dark => tui_dark,
         .light => tui_light,
         .high_contrast => tui_high_contrast,
+    };
+}
+
+/// Block and text color of a highlighted status message at `level`, from an
+/// EditorTheme or a TuiTheme.
+pub fn statusBlock(theme: anytype, level: StatusLevel) struct { bg: @TypeOf(theme.status_bg), fg: @TypeOf(theme.status_fg) } {
+    return switch (level) {
+        // A quiet message is never drawn as a block; it reads as a note.
+        .note, .quiet => .{ .bg = theme.status_note_bg, .fg = theme.status_note_fg },
+        .warning => .{ .bg = theme.status_warning_bg, .fg = theme.status_warning_fg },
+        .err => .{ .bg = theme.status_error_bg, .fg = theme.status_error_fg },
     };
 }
 
@@ -883,6 +955,75 @@ test "tui presets exist" {
     try std.testing.expectEqual(@as(u8, 225), dark.text_fg.rgb.r);
     const light = tuiPreset(.light);
     try std.testing.expectEqual(@as(u8, 16), light.text_fg.ansi);
+}
+
+/// Tests only: sRGB of a TuiColor whose value does not depend on the
+/// terminal's palette (RGB, the 6x6x6 cube, the gray ramp); null otherwise.
+fn testFixedRgb(c: TuiColor) ?ThemeColor {
+    return switch (c) {
+        .default => null,
+        .rgb => |v| .{ .r = v.r, .g = v.g, .b = v.b },
+        .ansi => |idx| blk: {
+            if (idx < 16) break :blk null;
+            if (idx >= 232) {
+                const gray: u8 = 8 + 10 * (idx - 232);
+                break :blk .{ .r = gray, .g = gray, .b = gray };
+            }
+            const steps = [_]u8{ 0, 95, 135, 175, 215, 255 };
+            const n = idx - 16;
+            break :blk .{ .r = steps[n / 36], .g = steps[(n / 6) % 6], .b = steps[n % 6] };
+        },
+    };
+}
+
+/// Tests only: WCAG contrast ratio of two colors (1 = none, 21 = black on white).
+fn testContrast(a: ThemeColor, b: ThemeColor) f64 {
+    const lum = struct {
+        fn channel(v: u8) f64 {
+            const c = @as(f64, @floatFromInt(v)) / 255.0;
+            return if (c <= 0.04045) c / 12.92 else std.math.pow(f64, (c + 0.055) / 1.055, 2.4);
+        }
+        fn of(c: ThemeColor) f64 {
+            return 0.2126 * channel(c.r) + 0.7152 * channel(c.g) + 0.0722 * channel(c.b);
+        }
+    };
+    const la = lum.of(a);
+    const lb = lum.of(b);
+    return (@max(la, lb) + 0.05) / (@min(la, lb) + 0.05);
+}
+
+test "status message blocks: every preset keeps its text readable, and the levels differ" {
+    const levels = [_]StatusLevel{ .note, .warning, .err };
+    for ([_]EditorTheme{ gui_dark, gui_light, gui_high_contrast }) |theme| {
+        for (levels) |level| {
+            const pair = statusBlock(theme, level);
+            try std.testing.expect(testContrast(pair.bg, pair.fg) >= 4.5);
+            // An opaque block: the bar's own text must not show through.
+            try std.testing.expectEqual(@as(u8, 255), pair.bg.a);
+        }
+        try std.testing.expect(!std.meta.eql(theme.status_note_bg, theme.status_warning_bg));
+        try std.testing.expect(!std.meta.eql(theme.status_warning_bg, theme.status_error_bg));
+        try std.testing.expect(!std.meta.eql(theme.status_note_bg, theme.status_bg));
+    }
+    for ([_]TuiTheme{ tui_terminal, tui_dark, tui_light, tui_high_contrast }) |theme| {
+        for (levels) |level| {
+            const pair = statusBlock(theme, level);
+            // Palette colors (the terminal preset) depend on the terminal.
+            const bg = testFixedRgb(pair.bg) orelse continue;
+            const fg = testFixedRgb(pair.fg) orelse continue;
+            try std.testing.expect(testContrast(bg, fg) >= 4.5);
+        }
+        try std.testing.expect(!std.meta.eql(theme.status_note_bg, theme.status_warning_bg));
+        try std.testing.expect(!std.meta.eql(theme.status_warning_bg, theme.status_error_bg));
+        try std.testing.expect(!std.meta.eql(theme.status_note_bg, theme.status_bg));
+    }
+    // The by-name setters reach the new fields (zide.set("color_status_error_bg", ...)).
+    var gui = gui_dark;
+    try std.testing.expect(setEditorColor(&gui, "status_error_bg", .{ .r = 1, .g = 2, .b = 3 }));
+    try std.testing.expectEqual(@as(u8, 2), statusBlock(gui, .err).bg.g);
+    var tui = tui_dark;
+    try std.testing.expect(setTuiColor(&tui, "status_note_fg", .{ .r = 9, .g = 8, .b = 7 }));
+    try std.testing.expectEqual(@as(u8, 9), statusBlock(&tui, .note).fg.rgb.r);
 }
 
 test "syntax theme colorForToken" {

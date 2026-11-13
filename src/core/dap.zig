@@ -112,15 +112,15 @@ pub const State = struct {
         if (self.storage_base == null) self.storage_base = editor.allocator.dupe(u8, base) catch null;
         self.binding_hash = null;
         const loaded = self.breakpoints.configure(editor.allocator, editor.io, base, workspace) catch |err| {
-            report(editor, @errorName(err));
+            fail(editor, @errorName(err));
             return;
         };
         if (loaded.failure) |err| {
             std.log.warn("Breakpoint file {s} in {s}: {s}; breakpoints of this workspace are not saved", .{ loaded.name(), base, @errorName(err) });
-            editor.status_message = std.fmt.bufPrint(&editor.status_buf, "Debug: breakpoint file {s}: {s} (not saved)", .{ loaded.name(), @errorName(err) }) catch "Debug: breakpoint file unusable (not saved)";
+            editor.setStatus(.err, std.fmt.bufPrint(&editor.status_buf, "Debug: breakpoint file {s}: {s} (not saved)", .{ loaded.name(), @errorName(err) }) catch "Debug: breakpoint file unusable (not saved)");
         } else if (loaded.skipped > 0) {
             std.log.warn("Breakpoint file {s} in {s}: skipped {d} invalid entries", .{ loaded.name(), base, loaded.skipped });
-            editor.status_message = std.fmt.bufPrint(&editor.status_buf, "Debug: breakpoint file {s}: skipped {d} invalid entries", .{ loaded.name(), loaded.skipped }) catch "Debug: skipped invalid breakpoints";
+            editor.setStatus(.warning, std.fmt.bufPrint(&editor.status_buf, "Debug: breakpoint file {s}: skipped {d} invalid entries", .{ loaded.name(), loaded.skipped }) catch "Debug: skipped invalid breakpoints");
         }
     }
     pub fn registerAdapter(self: *State, editor: *Editor, adapter: *Adapter) !void {
@@ -142,7 +142,7 @@ pub const State = struct {
         try self.configs.append(editor.allocator, config);
     }
     pub fn dropExtensions(self: *State, editor: *Editor) void {
-        if (self.session) |session| if (session.from_extension) session.stop(false) catch |err| report(editor, @errorName(err));
+        if (self.session) |session| if (session.from_extension) session.stop(false) catch |err| fail(editor, @errorName(err));
         var index: usize = 0;
         while (index < self.configs.items.len) {
             if (self.configs.items[index].from_extension) self.configs.orderedRemove(index).deinit(editor.allocator) else index += 1;
@@ -203,16 +203,16 @@ pub const State = struct {
     pub fn toggleBreakpoint(self: *State, editor: *Editor) void {
         const doc = editor.activeDoc();
         const path = doc.file_path orelse {
-            report(editor, "Save the file before setting a source breakpoint");
+            warn(editor, "Save the file before setting a source breakpoint");
             return;
         };
         const line: u32 = @intCast(doc.buffer.offsetToPos(doc.cursors.primary().offset).line + 1);
         const index = self.breakpoints.toggle(editor.allocator, editor.io, path, line) catch |err| {
-            report(editor, @errorName(err));
+            fail(editor, @errorName(err));
             return;
         };
-        if (self.session) |session| session.setBreakpoints(editor, index, false) catch |err| report(editor, @errorName(err));
-        self.breakpoints.save(editor.allocator, editor.io) catch |err| report(editor, @errorName(err));
+        if (self.session) |session| session.setBreakpoints(editor, index, false) catch |err| fail(editor, @errorName(err));
+        self.breakpoints.save(editor.allocator, editor.io) catch |err| fail(editor, @errorName(err));
         self.binding_hash = null;
         self.bind(editor) catch {};
     }
@@ -243,13 +243,13 @@ pub const State = struct {
     }
     pub fn control(self: *State, editor: *Editor, command: session_mod.Command) void {
         const session = self.session orelse {
-            report(editor, "No debug session");
+            warn(editor, "No debug session");
             return;
         };
-        session.control(command) catch |err| report(editor, @errorName(err));
+        session.control(command) catch |err| fail(editor, @errorName(err));
     }
     pub fn stop(self: *State, editor: *Editor, terminate: bool) void {
-        if (self.session) |session| session.stop(terminate) catch |err| report(editor, @errorName(err));
+        if (self.session) |session| session.stop(terminate) catch |err| fail(editor, @errorName(err));
     }
     pub fn show(self: *State, editor: *Editor, view: View) void {
         self.view = view;
@@ -327,7 +327,7 @@ pub const State = struct {
         }
     }
     pub fn activate(self: *State, editor: *Editor, index: usize) void {
-        self.activateInner(editor, index) catch |err| report(editor, @errorName(err));
+        self.activateInner(editor, index) catch |err| fail(editor, @errorName(err));
     }
     fn activateInner(self: *State, editor: *Editor, index: usize) !void {
         if (index >= self.count(editor)) return;
@@ -363,7 +363,7 @@ pub const State = struct {
                 if (try self.session.?.selectFrame(editor, index, true)) setNormal(editor);
             },
             .variables => self.session.?.expand(self.variable_indices.items[index]) catch |err| switch (err) {
-                error.VariableDepthLimit => report(editor, "variables nest deeper than 32 levels"),
+                error.VariableDepthLimit => warn(editor, "variables nest deeper than 32 levels"),
                 else => return err,
             },
             .breakpoints => {
@@ -391,8 +391,13 @@ pub const State = struct {
 fn setNormal(editor: *Editor) void {
     editor.setMode(.normal);
 }
-fn report(editor: *Editor, message: []const u8) void {
-    editor.status_message = std.fmt.bufPrint(&editor.status_buf, "Debug: {s}", .{message}) catch "Debugger error";
+/// A failure, in the status bar.
+fn fail(editor: *Editor, message: []const u8) void {
+    editor.setStatus(.err, std.fmt.bufPrint(&editor.status_buf, "Debug: {s}", .{message}) catch "Debugger error");
+}
+/// A refusal ("No debug session"): nothing was done.
+fn warn(editor: *Editor, message: []const u8) void {
+    editor.setStatus(.warning, std.fmt.bufPrint(&editor.status_buf, "Debug: {s}", .{message}) catch "Debugger error");
 }
 test "breakpoint markers rebind when a quick-open preview is promoted in place" {
     const t = std.testing;

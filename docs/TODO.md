@@ -170,7 +170,9 @@ Legend: **N** = native Zig, **L** = buildable as a Lua extension on the public A
 ## Two kinds of terminal (user, 2026-11-12 — the terminal panel's first on-screen run)
 
 Both notes came out of that run; neither is started. How the two kinds differ today is written
-up in Documentation.md (*Embedded Terminal → Two kinds of terminal*).
+up in Documentation.md (*Embedded Terminal → Two kinds of terminal*). **Decided the same evening
+(user): both wait for the hotkey listing remake** (*Hotkey convention overhaul* under
+User-requested) — the keys are being redone anyway, so nothing here is built before that pass.
 
 - **The terminal key as a real toggle** (N, S). "Kind of weird having two different commands
   to swap back and forth": Ctrl+` leaves a terminal (pane or panel) for the editor, but pressed
@@ -245,6 +247,21 @@ up in Documentation.md (*Embedded Terminal → Two kinds of terminal*).
   (1): a small box in a corner of the editor that fades out, like VS Code's notifications.
   Relatives: *GUI unsaved-changes prompts as real dialogs* (Prompts, above) and *Revisit the
   default themes* (Overlay look).
+  **User, the same evening:** likes the proposal — taken as (1)–(3), the block in the status
+  bar rather than the corner box — and wants it "sooner than later".
+  **DONE 2026-11-13 — (1), (2) and (3)** (go given that morning; as built in Documentation.md
+  → *Status messages*): a new message is a filled block for `status_message_seconds` (4;
+  0 = off; Settings dialog row), keeps that time through key presses and clicks, then settles
+  into the old plain text; the block may cover the rest of the bar, so nothing is cut; three
+  levels with their own colors in every preset (6 new theme fields per frontend) — about 190
+  of the 290 messages now say whether they are a warning or an error, through
+  `Editor.setStatus`; `zide.status(msg, "warning" | "error")` from Lua; the long delete
+  message is "Deleted <name> — the one from snippets-zig.lua is back". Decided on the way: a
+  message keeps its time while typing; a direct `status_message = ""` (a hint that stopped
+  being true) still removes it at once; progress and background chatter ("Auto-saved 2
+  file(s)", "Waiting for language server") is a fourth, `quiet` level that is never
+  highlighted. **Still open:** (4) a `show_messages` list of the last few; the corner box
+  was not built.
 
 ## Safety and trust
 
@@ -268,8 +285,10 @@ up in Documentation.md (*Embedded Terminal → Two kinds of terminal*).
 - **Reopen closed tab** (N, S) — **DONE 2026-10-08**: `reopen_closed_tab` on Ctrl+Shift+T and
   in the GUI File menu; last 20 closed files with their caret, open-again files skipped.
 - **Regex in find/replace and workspace search** (N, M). No regex engine in std — a small
-  backtracking engine (fun sub-project) or a vendored one. The same engine unlocks
-  comma-separated include/exclude lists in the search panel.
+  backtracking engine (fun sub-project) or a vendored one. Comma-separated include / exclude
+  lists in the search panel do not need it (corrected 2026-11-12: `glob` in `editorconfig.zig`
+  already matches such patterns). Both are steps in the proposal under *Find and replace
+  round-out*.
 
 ## Snippets panel (user, 2026-10-14; plan in ~/.claude/plans/playful-herding-wave.md)
 
@@ -531,11 +550,72 @@ not installed. *Zig tasks out of the box* needs no debugger and can go ahead whe
   in VS Code — multi-cursor is already there); and from Kate's power bar, escape sequences in
   both rows and `\1` capture groups in the replacement.
 
-  To decide before building: regular expressions in the first round or later; one bar (VS
-  Code: the replace row unfolds under the find row) or Kate's two (a quick bar and a power
-  bar); where it sits (top right over the text like VS Code; along the bottom like Kate and
-  today's TUI); and whether the workspace search panel's boxes get the same text box and
-  toggles at the same time, so the two stop disagreeing.
+  To decide before building (**all answered 2026-11-12 — see the plan below**): regular
+  expressions in the first round or later; one bar (VS Code: the replace row unfolds under
+  the find row) or Kate's two (a quick bar and a power bar); where it sits (top right over
+  the text like VS Code; along the bottom like Kate and today's TUI); and whether the
+  workspace search panel's boxes get the same text box and toggles at the same time, so the
+  two stop disagreeing.
+
+  **The user's walk-through of both editors (2026-11-12, four screenshots)** — what they
+  pointed at:
+  - *VS Code's box* (top right of the editor, current file only): an arrow unfolds the replace
+    row under the find row; `Aa` match case, whole word and `.*` regular expression sit in the
+    find box; *Preserve Case* (`AB`) in the replace box, then *Replace* and *Replace All*.
+  - *VS Code's Search tab* — ZIDE's Ctrl+Shift+F panel is its twin and already has search /
+    replace / files to include / files to exclude / `Aa` / whole word. What the tab has more:
+    *Search only in Open Editors* on the include box, *Use Exclude Settings and Ignore Files*
+    on the exclude box, comma lists in both (`libs/*, .py, .html`), regular expressions,
+    *Preserve Case*, and Up / Down for earlier searches.
+  - *Kate*: the bar runs along the bottom of the editor; a quick "incremental search bar"
+    switches to the "power search and replace bar". Named as what Kate has over VS Code:
+    **Find All** — every match in the file highlighted, so a long file can be scrolled and
+    stopped at any highlight — and **search in selection only**. Its modes: plain text, whole
+    words, escape sequences, regular expression, with a match-case toggle beside them.
+    (Common ground, for the record: VS Code tints the other matches too while its box is
+    open, only faintly, and its icon beside the arrows is *Find in Selection*.)
+
+  **The plan — agreed 2026-11-12 with the user's picks (marked below); not started, waits
+  for the go.**
+  - *Where*: one bar along the bottom of the editor area in both frontends — **the user's
+    pick**, Kate's place (Zed has the same bar at the top). The TUI's bar is there today; the
+    GUI's is a see-through strip across the top.
+  - *It stays open while you edit.* Today's bar is a mode that takes every key until Escape;
+    this one is a small panel with its own keyboard focus, like the search panel.
+  - *One bar.* Ctrl+F shows the find row; the replace row unfolds under it from Ctrl+H or
+    from a toggle on the bar named for what it does (`R`, hint "Replace row"). **The user's
+    point**: Kate's switch to its power bar and Zed's "Replace" toggle are the same unfolding
+    as VS Code's arrow, so one bar or two is only presentation — "just call it replace or
+    [R]". The short `R` keeps it apart from the *Replace* button inside that row.
+  - *Options are compact toggle buttons with hover hints* that say what they are — **the
+    user's pick**: `Aa` match case, `W` whole word, `.*`, `Sel` in selection only, `\n`
+    escapes, `AB` keep-case beside Replace. The GUI has no hover hints anywhere yet; dvui's
+    tooltip takes a plain rectangle, so painted buttons can have them. The TUI has no hover:
+    flipping a toggle names it in the status bar.
+  - *Highlighting every match is a toggle too* (`All`; off to start, stays as you left it) —
+    **the user's pick** over always-on. On: every match is tinted, the current one stronger,
+    with marks on the GUI scroll bar (Kate's Find All). Replace changes the current match
+    only, on or off. `3 of 17` and the tinted box when nothing matches show either way.
+  - Case is ignored unless `Aa` is on, as in VS Code, Kate and the search panel (Ctrl+F is
+    case-sensitive today).
+
+  Build order, each step checked on screen before the next:
+  1. *The find row*: real text boxes — one shared line editor in the core (caret, selection,
+     paste, Up / Down history) that the search panel, the palette and the prompts can move
+     onto later; opens with the selection or the last search; `Aa`, `W` and `All` with their
+     hints; previous / next (Shift+Enter / Enter, Shift+F3 / F3 from the text too); the count
+     and the tints. Ctrl+H keeps today's two-row bar until step 2.
+  2. *The replace row*: the `R` toggle and Ctrl+H unfold it; Replace / Replace All buttons,
+     `Sel`, `AB`, `\n`.
+  3. *Regular expressions* (**the user's pick**: third, not first): a small engine of ZIDE's
+     own (no new dependency) behind `.*`, with `$1` groups in the replacement.
+  4. *The search panel catches up*: the same boxes and buttons; comma lists and globs in
+     include / exclude; open files only; a switch to search ignored files too.
+
+  Keys follow VS Code as placeholders (Alt+C / Alt+W / Alt+R / Alt+L; Ctrl+Alt+Enter for
+  Replace All, because Ctrl+A turns into "select all" inside a real text box) and get their
+  final place in the hotkey pass; every button is also a command, so key maps and Lua can
+  drive it.
 
 ### Selection and editing
 

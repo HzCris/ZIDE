@@ -376,7 +376,7 @@ test "snippet edit, copy and delete: blocks rewrite in place, a rename moves the
     editor.startSnippetDelete(bundled_index);
     editor.applySnippetDelete();
     try t.expectEqual(Editor.Mode.normal, editor.mode);
-    try t.expectEqualStrings("Deleted from my-snippets.lua: Bundled (the one from snippets-zig.lua is back)", editor.status_message);
+    try t.expectEqualStrings("Deleted Bundled — the one from snippets-zig.lua is back", editor.status_message);
     try t.expect(editor.snippet_delete_target == null);
     t.allocator.free(text);
     text = try snippet_file.read(t.allocator, t.io, path);
