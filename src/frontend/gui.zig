@@ -24,6 +24,7 @@ const snippet_panel = @import("../core/snippet_panel.zig");
 const snippets_mod = @import("../core/snippets.zig");
 const snippet_form_mod = @import("../core/snippet_form.zig");
 const snippet_file = @import("../core/snippet_file.zig");
+const find_bar_mod = @import("../core/find_bar.zig");
 const icons = @import("icons.zig");
 const cursor_mod = @import("../core/cursor.zig");
 const keybind = @import("../core/keybind.zig");
@@ -573,6 +574,9 @@ pub fn frame(editor: *Editor, g: *GuiState) bool {
     // After the keybinds and serviceTick's focus repair, before any pane.
     trackKeyboardOwner(editor);
 
+    // Set again by whichever window draws the find bar this frame.
+    find_bar_geom = null;
+
     menuBar(editor);
     modalDialogs(editor);
     tabBar(editor);
@@ -836,12 +840,13 @@ fn menuBar(editor: *Editor) void {
         if (dvui.menuItemLabel(@src(), "Edit", .{ .submenu = true }, .{})) |r| {
             var fw = dvui.floatingMenu(@src(), .{ .from = r }, .{});
             defer fw.deinit();
+            // Like their keys: the find bar's box has undo steps of its own.
             if (dvui.menuItemLabel(@src(), "Undo             Ctrl+Z", .{}, .{ .expand = .horizontal }) != null) {
-                _ = editor.execCommand("undo", null);
+                if (!editor.panelAction("undo")) _ = editor.execCommand("undo", null);
                 m.close();
             }
             if (dvui.menuItemLabel(@src(), "Redo             Ctrl+Y", .{}, .{ .expand = .horizontal }) != null) {
-                _ = editor.execCommand("redo", null);
+                if (!editor.panelAction("redo")) _ = editor.execCommand("redo", null);
                 m.close();
             }
             // Like their keys: a focused side panel takes them.
@@ -871,6 +876,14 @@ fn menuBar(editor: *Editor) void {
             }
             if (dvui.menuItemLabel(@src(), "Find             Ctrl+F", .{}, .{ .expand = .horizontal }) != null) {
                 _ = editor.execAction("find");
+                m.close();
+            }
+            if (dvui.menuItemLabel(@src(), "Find Next        F3", .{}, .{ .expand = .horizontal }) != null) {
+                _ = editor.execCommand("find_next", null);
+                m.close();
+            }
+            if (dvui.menuItemLabel(@src(), "Find Previous    Shift+F3", .{}, .{ .expand = .horizontal }) != null) {
+                _ = editor.execCommand("find_previous", null);
                 m.close();
             }
             if (dvui.menuItemLabel(@src(), "Replace          Ctrl+H", .{}, .{ .expand = .horizontal }) != null) {
@@ -1589,9 +1602,10 @@ fn drawStatusBlock(editor: *Editor, font: dvui.Font, rs: dvui.RectScale, block: 
     renderOverlayText(font, text, block.x + pad, block.y + rs.s, rs, toDvui(pair.fg));
 }
 
-/// Editor area of the current window: the split-pane tree, plus (primary
-/// window only, side_panels) the docked file tree, Snippets panel,
-/// terminal panel and search panel.
+/// Editor area of the current window: the split-pane tree, the find bar
+/// under it when this window shows it, plus (primary window only,
+/// side_panels) the docked file tree, Snippets panel, terminal panel and
+/// search panel.
 fn editorArea(editor: *Editor, side_panels: bool) void {
     // --- Editor area (expand=.both, LAST child) ---
     // The file tree, the Snippets panel and a side-docked terminal panel
@@ -1622,6 +1636,9 @@ fn editorArea(editor: *Editor, side_panels: bool) void {
                 var center_col = dvui.box(@src(), .{ .dir = .vertical }, .{ .expand = .both });
                 defer center_col.deinit();
                 renderPanes(editor);
+                // The find bar: under the panes of the window it was opened
+                // in, above a bottom-docked terminal panel.
+                if (editor.find_bar.visible and editor.windows.items[cur_win].id == editor.find_bar.window_id) findBarGui(editor);
                 if (tp_size > 0 and tp_edge == .bottom) terminalPanel(editor, tp_size, .bottom);
             }
             if (tp_size > 0 and tp_edge == .right) terminalPanel(editor, tp_size, .right);
@@ -5047,23 +5064,10 @@ fn handleSearchKeysGui(editor: *Editor, wd: *dvui.WidgetData) void {
                     }
                     continue;
                 }
-                if (key.mod.alt()) {
-                    switch (key.code) {
-                        .c => {
-                            e.handle(@src(), wd);
-                            sp.case_sensitive = !sp.case_sensitive;
-                            if (sp.query_len > 0) editor.searchStart();
-                        },
-                        .w => {
-                            e.handle(@src(), wd);
-                            sp.whole_word = !sp.whole_word;
-                            if (sp.query_len > 0) editor.searchStart();
-                        },
-                        else => {},
-                    }
-                    continue;
-                }
-                if (key.mod.control() or key.mod.command()) continue; // global chords
+                // Global chords — Alt+C / Alt+W among them: find_toggle_case
+                // and find_toggle_whole_word flip the panel's two buttons
+                // while it has the keyboard.
+                if (key.mod.control() or key.mod.alt() or key.mod.command()) continue;
                 switch (key.code) {
                     .escape => {
                         e.handle(@src(), wd);
@@ -5126,6 +5130,449 @@ fn handleSearchKeysGui(editor: *Editor, wd: *dvui.WidgetData) void {
             },
             else => {},
         }
+    }
+}
+
+// ===========================================================================
+// The find bar (Ctrl+F): a row under the panes that stays open
+// ===========================================================================
+
+/// The bar's toggle buttons, in the order they are drawn: Aa and W sit in
+/// the text box, All beside it. `action` is the command a hover hint looks
+/// up the key of.
+const find_bar_buttons = [_]struct { which: find_bar_mod.Toggle, label: []const u8, action: []const u8 }{
+    .{ .which = .match_case, .label = "Aa", .action = "find_toggle_case" },
+    .{ .which = .whole_word, .label = "W", .action = "find_toggle_whole_word" },
+    .{ .which = .highlight_all, .label = "All", .action = "find_toggle_highlight_all" },
+};
+
+/// The bar as drawn this frame, in physical pixels: where its box and
+/// buttons are (clicks, hover hints and tests go through it). It is shown
+/// in one window at a time, so one record serves; null while no window
+/// draws it.
+const FindBarGeom = struct {
+    area: dvui.Rect.Physical = .{},
+    box: dvui.Rect.Physical = .{},
+    /// The part of the box that shows text (left of its Aa and W buttons).
+    text: dvui.Rect.Physical = .{},
+    /// In `find_bar_buttons` order.
+    toggles: [find_bar_buttons.len]dvui.Rect.Physical = @splat(.{}),
+    count: dvui.Rect.Physical = .{},
+    prev: dvui.Rect.Physical = .{},
+    next: dvui.Rect.Physical = .{},
+    close: dvui.Rect.Physical = .{},
+    scale: f32 = 1,
+};
+var find_bar_geom: ?FindBarGeom = null;
+/// A left press landed in the box: the drag after it selects there.
+var find_bar_drag: bool = false;
+/// Double / triple click in the box (the word, then everything).
+var find_bar_click_ns: i128 = 0;
+var find_bar_click_offset: usize = 0;
+var find_bar_click_count: u8 = 0;
+/// The box's caret blinks from its last move, in a pane's rhythm; it shows
+/// at once when the box takes the keyboard.
+var find_bar_blink_ns: i128 = 0;
+var find_bar_blink_caret: usize = std.math.maxInt(usize);
+var find_bar_had_keys: bool = false;
+
+/// Key and text events go to the find bar's box (in the window that shows it).
+fn findBarTakesKeys(editor: *const Editor) bool {
+    return guiMode(editor) == .normal and editor.keyboardOwner() == .find_bar;
+}
+
+/// Where everything sits in the bar's content rect: `Find`, the box (as
+/// wide as the row allows, 520 at most) with Aa and W at its right end,
+/// then All, the count, previous and next; close at the far right.
+fn findBarLayout(font: dvui.Font, area: dvui.Rect.Physical, scale: f32) FindBarGeom {
+    const pad = 8 * scale;
+    const gap = 6 * scale;
+    const box_h = font.lineHeight() * scale + 6 * scale;
+    const y = area.y + (area.h - box_h) / 2;
+    const chip_w = 26 * scale;
+    const all_w = font.textSize("All").w * scale + 12 * scale;
+    const count_w = font.textSize("100000+ found").w * scale;
+    const btn = box_h;
+    var g: FindBarGeom = .{ .area = area, .scale = scale };
+    var x = area.x + pad + font.textSize("Find").w * scale + gap;
+    const after = gap + all_w + gap + count_w + gap + btn + 2 * scale + btn + gap * 2 + btn + pad;
+    const box_w = std.math.clamp(area.x + area.w - x - after, 80 * scale, 520 * scale);
+    g.box = .{ .x = x, .y = y, .w = box_w, .h = box_h };
+    const chip_y = y + 3 * scale;
+    const chip_h = box_h - 6 * scale;
+    const word_x = x + box_w - chip_w - 4 * scale;
+    const case_x = word_x - chip_w - 4 * scale;
+    g.toggles[0] = .{ .x = case_x, .y = chip_y, .w = chip_w, .h = chip_h };
+    g.toggles[1] = .{ .x = word_x, .y = chip_y, .w = chip_w, .h = chip_h };
+    const text_x = x + 6 * scale;
+    g.text = .{ .x = text_x, .y = y, .w = @max(0, case_x - 4 * scale - text_x), .h = box_h };
+    x += box_w + gap;
+    g.toggles[2] = .{ .x = x, .y = y, .w = all_w, .h = box_h };
+    x += all_w + gap;
+    g.count = .{ .x = x, .y = y, .w = count_w, .h = box_h };
+    x += count_w + gap;
+    g.prev = .{ .x = x, .y = y, .w = btn, .h = box_h };
+    x += btn + 2 * scale;
+    g.next = .{ .x = x, .y = y, .w = btn, .h = box_h };
+    g.close = .{ .x = area.x + area.w - pad - btn, .y = y, .w = btn, .h = box_h };
+    return g;
+}
+
+/// The find bar of the current window: hand-painted like the search
+/// panel, with a real text box (find_bar.zig holds the state and the
+/// searching). It takes keys while its box owns the keyboard; the Ctrl /
+/// Alt / F-key chords were dispatched before it runs — the clipboard, word
+/// and undo ones into the box through Editor.panelAction.
+fn findBarGui(editor: *Editor) void {
+    if (!build_options.has_gui) return;
+    const fb = &editor.find_bar;
+    const font = dvui.Font.theme(.mono);
+    var bar = dvui.box(@src(), .{ .dir = .horizontal }, .{
+        .expand = .horizontal,
+        .background = true,
+        .style = .content,
+        .min_size_content = .{ .h = font.lineHeight() + 14 },
+        .name = "find_bar",
+    });
+    defer bar.deinit();
+
+    const wd = bar.data();
+    const rs = wd.contentRectScale();
+    if (rs.r.w <= 0 or rs.r.h <= 0) return;
+    const g = findBarLayout(font, rs.r, rs.s);
+    find_bar_geom = g;
+
+    findBarMouse(editor, wd, font, g);
+    if (fb.visible and findBarTakesKeys(editor)) findBarKeys(editor, wd);
+    // Closed by its button or Escape: nothing to draw (the row goes next frame).
+    if (!fb.visible) {
+        find_bar_geom = null;
+        find_bar_drag = false;
+        return;
+    }
+    if (findBarTakesKeys(editor)) dvui.wantTextInput(g.box.toNatural());
+    findBarDraw(editor, font, .{ .r = rs.r, .s = rs.s }, g);
+    findBarHints(editor, g);
+}
+
+/// Byte offset in the box's text under physical x `px`: the nearer edge of
+/// the character there.
+fn findBarOffsetAt(box: *const find_bar_mod.Needle, font: dvui.Font, g: FindBarGeom, px: f32) usize {
+    const text = box.text();
+    var at = @min(box.scroll, text.len);
+    const target = (px - g.text.x) / g.scale;
+    var x: f32 = 0;
+    while (at < text.len) {
+        const end = box.next(at);
+        const w = font.textSize(text[at..end]).w;
+        if (target < x + w / 2) break;
+        x += w;
+        at = end;
+    }
+    return at;
+}
+
+/// Clicks on the bar: any press gives its box the keyboard (the search
+/// starts where the caret in the text is); a button acts, a press in the
+/// box places the caret (Shift extends, a drag selects, a double-click
+/// takes the word, a third click everything).
+fn findBarMouse(editor: *Editor, wd: *dvui.WidgetData, font: dvui.Font, g: FindBarGeom) void {
+    const fb = &editor.find_bar;
+    for (dvui.events()) |*e| {
+        if (e.handled) continue;
+        if (e.evt != .mouse) continue;
+        if (!fb.visible) break;
+        const me = e.evt.mouse;
+        const inside = g.area.contains(me.p);
+        switch (me.action) {
+            .press => {
+                // A new press ends a drag whose release never arrived.
+                find_bar_drag = false;
+                if (!inside or me.button != .left) continue;
+                e.handle(@src(), wd);
+                if (cur_win != editor.active_window) editor.focusWindow(cur_win);
+                fb.focus(editor);
+                // Under a prompt the click only says where the keyboard goes
+                // afterwards, like a click on the file tree.
+                if (guiMode(editor) != .normal) continue;
+                win_ui.scroll_pinned = false;
+                editor.dismissStatus();
+                if (g.close.contains(me.p)) {
+                    fb.close(editor);
+                    continue;
+                }
+                if (g.prev.contains(me.p)) {
+                    fb.step(editor, false);
+                    continue;
+                }
+                if (g.next.contains(me.p)) {
+                    fb.step(editor, true);
+                    continue;
+                }
+                var toggled = false;
+                for (find_bar_buttons, g.toggles) |button, rect| {
+                    if (rect.contains(me.p)) {
+                        fb.toggle(editor, button.which);
+                        toggled = true;
+                        break;
+                    }
+                }
+                if (toggled or !g.box.contains(me.p)) continue;
+                const offset = findBarOffsetAt(&fb.needle, font, g, me.p.x);
+                const now_ns: i128 = std.Io.Clock.now(.awake, editor.io).nanoseconds;
+                const again = offset == find_bar_click_offset and now_ns - find_bar_click_ns < 400 * std.time.ns_per_ms;
+                find_bar_click_count = if (again and find_bar_click_count < 3) find_bar_click_count + 1 else 1;
+                find_bar_click_ns = now_ns;
+                find_bar_click_offset = offset;
+                if (me.mod.shift()) {
+                    fb.needle.setCaret(offset, true);
+                } else switch (find_bar_click_count) {
+                    2 => fb.needle.selectWordAt(offset),
+                    3 => fb.needle.selectAll(),
+                    else => {
+                        fb.needle.setCaret(offset, false);
+                        find_bar_drag = true;
+                    },
+                }
+            },
+            .motion => {
+                if (!find_bar_drag) continue;
+                e.handle(@src(), wd);
+                fb.needle.setCaret(findBarOffsetAt(&fb.needle, font, g, me.p.x), true);
+            },
+            .release => {
+                if (me.button == .left) find_bar_drag = false;
+            },
+            .position => {
+                if (inside) dvui.cursorSet(if (g.text.contains(me.p)) .ibeam else .arrow);
+            },
+            else => {},
+        }
+    }
+}
+
+/// Keys while the box owns the keyboard: Enter / Shift+Enter go to the next
+/// / previous match, Escape closes the bar, Up / Down walk the earlier
+/// searches, the arrows, Home / End, Backspace and Delete edit the box
+/// (Shift selects), and typed text lands at its caret.
+fn findBarKeys(editor: *Editor, wd: *dvui.WidgetData) void {
+    const fb = &editor.find_bar;
+    const box = &fb.needle;
+    for (dvui.events()) |*e| {
+        if (e.handled) continue;
+        // Escape closed the bar: the rest of the input is not its.
+        if (!findBarTakesKeys(editor)) break;
+        switch (e.evt) {
+            .key => |key| {
+                if (key.action != .down and key.action != .repeat) continue;
+                if (isModifierKey(key.code)) continue;
+                if (hasCommandMod(key.mod)) continue; // dispatched globally
+                const shift = key.mod.shift();
+                switch (key.code) {
+                    .escape, .enter, .up, .down, .left, .right, .home, .end, .backspace, .delete, .tab => {},
+                    else => continue, // a text key: its text event follows
+                }
+                e.handle(@src(), wd);
+                win_ui.scroll_pinned = false;
+                editor.dismissStatus();
+                switch (key.code) {
+                    .escape => fb.close(editor),
+                    .enter => fb.step(editor, !shift),
+                    .up => fb.historyStep(editor, true),
+                    .down => fb.historyStep(editor, false),
+                    .left => box.moveLeft(shift),
+                    .right => box.moveRight(shift),
+                    .home => box.moveHome(shift),
+                    .end => box.moveEnd(shift),
+                    .backspace => if (box.backspace()) fb.edited(editor),
+                    .delete => if (box.deleteForward()) fb.edited(editor),
+                    // One box for now: Tab stays in it.
+                    else => {},
+                }
+            },
+            .text => |te| switch (te.action) {
+                .value => |val| {
+                    // `selected` = uncommitted IME composition.
+                    if (val.txt.len == 0 or val.selected) continue;
+                    e.handle(@src(), wd);
+                    // Windows types a " " for Ctrl+Space; the chord already ran.
+                    if (win_ui.swallow_space and std.mem.eql(u8, val.txt, " ")) {
+                        win_ui.swallow_space = false;
+                        continue;
+                    }
+                    win_ui.scroll_pinned = false;
+                    if (box.insert(val.txt)) fb.edited(editor);
+                },
+                else => {},
+            },
+            else => {},
+        }
+    }
+}
+
+/// What fits a text box `max_w` logical pixels wide, for LineEdit.scrollToCaret.
+const FindBarFit = struct { font: dvui.Font, max_w: f32 };
+
+fn findBarFits(ctx: FindBarFit, piece: []const u8) bool {
+    return ctx.font.textSize(piece).w <= ctx.max_w;
+}
+
+fn findBarDraw(editor: *Editor, font: dvui.Font, rs: dvui.RectScale, g: FindBarGeom) void {
+    const fb = &editor.find_bar;
+    const box = &fb.needle;
+    const scale = g.scale;
+    const focused = findBarTakesKeys(editor);
+    const fg = toDvui(editor.theme.text);
+    const dim = fg.opacity(0.55);
+    const sel_bg = toDvui(editor.theme.selection);
+    const accent = toDvui(editor.theme.cursor);
+    const warn = toDvui(editor.theme.overlay_warn);
+    const line_w = @max(1.0, scale);
+    const rad = 3 * scale;
+    const corners: dvui.Rect.Physical = .{ .x = rad, .y = rad, .w = rad, .h = rad };
+    const lh = font.lineHeight() * scale;
+    const text_y = g.box.y + (g.box.h - lh) / 2;
+
+    const prev_clip = dvui.clip(g.area);
+    defer dvui.clipSet(prev_clip);
+
+    // A line between the panes and the bar.
+    (dvui.Rect.Physical{ .x = g.area.x, .y = g.area.y, .w = g.area.w, .h = line_w }).fill(.{}, .{ .color = toDvui(editor.theme.panel_border), .fade = 1.0 });
+    renderOverlayText(font, "Find", g.area.x + 8 * scale, text_y, rs, if (focused) fg else dim);
+
+    const count = fb.count(editor);
+    const none = box.len > 0 and count.total == 0;
+
+    // The box: its edge in the caret color while it has the keyboard, the
+    // whole box tinted when the text matches nothing.
+    g.box.fill(corners, .{ .color = toDvui(editor.theme.gutter_bg), .fade = 1.0 });
+    if (none) g.box.fill(corners, .{ .color = warn.opacity(0.2), .fade = 1.0 });
+    g.box.stroke(corners, .{ .thickness = line_w, .color = if (none) warn else if (focused) accent else dim, .closed = true });
+
+    // Its text, scrolled so the caret is in view (two pixels stay free for it).
+    {
+        const text_clip = dvui.clip(g.text);
+        defer dvui.clipSet(text_clip);
+        box.scrollToCaret(FindBarFit{ .font = font, .max_w = @max(0, g.text.w / scale - 2) }, findBarFits);
+        const text = box.text();
+        const first = @min(box.scroll, text.len);
+        const shown = fitOverlayText(font, text[first..], g.text.w, scale);
+        const last = first + shown.len;
+        if (text.len == 0) {
+            renderOverlayText(font, "Enter: next match · Shift+Enter: previous", g.text.x, text_y, rs, dim);
+        } else {
+            if (if (focused) box.selection() else null) |r| {
+                const a = std.math.clamp(r.start, first, last);
+                const b = std.math.clamp(r.end, first, last);
+                const x0 = font.textSize(text[first..a]).w * scale;
+                const x1 = font.textSize(text[first..b]).w * scale;
+                if (x1 > x0) {
+                    (dvui.Rect.Physical{ .x = g.text.x + x0, .y = g.box.y + 3 * scale, .w = x1 - x0, .h = g.box.h - 6 * scale }).fill(.{}, .{ .color = sel_bg, .fade = 1.0 });
+                }
+            }
+            renderOverlayText(font, shown, g.text.x, text_y, rs, fg);
+        }
+        if (focused and box.caret >= first and box.caret <= last) {
+            const now_ns: i128 = std.Io.Clock.now(.awake, editor.io).nanoseconds;
+            if (box.caret != find_bar_blink_caret or !find_bar_had_keys) {
+                find_bar_blink_ns = now_ns;
+                find_bar_blink_caret = box.caret;
+            }
+            const cycle = @mod(@divFloor(now_ns - find_bar_blink_ns, std.time.ns_per_ms), blink_interval_ms * 2);
+            const blink_on = cycle < blink_interval_ms;
+            if (blink_on) {
+                const cx = g.text.x + font.textSize(text[first..box.caret]).w * scale;
+                (dvui.Rect.Physical{ .x = cx, .y = g.box.y + 3 * scale, .w = @max(2.0, 2 * scale), .h = g.box.h - 6 * scale }).fill(.{}, .{ .color = accent, .fade = 1.0 });
+            }
+            // Wake up for the next blink instead of repainting all the time.
+            const until: i128 = if (blink_on) blink_interval_ms - cycle else blink_interval_ms * 2 - cycle;
+            const micros: i32 = @intCast(@max(until * 1000, 1000));
+            dvui.animation(dvui.Id.extendId(null, @src(), 0), "_blink", .{ .start_time = micros, .end_time = micros + 1000 });
+        }
+    }
+    find_bar_had_keys = focused;
+
+    // The toggles: Aa and W in the box, All beside it with an edge of its own.
+    for (find_bar_buttons, g.toggles, 0..) |button, rect, i| {
+        const lit = fb.isOn(button.which);
+        drawSearchChip(font, rs, rect.x, rect.y, rect.w, rect.h, scale, button.label, lit, fg, dim, sel_bg);
+        if (i == 2 and !lit) rect.stroke(corners, .{ .thickness = line_w, .color = dim, .closed = true });
+    }
+
+    // "3 of 17" — in the warning color when there is nothing to count.
+    var count_buf: [32]u8 = undefined;
+    const count_txt = find_bar_mod.countLabel(count, box.len > 0, &count_buf);
+    if (count_txt.len > 0) renderOverlayText(font, count_txt, g.count.x, text_y, rs, if (none) warn else if (count.current != null) fg else dim);
+
+    // Previous, next, close.
+    const icon_sz = @min(g.prev.h - 8 * scale, 14 * scale);
+    const glyphs = [_]struct { rect: dvui.Rect.Physical, name: []const u8, tvg: []const u8 }{
+        .{ .rect = g.prev, .name = "find_prev", .tvg = icons.tvg(.chevron_up) orelse dvui.entypo.chevron_small_up },
+        .{ .rect = g.next, .name = "find_next", .tvg = icons.tvg(.chevron_down) orelse dvui.entypo.chevron_small_down },
+        .{ .rect = g.close, .name = "find_close", .tvg = icons.tvg(.close) orelse dvui.entypo.cross },
+    };
+    for (glyphs) |glyph| {
+        const is_close = glyph.rect.x == g.close.x;
+        // The close glyph is drawn small inside its own frame.
+        const sz = if (is_close) @min(glyph.rect.h - 2 * scale, icon_sz * 1.5) else icon_sz;
+        renderIconTinted(glyph.name, glyph.tvg, .{
+            .x = glyph.rect.x + (glyph.rect.w - sz) / 2,
+            .y = glyph.rect.y + (glyph.rect.h - sz) / 2,
+            .w = sz,
+            .h = sz,
+        }, scale, if (none and !is_close) dim else fg);
+    }
+}
+
+/// "Match case (Alt+C)": `what`, then in brackets the key that is always
+/// `fixed` and the key bound to `action` — whichever exist.
+fn findBarHintText(editor: *const Editor, what: []const u8, fixed: []const u8, action: []const u8, buf: []u8) []const u8 {
+    var key_buf: [keybind.max_combo_len]u8 = undefined;
+    const bound = if (editor.keybinds.comboFor(action)) |combo| keybind.displayCombo(combo, &key_buf) else "";
+    if (fixed.len == 0 and bound.len == 0) return what;
+    const sep: []const u8 = if (fixed.len > 0 and bound.len > 0) ", " else "";
+    return std.fmt.bufPrint(buf, "{s} ({s}{s}{s})", .{ what, fixed, sep, bound }) catch what;
+}
+
+/// A hint that shows while the pointer rests on `rect`. (dvui derives a
+/// tooltip's id from its source line and parent alone — the options'
+/// id_extra is not used — so each hint gets a parent of its own.)
+fn findBarHint(rect: dvui.Rect.Physical, text: []const u8, id_extra: usize) void {
+    var parent = dvui.virtualParent(@src(), .{ .id_extra = id_extra });
+    defer parent.deinit();
+    dvui.tooltip(@src(), .{ .active_rect = rect, .position = .vertical, .delay = 400_000 }, "{s}", .{text}, .{});
+}
+
+/// Hover hints for the bar's buttons: what each one is, and its key.
+fn findBarHints(editor: *const Editor, g: FindBarGeom) void {
+    var buf: [96]u8 = undefined;
+    for (find_bar_buttons, g.toggles, 0..) |button, rect, i| {
+        findBarHint(rect, findBarHintText(editor, button.which.label(), "", button.action, &buf), i);
+    }
+    findBarHint(g.prev, findBarHintText(editor, "Previous match", "Shift+Enter", "find_previous", &buf), 10);
+    findBarHint(g.next, findBarHintText(editor, "Next match", "Enter", "find_next", &buf), 11);
+    findBarHint(g.close, "Close (Escape)", 12);
+}
+
+/// Marks for the find bar's matches where a pane's scroll bar runs: a short
+/// line at each match's height in the document, one per pixel row at most.
+/// A document shorter than the view is not stretched over the bar: its
+/// marks sit beside their lines.
+fn drawFindMarks(doc: *const Document, list: *const find_bar_mod.MatchList, area: dvui.Rect.Physical, line_height: f32, scale: f32, color: dvui.Color) void {
+    const starts = doc.buffer.line_starts.items;
+    if (starts.len == 0 or area.h <= 0) return;
+    const mark_h = @max(2.0, 2 * scale);
+    const mark_w = 6 * scale;
+    const x = area.x + area.w - mark_w - 2 * scale;
+    const total: f32 = @floatFromInt(@max(starts.len, editorSbVisLines(area, line_height)));
+    var line: usize = 0;
+    var last_y: f32 = -1;
+    for (list.items.items) |m| {
+        while (line + 1 < starts.len and starts[line + 1] <= m.start) line += 1;
+        const y = @floor(area.y + (area.h - mark_h) * @as(f32, @floatFromInt(line)) / total);
+        if (y == last_y) continue;
+        last_y = y;
+        (dvui.Rect.Physical{ .x = x, .y = y, .w = mark_w, .h = mark_h }).fill(.{}, .{ .color = color, .fade = 1.0 });
     }
 }
 
@@ -5358,6 +5805,14 @@ fn editorPane(editor: *Editor, pane_id: u8) void {
     // Wrap continuation marker style
     const wrap_marker_color = toDvui(editor.theme.wrap_marker);
 
+    // The find bar's matches in this document: a soft fill behind each one
+    // with its All button on, and an outline around the one the bar is on.
+    // (Asked before any line is read: listing the matches reads the whole
+    // buffer through its shared scratch slice.)
+    const find_paint = editor.find_bar.paint(editor, doc);
+    const find_fill = toDvui(editor.theme.find_match_bg);
+    const find_edge = toDvui(editor.theme.find_match_border);
+
     // --- Render lines (gutter + text in two clips) ---
     // Every column below is snapped to a code-point boundary of the drawn
     // line before it slices text for dvui (which decodes with `catch
@@ -5409,6 +5864,38 @@ fn editorPane(editor: *Editor, pane_id: u8) void {
             const e_exp = if (past_eol) line_text.len + 1 else displayCol(orig_line, line_text, e_in, tab_width);
             line_sels[line_sel_count] = .{ .start = s_exp, .end = e_exp, .to_eol = past_eol };
             line_sel_count += 1;
+        }
+
+        // Find-bar matches on this line as expanded column spans, constant
+        // across wrap rows like the selections (the first 256 of a line —
+        // more than any line one can read shows).
+        const HitSpan = struct { start: usize, end: usize, current: bool };
+        var line_hits: [256]HitSpan = undefined;
+        var line_hit_count: usize = 0;
+        if (find_paint.all != null or find_paint.current != null) {
+            const line_end_offset = line_start_offset + orig_line.len;
+            const listed: []const find_bar_mod.Match = if (find_paint.all) |list| list.within(line_start_offset, line_end_offset) else &.{};
+            const on: ?find_bar_mod.Match = if (find_paint.current) |m| (if (m.start < line_end_offset and m.end > line_start_offset) m else null) else null;
+            for (listed) |m| {
+                if (line_hit_count + 1 >= line_hits.len) break; // one slot stays free for `on`
+                if (on) |cur| {
+                    if (cur.start == m.start and cur.end == m.end) continue;
+                }
+                line_hits[line_hit_count] = .{
+                    .start = displayCol(orig_line, line_text, m.start -| line_start_offset, tab_width),
+                    .end = displayCol(orig_line, line_text, @min(m.end -| line_start_offset, orig_line.len), tab_width),
+                    .current = false,
+                };
+                line_hit_count += 1;
+            }
+            if (on) |m| {
+                line_hits[line_hit_count] = .{
+                    .start = displayCol(orig_line, line_text, m.start -| line_start_offset, tab_width),
+                    .end = displayCol(orig_line, line_text, @min(m.end -| line_start_offset, orig_line.len), tab_width),
+                    .current = true,
+                };
+                line_hit_count += 1;
+            }
         }
 
         // Pre-compute expanded column for primary cursor on this line
@@ -5558,6 +6045,16 @@ fn editorPane(editor: *Editor, pane_id: u8) void {
                     }
                 }
 
+                // Find-bar matches: the soft fill, under the text.
+                for (line_hits[0..line_hit_count]) |hit| {
+                    if (hit.current or hit.start >= row_end or hit.end <= row_start) continue;
+                    const hx0 = font.textSize(segment[0..@min(@max(hit.start, row_start) - row_start, segment.len)]).w * scale;
+                    const hx1 = font.textSize(segment[0..@min(@min(hit.end, row_end) - row_start, segment.len)]).w * scale;
+                    if (hx1 > hx0) {
+                        (dvui.Rect.Physical{ .x = row_x + hx0, .y = y, .w = hx1 - hx0, .h = line_height }).fill(.{}, .{ .color = find_fill, .fade = 1.0 });
+                    }
+                }
+
                 // Text (syntax-highlighted or plain)
                 if (segment.len > 0) {
                     if (span_count > 0) {
@@ -5633,6 +6130,18 @@ fn editorPane(editor: *Editor, pane_id: u8) void {
                         const bw = font.textSize(segment[local .. local + 1]).w * scale;
                         const br: dvui.Rect.Physical = .{ .x = row_x + bx, .y = y, .w = bw, .h = line_height };
                         br.stroke(.{}, .{ .thickness = 1 * scale, .color = caret_color, .closed = true });
+                    }
+                }
+
+                // The match the find bar is on: an outline over the text
+                // (it is selected, so the selection's fill is under it).
+                for (line_hits[0..line_hit_count]) |hit| {
+                    if (!hit.current or hit.start >= row_end or hit.end <= row_start) continue;
+                    const hx0 = font.textSize(segment[0..@min(@max(hit.start, row_start) - row_start, segment.len)]).w * scale;
+                    const hx1 = font.textSize(segment[0..@min(@min(hit.end, row_end) - row_start, segment.len)]).w * scale;
+                    if (hx1 > hx0) {
+                        const outline: dvui.Rect.Physical = .{ .x = row_x + hx0, .y = y, .w = hx1 - hx0, .h = line_height };
+                        outline.stroke(.{}, .{ .thickness = @max(1.0, scale), .color = find_edge, .closed = true });
                     }
                 }
 
@@ -5754,6 +6263,9 @@ fn editorPane(editor: *Editor, pane_id: u8) void {
         (dvui.Rect.Physical{ .x = render_area.x + render_area.w - border_w, .y = render_area.y, .w = border_w, .h = render_area.h }).fill(.{}, .{ .color = focus_color, .fade = 0.6 });
     }
 
+    // --- Find-bar marks where the scroll bar runs (All on), under the thumb ---
+    if (find_paint.all) |list| drawFindMarks(doc, list, render_area, line_height, scale, find_edge);
+
     // --- Scrollbar: slim pill over the right edge (matches the file tree) ---
     const sb_max_top = editorMaxScrollTop(doc, font, text_area_w_logical, editorSbVisLines(render_area, line_height), tab_width, do_wrap);
     if (editorSbThumb(doc, render_area, line_height, scale, sb_max_top)) |thumb| {
@@ -5767,7 +6279,7 @@ fn editorPane(editor: *Editor, pane_id: u8) void {
         thumb.fill(.{ .x = rad, .y = rad, .w = rad, .h = rad }, .{ .color = sb_color, .fade = 1.0 });
     }
 
-    // --- Modal overlays (find, find_replace, command_palette, goto_line, confirm_quit) ---
+    // --- Modal overlays (find_replace, command_palette, goto_line, confirm_quit) ---
     // Only render modals in the focused pane.
     if (is_active_pane and guiMode(editor) != .normal) {
         drawModalOverlay(editor, render_area, render_rs, scale);
@@ -7816,7 +8328,6 @@ fn guiLineNumberDigits(total_lines: usize, min_digits: usize) usize {
 fn handleModalKey(editor: *Editor, key: dvui.Event.Key) void {
     switch (editor.mode) {
         .goto_line => handleGotoLineKey(editor, key),
-        .find => handleFindKeyGui(editor, key),
         .find_replace => handleFindReplaceKeyGui(editor, key),
         .command_palette => handlePaletteKeyGui(editor, key),
         .picker => handlePickerKeyGui(editor, key),
@@ -7856,11 +8367,6 @@ fn handleModalText(editor: *Editor, txt: []const u8) void {
                 text_input.append(&editor.open_buf, &editor.open_buf_len, txt);
             }
         },
-        .find => {
-            editor.status_message = "";
-            text_input.append(&editor.find_buf, &editor.find_buf_len, txt);
-            editor.findIncremental();
-        },
         .find_replace => {
             editor.status_message = "";
             if (editor.replace_field_active) {
@@ -7898,25 +8404,6 @@ fn handleGotoLineKey(editor: *Editor, key: dvui.Event.Key) void {
         },
         .backspace => {
             if (editor.goto_buf_len > 0) editor.goto_buf_len -= 1;
-        },
-        else => {},
-    }
-}
-
-fn handleFindKeyGui(editor: *Editor, key: dvui.Event.Key) void {
-    switch (key.code) {
-        .escape => {
-            editor.setMode(.normal);
-            editor.status_message = "";
-        },
-        .enter => {
-            if (editor.find_buf_len > 0) editor.findNext();
-        },
-        .backspace => {
-            if (editor.find_buf_len > 0) {
-                text_input.backspace(&editor.find_buf, &editor.find_buf_len);
-                editor.findIncremental();
-            }
         },
         else => {},
     }
@@ -8156,6 +8643,9 @@ const settings_defs = [_]SettingDef{
     .{ .key = "auto_save", .label = "Auto Save", .kind = .boolean, .desc = "Auto-save dirty documents periodically" },
     .{ .key = "auto_save_interval_ms", .label = "Auto Save Interval (ms)", .kind = .number, .desc = "Delay before auto-save (500-300000)", .min = 500, .max = 300000 },
     .{ .key = "status_message_seconds", .label = "Message Highlight (s)", .kind = .number, .desc = "Seconds a new status-bar message stays highlighted, 0 = off (0-30)", .min = 0, .max = 30 },
+    .{ .key = "find_match_case", .label = "Find: Match Case", .kind = .boolean, .desc = "How the find bar's Aa button starts out: upper and lower case must match" },
+    .{ .key = "find_whole_word", .label = "Find: Whole Word", .kind = .boolean, .desc = "How the find bar's W button starts out: match whole words only" },
+    .{ .key = "find_highlight_all", .label = "Find: Highlight All Matches", .kind = .boolean, .desc = "The find bar's All button: tint every match and mark them on the scroll bar" },
     .{ .key = "gutter_min_digits", .label = "Gutter Min Digits", .kind = .number, .desc = "Minimum width of line number gutter (1-10)", .min = 1, .max = 10 },
     .{ .key = "completion_min_chars", .label = "Completion Min Chars", .kind = .number, .desc = "Identifier characters typed before the popup opens by itself (1-8)", .min = 1, .max = 8 },
     .{ .key = "page_size", .label = "Page Size", .kind = .number, .desc = "Lines to scroll on Page Up/Down (5-200)", .min = 5, .max = 200 },
@@ -8417,6 +8907,9 @@ fn getSettingBool(editor: *const Editor, key: []const u8) bool {
     if (std.mem.eql(u8, key, "tui_filetree_icons")) return editor.tui_filetree_icons;
     if (std.mem.eql(u8, key, "snippets_visible")) return editor.snippets_visible;
     if (std.mem.eql(u8, key, "snippets_double_click")) return editor.snippets_double_click;
+    if (std.mem.eql(u8, key, "find_match_case")) return editor.find_bar.options.match_case;
+    if (std.mem.eql(u8, key, "find_whole_word")) return editor.find_bar.options.whole_word;
+    if (std.mem.eql(u8, key, "find_highlight_all")) return editor.find_bar.highlight_all;
     return false;
 }
 
@@ -8454,6 +8947,9 @@ fn applySettingBool(editor: *Editor, key: []const u8, val: bool) void {
         if (!val) editor.snippets_focused = false;
     }
     if (std.mem.eql(u8, key, "snippets_double_click")) editor.snippets_double_click = val;
+    if (std.mem.eql(u8, key, "find_match_case")) editor.find_bar.options.match_case = val;
+    if (std.mem.eql(u8, key, "find_whole_word")) editor.find_bar.options.whole_word = val;
+    if (std.mem.eql(u8, key, "find_highlight_all")) editor.find_bar.highlight_all = val;
 }
 
 fn getSettingNumber(editor: *const Editor, key: []const u8) i64 {
@@ -9045,30 +9541,6 @@ fn drawModalOverlay(editor: *Editor, render_area: dvui.Rect.Physical, render_rs:
             var buf: [64]u8 = undefined;
             const txt = std.fmt.bufPrint(&buf, "Go to line: {s}_", .{editor.goto_buf[0..editor.goto_buf_len]}) catch "Go to line: ";
             renderOverlayText(font, txt, render_area.x + pad, render_area.y + pad, render_rs, fg);
-        },
-        .find => {
-            const h = lh + pad * 2;
-            fillBar(render_area, 0, h, bg);
-            var buf: [300]u8 = undefined;
-            const txt = std.fmt.bufPrint(&buf, "Find: {s}_", .{editor.find_buf[0..editor.find_buf_len]}) catch "Find: ";
-            renderOverlayText(font, txt, render_area.x + pad, render_area.y + pad, render_rs, fg);
-            // Show match count on the right
-            const needle = editor.find_buf[0..editor.find_buf_len];
-            if (needle.len > 0) {
-                const match_count = guiCountMatches(editor, needle);
-                var count_buf: [64]u8 = undefined;
-                const count_str = std.fmt.bufPrint(&count_buf, "{d} match{s}", .{
-                    match_count, @as([]const u8, if (match_count == 1) "" else "es"),
-                }) catch "";
-                if (count_str.len > 0) {
-                    const count_w = font.textSize(count_str).w * scale;
-                    const count_color = if (match_count == 0) warn_color else dim;
-                    renderOverlayText(font, count_str, render_area.x + render_area.w - count_w - pad, render_area.y + pad, render_rs, count_color);
-                }
-            } else if (editor.status_message.len > 0) {
-                const msg_w = font.textSize(editor.status_message).w * scale;
-                renderOverlayText(font, editor.status_message, render_area.x + render_area.w - msg_w - pad, render_area.y + pad, render_rs, warn_color);
-            }
         },
         .find_replace => {
             const h = lh * 2 + pad * 3;
@@ -11630,4 +12102,207 @@ test "GUI status messages: a new one is a filled block in its level's colors, mo
     try snippetsTestFrame(ui.window, &editor, &g, &ms);
     editor.status_flash.shown_ns.? -= 5 * std.time.ns_per_s;
     try snippetFormTestCapture(&editor, &g, &ms, "status_message_settled.png");
+}
+
+/// Tests only: a left click in the middle of `rect`.
+fn findBarTestClick(window: *dvui.Window, rect: dvui.Rect.Physical) !void {
+    _ = try window.addEventMouseMotion(.{ .pt = .{ .x = rect.x + rect.w / 2, .y = rect.y + rect.h / 2 } });
+    _ = try window.addEventMouseButton(.left, .press);
+    _ = try window.addEventMouseButton(.left, .release);
+}
+
+/// Tests only: the primary cursor's selection is exactly [start, end).
+fn findBarTestSelection(doc: *Document, start: usize, end: usize) !void {
+    const r = doc.cursors.primaryConst().selectionRange() orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(start, r.start);
+    try std.testing.expectEqual(end, r.end);
+}
+
+test "GUI find bar: Ctrl+F opens a row under the panes; typing, Enter, F3, the buttons and clicks drive it; Escape closes it" {
+    if (!build_options.has_gui) return error.SkipZigTest;
+    const t = std.testing;
+    var ui = try dvui.testing.init(.{ .window_size = .{ .w = 900, .h = 600 } });
+    defer ui.deinit();
+    var editor = try Editor.init(t.allocator, t.io);
+    defer editor.deinit();
+    var g = try GuiState.init(t.allocator);
+    defer g.deinit();
+    defer win_ui = undefined;
+    applyWindowFonts(ui.window, &g, &editor);
+    try snippetsTestSetup(&editor);
+    find_bar_geom = null;
+    find_bar_drag = false;
+    find_bar_click_count = 0;
+    var ms: u64 = 0;
+    const doc = editor.activeDoc();
+    const body = "const alpha = 1;\nconst Alpha = alpha + 2;\nvar alphabet = alpha;\n";
+    try doc.loadText(body);
+    const fb = &editor.find_bar;
+    for (0..2) |_| try snippetsTestFrame(ui.window, &editor, &g, &ms);
+    try t.expect(find_bar_geom == null);
+
+    // Ctrl+F: the row is there in the same frame, its box has the keyboard,
+    // and the mode stays normal — the text is live behind it.
+    try dvui.testing.pressKey(.f, .lcontrol);
+    try snippetsTestFrame(ui.window, &editor, &g, &ms);
+    try t.expect(fb.visible);
+    try t.expectEqual(Editor.KeyboardOwner.find_bar, editor.keyboardOwner());
+    try t.expectEqual(Editor.Mode.normal, editor.mode);
+    for (0..2) |_| try snippetsTestFrame(ui.window, &editor, &g, &ms);
+    var geom = find_bar_geom orelse return error.TestUnexpectedResult;
+    try t.expect(geom.area.w > 600 and geom.area.h > 0);
+    try t.expect(geom.box.w >= 80 * geom.scale);
+    try t.expect(geom.text.x > geom.box.x and geom.text.w > 0);
+    try t.expect(geom.toggles[0].x > geom.text.x and geom.toggles[1].x > geom.toggles[0].x);
+    try t.expect(geom.toggles[2].x > geom.box.x + geom.box.w);
+    try t.expect(geom.next.x > geom.prev.x and geom.close.x > geom.next.x);
+    try snippetFormTestCapture(&editor, &g, &ms, "find_bar_empty.png");
+
+    // Typing goes to the box, never into the document; the first match from
+    // the caret is selected, upper and lower case alike.
+    try dvui.testing.writeText("alpha");
+    try snippetsTestFrame(ui.window, &editor, &g, &ms);
+    try t.expectEqualStrings("alpha", fb.needle.text());
+    try t.expectEqualStrings(body, doc.buffer.slice(0, doc.buffer.byteLen()));
+    try findBarTestSelection(doc, 6, 11);
+    try t.expectEqual(find_bar_mod.Count{ .total = 5, .current = 0 }, fb.count(&editor));
+
+    // Enter / Shift+Enter, F3 / Shift+F3
+    try dvui.testing.pressKey(.enter, .none);
+    try snippetsTestFrame(ui.window, &editor, &g, &ms);
+    try findBarTestSelection(doc, 23, 28);
+    try dvui.testing.pressKey(.f3, .none);
+    try snippetsTestFrame(ui.window, &editor, &g, &ms);
+    try findBarTestSelection(doc, 31, 36);
+    try dvui.testing.pressKey(.f3, .lshift);
+    try snippetsTestFrame(ui.window, &editor, &g, &ms);
+    try findBarTestSelection(doc, 23, 28);
+    try dvui.testing.pressKey(.enter, .lshift);
+    try snippetsTestFrame(ui.window, &editor, &g, &ms);
+    try findBarTestSelection(doc, 6, 11);
+    try snippetFormTestCapture(&editor, &g, &ms, "find_bar_match.png");
+
+    // The buttons: W, then Aa — each a click, each narrowing the matches
+    geom = find_bar_geom.?;
+    try findBarTestClick(ui.window, geom.toggles[1]);
+    try snippetsTestFrame(ui.window, &editor, &g, &ms);
+    try t.expect(fb.options.whole_word);
+    try t.expectEqual(@as(usize, 4), fb.count(&editor).total);
+    try t.expectEqual(Editor.KeyboardOwner.find_bar, editor.keyboardOwner());
+    try findBarTestClick(ui.window, geom.toggles[0]);
+    try snippetsTestFrame(ui.window, &editor, &g, &ms);
+    try t.expect(fb.options.match_case);
+    try t.expectEqual(find_bar_mod.Count{ .total = 3, .current = 0 }, fb.count(&editor));
+    // Alt+C / Alt+W are the same two buttons
+    try dvui.testing.pressKey(.c, .lalt);
+    try dvui.testing.pressKey(.w, .lalt);
+    try snippetsTestFrame(ui.window, &editor, &g, &ms);
+    try t.expect(!fb.options.match_case and !fb.options.whole_word);
+    try t.expectEqual(@as(usize, 5), fb.count(&editor).total);
+
+    // All: every match tinted, marks where the scroll bar runs
+    try findBarTestClick(ui.window, geom.toggles[2]);
+    try snippetsTestFrame(ui.window, &editor, &g, &ms);
+    try t.expect(fb.highlight_all);
+    try t.expectEqual(@as(usize, 5), fb.paint(&editor, doc).all.?.items.items.len);
+    try snippetFormTestCapture(&editor, &g, &ms, "find_bar_all.png");
+
+    // The arrows
+    try findBarTestClick(ui.window, geom.next);
+    try snippetsTestFrame(ui.window, &editor, &g, &ms);
+    try findBarTestSelection(doc, 23, 28);
+    try findBarTestClick(ui.window, geom.prev);
+    try snippetsTestFrame(ui.window, &editor, &g, &ms);
+    try findBarTestSelection(doc, 6, 11);
+
+    // The box is a text box: a click places the caret, a double-click takes
+    // the word, the editing chords stay in it.
+    _ = try ui.window.addEventMouseMotion(.{ .pt = .{ .x = geom.text.x + 1, .y = geom.text.y + geom.text.h / 2 } });
+    _ = try ui.window.addEventMouseButton(.left, .press);
+    _ = try ui.window.addEventMouseButton(.left, .release);
+    try snippetsTestFrame(ui.window, &editor, &g, &ms);
+    try t.expectEqual(@as(usize, 0), fb.needle.caret);
+    try t.expect(fb.needle.selection() == null);
+    _ = try ui.window.addEventMouseButton(.left, .press);
+    _ = try ui.window.addEventMouseButton(.left, .release);
+    try snippetsTestFrame(ui.window, &editor, &g, &ms);
+    try t.expectEqualStrings("alpha", fb.needle.selectedText());
+    try dvui.testing.pressKey(.end, .none);
+    try dvui.testing.writeText("zz");
+    try snippetsTestFrame(ui.window, &editor, &g, &ms);
+    try t.expectEqualStrings("alphazz", fb.needle.text());
+    try t.expectEqual(find_bar_mod.Count{}, fb.count(&editor));
+    try snippetFormTestCapture(&editor, &g, &ms, "find_bar_none.png");
+    try dvui.testing.pressKey(.backspace, .lcontrol);
+    try snippetsTestFrame(ui.window, &editor, &g, &ms);
+    try t.expectEqualStrings("", fb.needle.text());
+    try dvui.testing.pressKey(.z, .lcontrol);
+    try snippetsTestFrame(ui.window, &editor, &g, &ms);
+    try t.expectEqualStrings("alphazz", fb.needle.text());
+    try dvui.testing.pressKey(.backspace, .none);
+    try dvui.testing.pressKey(.backspace, .none);
+    try snippetsTestFrame(ui.window, &editor, &g, &ms);
+    try t.expectEqualStrings("alpha", fb.needle.text());
+    try t.expectEqualStrings(body, doc.buffer.slice(0, doc.buffer.byteLen()));
+    try t.expect(!doc.dirty);
+
+    // A hint shows while the pointer rests on a button
+    _ = try ui.window.addEventMouseMotion(.{ .pt = .{ .x = geom.toggles[0].x + geom.toggles[0].w / 2, .y = geom.toggles[0].y + geom.toggles[0].h / 2 } });
+    for (0..8) |_| try snippetsTestFrame(ui.window, &editor, &g, &ms);
+    try snippetFormTestCapture(&editor, &g, &ms, "find_bar_hint.png");
+    var hint_buf: [96]u8 = undefined;
+    try t.expectEqualStrings("Match case (Alt+C)", findBarHintText(&editor, "Match case", "", "find_toggle_case", &hint_buf));
+    try t.expectEqualStrings("Next match (Enter, F3)", findBarHintText(&editor, "Next match", "Enter", "find_next", &hint_buf));
+    editor.keybinds.remove("f3");
+    try t.expectEqualStrings("Next match (Enter)", findBarHintText(&editor, "Next match", "Enter", "find_next", &hint_buf));
+    try t.expectEqualStrings("Plain", findBarHintText(&editor, "Plain", "", "no_such_action", &hint_buf));
+    try editor.keybinds.set("f3", "find_next");
+
+    // A click in the text gives the pane the keyboard; the bar stays up and
+    // F3 keeps walking. Escape there closes the bar.
+    _ = try ui.window.addEventMouseMotion(.{ .pt = .{ .x = geom.area.x + geom.area.w / 2, .y = geom.area.y - 200 } });
+    _ = try ui.window.addEventMouseButton(.left, .press);
+    _ = try ui.window.addEventMouseButton(.left, .release);
+    for (0..2) |_| try snippetsTestFrame(ui.window, &editor, &g, &ms);
+    try t.expectEqual(Editor.KeyboardOwner.editor, editor.keyboardOwner());
+    try t.expect(fb.visible);
+    try t.expect(find_bar_geom != null);
+    doc.cursors.primary().* = .{ .offset = 0 };
+    try dvui.testing.pressKey(.f3, .none);
+    try snippetsTestFrame(ui.window, &editor, &g, &ms);
+    try findBarTestSelection(doc, 6, 11);
+    try dvui.testing.pressKey(.escape, .none);
+    for (0..2) |_| try snippetsTestFrame(ui.window, &editor, &g, &ms);
+    try t.expect(!fb.visible);
+    try t.expect(find_bar_geom == null);
+    try findBarTestSelection(doc, 6, 11);
+
+    // The close button, and Escape in the box
+    try dvui.testing.pressKey(.f, .lcontrol);
+    for (0..2) |_| try snippetsTestFrame(ui.window, &editor, &g, &ms);
+    try t.expectEqual(Editor.KeyboardOwner.find_bar, editor.keyboardOwner());
+    try t.expectEqualStrings("alpha", fb.needle.selectedText()); // seeded from the selection
+    try findBarTestClick(ui.window, find_bar_geom.?.close);
+    for (0..2) |_| try snippetsTestFrame(ui.window, &editor, &g, &ms);
+    try t.expect(!fb.visible);
+    try t.expectEqual(Editor.KeyboardOwner.editor, editor.keyboardOwner());
+    try dvui.testing.pressKey(.f, .lcontrol);
+    try snippetsTestFrame(ui.window, &editor, &g, &ms);
+    try dvui.testing.pressKey(.escape, .none);
+    for (0..2) |_| try snippetsTestFrame(ui.window, &editor, &g, &ms);
+    try t.expect(!fb.visible);
+    try t.expectEqual(Editor.KeyboardOwner.editor, editor.keyboardOwner());
+    // Typing lands in the document again
+    try dvui.testing.writeText("X");
+    for (0..2) |_| try snippetsTestFrame(ui.window, &editor, &g, &ms);
+    try t.expect(doc.dirty);
+
+    // ZIDE_CAPTURE_DIR=<dir>: the light theme, All on, the box with the keyboard
+    switchTheme(&editor, "light");
+    try doc.loadText(body);
+    try dvui.testing.pressKey(.f, .lcontrol);
+    for (0..3) |_| try snippetsTestFrame(ui.window, &editor, &g, &ms);
+    try dvui.testing.pressKey(.enter, .none);
+    for (0..2) |_| try snippetsTestFrame(ui.window, &editor, &g, &ms);
+    try snippetFormTestCapture(&editor, &g, &ms, "find_bar_light.png");
 }

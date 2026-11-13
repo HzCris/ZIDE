@@ -21,6 +21,7 @@ const fileicons = @import("../core/fileicons.zig");
 const FileTree = filetree_mod.FileTree;
 const snippets_mod = @import("../core/snippets.zig");
 const snippet_form_mod = @import("../core/snippet_form.zig");
+const find_bar_mod = @import("../core/find_bar.zig");
 
 const Key = vaxis.Key;
 const Cell = vaxis.Cell;
@@ -277,10 +278,10 @@ fn firstLine(text: []const u8) []const u8 {
 }
 
 /// Where a paste goes: the focused terminal's program (bracketed when it
-/// asked for that), the document as one edit, the search field, the
-/// snippet form's active field or a single-line prompt as typed text (its
-/// first line). Pickers and confirmation prompts never take a paste — a
-/// pasted letter must not answer them.
+/// asked for that), the document as one edit, the search field, the find
+/// bar's box, the snippet form's active field or a single-line prompt as
+/// typed text (its first line). Pickers and confirmation prompts never take
+/// a paste — a pasted letter must not answer them.
 fn applyPaste(editor: *Editor, text: []const u8) void {
     if (text.len == 0) return;
     editor.validateSnippetState();
@@ -291,9 +292,10 @@ fn applyPaste(editor: *Editor, text: []const u8) void {
             .terminal_panel => if (editor.terminalPanelTerminal()) |term| term.paste(text),
             .editor => pasteIntoDocument(editor, text),
             .search => typeLine(editor, firstLine(text)),
+            .find_bar => findBarInsert(editor, firstLine(text)),
             .filetree, .snippets => {},
         },
-        .find, .find_replace, .file_open, .folder_open, .save_as, .command_palette, .picker, .goto_line, .file_finder, .symbol_rename, .snippet_form => typeLine(editor, firstLine(text)),
+        .find_replace, .file_open, .folder_open, .save_as, .command_palette, .picker, .goto_line, .file_finder, .symbol_rename, .snippet_form => typeLine(editor, firstLine(text)),
         .filetree_prompt => if (editor.filetree_prompt_kind != .delete_confirm) typeLine(editor, firstLine(text)),
         else => {},
     }
@@ -507,18 +509,6 @@ pub fn run(allocator: std.mem.Allocator, editor: *Editor) !void {
 
         // Draw overlay if in a special mode (replaces status bar)
         switch (editor.mode) {
-            .find => {
-                drawOverlay(win, editor, "Find: ", editor.find_buf[0..editor.find_buf_len], width, height);
-                // Show search status message (e.g. "No matches found") right-aligned
-                if (editor.status_message.len > 0) {
-                    const msg_style: Style = .{ .bg = toVaxis(editor.tui_theme.overlay_bg), .fg = toVaxis(editor.tui_theme.overlay_warn) };
-                    const overlay_y: u16 = height -| 1;
-                    const msg_win = win.child(.{ .y_off = @intCast(overlay_y), .width = width, .height = 1 });
-                    const msg_len: u16 = @intCast(@min(editor.status_message.len, width));
-                    const msg_x: u16 = width -| msg_len -| 1;
-                    _ = writeStr(msg_win, msg_x, 0, editor.status_message, msg_style);
-                }
-            },
             .find_replace => {
                 drawFindReplaceOverlay(win, editor, width, height);
             },
@@ -592,11 +582,13 @@ pub fn run(allocator: std.mem.Allocator, editor: *Editor) !void {
                 }
             },
             // The caret follows the keyboard: the editor's or the terminal's
-            // cursor, none while a side panel owns the keys (the tree and the
-            // search panel draw their own selection / field marker).
+            // cursor, the find bar's box, none while a side panel owns the
+            // keys (the tree and the search panel draw their own selection /
+            // field marker).
             .normal => switch (editor.keyboardOwner()) {
                 .editor, .terminal => positionCursor(win, editor, width, height),
                 .terminal_panel => positionTerminalPanelCursor(win, editor),
+                .find_bar => positionFindBarCursor(win, editor),
                 .filetree, .snippets, .search => win.hideCursor(),
             },
         }
@@ -633,6 +625,7 @@ fn dispatchKey(editor: *Editor, key: Key) void {
             .filetree => return handleFiletreeKey(editor, key),
             .snippets => return handleSnippetsKey(editor, key),
             .search => return handleSearchKey(editor, key),
+            .find_bar => return handleFindBarKey(editor, key),
             .editor => {},
         }
     }
@@ -657,7 +650,6 @@ fn dispatchKey(editor: *Editor, key: Key) void {
     const plain = !hasCommandMod(key);
     switch (editor.mode) {
         .normal => handleKey(editor, key),
-        .find => handleFindKey(editor, key),
         .find_replace => handleFindReplaceKey(editor, key),
         .file_open => handleFileOpenKey(editor, key),
         .folder_open => handleFolderOpenKey(editor, key),
@@ -882,6 +874,33 @@ var filetree_band: ?FiletreeBand = null;
 /// hidden. Used for mouse hit-testing like filetree_band.
 const SearchBand = struct { y: u16, h: u16 };
 var search_band: ?SearchBand = null;
+
+/// The find bar's row from the last draw (absolute screen cells): where its
+/// box and buttons are — clicks and the caret are placed through it. Null
+/// when the bar is not drawn.
+const FindBarBand = struct {
+    const Span = struct {
+        x: u16 = 0,
+        w: u16 = 0,
+
+        fn has(self: Span, col: u16) bool {
+            return col >= self.x and col < self.x + self.w;
+        }
+    };
+
+    x: u16,
+    y: u16,
+    w: u16,
+    box: Span = .{},
+    /// In `find_bar_toggles` order.
+    toggles: [find_bar_toggles.len]Span = @splat(.{}),
+    prev: Span = .{},
+    next: Span = .{},
+    close: Span = .{},
+};
+var find_bar_band: ?FindBarBand = null;
+/// A left press landed in the find bar's box: the drag after it selects there.
+var find_bar_drag: bool = false;
 /// The snippet form band (full width, above the search panel and the
 /// status bar) with the rows it showed, from the last draw; null when
 /// hidden. Clicks pick a field through it.
@@ -932,6 +951,7 @@ fn drawEditor(win: Window, editor: *Editor, width: u16, height: u16) void {
     snippets_band = null;
     terminal_panel_band = null;
     search_band = null;
+    find_bar_band = null;
     snippet_form_band = null;
     encoding_band = null;
     encoding_picker_band = null;
@@ -1056,6 +1076,14 @@ fn drawEditor(win: Window, editor: *Editor, width: u16, height: u16) void {
         }
     }
 
+    // The find bar: one row under the panes, as wide as they are (a bottom
+    // terminal panel sits below it). Without a row and twelve columns to
+    // spare it is not drawn, and its box lets go of the keyboard — typing
+    // must not land unseen.
+    const find_h: u16 = if (editor.find_bar.visible and panes_height >= 2 and content_width >= find_bar_min_width) 1 else 0;
+    if (find_h == 0 and editor.keyboardOwner() == .find_bar) _ = editor.takeKeyboardFocus(.pane);
+    panes_height -= find_h;
+
     // Render pane tree into the content area
     const content_win = win.child(.{
         .x_off = @intCast(content_x),
@@ -1068,6 +1096,18 @@ fn drawEditor(win: Window, editor: *Editor, width: u16, height: u16) void {
     // one row up / one col right, drawing the cursor next to the wrong line
     // and skewing mouse hit-testing.)
     renderPaneLayout(content_win, editor, 0, content_x, tab_bar_height, content_width, panes_height);
+
+    // Find bar (after the panes: its count reads the selection they showed)
+    if (find_h > 0) {
+        const bar_y = tab_bar_height + panes_height;
+        const bar_win = win.child(.{
+            .x_off = @intCast(content_x),
+            .y_off = @intCast(bar_y),
+            .height = 1,
+            .width = content_width,
+        });
+        find_bar_band = drawFindBar(bar_win, editor, content_x, bar_y, content_width);
+    }
 
     // Snippet form band (full width, above the search panel)
     if (form_h > 0) {
@@ -2627,6 +2667,10 @@ fn drawContent(win: Window, doc: *Document, editor: *Editor, width: u16, height:
     const bracket_pair: ?brackets.Pair = if (doc == editor.activeDoc()) brackets.matchAtCaret(&doc.buffer, doc.cursors.primaryConst().offset) else null;
 
     const cursor_pos = doc.cursorPos();
+    // The find bar's matches, when its All button is on and this is the
+    // document it searches. (Asked before any line is read: listing the
+    // matches reads the whole buffer through its shared scratch slice.)
+    const find_tints = editor.find_bar.paint(editor, doc).all;
 
     const bg = toVaxis(editor.tui_theme.text_bg);
     const line_num_style: Style = .{ .fg = toVaxis(editor.tui_theme.gutter_text), .bg = bg };
@@ -2857,6 +2901,37 @@ fn drawContent(win: Window, doc: *Document, editor: *Editor, width: u16, height:
                             new_cell.style.bg = sel_style.bg;
                             new_cell.style.fg = sel_style.fg;
                             win.writeCell(text_start_x + cx, y, new_cell);
+                        }
+                    }
+                }
+            }
+
+            // Find matches: tinted cells, restyled post-hoc like the
+            // secondary selections. The match the bar is on is the selection
+            // and keeps its colors.
+            if (find_tints) |list| {
+                if (text_start_x < width) {
+                    const line_start_offset = doc.buffer.posToOffset(line_idx, 0);
+                    const seg_text = line[seg.start..seg.end];
+                    const abs_seg_start = line_start_offset + seg.start;
+                    const abs_seg_end = line_start_offset + seg.end;
+                    for (list.within(abs_seg_start, abs_seg_end)) |m| {
+                        if (sel) |cur| {
+                            if (cur.start == m.start and cur.end == m.end) continue;
+                        }
+                        const lo = m.start -| abs_seg_start;
+                        const hi = @min(m.end, abs_seg_end) - abs_seg_start;
+                        const cx_start = advanceCols(seg_text[0..@min(lo, seg_text.len)], seg.col0, tab) - seg.col0;
+                        const cx_end = advanceCols(seg_text[0..@min(hi, seg_text.len)], seg.col0, tab) - seg.col0;
+                        var cx: u16 = @intCast(@min(cx_start, text_width));
+                        const cx_lim: u16 = @intCast(@min(cx_end, text_width));
+                        while (cx < cx_lim) : (cx += 1) {
+                            if (win.readCell(text_start_x + cx, y)) |cell| {
+                                var new_cell = cell;
+                                new_cell.style.bg = toVaxis(editor.tui_theme.find_match_bg);
+                                new_cell.style.fg = toVaxis(editor.tui_theme.find_match_fg);
+                                win.writeCell(text_start_x + cx, y, new_cell);
+                            }
                         }
                     }
                 }
@@ -3312,6 +3387,7 @@ fn handleMouse(editor: *Editor, mouse: vaxis.Mouse) void {
                 press_pane = null;
                 block_drag = false;
                 block_engaged = false;
+                find_bar_drag = false;
             },
             .motion => {},
         },
@@ -3328,6 +3404,7 @@ fn mousePress(editor: *Editor, mouse: vaxis.Mouse) void {
     press_pane = null;
     block_drag = false;
     block_engaged = false;
+    find_bar_drag = false;
 
     // Tab bar click: show the document in the focused pane, which also takes
     // the keyboard back from a focused side panel (Editor.showDocIn)
@@ -3337,6 +3414,14 @@ fn mousePress(editor: *Editor, mouse: vaxis.Mouse) void {
             if (tabAtX(editor, @intCast(mouse.col))) |doc_idx| editor.showDocIn(0, doc_idx);
         }
         return;
+    }
+
+    // Find bar row: its box takes the keyboard, its buttons act
+    if (find_bar_band) |band| {
+        if (mouse.row == band.y and mouse.col >= band.x and mouse.col < @as(i32, band.x) + band.w) {
+            handleFindBarClick(editor, band, @intCast(mouse.col), mouse.mods.shift);
+            return;
+        }
     }
 
     // Search panel band: clicks focus the panel / pick a row
@@ -3415,6 +3500,14 @@ fn clampLocal(v: i16, origin: u16, size: u16) u16 {
 }
 
 fn mouseDrag(editor: *Editor, mouse: vaxis.Mouse) void {
+    // A drag that began in the find bar's box selects in it.
+    if (find_bar_drag) {
+        const band = find_bar_band orelse return;
+        const cell = clampLocal(mouse.col, band.box.x, @max(band.box.w, 1));
+        const box = &editor.find_bar.needle;
+        box.setCaret(findBarOffsetAt(box, cell), true);
+        return;
+    }
     // A drag stays in the pane its press landed in, clamped to that pane's
     // text: resolved against the pane under the mouse, it wrote another
     // document's offset into this one (an offset past its end).
@@ -3954,22 +4047,10 @@ fn handleSearchKey(editor: *Editor, key: Key) void {
         editor.searchHide();
         return;
     }
-    // Global chords still work from the panel (Ctrl+Shift+F cycle, F4, …)
+    // Global chords still work from the panel (Ctrl+Shift+F cycle, F4, …).
+    // Alt+C / Alt+W are two of them: find_toggle_case and
+    // find_toggle_whole_word flip the panel's buttons while it has the keys.
     if (tryKeybindCommand(editor, key)) return;
-    if (key.mods.alt) {
-        switch (key.codepoint) {
-            'c' => {
-                sp.case_sensitive = !sp.case_sensitive;
-                if (sp.query_len > 0) editor.searchStart();
-            },
-            'w' => {
-                sp.whole_word = !sp.whole_word;
-                if (sp.query_len > 0) editor.searchStart();
-            },
-            else => {},
-        }
-        return;
-    }
     if (key.codepoint == Key.tab) {
         sp.cycleField();
         return;
@@ -4553,33 +4634,222 @@ test "prompt input ignores functional keys that arrive without text" {
     try std.testing.expectEqualStrings("a é", buf[0..len]);
 }
 
-/// Handle keys in Find mode.
-fn handleFindKey(editor: *Editor, key: Key) void {
-    if (key.isModifier()) return;
+// ===========================================================================
+// The find bar (Ctrl+F): one row under the panes that stays open
+// ===========================================================================
 
-    if (key.codepoint == Key.escape) {
-        // Close find, keep cursor at current match
-        editor.setMode(.normal);
-        editor.status_message = "";
-        return;
+/// The bar's toggle buttons, in the order they are drawn. No hover in a
+/// terminal: flipping one names it in the status bar.
+const find_bar_toggles = [_]struct { which: find_bar_mod.Toggle, label: []const u8 }{
+    .{ .which = .match_case, .label = " Aa " },
+    .{ .which = .whole_word, .label = " W " },
+    .{ .which = .highlight_all, .label = " All " },
+};
+
+/// Narrowest pane area the bar is drawn in, and the fewest cells its box
+/// keeps before a part of the bar is left out.
+const find_bar_min_width: u16 = 12;
+
+/// `piece` takes at most `width` cells.
+fn fitsCells(width: usize, piece: []const u8) bool {
+    return advanceCols(piece, 0, 1) <= width;
+}
+
+/// Draw the find bar into `win` (one row of `width` cells whose first cell
+/// is screen cell x0, y0): ` Find `, the text box, the toggle buttons, the
+/// count, previous / next and close. A narrow row leaves out what it has
+/// no room for, the label first.
+fn drawFindBar(win: Window, editor: *Editor, x0: u16, y0: u16, width: u16) FindBarBand {
+    const fb = &editor.find_bar;
+    const th = &editor.tui_theme;
+    const focused = editor.mode == .normal and editor.keyboardOwner() == .find_bar;
+    const base: Style = .{ .bg = toVaxis(th.overlay_bg), .fg = toVaxis(th.overlay_fg) };
+    const dim: Style = .{ .bg = toVaxis(th.overlay_bg), .fg = toVaxis(th.overlay_dim) };
+    const lit: Style = .{ .bg = toVaxis(th.overlay_selection_bg), .fg = toVaxis(th.overlay_selection_fg), .bold = true };
+    win.fill(.{ .style = base });
+
+    const count = fb.count(editor);
+    var count_buf: [32]u8 = undefined;
+    const count_txt = find_bar_mod.countLabel(count, fb.needle.len > 0, &count_buf);
+    const none = fb.needle.len > 0 and count.total == 0;
+
+    // What fits beside a box of at least find_bar_min_width cells.
+    const label = " Find ";
+    const toggles_w: u16 = comptime blk: {
+        var w: u16 = 0;
+        for (find_bar_toggles) |tg| w += tg.label.len + 1;
+        break :blk w;
+    };
+    const count_w: u16 = 14; // "100000+ found" and a blank
+    const nav_w: u16 = 7;
+    const close_w: u16 = 3;
+    var room: u16 = width;
+    const Parts = struct { toggles: bool = false, count: bool = false, close: bool = false, nav: bool = false, label: bool = false };
+    var show: Parts = .{};
+    if (room >= toggles_w + find_bar_min_width) {
+        room -= toggles_w;
+        show.toggles = true;
     }
-    if (key.codepoint == Key.enter) {
-        // Find next match from current position
-        if (editor.find_buf_len > 0) {
-            editor.findNext();
+    if (room >= count_w + find_bar_min_width) {
+        room -= count_w;
+        show.count = true;
+    }
+    if (room >= close_w + find_bar_min_width) {
+        room -= close_w;
+        show.close = true;
+    }
+    if (room >= nav_w + find_bar_min_width) {
+        room -= nav_w;
+        show.nav = true;
+    }
+    if (room >= label.len + find_bar_min_width) {
+        room -= label.len;
+        show.label = true;
+    }
+
+    var band: FindBarBand = .{ .x = x0, .y = y0, .w = width };
+    var x: u16 = 0;
+    if (show.label) {
+        const label_style: Style = if (focused) .{ .bg = base.bg, .fg = toVaxis(th.overlay_accent), .bold = true } else dim;
+        x = writeStr(win, 0, 0, label, label_style);
+    }
+
+    // The box: `room` cells, the last one a blank before the buttons.
+    // Underlined so its extent shows; tinted when the text matches nothing.
+    const box_w: u16 = room - 1;
+    band.box = .{ .x = x0 + x, .w = box_w };
+    const box = &fb.needle;
+    // One cell stays free for the caret after the last character.
+    box.scrollToCaret(@as(usize, box_w - 1), fitsCells);
+    const field: Style = if (none)
+        .{ .bg = toVaxis(th.status_error_bg), .fg = toVaxis(th.status_error_fg) }
+    else
+        .{ .bg = toVaxis(th.text_bg), .fg = toVaxis(th.text_fg), .ul_style = .single };
+    const box_win = win.child(.{ .x_off = @intCast(x), .y_off = 0, .width = box_w, .height = 1 });
+    box_win.fill(.{ .style = field });
+    const text = box.text();
+    const first = @min(box.scroll, text.len);
+    const last = first + fitEnd(text[first..], 0, box_w, 1);
+    if (if (focused) box.selection() else null) |r| {
+        const a = std.math.clamp(r.start, first, last);
+        const b = std.math.clamp(r.end, first, last);
+        const picked: Style = .{ .bg = toVaxis(th.selection_bg), .fg = toVaxis(th.selection_fg) };
+        var bx: u16 = 0;
+        if (a > first) bx = writeStr(box_win, bx, 0, text[first..a], field);
+        if (b > a) bx = writeStr(box_win, bx, 0, text[a..b], picked);
+        if (last > b) _ = writeStr(box_win, bx, 0, text[b..last], field);
+    } else if (last > first) {
+        _ = writeStr(box_win, 0, 0, text[first..last], field);
+    }
+    x += room;
+
+    if (show.toggles) {
+        for (find_bar_toggles, 0..) |tg, i| {
+            band.toggles[i] = .{ .x = x0 + x, .w = @intCast(tg.label.len) };
+            x = writeStr(win, x, 0, tg.label, if (fb.isOn(tg.which)) lit else dim) + 1;
         }
-        return;
     }
-    if (key.codepoint == Key.backspace) {
-        if (editor.find_buf_len > 0) {
-            text_input.backspace(&editor.find_buf, &editor.find_buf_len);
-            editor.findIncremental();
-        }
-        return;
+    if (show.count) {
+        const shown: u16 = @intCast(@min(count_txt.len, count_w - 1));
+        const count_style: Style = if (none) .{ .bg = base.bg, .fg = toVaxis(th.overlay_warn), .bold = true } else dim;
+        if (shown > 0) _ = writeStr(win, x + (count_w - 1 - shown), 0, count_txt[0..shown], count_style);
+        x += count_w;
     }
-    editor.status_message = "";
-    appendToInputBuf(&editor.find_buf, &editor.find_buf_len, key);
-    editor.findIncremental();
+    if (show.nav) {
+        band.prev = .{ .x = x0 + x, .w = 3 };
+        _ = writeStr(win, x, 0, " \u{2191} ", base);
+        band.next = .{ .x = x0 + x + 3, .w = 3 };
+        _ = writeStr(win, x + 3, 0, " \u{2193} ", base);
+        x += nav_w;
+    }
+    if (show.close) {
+        band.close = .{ .x = x0 + x, .w = close_w };
+        _ = writeStr(win, x, 0, " \u{00d7} ", base);
+    }
+    return band;
+}
+
+/// The terminal caret in the find bar's box (hidden when the bar is not
+/// drawn, or the caret is outside what the box shows).
+fn positionFindBarCursor(win: Window, editor: *Editor) void {
+    const band = find_bar_band orelse return win.hideCursor();
+    const box = &editor.find_bar.needle;
+    if (box.scroll > box.caret) return win.hideCursor();
+    const col = advanceCols(box.text()[box.scroll..box.caret], 0, 1);
+    if (col >= band.box.w) return win.hideCursor();
+    win.showCursor(band.box.x + @as(u16, @intCast(col)), band.y);
+    win.setCursorShape(.beam_blink);
+}
+
+/// Byte offset in the box's text for cell `cell` of the box as drawn.
+fn findBarOffsetAt(box: *const find_bar_mod.Needle, cell: usize) usize {
+    const text = box.text();
+    const first = @min(box.scroll, text.len);
+    return first + byteAtCol(text[first..], 0, cell, 1, true);
+}
+
+/// A left press on the find bar's row: the box takes the keyboard (the
+/// search starts where the caret in the text is), and the press acts on
+/// what it hit — a toggle, previous / next, close, or a place in the box.
+fn handleFindBarClick(editor: *Editor, band: FindBarBand, col: u16, shift: bool) void {
+    const fb = &editor.find_bar;
+    fb.focus(editor);
+    if (band.close.has(col)) return fb.close(editor);
+    if (band.prev.has(col)) return fb.step(editor, false);
+    if (band.next.has(col)) return fb.step(editor, true);
+    for (find_bar_toggles, band.toggles) |tg, span| {
+        if (span.has(col)) return fb.toggle(editor, tg.which);
+    }
+    if (band.box.has(col)) {
+        fb.needle.setCaret(findBarOffsetAt(&fb.needle, col - band.box.x), shift);
+        find_bar_drag = true;
+    }
+}
+
+/// Typed or pasted text for the find bar's box.
+fn findBarInsert(editor: *Editor, text: []const u8) void {
+    scroll_pinned = false;
+    if (editor.find_bar.needle.insert(text)) editor.find_bar.edited(editor);
+}
+
+/// Keys while the find bar's box owns the keyboard: Enter / Shift+Enter go
+/// to the next / previous match, Escape closes the bar, Up / Down walk the
+/// earlier searches, the arrows, Home / End, Backspace and Delete edit the
+/// box (Shift selects). The Ctrl / Alt / F-key chords go through the
+/// keybind map first — the clipboard, word and undo ones edit the box
+/// (Editor.panelAction), F3 and the toggles are commands.
+fn handleFindBarKey(editor: *Editor, key: Key) void {
+    if (key.isModifier()) return;
+    scroll_pinned = false;
+    editor.dismissStatus();
+    if (tryKeybindCommand(editor, key)) return;
+    if (key.mods.super) return;
+    const fb = &editor.find_bar;
+    const box = &fb.needle;
+    const shift = key.mods.shift;
+    switch (key.codepoint) {
+        Key.escape => fb.close(editor),
+        Key.enter => fb.step(editor, !shift),
+        Key.up => fb.historyStep(editor, true),
+        Key.down => fb.historyStep(editor, false),
+        Key.left => box.moveLeft(shift),
+        Key.right => box.moveRight(shift),
+        Key.home => box.moveHome(shift),
+        Key.end => box.moveEnd(shift),
+        Key.backspace => if (box.backspace()) fb.edited(editor),
+        Key.delete => if (box.deleteForward()) fb.edited(editor),
+        // One box for now: Tab stays in it.
+        Key.tab => {},
+        else => {
+            if (key.text) |text| {
+                findBarInsert(editor, text);
+            } else if (isTextCodepoint(key.codepoint)) {
+                var bytes: [4]u8 = undefined;
+                const n = std.unicode.utf8Encode(key.codepoint, &bytes) catch return;
+                findBarInsert(editor, bytes[0..n]);
+            }
+        },
+    }
 }
 
 /// Draw the Find & Replace two-line overlay.
@@ -5556,14 +5826,18 @@ test "TUI paste: a bracketed paste is one verbatim edit; prompts take its first 
     try t.expectEqualStrings("", doc.buffer.slice(0, doc.buffer.byteLen()));
     doc.readonly = false;
 
-    // A single-line prompt takes the first line, as if typed
-    _ = editor.execAction("find");
-    handleInputEvent(&editor, .paste_start, null);
-    for ("needle") |c| handleInputEvent(&editor, .{ .key_press = .{ .codepoint = c, .text = &[_]u8{c} } }, null);
-    handleInputEvent(&editor, .{ .key_press = .{ .codepoint = Key.enter } }, null);
-    handleInputEvent(&editor, .{ .key_press = .{ .codepoint = 'x', .text = "x" } }, null);
-    handleInputEvent(&editor, .paste_end, null);
-    try t.expectEqual(Editor.Mode.find, editor.mode);
+    // The find bar's box and a single-line prompt take the first line
+    for ([_][]const u8{ "find", "find_replace" }) |action| {
+        _ = editor.execAction(action);
+        handleInputEvent(&editor, .paste_start, null);
+        for ("needle") |c| handleInputEvent(&editor, .{ .key_press = .{ .codepoint = c, .text = &[_]u8{c} } }, null);
+        handleInputEvent(&editor, .{ .key_press = .{ .codepoint = Key.enter } }, null);
+        handleInputEvent(&editor, .{ .key_press = .{ .codepoint = 'x', .text = "x" } }, null);
+        handleInputEvent(&editor, .paste_end, null);
+    }
+    try t.expectEqualStrings("needle", editor.find_bar.needle.text());
+    try t.expect(!editor.find_bar.visible); // Ctrl+H closed it: one find row at a time
+    try t.expectEqual(Editor.Mode.find_replace, editor.mode);
     try t.expectEqualStrings("needle", editor.find_buf[0..editor.find_buf_len]);
     editor.setMode(.normal);
 
@@ -6256,6 +6530,210 @@ test "TUI status messages: a new one is a filled block that outlasts key presses
     testFrame(win, &editor);
     try t.expectEqualStrings("Saved a.zig", testCells(&screen, 44, bar_y, 11, &buf));
     try t.expectEqual(bar_bg, screen.readCell(44, bar_y).?.style.bg);
+}
+
+/// Tests only: the primary cursor's selection is exactly [start, end).
+fn testExpectSelection(doc: *Document, start: usize, end: usize) !void {
+    const r = doc.cursors.primaryConst().selectionRange() orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(start, r.start);
+    try std.testing.expectEqual(end, r.end);
+}
+
+test "TUI find bar: a row under the panes with the caret in its box; typing, Enter, F3, the toggles and clicks work; Escape closes it" {
+    const t = std.testing;
+    var editor = try Editor.init(t.allocator, t.io);
+    defer editor.deinit();
+    editor.lsp_enabled = false;
+    editor.filetree_visible = false;
+    editor.clipboard_set_fn = TestClipboard.set;
+    editor.clipboard_get_fn = TestClipboard.get;
+    const doc = editor.activeDoc();
+    const body = "alpha beta\nAlpha gamma\nalphabet\n";
+    try doc.loadText(body);
+    var screen = try testScreen(t.allocator);
+    defer screen.deinit(t.allocator);
+    const win = testWin(&screen);
+    testFrame(win, &editor);
+    try t.expect(find_bar_band == null);
+    const full_h = pane_rects[0].h;
+    var buf: [400]u8 = undefined;
+    const fb = &editor.find_bar;
+
+    // Ctrl+F: one row right under the panes, above the status bar. Not a
+    // prompt — the box has the keyboard, the text stays live.
+    testKey(&editor, 'f', .{ .ctrl = true });
+    try t.expectEqual(Editor.KeyboardOwner.find_bar, editor.keyboardOwner());
+    try t.expectEqual(Editor.Mode.normal, editor.mode);
+    testFrame(win, &editor);
+    var band = find_bar_band.?;
+    try t.expectEqual(@as(u16, 28), band.y);
+    try t.expectEqual(full_h - 1, pane_rects[0].h);
+    try t.expectEqual(pane_rects[0].y + pane_rects[0].h, band.y);
+    try t.expectEqualStrings(" Find ", testCells(&screen, 0, band.y, 6, &buf));
+    try t.expectEqual(@as(u16, 6), band.box.x);
+    try t.expectEqual(@as(u16, 3), band.close.w);
+
+    // Typing goes to the box, never into the document. The first match
+    // from the caret is selected, upper and lower case alike.
+    testType(&editor, "alpha");
+    try t.expectEqualStrings(body, doc.buffer.slice(0, doc.buffer.byteLen()));
+    try t.expectEqualStrings("alpha", fb.needle.text());
+    try testExpectSelection(doc, 0, 5);
+    testFrame(win, &editor);
+    var row = testCells(&screen, 0, band.y, 100, &buf);
+    try t.expect(std.mem.indexOf(u8, row, " Find alpha") != null);
+    try t.expect(std.mem.indexOf(u8, row, "1 of 3") != null);
+    try t.expect(std.mem.indexOf(u8, row, " Aa   W   All ") != null);
+
+    // Enter / Shift+Enter and F3 / Shift+F3 walk the matches, around the ends
+    testKey(&editor, Key.enter, .{});
+    try testExpectSelection(doc, 11, 16);
+    testKey(&editor, Key.f3, .{});
+    try testExpectSelection(doc, 23, 28);
+    testKey(&editor, Key.f3, .{ .shift = true });
+    try testExpectSelection(doc, 11, 16);
+    testKey(&editor, Key.enter, .{ .shift = true });
+    try testExpectSelection(doc, 0, 5);
+    testKey(&editor, Key.enter, .{ .shift = true });
+    try testExpectSelection(doc, 23, 28);
+    try t.expectEqualStrings("Find: on to the last match", editor.status_message);
+    testKey(&editor, Key.enter, .{});
+    try testExpectSelection(doc, 0, 5);
+
+    // Alt+W: whole words only. No hover in a terminal — the status bar
+    // names the button.
+    testKey(&editor, 'w', .{ .alt = true });
+    try t.expect(fb.options.whole_word);
+    try t.expectEqualStrings("Whole word: on", editor.status_message);
+    testFrame(win, &editor);
+    row = testCells(&screen, 0, band.y, 100, &buf);
+    try t.expect(std.mem.indexOf(u8, row, "1 of 2") != null);
+    // A click on Aa: upper and lower case must match too
+    testClick(&editor, band.toggles[0].x + 1, band.y);
+    try t.expect(fb.options.match_case);
+    try t.expectEqualStrings("Match case: on", editor.status_message);
+    testFrame(win, &editor);
+    row = testCells(&screen, 0, band.y, 100, &buf);
+    try t.expect(std.mem.indexOf(u8, row, "1 of 1") != null);
+    testKey(&editor, 'c', .{ .alt = true });
+    testKey(&editor, 'w', .{ .alt = true });
+    try t.expect(!fb.options.match_case and !fb.options.whole_word);
+
+    // All (Alt+A): the other matches are tinted; the one the bar is on
+    // keeps the selection's colors.
+    testFrame(win, &editor);
+    const text_x = pane_rects[0].x + lineNumberWidth(doc.lineCount(), editor.gutter_min_digits) + 1;
+    const top = pane_rects[0].y;
+    const tint = toVaxis(editor.tui_theme.find_match_bg);
+    try t.expect(!std.meta.eql(screen.readCell(text_x, top + 1).?.style.bg, tint));
+    testKey(&editor, 'a', .{ .alt = true });
+    try t.expect(fb.highlight_all);
+    testFrame(win, &editor);
+    try t.expect(std.meta.eql(screen.readCell(text_x, top).?.style.bg, toVaxis(editor.tui_theme.selection_bg)));
+    try t.expect(std.meta.eql(screen.readCell(text_x, top + 1).?.style.bg, tint));
+    try t.expect(std.meta.eql(screen.readCell(text_x + 4, top + 1).?.style.bg, tint));
+    try t.expect(!std.meta.eql(screen.readCell(text_x + 5, top + 1).?.style.bg, tint));
+    try t.expect(std.meta.eql(screen.readCell(text_x + 4, top + 2).?.style.bg, tint));
+    try t.expect(!std.meta.eql(screen.readCell(text_x + 5, top + 2).?.style.bg, tint));
+    try testCaptureScreen(&screen, "find_bar_tui.txt");
+
+    // The box edits like a text box: the caret moves, text lands at it,
+    // Ctrl+Z takes it back, Shift selects, Ctrl+A is the box's own.
+    testKey(&editor, Key.left, .{});
+    try t.expectEqual(@as(usize, 4), fb.needle.caret);
+    testType(&editor, "X");
+    try t.expectEqualStrings("alphXa", fb.needle.text());
+    try t.expectEqual(@as(?usize, null), doc.cursors.primaryConst().anchor);
+    testFrame(win, &editor);
+    row = testCells(&screen, 0, band.y, 100, &buf);
+    try t.expect(std.mem.indexOf(u8, row, "No results") != null);
+    try testCaptureScreen(&screen, "find_bar_tui_none.txt");
+    testKey(&editor, 'z', .{ .ctrl = true });
+    try t.expectEqualStrings("alpha", fb.needle.text());
+    try testExpectSelection(doc, 0, 5);
+    testKey(&editor, Key.home, .{ .shift = true });
+    try t.expectEqualStrings("alph", fb.needle.selectedText());
+    testKey(&editor, Key.backspace, .{});
+    try t.expectEqualStrings("a", fb.needle.text());
+    testKey(&editor, 'a', .{ .ctrl = true });
+    testType(&editor, "beta");
+    try t.expectEqualStrings("beta", fb.needle.text());
+    try testExpectSelection(doc, 6, 10);
+    try t.expectEqualStrings(body, doc.buffer.slice(0, doc.buffer.byteLen()));
+
+    // A click in the box places the caret; Up brings back the earlier search
+    testFrame(win, &editor);
+    band = find_bar_band.?;
+    testClick(&editor, band.box.x + 2, band.y);
+    try t.expectEqual(@as(usize, 2), fb.needle.caret);
+    try t.expect(fb.needle.selection() == null);
+    testKey(&editor, Key.up, .{});
+    try t.expectEqualStrings("alpha", fb.needle.text());
+    testKey(&editor, Key.down, .{});
+    try t.expectEqualStrings("beta", fb.needle.text());
+    testKey(&editor, Key.up, .{});
+
+    // A click in the text gives it the keyboard; the bar stays up and F3
+    // keeps walking. Typing edits the document again.
+    testFrame(win, &editor);
+    const rect = pane_rects[0];
+    testClick(&editor, rect.x + rect.w - 2, rect.y);
+    try t.expectEqual(Editor.KeyboardOwner.editor, editor.keyboardOwner());
+    try t.expect(fb.visible);
+    testKey(&editor, Key.f3, .{});
+    try testExpectSelection(doc, 11, 16);
+    // Escape in the text closes the bar; the match stays selected
+    testKey(&editor, Key.escape, .{});
+    try t.expect(!fb.visible);
+    try testExpectSelection(doc, 11, 16);
+    testFrame(win, &editor);
+    try t.expect(find_bar_band == null);
+    try t.expectEqual(full_h, pane_rects[0].h);
+    // F3 still works without the bar
+    testKey(&editor, Key.f3, .{});
+    try testExpectSelection(doc, 23, 28);
+
+    // Escape in the box closes it too and hands the keyboard back
+    testKey(&editor, 'f', .{ .ctrl = true });
+    try t.expectEqual(Editor.KeyboardOwner.find_bar, editor.keyboardOwner());
+    testKey(&editor, Key.escape, .{});
+    try t.expect(!fb.visible);
+    try t.expectEqual(Editor.KeyboardOwner.editor, editor.keyboardOwner());
+
+    // A narrow pane area keeps the box and leaves parts of the bar out
+    testKey(&editor, 'f', .{ .ctrl = true });
+    frameArenaReset();
+    drawEditor(win, &editor, 30, 30);
+    band = find_bar_band.?;
+    try t.expectEqual(@as(u16, 30), band.w);
+    try t.expectEqual(@as(u16, 0), band.prev.w);
+    try t.expectEqual(@as(u16, 3), band.close.w);
+    try t.expectEqual(@as(u16, 11), band.box.w);
+    // No row to spare: not drawn, and the box lets go of the keyboard
+    frameArenaReset();
+    drawEditor(win, &editor, 100, 2);
+    try t.expect(find_bar_band == null);
+    try t.expectEqual(Editor.KeyboardOwner.editor, editor.keyboardOwner());
+}
+
+test "TUI search panel: Alt+C and Alt+W flip its own two buttons while it has the keyboard" {
+    const t = std.testing;
+    var editor = try Editor.init(t.allocator, t.io);
+    defer editor.deinit();
+    editor.lsp_enabled = false;
+    editor.filetree_visible = false;
+    try t.expect(editor.takeKeyboardFocus(.search));
+    testKey(&editor, 'c', .{ .alt = true });
+    try t.expect(editor.search.case_sensitive);
+    try t.expect(!editor.find_bar.options.match_case);
+    testKey(&editor, 'w', .{ .alt = true });
+    try t.expect(editor.search.whole_word);
+    try t.expect(!editor.find_bar.options.whole_word);
+    // Back in the text they are the find bar's
+    try t.expect(editor.takeKeyboardFocus(.pane));
+    testKey(&editor, 'c', .{ .alt = true });
+    try t.expect(editor.find_bar.options.match_case);
+    try t.expect(editor.search.case_sensitive);
 }
 
 test "TUI snippets panel: docks beside the tree, a click selects then inserts, keys drive the list" {

@@ -278,7 +278,7 @@ const exec_action_commands = [_]struct { name: []const u8, description: []const 
     .{ .name = "next_doc", .description = "Switch to the next tab" },
     .{ .name = "prev_doc", .description = "Switch to the previous tab" },
     .{ .name = "quit", .description = "Quit ZIDE (asks about unsaved changes)" },
-    .{ .name = "find", .description = "Find in the current document" },
+    .{ .name = "find", .description = "Find in the current document (the find bar along the bottom; Escape closes it)" },
     .{ .name = "find_replace", .description = "Find and replace in the current document" },
     .{ .name = "goto_line", .description = "Go to a line number" },
     .{ .name = "command_palette", .description = "Open the command palette" },
@@ -420,6 +420,12 @@ pub fn registerBuiltins(registry: *CommandRegistry) !void {
     try registry.register("reopen_with_encoding", "Reopen with Encoding", cmdReopenEncoding);
     try registry.register("save_with_encoding", "Save with Encoding", cmdSaveEncoding);
     try registry.register("quick_open", "Fuzzy-find a file in the workspace (live preview)", cmdQuickOpen);
+    try registry.register("find_next", "Find: go to the next match (works with the find bar closed)", cmdFindNext);
+    try registry.register("find_previous", "Find: go to the previous match (works with the find bar closed)", cmdFindPrevious);
+    try registry.register("find_close", "Find: close the find bar", cmdFindClose);
+    try registry.register("find_toggle_case", "Find: match upper and lower case exactly, or not (the Aa button)", cmdFindToggleCase);
+    try registry.register("find_toggle_whole_word", "Find: match whole words only, or not (the W button)", cmdFindToggleWholeWord);
+    try registry.register("find_toggle_highlight_all", "Find: highlight every match, or only the current one (the All button)", cmdFindToggleHighlightAll);
     try registry.register("find_in_files", "Search & replace across the workspace (results panel)", cmdFindInFiles);
     try registry.register("next_result", "Jump to the next workspace search result", cmdNextResult);
     try registry.register("prev_result", "Jump to the previous workspace search result", cmdPrevResult);
@@ -1872,6 +1878,44 @@ fn cmdQuickOpen(editor: *Editor, _: ?[]const u8) void {
     editor.finderOpen();
 }
 
+// --- The find bar ---
+
+fn cmdFindNext(editor: *Editor, _: ?[]const u8) void {
+    editor.find_bar.step(editor, true);
+}
+
+fn cmdFindPrevious(editor: *Editor, _: ?[]const u8) void {
+    editor.find_bar.step(editor, false);
+}
+
+fn cmdFindClose(editor: *Editor, _: ?[]const u8) void {
+    if (editor.find_bar.visible) editor.find_bar.close(editor);
+}
+
+/// Alt+C / Alt+W belong to whichever search has the keyboard: the workspace
+/// search panel's own two buttons while it does, else the find bar's.
+fn cmdFindToggleCase(editor: *Editor, _: ?[]const u8) void {
+    if (editor.mode == .normal and editor.keyboardOwner() == .search) {
+        editor.search.case_sensitive = !editor.search.case_sensitive;
+        if (editor.search.query_len > 0) editor.searchStart();
+        return;
+    }
+    editor.find_bar.toggle(editor, .match_case);
+}
+
+fn cmdFindToggleWholeWord(editor: *Editor, _: ?[]const u8) void {
+    if (editor.mode == .normal and editor.keyboardOwner() == .search) {
+        editor.search.whole_word = !editor.search.whole_word;
+        if (editor.search.query_len > 0) editor.searchStart();
+        return;
+    }
+    editor.find_bar.toggle(editor, .whole_word);
+}
+
+fn cmdFindToggleHighlightAll(editor: *Editor, _: ?[]const u8) void {
+    editor.find_bar.toggle(editor, .highlight_all);
+}
+
 // --- Workspace search & replace ---
 
 fn cmdFindInFiles(editor: *Editor, _: ?[]const u8) void {
@@ -2212,9 +2256,14 @@ fn cmdAddNextOccurrence(editor: *Editor, _: ?[]const u8) void {
 }
 
 fn cmdEscapeMulticursor(editor: *Editor, _: ?[]const u8) void {
-    // Escape closes the signature popup first, then thins the cursors.
+    // Escape closes the signature popup first, then a find bar shown in
+    // this window, then thins the cursors.
     if (editor.signature != null) {
         editor.clearSignature();
+        return;
+    }
+    if (editor.find_bar.visible and editor.find_bar.window_id == editor.activeWindow().id) {
+        editor.find_bar.close(editor);
         return;
     }
     editor.activeDoc().cursors.clearSecondary();

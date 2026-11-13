@@ -76,8 +76,10 @@ Reloading extensions cancels their tasks, disconnects their active debug session
 | Ctrl+X | Cut |
 | Ctrl+V | Paste |
 | Ctrl+A | Select all |
-| Ctrl+F | Find |
-| Ctrl+H | Find and Replace |
+| Ctrl+F | Find — the find bar along the bottom of the editor area; it stays open while you edit (see *Find bar*) |
+| F3 / Shift+F3 | Next / previous match of the find bar's text — also with the bar closed |
+| Alt+C / Alt+W / Alt+A | Find bar: match case / whole word / highlight all matches (placeholder keys; with the workspace search panel focused, Alt+C and Alt+W flip its own two buttons) |
+| Ctrl+H | Find and Replace (the two-row prompt, until the replace row joins the find bar) |
 | Ctrl+G | Go to line |
 | Ctrl+P | Command palette |
 | Ctrl+E | Quick open (fuzzy file finder with live preview) |
@@ -115,7 +117,7 @@ Reloading extensions cancels their tasks, disconnects their active debug session
 | Ctrl+K | Delete line |
 | Ctrl+/ | Toggle comment on selected lines (uses the language's line comment; wraps in block comments for languages without one, e.g. CSS) |
 | Alt+M | Jump to the bracket matching the one at the caret |
-| Escape / Left-click | End snippet field navigation, remove secondary cursors |
+| Escape / Left-click | End snippet field navigation, remove secondary cursors; before the cursors go, Escape closes a find bar shown in that window |
 | Ctrl+Left/Right | Word movement |
 | Ctrl+Shift+Left/Right | Word selection |
 | Ctrl+Backspace | Delete word backward |
@@ -165,16 +167,15 @@ Windows terminals commonly intercept Alt combos (Windows Terminal binds Alt+arro
 - UTF-8 aware cursor movement
 - Selection (Shift+arrows, Shift+Home/End, Ctrl+A select all)
 - Copy/Cut/Paste with system clipboard (Windows Win32 API, Linux wl-copy/xclip/xsel; the Linux readers `wl-paste`/`xclip`/`xsel` get 2 seconds, a timeout is logged). With several cursors, copy and cut join every selection in document order with the document's line ending (a bare caret contributes an empty line) and cut removes them all as one undo step; pasting N lines with N cursors gives each cursor its own line, any other count pastes the whole text at every cursor. Paste converts line breaks to the document's line ending. The Windows clipboard's CRLF reads as LF, and broken UTF-16 (unpaired surrogates) pastes as U+FFFD instead of silently falling back to the stale internal clipboard
-- Paste from the terminal (bracketed paste; Linux/macOS): lands as one undoable edit at every cursor — no auto-indent, no auto-closed brackets, line breaks converted to the document's, other control characters dropped. A paste into a prompt or the search panel types its first line; pickers, confirmation prompts and the file tree ignore pastes; a terminal pane passes the paste to its program. The Windows TUI gets no paste markers (see *Not Yet Implemented*)
+- Paste from the terminal (bracketed paste; Linux/macOS): lands as one undoable edit at every cursor — no auto-indent, no auto-closed brackets, line breaks converted to the document's, other control characters dropped. A paste into a prompt, the search panel or the find bar's box types its first line; pickers, confirmation prompts and the file tree ignore pastes; a terminal pane passes the paste to its program. The Windows TUI gets no paste markers (see *Not Yet Implemented*)
 
 **Navigation:**
-- Incremental/live search (jumps to matches as you type; emptying the query or a query with no match returns the caret to the start point — Escape closes the bar at the current match)
-- Find with wrap-around search and "No matches found" / "Search wrapped" feedback
+- Find bar (Ctrl+F): one row under the panes that stays open while you edit — ` Find `, an underlined text box with a real caret, the ` Aa ` / ` W ` / ` All ` buttons, the count (`3 of 17`), `↑` `↓` and `×`, all clickable (a drag in the box selects). Typing searches as you go; Enter / Shift+Enter and F3 / Shift+F3 walk the matches around the ends of the document; with ` All ` on every match is a tinted cell and the one you are on keeps the selection's colors; a text that is nowhere puts the box in the error colors and the count reads `No results`. A narrow terminal leaves out the label first, then the arrows, the close button, the count and the buttons — the box keeps at least 12 cells — and under 12 columns (or with a single text row) the bar is not drawn and the keyboard stays with the pane. There is no hover in a terminal: flip a button and the status bar names it. Some terminals cannot tell Shift+Enter from Enter; Shift+F3 always works. Everything else is under *Find bar* in Shared / Core
 - Find and Replace (Ctrl+H, Tab to switch fields, Enter for next — in the Replace field it replaces the current match and then finds the next; Ctrl+A or Ctrl+Enter replace all, shows count)
 - Go to line (Ctrl+G; drops secondary cursors and the selection)
 - Command palette (Ctrl+P): the typed letters match a command name in order, case does not matter and a space stands for an underscore (`set baseline` finds `review_set_baseline`); Tab spells the highlighted command out in the input, arrows move the highlight, Enter runs it; the list scrolls past its visible rows
 - Quick open (Ctrl+E, `quick_open` in the palette): fuzzy-find any workspace file by name — basename matches rank first; arrowing through results **live-previews** each file in the pane behind the bottom-anchored panel (no tab is created — nothing like VS Code's italic preview tabs); PageUp/PageDown scroll the preview; Enter opens it as a normal tab (EditorConfig rules and stored Problems apply, as for any open), Escape restores exactly where you were — the pre-finder document is found by identity, even if tabs closed meanwhile. Previews never show diagnostics; a preview that was edited meanwhile (e.g. by a Lua timer) is kept as a tab instead of being discarded. The result list scrolls, so all 200 matches are reachable. Lua `zide.exec`, New document, Save and every file open (goto-definition, debugger stops) end quick open first, so nothing acts on, or lands behind, a preview; while it is up the TUI ignores other clicks and chords, and in the GUI a click on the menu bar or tab bar closes it first. Walks the file tree root (caps: 20,000 files, 12 directory levels), skipping dot-entries, `zig-out`, and plain (non-glob) entries from the workspace's top-level `.gitignore` (`name`, `name/`, root-anchored `/name`; `!name` and `!/name` re-include such a name, also un-pruning nested folders of that name; globs, glob or path negations and paths like `src/gen/` are ignored — the file tree still shows these folders; matching is case-sensitive, `name/` also matches files with that name, later lines win, lines with backslash escapes are skipped, and a `.gitignore` over 64 KiB is ignored entirely)
-- Workspace search & replace (Ctrl+Shift+F, `find_in_files`): **docked bottom panel** with search / replace / files-to-include / files-to-exclude fields (Tab cycles, click focuses; include and exclude take `*.ext` or a path substring and apply to both open buffers and the disk walk), case (Alt+C) and whole-word (Alt+W) toggles. While the panel owns the keyboard, Ctrl+C copies the focused field, Ctrl+X cuts it, Ctrl+V pastes the clipboard's first line and Ctrl+Backspace deletes the previous word; Ctrl+A and Ctrl+Delete leave the document alone (see *Keyboard focus* under Command System). A background worker streams `path:line: excerpt` results in live — open documents are searched **in-buffer** (dirty edits included) and skipped on disk — an open document whose path cannot be resolved (a reserved name, an unreachable share) is left out and counted as skipped, and the disk walk still runs; dot-entries, `zig-out`, plain (non-glob) entries from the workspace's top-level `.gitignore` (same rules as quick open), binaries, and files > 8 MB are skipped; results cap at 2000 with an explicit "(capped)" note. Up/Down move the result selection and PgUp/PgDn jump eight rows (the GUI skips collapsed file groups). Enter opens a result with the match selected (the GUI also opens on double-click), refreshing that file when needed; the nearest surviving match is selected, or the caret and selection stay intact if none remains. Results retain their original query. Finish the search and rerun it after changing criteria before replacing. Filters use workspace-relative paths for files inside the workspace and absolute paths for named open files outside it; Escape hides the panel but results persist — **F4 / Shift+F4** cycle through them while editing. Replace All (Enter on the Replace field) asks per operation: `[A]ll` (open docs get one undoable edit group each and stay unsaved; closed files are rewritten on disk — **not undoable**) or `[O]pen docs only` — only unmodified letters answer, so Ctrl+A does not mean All. Matching is literal (no regex yet); the filter takes `*.ext` or a path substring
+- Workspace search & replace (Ctrl+Shift+F, `find_in_files`): **docked bottom panel** with search / replace / files-to-include / files-to-exclude fields (Tab cycles, click focuses; include and exclude take `*.ext` or a path substring and apply to both open buffers and the disk walk), case (Alt+C) and whole-word (Alt+W) toggles — the keys of `find_toggle_case` / `find_toggle_whole_word`, which flip the panel's own two buttons while it owns the keyboard and the find bar's otherwise. While the panel owns the keyboard, Ctrl+C copies the focused field, Ctrl+X cuts it, Ctrl+V pastes the clipboard's first line and Ctrl+Backspace deletes the previous word; Ctrl+A and Ctrl+Delete leave the document alone (see *Keyboard focus* under Command System). A background worker streams `path:line: excerpt` results in live — open documents are searched **in-buffer** (dirty edits included) and skipped on disk — an open document whose path cannot be resolved (a reserved name, an unreachable share) is left out and counted as skipped, and the disk walk still runs; dot-entries, `zig-out`, plain (non-glob) entries from the workspace's top-level `.gitignore` (same rules as quick open), binaries, and files > 8 MB are skipped; results cap at 2000 with an explicit "(capped)" note. Up/Down move the result selection and PgUp/PgDn jump eight rows (the GUI skips collapsed file groups). Enter opens a result with the match selected (the GUI also opens on double-click), refreshing that file when needed; the nearest surviving match is selected, or the caret and selection stay intact if none remains. Results retain their original query. Finish the search and rerun it after changing criteria before replacing. Filters use workspace-relative paths for files inside the workspace and absolute paths for named open files outside it; Escape hides the panel but results persist — **F4 / Shift+F4** cycle through them while editing. Replace All (Enter on the Replace field) asks per operation: `[A]ll` (open docs get one undoable edit group each and stay unsaved; closed files are rewritten on disk — **not undoable**) or `[O]pen docs only` — only unmodified letters answer, so Ctrl+A does not mean All. Matching is literal (no regex yet); the filter takes `*.ext` or a path substring
 - Navigation history (`navigate_back` / `navigate_forward` — Ctrl+Alt+Left / Ctrl+Alt+Right, Alt-free F7 / Shift+F7): every jump records the caret it leaves — go to definition, go to line, next TODO, quick open, search results (Enter and F4), Problems / Task Output / Changes / Debug locations, file-tree opens, Open File, and debugger stops — so back returns there and forward re-jumps. Points on the same line collapse into one, a new jump forgets the forward entries, 100 entries are kept, closed files are reopened on the way back, entries for a closed untitled buffer are skipped, and the status bar says `Nothing to go back to` / `Nothing to go forward to` when the history is exhausted
 - Ctrl+Home/End for file start/end
 - Page Up/Down
@@ -236,6 +237,7 @@ Windows terminals commonly intercept Alt combos (Windows Terminal binds Alt+arro
     - Languages: `lsp_enabled` (true; off = no language servers, running ones stop on the next frame), `syntax_highlighting` (true; off = plain-text look), `completion_auto` (true; off = the completion popup only opens on Ctrl+Space), `completion_min_chars` (1, 1–8; identifier characters typed before the popup opens by itself), `signature_help_auto` (true; off = signature help only on Ctrl+Shift+Space)
     - Review: `review_stage_on_approve` (true; approving a changed file also stages it — off = verdicts never touch git)
     - Appearance: `theme` ("dark"), `tui_theme` ("terminal"), `gutter_min_digits` (3, 1–10, both frontends), `status_message_seconds` (4, 0–30; how long a new status-bar message stays highlighted, 0 = never — see *Status messages*), `secondary_window_chrome` (true; GUI: menu bar + status bar in extra windows, false = bare pane containers), `page_size` (accepted but overwritten by the viewport height every frame, so it has no lasting effect)
+    - Find bar: `find_match_case` (false), `find_whole_word` (false), `find_highlight_all` (false) — how the bar's `Aa`, `W` and `All` buttons start out. Flipping `All` in the bar writes its line to init.lua; `Aa` and `W` flipped in the bar last until ZIDE closes and start from these two again (see *Find bar*). All three have rows in the Settings dialog, which show the buttons as they are right now
     - File tree: `filetree_visible` (true), `filetree_side` ("left"/"right"), `filetree_width` (240 GUI px, 120–600), `tui_filetree_width` (30 columns, 16–80), `filetree_root` (starting directory, "" = cwd; stored unvalidated from Lua — the Settings dialog checks it), `filetree_git_colors` (true; off = no tree Git colors, Changes and gutters remain available), `filetree_auto_reveal` (true, read by the GUI), `tui_filetree_icons` (false), `filetree_font_size` (0 = theme font, 0–32), `filetree_icon_scale` (90, 50–200)
     - Snippets panel: `snippets_visible` (false; at runtime hiding it also returns the keyboard to the pane), `snippets_side` ("auto"/"left"/"right"; auto docks opposite the file tree), `snippets_width` (260 GUI px, 120–600), `tui_snippets_width` (32 columns, 16–80), `snippets_double_click` (false; GUI: true makes a click only select a snippet and keep its preview — a double-click or Enter inserts it). All five have rows in the Settings dialog
     - Terminal panel: `terminal_panel_side` ("bottom"/"left"/"right"), `terminal_panel_width` (420 GUI px, 160–1600; used at a side), `terminal_panel_height` (240 GUI px, 80–1200; used at the bottom), `tui_terminal_panel_width` (60 columns, 20–200), `tui_terminal_panel_height` (12 rows, 3–60). All five have rows in the Settings dialog
@@ -250,7 +252,7 @@ Windows terminals commonly intercept Alt combos (Windows Terminal binds Alt+arro
   - `zide.get(key)` — read current settings (the color families and `mono_font_*` return nil; `theme`/`tui_theme` return `"custom"` after any color override)
   - `zide.bind(key_combo, command [, { language = "zig" }])` — remap keybindings; with the `language` option the binding lives in that language's overlay and applies only while editing a file of that language (see *Command System*)
   - `zide.unbind(key_combo [, { language = "zig" }])` — remove a keybinding (global, or from a language overlay)
-  - Settings ZIDE writes back to init.lua (Settings dialog, theme switches, tree width and side, `toggle_tui_icons`) update or append one `zide.set("key", value)` line: string values are quoted and escaped (Windows paths survive), a line that would not compile is refused, and keys must be identifiers
+  - Settings ZIDE writes back to init.lua (Settings dialog, theme switches, tree width and side, `toggle_tui_icons`, the find bar's `All` button) update or append one `zide.set("key", value)` line: string values are quoted and escaped (Windows paths survive), a line that would not compile is refused, and keys must be identifiers
   - Config load order: init.lua → themes/gui-theme.lua → themes/tui-theme.lua → themes/syntax-theme.lua → extensions/*.lua → themes/syn_theme_<lang>.lua — a later file's `zide.set` overrides an earlier one's, and extension files load in directory order (not sorted)
 - Data-driven keybinding map (all Ctrl/Alt shortcuts remappable, globally or per language)
 - File tree side panel (Ctrl+B) — dockable left/right column band with mouse + keyboard browsing, create/rename/delete prompts, reveal-current-file (see File Tree section)
@@ -263,7 +265,7 @@ Windows terminals commonly intercept Alt combos (Windows Terminal binds Alt+arro
   - "terminal" mode (default): uses ANSI indices, respects terminal color scheme
   - Named themes use direct RGB colors for a consistent look
   - Custom overrides via `~/.config/zide/themes/tui-theme.lua` (auto-created with commented defaults on first run)
-  - 40 named TUI color fields across editor, gutter and wrap/tilde markers, tab bar, status bar, new status messages (`tui_color_status_note_bg` / `_fg`, `tui_color_status_warning_bg` / `_fg`, `tui_color_status_error_bg` / `_fg` — see *Status messages*), Git status, review reader rows (`tui_color_review_added_bg`, `tui_color_review_modified_bg`, `tui_color_review_ghost_bg`, `tui_color_review_ghost_fg`, `tui_color_review_marker_fg`), and overlay panels — the auto-created tui-theme.lua template lists them (the four `tui_color_git_*` fields are described under *File Tree → Git status colors*)
+  - 42 named TUI color fields across editor, gutter and wrap/tilde markers, tab bar, status bar, new status messages (`tui_color_status_note_bg` / `_fg`, `tui_color_status_warning_bg` / `_fg`, `tui_color_status_error_bg` / `_fg` — see *Status messages*), the find bar's matches (`tui_color_find_match_bg` / `_fg` — see *Find bar*), Git status, review reader rows (`tui_color_review_added_bg`, `tui_color_review_modified_bg`, `tui_color_review_ghost_bg`, `tui_color_review_ghost_fg`, `tui_color_review_marker_fg`), and overlay panels — the auto-created tui-theme.lua template lists them (the four `tui_color_git_*` fields are described under *File Tree → Git status colors*)
 
 ### TUI — Not Yet Implemented
 - Bracketed paste on Windows: vaxis's Windows reader forwards no paste markers, so a paste made by the terminal arrives as typed keys
@@ -297,7 +299,7 @@ Cross-frontend gaps are tracked in [TODO.md](TODO.md) (verified backlog: navigat
 - Status messages: a new one is a filled, rounded block after the line / column block for a few seconds — blue for a note, amber for a warning, red for an error (dark theme) — and moves left over the rest of the bar when it is long; it keeps its time while you type, then settles into plain text in the same place until the next key press or click (see *Status messages* under Shared / Core)
 - Line numbers with active line highlight in gutter
 - Go to line (Ctrl+G, overlay input; drops secondary cursors and the selection)
-- Find with incremental search, wrap-around, and status feedback (Ctrl+F)
+- Find bar (Ctrl+F, Edit > Find): a row along the bottom of the editor area — above a terminal panel docked at the bottom — that stays open while you edit. `Find`, a text box (80 to 520 pixels wide; caret, selection, click / Shift+click / drag, double-click for a word, a third click for everything) with the `Aa` and `W` buttons inside its right end, then `All`, the count (`3 of 17`), the previous / next arrows, and close at the far right. The box's edge takes the caret color while it has the keyboard; a text that is nowhere gives it a red edge and a tint, and the count reads `No results`. Resting the pointer on a button shows what it is and its key — looked up in the keybind map, so a rebound key shows correctly (the first hover hints in ZIDE). With `All` on every match has a soft fill under the text and a short mark at its height where the scroll bar runs (a document shorter than the view keeps its marks beside their lines); the match the bar is on has an outline. Edit > Find Next (F3) / Find Previous (Shift+F3); Edit > Undo / Redo / Cut / Copy / Paste / Select All act on the box while it has the keyboard. Everything else is under *Find bar* in Shared / Core
 - Find and Replace (Ctrl+H, Tab to switch fields, Enter for next — in the Replace field it replaces the current match and then finds the next; Ctrl+A or Ctrl+Enter replace all, shows count)
 - Command palette (Ctrl+P): letters match in order, case does not matter, a space stands for an underscore; Tab completes the highlighted command, arrows move the highlight, Enter runs it
 - Navigation history: Ctrl+Alt+Left / Ctrl+Alt+Right (or F7 / Shift+F7) go back / forward through jumps — same behavior as the TUI (see its Navigation list)
@@ -309,7 +311,7 @@ Cross-frontend gaps are tracked in [TODO.md](TODO.md) (verified backlog: navigat
 - Auto-save (off by default; saves dirty documents with file paths after a configurable interval, default 5s)
 - Application icon embedded in exe
 - SDL3GPU backend (GPU-accelerated rendering, opt-in via `zig build -Dgpu=true`, default SDL3 for lower memory)
-- Find/Replace match count display (shows "N matches" for the active document in overlay bar)
+- Find and Replace match count display (the Ctrl+H overlay shows "N matches" for the active document; the find bar has its own count)
 - Command palette arrow cycling with highlighted selection and Tab completion (Enter executes the highlighted command; the GUI shows and cycles only the first 10 matches, without wrapping — type to narrow; the TUI list scrolls); the chosen command runs at the end of the frame, after every pane has drawn, so a Lua command that splits or closes panes is safe from the palette
 - Configurable line number gutter width (`zide.set("gutter_min_digits", N)` in init.lua, default 3 — the TUI honors it too)
 - Mouse selection: double-click selects word (non-ASCII words like `café` included), triple-click selects line, drag extends by word/line accordingly, Shift+click extends selection, Alt+click adds cursor, Shift+Alt+drag for block (column) selection (one cursor per line over the dragged column span)
@@ -331,7 +333,7 @@ Cross-frontend gaps are tracked in [TODO.md](TODO.md) (verified backlog: navigat
   - Split/close commands in the View menu and palette; focus-next/prev only via keys or the palette
 - Multiple OS windows (View menu, command palette, Ctrl+Shift+N)
   - `open_in_new_window` moves the current document into a new window — its tab goes with it and the source pane switches to the neighbouring tab (the main window gets a fresh untitled document when that was its last tab); `move_pane_to_new_window` moves the focused pane there the same way — a terminal is never shown twice, so a lone terminal pane leaves a fresh untitled document behind in the main window, and an extra window that loses its only pane closes; `detach_terminal` (Ctrl+Alt+`) is the terminal-pane shortcut for that move
-  - Every window has its own split tree and focused pane; the window with OS keyboard focus is the active one (clicking a window's title bar is enough). Keys, IME and modal prompts follow the active pane; switching windows cancels transient input (finder, palette, find bar) and prompts that would otherwise be left stuck — a rename preview (the server gets `applied: false`), a Git stage prompt, a task save-before-run prompt; pending save and encoding decisions follow focus while retaining their original document; the Settings dialog instead stays in the window it was opened from while the other windows keep working
+  - Every window has its own split tree and focused pane; the window with OS keyboard focus is the active one (clicking a window's title bar is enough). Keys, IME and modal prompts follow the active pane; switching windows cancels transient input (finder, palette, the find-and-replace prompt) and prompts that would otherwise be left stuck — a rename preview (the server gets `applied: false`), a Git stage prompt, a task save-before-run prompt; pending save and encoding decisions follow focus while retaining their original document; the Settings dialog instead stays in the window it was opened from while the other windows keep working; the find bar stays in the window it was opened in and its box lets go of the keyboard (Ctrl+F in another window moves the bar there)
   - Each window owns its tabs: a document is listed in exactly one window. Files you open or create join the window you are working in, Ctrl+Tab / Ctrl+Shift+Tab cycle that window's tabs, and showing a document in another window (tab drop, Open in New Window, a file-tree double-click while that window is active) moves its tab there. Closing the last tab of an extra window closes the window; the main window gets a fresh untitled document instead. The status bar shows that window's document (`Terminal` for a terminal pane)
   - Drag a tab out of the tab bar to move that document into a new window under the pointer; drop it on another ZIDE window to move it there; release anywhere on the same window or press Escape to cancel. Right-click a tab → Move to New Window / Close Tab (a tab with unsaved changes asks first). The main window hides its tab bar with a single document — use Ctrl+Shift+N there; extra windows always show the bar so a tab can be dragged back. Wayland has no global pointer position: the drop always opens a new window where the compositor puts it
   - The file tree and the search panel live in the main window only — Ctrl+B and Ctrl+Shift+F bring the main window forward (Reveal in Tree run from an extra window's View menu or the palette currently does not raise it)
@@ -343,11 +345,11 @@ Cross-frontend gaps are tracked in [TODO.md](TODO.md) (verified backlog: navigat
   - `zide.set("theme", "dark")` / `"light"` / `"high_contrast"` — switch preset
   - `zide.set("color_*", "#RRGGBB")` or `"#RRGGBBAA"` — override individual colors
   - Custom overrides via `~/.config/zide/themes/gui-theme.lua`
-  - 35 named editor color fields: text, selection, cursor, gutter_bg, gutter_text, gutter_text_active, gutter_separator, panel_border, wrap_marker, tilde, overlay_bg, overlay_fg, overlay_dim, overlay_warn, overlay_selection, overlay_hint, bool_true, bool_false (both currently unused by any renderer), status_bg, status_fg, status_note_bg, status_note_fg, status_warning_bg, status_warning_fg, status_error_bg, status_error_fg (a new status message's block and text, per level — see *Status messages*), plus git_added, git_modified, git_deleted, git_untracked (see *File Tree → Git status colors*) and review_added_bg, review_modified_bg, review_ghost_bg, review_ghost_fg, review_marker_fg (see *Reading a change*)
+  - 37 named editor color fields: text, selection, cursor, gutter_bg, gutter_text, gutter_text_active, gutter_separator, panel_border, wrap_marker, tilde, overlay_bg, overlay_fg, overlay_dim, overlay_warn, overlay_selection, overlay_hint, bool_true, bool_false (both currently unused by any renderer), status_bg, status_fg, status_note_bg, status_note_fg, status_warning_bg, status_warning_fg, status_error_bg, status_error_fg (a new status message's block and text, per level — see *Status messages*), find_match_bg, find_match_border (the find bar's matches: the fill, and the outline plus the scroll-bar marks — see *Find bar*), plus git_added, git_modified, git_deleted, git_untracked (see *File Tree → Git status colors*) and review_added_bg, review_modified_bg, review_ghost_bg, review_ghost_fg, review_marker_fg (see *Reading a change*)
   - Any `color_*` override makes the active theme `"custom"`: `zide.get("theme")` reports that, the Settings dropdown shows "dark", and the GUI chrome (menus, tabs) falls back to the dark style. Theme switches re-apply only the syntax override files — `gui-theme.lua` / `tui-theme.lua` overrides return at the next launch
 - Menu bar reorganized:
   - File: New, Open File, Open Folder, Recent Projects (submenu), Save, Save As, Close Tab, Reopen Closed Tab, Exit
-  - Edit: Undo, Redo, Cut, Copy, Paste, Select All, Toggle Comment, Find, Replace, Go to Line
+  - Edit: Undo, Redo, Cut, Copy, Paste, Select All, Save Selection as Snippet, Toggle Comment, Find, Find Next, Find Previous, Replace, Go to Line
   - View: Command Palette, File Tree, Reveal in Tree, Next Tab, Prev Tab, Split Vertical, Split Horizontal, Close Pane, Open in New Window, Move Pane to New Window, Close Window, Detach Terminal
   - Preferences: Settings, Open Settings File, Theme > (Dark / Light / High Contrast), Open Theme File, Open Theme Folder
   - Help: Documentation, About ZIDE
@@ -910,6 +912,8 @@ Press **F12** to jump to the definition of the symbol under the cursor. If the d
 | `src/core/workspace_edit.zig` | Workspace-edit preview/apply (rename and server `applyEdit`) |
 | `src/core/line_diff.zig` | Buffer-vs-index line diff behind the Git gutter marks |
 | `src/core/search.zig` | Workspace search/replace engine (background walk, streaming results) |
+| `src/core/find_bar.zig` | The find bar: its state, the per-document match list, next / previous, the buttons, the box's editing chords |
+| `src/core/line_edit.zig` | Single-line text box (caret, selection, undo, view scroll) and its history list — the find bar's box |
 | `src/core/walk_ignore.zig` | Top-level `.gitignore` pruning for quick open and workspace search |
 | `src/core/snippets.zig` | Snippet templates: parsing, indentation-aware insertion, field tracking |
 | `src/core/snippet_panel.zig` | Snippets side panel model: the registry's definitions for one document as collapsible group rows, selection and preview |
@@ -1015,7 +1019,91 @@ If Windows-1252 cannot represent edited text (C1 control characters included), s
 
 Explicit encoding choices are remembered by file path for the current session. With `session_persistence` enabled, those choices are also saved and restored; older session files remain supported. Quick-open previews and workspace searches reuse known choices and otherwise skip files whose encoding is unresolved, malformed, binary, or unreadable. Their skipped counts are shown without interrupting with dialogs. Deliberately opening an unresolved file offers the picker. Search positions refer to decoded UTF-8 buffer bytes; closed-file replacements preserve source formats and report failed files separately from successful replacements.
 
-Find/replace, workspace search, quick open, command palette, and filename prompts accept Unicode text and remove complete code points on Backspace; keys that carry no text (arrows, Home/End, F-keys) are never typed into a prompt. Matching is literal; existing case-insensitive matching folds ASCII letters, and whole-word matching treats ASCII letters, digits, underscores and every non-ASCII character as word characters. Replace One accepts an empty replacement to delete a match. Replace All is one undoable transaction per open document and preserves every cursor and selection in undo/redo.
+The find bar, find and replace, workspace search, quick open, command palette, and filename prompts accept Unicode text and remove complete code points on Backspace; keys that carry no text (arrows, Home/End, F-keys) are never typed into a prompt. Matching is literal; existing case-insensitive matching folds ASCII letters, and whole-word matching treats ASCII letters, digits, underscores and every non-ASCII character as word characters. Replace One accepts an empty replacement to delete a match. Replace All is one undoable transaction per open document and preserves every cursor and selection in undo/redo.
+
+### Find bar
+
+Ctrl+F (`find`, Edit > Find) shows the find bar: one row along the bottom of the editor area,
+under the panes and above a terminal panel docked at the bottom. It is not a prompt — the
+text stays live behind it, the bar stays open while you edit, and Escape closes it. Both
+frontends draw the same bar from the same state.
+
+- **Opening.** The box takes the keyboard. A selection inside one line (up to 256 bytes, no
+  tab or other control character) becomes the text to find; without one the last search
+  stays. Either way the box's text is selected, so typing replaces it. The caret in the
+  document does not move until you type. Ctrl+F while the box already has the keyboard
+  selects its text again.
+- **Typing searches as you go**, from where the caret (or the start of the selection) was
+  when the box took the keyboard, then from each match Enter or F3 went to. The first match
+  from there is selected and brought into view — a match outside the view lands a third of
+  the way down it. A text that is nowhere puts the caret back where the search began with
+  nothing selected; the bar says `No results` and tints its box, and the status bar stays
+  quiet. A jump made from the box (Ctrl+G, F12) moves the starting point to the new caret.
+- **Next / previous**: Enter / Shift+Enter in the box; F3 / Shift+F3 (`find_next` /
+  `find_previous`) from the box and from the text; the two arrows on the bar; Edit > Find
+  Next / Find Previous. They go around the ends of the document and say so quietly ("Find:
+  back at the first match", "Find: on to the last match"). F3 works with the bar closed
+  too — it walks the last search and reports `Not found: …` as a warning in the status bar —
+  and with nothing searched yet it opens the bar. Going to a match leaves one cursor.
+- **The buttons.** Each is a command, and each names itself in the status bar when flipped
+  ("Match case: on"):
+  - `Aa` — match case (`find_toggle_case`, Alt+C). Off: upper and lower case are the same.
+  - `W` — whole word (`find_toggle_whole_word`, Alt+W).
+  - `All` — highlight all matches (`find_toggle_highlight_all`, Alt+A). On: every match in
+    the document is tinted and, in the GUI, marked where the scroll bar runs. Off: only the
+    match you are on shows — it is the selection. Off to start, and it stays as you left it:
+    flipping it writes `zide.set("find_highlight_all", …)` to init.lua.
+
+  `Aa` and `W` flipped in the bar last until ZIDE closes. How they start out is
+  `find_match_case` / `find_whole_word` (init.lua or the Settings dialog), so a search never
+  quietly finds less than you expect after a restart. The three keys are placeholders until
+  the hotkey pass. While the workspace search panel owns the keyboard, Alt+C and Alt+W flip
+  *its* two buttons instead.
+- **The count**: `3 of 17` when the selection is exactly a match, `17 found` when it is not,
+  `No results`, and `100000+` for a text that matches more than 100,000 times (the tints
+  stop at that many; next / previous still reach every match).
+- **The box is a text box.** A caret, Left / Right, Home / End, Shift to select, Backspace /
+  Delete. The keys bound to copy, cut, paste (the clipboard's first line), select all, word
+  left / right (with Shift too), delete word backward / forward, undo and redo act on the
+  box — it has undo steps of its own — and Ctrl+Home / Ctrl+End are its Home / End. Up /
+  Down walk the last 20 searches; below the newest, what you were typing comes back. Up to
+  256 bytes, one line; Tab does nothing yet. Keys that would edit the text behind the box
+  (delete line, duplicate line, toggle comment, move line, add cursor, add next occurrence,
+  completion, signature help, matching bracket) do nothing while the box has the keyboard;
+  everything else — save, the palette, go to line, pane and window commands, your own Lua
+  commands — runs as usual.
+- **Escape** in the box closes the bar: the match stays selected, the text joins the earlier
+  searches, and the keyboard goes back to the pane. `find_close` and the bar's close button
+  do the same. Escape in the text first ends snippet-field navigation or closes an open
+  completion or signature popup; after those it closes a bar shown in that window, and only
+  the next Escape removes extra cursors.
+- **Clicking in the text** gives the pane the keyboard and leaves the bar up; a click on the
+  bar gives its box the keyboard again, and the search starts from the caret.
+- **Windows and panes.** The bar belongs to the window it was opened in and searches the
+  document in that window's focused pane. Ctrl+F in another window moves it there with the
+  same text; closing its window closes it. F3 always acts on the focused document. From a
+  terminal pane, Ctrl+F (and a click on the bar) moves to the window's first text pane, or
+  says "Find: this window has no text pane to search". Ctrl+H is still the two-row prompt
+  and closes the bar first — one find row at a time until the replace row joins the bar.
+- **Matching** is plain text: upper and lower case are folded for ASCII letters only, so
+  `É` does not find `é` with `Aa` off, and a whole word is bounded by anything that is not
+  a letter, a digit, `_` or a non-ASCII character. Matches never overlap (`aa` is found
+  twice in `aaaa`). Regular expressions, search in the selection and escape sequences are
+  the next steps (see `docs/TODO.md`).
+- **Colors**: GUI `find_match_bg` (the fill — give it an alpha, like `#e5c07b46`, so the
+  text keeps its syntax colors) and `find_match_border` (the outline and the scroll-bar
+  marks); TUI `find_match_bg` / `find_match_fg`. Set them with
+  `zide.set("color_find_match_bg", …)` / `zide.set("tui_color_find_match_bg", …)`; every
+  preset has its own, and the theme templates list them.
+
+In the code: `find_bar.zig` holds the state (`Editor.find_bar`), what the bar does to a
+document, and the match list — every match of the box's text in one version of one document,
+listed again only when the text, a button or the document changes; the count, the tints and
+the marks all read it. `line_edit.zig` is the single-line text box, written to serve the other
+prompts later. The box owns the keyboard as `KeyboardOwner.find_bar` (see *Keyboard focus*),
+and its chords arrive through `Editor.panelAction`. A painter calls
+`editor.find_bar.paint(editor, doc)` once per pane **before** it reads lines of that document:
+listing the matches reads the whole buffer through its shared scratch slice.
 
 ### Status messages
 
@@ -1038,8 +1126,9 @@ failed: AccessDenied" — goes to the message slot of the status bar, in both fr
   than the bar itself ends in "…". Settled, it is clipped to its slot again (GUI: up to the
   file name; TUI: half the row).
 - A terminal pane or the terminal panel with the keyboard shows the block too (the TUI's
-  ` [TERMINAL]` row used to show no messages at all); in the TUI's Find row the search
-  messages stay where they were, at the right end of that row.
+  ` [TERMINAL]` row used to show no messages at all); in the TUI's Find and Replace prompt
+  the search messages stay where they were, at the right end of its Find row. The find bar
+  shows `No results` itself and leaves the status bar alone.
 - Hints that describe a state, not an event — "Release to hide the file tree" while you drag
   a panel edge, "Drop outside the tab bar to open in a new window" while you drag a tab —
   leave the moment they stop being true.
@@ -1100,9 +1189,9 @@ All editing actions go through named commands in `CommandRegistry`. Commands can
 
 Key combos for `zide.bind` / `zide.unbind` accept any case and modifier order (`Ctrl+Shift+K` = `shift+ctrl+k`; `control` works for `ctrl`). Key name aliases: `pageup`/`pgup` → `page_up`, `pagedown`/`pgdn` → `page_down`, `esc` → `escape`, `return` → `enter`, `del` → `delete`, `ins` → `insert`, `\` → `backslash`, plus `space` and the dvui-style punctuation names `slash`, `period`, `semicolon`, `comma`, `minus`, `equal`, `grave`, `apostrophe`, `left_bracket`, `right_bracket`. Both frontends deliver letters, digits, F1–F12, the named keys (arrows, `home`, `end`, `page_up`, `page_down`, `insert`, `delete`, `tab`, `enter`, `escape`, `backspace`, `space`, `backslash`) and the punctuation `[ ] ; ' , . / - =` plus backtick (`grave`), so `ctrl+1` or `ctrl+insert` work in the GUI and the TUI alike; Ctrl+Space (`ctrl+space`) works in the TUI too. `zide.bind` logs one warning for a key or modifier that can never fire and one when the command is not registered (yet); the binding still stands, so an extension may register the command later.
 
-**Keyboard focus.** In normal mode exactly one of the focused editor pane, the focused terminal pane, the file tree, the Snippets panel, the search panel and the terminal panel owns the keyboard (when flags disagree, the tree wins, then the Snippets panel, then the search panel). The docked panels live in the main window and can own the keyboard only while that window is focused. Clicking any pane, clicking a tab, splitting, F6 / Shift+F6, switching windows and `toggle_terminal` (Ctrl+backtick) give the keyboard back to the pane; `toggle_terminal` with a panel focused over a terminal pane focuses that terminal instead of opening another, and from the terminal panel it goes back to the editor. While a panel owns the keyboard, clipboard, select-all and word-delete chords never touch the document behind it: in the search panel the keys bound to copy and cut take the whole focused field, paste appends the clipboard's first line and Ctrl+Backspace deletes the previous word, while Ctrl+A and Ctrl+Delete do nothing; in the file tree the keys bound to copy, cut and paste drive the file clipboard; the Snippets panel swallows them all; the terminal panel's shell gets them as bytes like a terminal pane (Ctrl+C is the interrupt). The Edit menu's Cut/Copy/Paste/Select All follow the same rule.
+**Keyboard focus.** In normal mode exactly one of the focused editor pane, the focused terminal pane, the file tree, the Snippets panel, the search panel, the terminal panel and the find bar's text box owns the keyboard (when flags disagree, the tree wins, then the Snippets panel, then the search panel, then the terminal panel, then the find bar). The docked panels live in the main window and can own the keyboard only while that window is focused; the find bar's box can own it only in the window that shows the bar, and never over a terminal pane. Clicking any pane, clicking a tab, splitting, F6 / Shift+F6, switching windows and `toggle_terminal` (Ctrl+backtick) give the keyboard back to the pane; `toggle_terminal` with a panel focused over a terminal pane focuses that terminal instead of opening another, and from the terminal panel it goes back to the editor. While a panel owns the keyboard, clipboard, select-all and word-delete chords never touch the document behind it: in the search panel the keys bound to copy and cut take the whole focused field, paste appends the clipboard's first line and Ctrl+Backspace deletes the previous word, while Ctrl+A and Ctrl+Delete do nothing; in the file tree the keys bound to copy, cut and paste drive the file clipboard; the Snippets panel swallows them all; the terminal panel's shell gets them as bytes like a terminal pane (Ctrl+C is the interrupt); the find bar's box takes them and the word-move, undo and redo chords as a text box, and swallows the chords that would edit the document (see *Find bar*). The Edit menu's Cut/Copy/Paste/Select All follow the same rule, and its Undo/Redo follow the find bar's box.
 
-About 179 registered commands; every one is listed in the command palette and bindable with `zide.bind`. The tables below are the complete set (names as the code registers them, 2026-11-12). "Default key" is the shipped binding; **hard-wired** means the frontends dispatch that plain key themselves, so it is not in the keybind map — the command can still be bound to a chord of your own. `theme_*`, `gui_theme_*` and `tui_theme_*` re-apply `themes/syntax-theme.lua` and the `syn_theme_<lang>.lua` files on top of the new palette (the editor-color override files `gui-theme.lua` / `tui-theme.lua` are not re-run until the next launch).
+About 186 registered commands; every one is listed in the command palette and bindable with `zide.bind`. The tables below are the complete set (names as the code registers them, 2026-11-13). "Default key" is the shipped binding; **hard-wired** means the frontends dispatch that plain key themselves, so it is not in the keybind map — the command can still be bound to a chord of your own. `theme_*`, `gui_theme_*` and `tui_theme_*` re-apply `themes/syntax-theme.lua` and the `syn_theme_<lang>.lua` files on top of the new palette (the editor-color override files `gui-theme.lua` / `tui-theme.lua` are not re-run until the next launch).
 
 **Files, tabs and projects**
 
@@ -1146,7 +1235,7 @@ About 179 registered commands; every one is listed in the command palette and bi
 | `select_all` | Ctrl+A | Select all text |
 | `add_cursor_above` / `add_cursor_below` | Ctrl+Shift+Up / Down, also Ctrl+Alt+Up / Down | Add a cursor on the line above / below |
 | `add_next_occurrence` | Ctrl+D | Add a cursor at the next occurrence (selects the word first) |
-| `escape_multicursor` | Escape (hard-wired) | Remove secondary cursors |
+| `escape_multicursor` | Escape (hard-wired) | Close the signature popup; else close a find bar shown in this window; else remove secondary cursors |
 | `goto_line` | Ctrl+G | Go to a line number |
 | `goto_matching_bracket` | Alt+M | Jump to the bracket matching the one at the caret |
 | `navigate_back` / `navigate_forward` | Ctrl+Alt+Left / Right, also F7 / Shift+F7 | Move through the jump history |
@@ -1171,8 +1260,12 @@ About 179 registered commands; every one is listed in the command palette and bi
 
 | Command | Default key | What it does |
 | --- | --- | --- |
-| `find` | Ctrl+F | Find in the current document |
-| `find_replace` | Ctrl+H | Find and replace in the current document |
+| `find` | Ctrl+F | Show the find bar with the keyboard in its box (see *Find bar*) |
+| `find_next` / `find_previous` | F3 / Shift+F3 | Go to the next / previous match of the find bar's text — also with the bar closed |
+| `find_toggle_case` / `find_toggle_whole_word` | Alt+C / Alt+W | The find bar's `Aa` / `W` buttons; the workspace search panel's two while that panel owns the keyboard |
+| `find_toggle_highlight_all` | Alt+A | The find bar's `All` button: tint every match, or only the current one |
+| `find_close` | — (Escape in the bar or the text is hard-wired) | Close the find bar |
+| `find_replace` | Ctrl+H | Find and replace in the current document (the two-row prompt; closes the find bar) |
 | `find_in_files` | Ctrl+Shift+F | Search and replace across the workspace (results panel) |
 | `next_result` / `prev_result` | F4 / Shift+F4 | Step through the workspace search results |
 

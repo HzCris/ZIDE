@@ -201,7 +201,8 @@ User-requested) — the keys are being redone anyway, so nothing here is built b
 
 ## Overlay look and default themes (user, 2026-10-08)
 
-- **Opaque overlay panels** (N, S–M). The palette, picker, find bar and prompts draw a
+- **Opaque overlay panels** (N, S–M). The palette, picker and prompts (Ctrl+H's find-and-replace
+  prompt among them; Ctrl+F's find bar became an opaque row of its own on 2026-11-13) draw a
   translucent bar over the code, so the text behind bleeds through and long rows ran off the
   window (rows are clipped now). Quick open already draws an opaque, bordered, top-centered
   panel — move the palette and picker (and the other overlays) to that style, with a width cap.
@@ -457,11 +458,11 @@ field came back empty, or the code was read), and none of it repeats a section a
 by area, most useful first inside each group. Almost all of it is native work, because it lives
 in the painters, the language-server client or input handling; the few Lua-sized pieces say so.
 
-**The order picked on 2026-11-12** (the user's, after reading the list). Nothing below is
-started; each pick is talked through before any code is written.
+**The order picked on 2026-11-12** (the user's, after reading the list). Each pick is talked
+through before any code is written; only the first is started.
 
 1. **Find and replace in a document**, modeled on Kate's and VS Code's (*Find and replace in a
-   document*).
+   document*). **In progress: step 1 of 4, the find row, built 2026-11-13.**
 2. **Code actions / quick fixes** and **mouse reach for language features** (*Language
    server*).
 3. **Menus for what already exists** and **command palette rows that explain themselves**
@@ -519,24 +520,22 @@ not installed. *Zig tasks out of the box* needs no debugger and can go ahead whe
 ### Find and replace in a document
 
 - **Find and replace round-out** (N, M; first pick of 2026-11-12 — the models are Kate's and
-  VS Code's bars). Today, read from the code:
-  - *Find* (Ctrl+F) is one row: typing searches forward from the caret, Enter goes to the next
-    match and wraps, Escape closes. *Replace* (Ctrl+H) adds a second row: Tab switches rows,
-    Enter in the replace row replaces the current match and moves on, Ctrl+Enter or Ctrl+A
-    replaces all (already one undo step).
-  - Always case-sensitive, no whole-word option: `find_case_sensitive` / `find_whole_word` in
-    `editor.zig` are never assigned. The workspace search panel has both toggles and ignores
-    case by default, so the two searches disagree about the same word.
-  - Forward only (`findNext`), and nothing works once the bar is closed (no `find_next`
-    command, F3 is unbound).
-  - The rows are painted text, not text boxes: characters go on at the end and Backspace takes
-    the last one — no caret inside the row, no selecting, no buttons, no mouse. In the GUI
-    Ctrl+V does nothing there, and both rows open empty every time with no history, so a
-    copied or selected word has to be retyped. 256 bytes per row.
-  - Only the current match is marked. The GUI shows `N matches` but not which one the caret is
-    on; the TUI shows no count.
+  VS Code's bars). Today, read from the code (2026-11-13, after step 1 of the plan below):
+  - *Find* (Ctrl+F) is the find bar: a row along the bottom of the editor area that stays open
+    while you edit, a real text box with its own history, `Aa` / `W` / `All`, `3 of 17`,
+    previous / next, and F3 / Shift+F3 with the bar closed too — *Find bar* in
+    Documentation.md has all of it.
+  - *Replace* (Ctrl+H) is still the old two-row prompt until step 2, and everything the first
+    review found is still true of it: Tab switches rows, Enter in the replace row replaces the
+    current match and moves on, Ctrl+Enter or Ctrl+A replaces all (one undo step). Its rows
+    are painted text, not text boxes (characters go on at the end, Backspace takes the last
+    one, no caret inside the row, no selecting, no mouse, no history; in the GUI Ctrl+V does
+    nothing there). It is always case-sensitive (`find_case_sensitive` / `find_whole_word` in
+    `editor.zig` are never assigned) and forward only, so until step 2 Ctrl+H and Ctrl+F
+    disagree about case. The GUI shows its `N matches`, the TUI no count.
   - No regular expressions (their own entry under *Editing*: there is no engine yet), no `\n`
-    or `\t` in either row, no replace limited to the selection, no keep-the-case replace.
+    or `\t` in any row, no search or replace limited to the selection, no keep-the-case
+    replace, no "every match becomes a cursor".
 
   The target, from what Kate and VS Code share: rows that are real text boxes (caret,
   selection, paste, Up / Down through earlier searches); toggles for match case and whole word
@@ -575,11 +574,13 @@ not installed. *Zig tasks out of the box* needs no debugger and can go ahead whe
     (Common ground, for the record: VS Code tints the other matches too while its box is
     open, only faintly, and its icon beside the arrows is *Find in Selection*.)
 
-  **The plan — agreed 2026-11-12 with the user's picks (marked below); not started, waits
-  for the go.**
+  **The plan — agreed 2026-11-12 with the user's picks (marked below); the go came on
+  2026-11-13. Step 1 is built and waits for the on-screen check; steps 2 to 4 are not
+  started.**
   - *Where*: one bar along the bottom of the editor area in both frontends — **the user's
-    pick**, Kate's place (Zed has the same bar at the top). The TUI's bar is there today; the
-    GUI's is a see-through strip across the top.
+    pick**, Kate's place (Zed has the same bar at the top). Before step 1 the TUI's prompt was
+    there and the GUI's was a see-through strip across the top of the pane (Ctrl+H's prompt
+    still is).
   - *It stays open while you edit.* Today's bar is a mode that takes every key until Escape;
     this one is a small panel with its own keyboard focus, like the search panel.
   - *One bar.* Ctrl+F shows the find row; the replace row unfolds under it from Ctrl+H or
@@ -600,11 +601,31 @@ not installed. *Zig tasks out of the box* needs no debugger and can go ahead whe
     case-sensitive today).
 
   Build order, each step checked on screen before the next:
-  1. *The find row*: real text boxes — one shared line editor in the core (caret, selection,
-     paste, Up / Down history) that the search panel, the palette and the prompts can move
-     onto later; opens with the selection or the last search; `Aa`, `W` and `All` with their
-     hints; previous / next (Shift+Enter / Enter, Shift+F3 / F3 from the text too); the count
-     and the tints. Ctrl+H keeps today's two-row bar until step 2.
+  1. **DONE 2026-11-13 (built; the on-screen check is the user's).** *The find row*: real text
+     boxes — one shared line editor in the core (caret, selection, paste, Up / Down history)
+     that the search panel, the palette and the prompts can move onto later; opens with the
+     selection or the last search; `Aa`, `W` and `All` with their hints; previous / next
+     (Shift+Enter / Enter, Shift+F3 / F3 from the text too); the count and the tints. Ctrl+H
+     keeps the old two-row prompt until step 2.
+     - As built: `src/core/line_edit.zig` (the text box) and `src/core/find_bar.zig` (state,
+       match list, everything the bar does), painted by both frontends; the bar belongs to
+       one window and its box owns the keyboard like a panel. New commands `find_next`,
+       `find_previous`, `find_close`, `find_toggle_case`, `find_toggle_whole_word`,
+       `find_toggle_highlight_all`; settings `find_match_case`, `find_whole_word`,
+       `find_highlight_all`; theme colors `find_match_bg` / `find_match_border` (GUI) and
+       `find_match_bg` / `find_match_fg` (TUI). The first hover hints in the GUI.
+     - Decided while building — the user's to overrule: only `All` is written to init.lua
+       when flipped (`Aa` and `W` start from their settings on every launch, so a search
+       never quietly finds less after a restart); Alt+A is `All`'s placeholder key; Escape in
+       the text closes the bar before it removes extra cursors; F3 with nothing searched yet
+       opens the bar; Ctrl+H closes the bar (one find row at a time until step 2); keys that
+       would edit the text behind the box do nothing while the box has the keyboard.
+     - Fixed on the way: Alt+C / Alt+W never fired in the TUI's workspace search panel (the
+       keybind dispatcher took every Alt chord first); they are commands now and flip the
+       panel's two buttons while it owns the keyboard.
+     - Not in this step: the word at the caret as the starting text (the selection or the
+       last search is the plan), case folding outside ASCII (`É` / `é`), Tab between boxes
+       (one box so far), a history kept across restarts.
   2. *The replace row*: the `R` toggle and Ctrl+H unfold it; Replace / Replace All buttons,
      `Sel`, `AB`, `\n`.
   3. *Regular expressions* (**the user's pick**: third, not first): a small engine of ZIDE's
@@ -626,7 +647,7 @@ not installed. *Zig tasks out of the box* needs no debugger and can go ahead whe
 - **A typed bracket or quote wraps the selection** (N, S). Today typing `(` `[` `{` `"` `'` or
   a backtick over selected text replaces it with an empty pair (`cmdInsertChar`); the usual
   behavior is to put the pair around the selection.
-- **Small commands that are not among the 179** (N, S each). `select_line`; open a line above /
+- **Small commands that are not among the 186** (N, S each). `select_line`; open a line above /
   below without splitting the current one; scroll the view a line without moving the caret
   (Ctrl+Up / Ctrl+Down); Backspace inside leading spaces removing one indent level instead of
   one space; a typed `}` on a blank indented line stepping back one level; and

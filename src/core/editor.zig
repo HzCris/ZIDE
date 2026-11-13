@@ -28,6 +28,7 @@ pub const snippet_form_mod = @import("snippet_form.zig");
 pub const snippet_file = @import("snippet_file.zig");
 const nav_history = @import("nav_history.zig");
 pub const status_mod = @import("status_message.zig");
+pub const find_bar_mod = @import("find_bar.zig");
 const picker_mod = @import("picker.zig");
 const WalkIgnore = @import("walk_ignore.zig").WalkIgnore;
 const zlua = @import("zlua");
@@ -72,7 +73,11 @@ pub const Editor = struct {
     mode: Mode = .normal,
     /// setMode is running a leave-hook: a nested setMode only assigns.
     mode_leaving: bool = false,
-    /// Find/replace input buffers.
+    /// The find bar (Ctrl+F, find_bar.zig): a row along the bottom of one
+    /// window's editor area that stays open while you edit.
+    find_bar: find_bar_mod.State = .{},
+    /// Input buffers of the find-and-replace prompt (Ctrl+H, `.find_replace`
+    /// mode) — its own, apart from the find bar's box.
     find_buf: [256]u8 = undefined,
     find_buf_len: usize = 0,
     replace_buf: [256]u8 = undefined,
@@ -126,7 +131,8 @@ pub const Editor = struct {
     /// Go to line input buffer.
     goto_buf: [32]u8 = undefined,
     goto_buf_len: usize = 0,
-    /// Saved cursor offset when entering find mode (for incremental search).
+    /// The find-and-replace prompt: the caret when it opened (its
+    /// incremental search starts there) and its fixed matching rules.
     find_origin: usize = 0,
     find_case_sensitive: bool = true,
     find_whole_word: bool = false,
@@ -520,7 +526,8 @@ pub const Editor = struct {
 
     pub const Mode = enum {
         normal,
-        find,
+        /// The find-and-replace prompt (Ctrl+H). Plain find is not a mode:
+        /// the find bar (`find_bar`) leaves the text live.
         find_replace,
         file_open,
         /// TUI prompt for `open_folder` (the GUI answers with a native dialog).
@@ -666,6 +673,7 @@ pub const Editor = struct {
         self.review.deinit(self);
         self.dap.deinit(self);
         self.tool_panel.deinit(self.allocator);
+        self.find_bar.deinit(self.allocator);
         self.jobs.deinit();
         self.problems.deinit();
         self.project_formatting.deinit();
@@ -846,22 +854,26 @@ pub const Editor = struct {
 
     // ---- Keyboard focus (normal mode) ----
     //
-    // In normal mode exactly one of the file tree, the search panel, the
+    // In normal mode exactly one of the file tree, the Snippets panel, the
+    // search panel, the terminal panel, the find bar's text box, the
     // focused terminal pane and the focused editor pane owns the keyboard.
-    // The two panel flags stay plain fields (frontends read them), but only
-    // takeKeyboardFocus sets one; every way a pane takes focus clears both,
-    // and normalizeKeyboardFocus repairs direct writes once per tick.
+    // The focus flags stay plain fields (frontends read them), but only
+    // takeKeyboardFocus sets one; every way a pane takes focus clears them
+    // all, and normalizeKeyboardFocus repairs direct writes once per tick.
 
     /// Who gets keys and text in normal mode. `.terminal` is a focused
-    /// terminal pane, `.terminal_panel` the docked terminal panel's shell.
-    pub const KeyboardOwner = enum { editor, terminal, filetree, snippets, search, terminal_panel };
+    /// terminal pane, `.terminal_panel` the docked terminal panel's shell,
+    /// `.find_bar` the find bar's text box.
+    pub const KeyboardOwner = enum { editor, terminal, filetree, snippets, search, terminal_panel, find_bar };
     /// What takeKeyboardFocus hands the keyboard to: the focused pane
-    /// (editor or terminal, whichever it is) or one of the docked panels.
-    pub const FocusTarget = enum { pane, filetree, snippets, search, terminal_panel };
+    /// (editor or terminal, whichever it is), one of the docked panels, or
+    /// the find bar.
+    pub const FocusTarget = enum { pane, filetree, snippets, search, terminal_panel, find_bar };
 
     /// Pure read. The docked panels live in the primary window and own the
     /// keyboard only while it is focused (the tree before the Snippets
-    /// panel before the search panel before the terminal panel); otherwise
+    /// panel before the search panel before the terminal panel); the find
+    /// bar's box owns it only in the window that shows the bar; otherwise
     /// the focused pane does.
     pub fn keyboardOwner(self: *const Editor) KeyboardOwner {
         if (self.active_window == 0) {
@@ -870,16 +882,20 @@ pub const Editor = struct {
             if (self.search_focused) return .search;
             if (self.terminal_panel_focused) return .terminal_panel;
         }
+        if (self.find_bar.focused and self.find_bar.visible and self.activeWindow().id == self.find_bar.window_id) return .find_bar;
         return if (self.activePaneIsTerminal()) .terminal else .editor;
     }
 
     /// THE setter of panel focus. `.pane` gives the keyboard back to the
-    /// focused pane (every panel flag cleared). A panel target focuses the
+    /// focused pane (every focus flag cleared). A panel target focuses the
     /// primary window, shows the panel, takes the keyboard from the other
     /// panels and closes the editor's completion popup; false when the file
     /// tree cannot be opened (the tree is then hidden and unfocused).
+    /// `.find_bar` shows the find bar in the focused window, whichever it
+    /// is, and gives its box the keyboard (find_bar.State.focus also notes
+    /// where the search starts).
     pub fn takeKeyboardFocus(self: *Editor, target: FocusTarget) bool {
-        if (target != .pane and self.active_window != 0) self.focusWindow(0);
+        if (target != .pane and target != .find_bar and self.active_window != 0) self.focusWindow(0);
         if (target == .filetree) {
             // A tree that cannot open leaves the current owner alone.
             self.filetree_visible = true;
@@ -891,6 +907,7 @@ pub const Editor = struct {
         self.snippets_focused = false;
         self.search_focused = false;
         self.terminal_panel_focused = false;
+        self.find_bar.focused = false;
         switch (target) {
             .pane => return true,
             .filetree => self.filetree_focused = true,
@@ -906,17 +923,34 @@ pub const Editor = struct {
                 self.terminal_panel_visible = true;
                 self.terminal_panel_focused = true;
             },
+            .find_bar => {
+                self.find_bar.visible = true;
+                self.find_bar.window_id = self.activeWindow().id;
+                self.find_bar.focused = true;
+            },
         }
         self.clearCompletionItems();
         return true;
+    }
+
+    /// Index into `windows` of the window with this id; null once it closed.
+    pub fn windowIndexForId(self: *const Editor, id: u32) ?usize {
+        for (self.windows.items, 0..) |win, idx| {
+            if (win.id == id) return idx;
+        }
+        return null;
     }
 
     /// Repair panel focus that a direct flag write, or a panel hidden under
     /// it, left inconsistent: a flag whose panel is hidden (or whose tree
     /// was never built) is cleared, all are while a secondary window is
     /// focused, and when several are set the tree keeps the keyboard, then
-    /// the Snippets panel. First thing in serviceTick.
+    /// the Snippets panel. The find bar goes with its window, and its box
+    /// lets go while another window, a panel or a terminal pane has the
+    /// keyboard. First thing in serviceTick.
     pub fn normalizeKeyboardFocus(self: *Editor) void {
+        if (self.find_bar.visible and self.windowIndexForId(self.find_bar.window_id) == null) self.find_bar.close(self);
+        if (!self.find_bar.visible or self.activeWindow().id != self.find_bar.window_id or self.activePaneIsTerminal()) self.find_bar.focused = false;
         if (self.active_window != 0) {
             self.filetree_focused = false;
             self.snippets_focused = false;
@@ -943,6 +977,7 @@ pub const Editor = struct {
             self.terminal_panel_focused = false;
         }
         if (self.search_focused) self.terminal_panel_focused = false;
+        if (self.filetree_focused or self.snippets_focused or self.search_focused or self.terminal_panel_focused) self.find_bar.focused = false;
     }
 
     /// The editing chords a focused side panel takes over (panelAction).
@@ -951,15 +986,20 @@ pub const Editor = struct {
     /// Clipboard and word-delete chords while a side panel owns the
     /// keyboard (normal mode): the tree copies, cuts and pastes files, the
     /// search panel edits its focused field, and the other chords are
-    /// swallowed so the document behind the panel is never edited. True =
-    /// consumed, and the caller must not run the action; false for any
-    /// other action, for the editor and terminal owners, and in modal modes.
+    /// swallowed so the document behind the panel is never edited. The
+    /// find bar's box takes those and the word-move and undo chords too
+    /// (find_bar.State.chord). True = consumed, and the caller must not run
+    /// the action; false for any other action, for the editor and terminal
+    /// owners, and in modal modes.
     pub fn panelAction(self: *Editor, action: []const u8) bool {
         if (self.mode != .normal) return false;
+        const owner = self.keyboardOwner();
+        if (owner == .find_bar) return self.find_bar.chord(self, action);
         const chord = std.meta.stringToEnum(PanelChord, action) orelse return false;
-        switch (self.keyboardOwner()) {
+        switch (owner) {
             // A shell gets its chords as bytes (Ctrl+C is the interrupt).
-            .editor, .terminal, .terminal_panel => return false,
+            // (The find bar answered above.)
+            .editor, .terminal, .terminal_panel, .find_bar => return false,
             .filetree => switch (chord) {
                 .copy => self.filetreeClipCapture(false),
                 .cut => self.filetreeClipCapture(true),
@@ -2947,12 +2987,12 @@ pub const Editor = struct {
             return true;
         }
         if (std.mem.eql(u8, action, "find")) {
-            self.setMode(.find);
-            self.find_buf_len = 0;
-            self.find_origin = self.activeDoc().cursors.primary().offset;
+            self.find_bar.open(self);
             return true;
         }
         if (std.mem.eql(u8, action, "find_replace")) {
+            // The prompt has its own find field: one find row at a time.
+            if (self.find_bar.visible) self.find_bar.close(self);
             self.setMode(.find_replace);
             self.find_buf_len = 0;
             self.replace_buf_len = 0;
@@ -4147,6 +4187,9 @@ pub const Editor = struct {
         // on in the primary, with what was typed.
         if (win.id == self.settings_window_id) self.settings_window_id = self.windows.items[0].id;
         if (win.id == self.snippet_form.window_id) self.snippet_form.window_id = self.windows.items[0].id;
+        // A find bar shown there goes with it (Ctrl+F shows it again in
+        // whichever window has the keyboard).
+        if (self.find_bar.visible and win.id == self.find_bar.window_id) self.find_bar.close(self);
         // Its documents stay open: the tabs go back to the main window.
         self.windows.items[0].tabs.appendSlice(self.allocator, win.tabs.items) catch {};
         win.tabs.deinit(self.allocator);
@@ -4307,7 +4350,7 @@ pub const Editor = struct {
     }
 
     /// First editor (non-terminal) leaf of `win`, if any.
-    fn firstEditorPaneIn(self: *Editor, win: *EditorWindow) ?u8 {
+    pub fn firstEditorPaneIn(self: *Editor, win: *EditorWindow) ?u8 {
         var leaves: std.ArrayList(u8) = .empty;
         defer leaves.deinit(self.allocator);
         win.layout.collectLeaves(0, &leaves) catch return null;
@@ -7601,7 +7644,7 @@ test "panelAction: search field owns clipboard and word-delete chords" {
 
     // Other actions, and modal modes, are not the panel's.
     try t.expect(!editor.panelAction("undo"));
-    editor.setMode(.find);
+    editor.setMode(.find_replace);
     try t.expect(!editor.panelAction("paste"));
     editor.setMode(.normal);
 
@@ -8270,9 +8313,9 @@ test "autosave and workspace replacements report failures and preserve source fo
         try t.expectEqualDeep(text_file.TextFormat{ .encoding = .windows1252 }, doc.format);
     }
     try doc.insertAtCursor("😀");
-    editor.setMode(.find);
+    editor.setMode(.find_replace);
     try t.expectEqual(@as(usize, 0), editor.autoSaveAll());
-    try t.expectEqual(Editor.Mode.find, editor.mode);
+    try t.expectEqual(Editor.Mode.find_replace, editor.mode);
     try t.expect(std.mem.indexOf(u8, editor.status_message, "failed") != null);
     try t.expect(doc.dirty);
     const bytes = try tmp.dir.readFileAlloc(t.io, "legacy.txt", t.allocator, .limited(100));
@@ -8361,9 +8404,9 @@ test "quick open: a command ends the session; later documents are never taken fo
     try t.expect(editor.activeDoc().preview);
     // A command (menu, keybind, Lua exec) ends quick-open first.
     try t.expect(editor.execAction("find"));
-    try t.expectEqual(Editor.Mode.find, editor.mode);
+    try t.expect(editor.find_bar.visible);
     try expectNoPeek(&editor);
-    editor.setMode(.normal);
+    editor.find_bar.close(&editor);
     // The next appended document is a real tab, not a stale preview...
     try t.expect(editor.execAction("new_document"));
     const draft_id = editor.activeDoc().id;

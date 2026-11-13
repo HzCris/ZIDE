@@ -129,6 +129,8 @@ const welcome_text =
     \\//
     \\// Find & go
     \\//   Ctrl+F            find               Ctrl+H           find & replace
+    \\//   F3 / Shift+F3     next / previous match (Enter / Shift+Enter in the find bar)
+    \\//   Alt+C / W / A     find: match case / whole word / highlight all matches
     \\//   Ctrl+G            go to line         Ctrl+P           command palette
     \\//   Ctrl+E            open file by fuzzy name (arrows live-preview, Esc restores)
     \\//   Ctrl+Shift+F      workspace search & replace   F4/Shift+F4  cycle results
@@ -733,6 +735,8 @@ comptime {
     _ = @import("core/walk_ignore.zig");
     _ = @import("core/text_file.zig");
     _ = @import("core/text_input.zig");
+    _ = @import("core/line_edit.zig");
+    _ = @import("core/find_bar.zig");
     // Every core file with tests must be listed: tests in files that are
     // only imported by other files are never discovered by the test runner.
     _ = @import("core/clipboard.zig");

@@ -283,6 +283,10 @@ fn createGuiThemeTemplate(path: [:0]const u8) void {
         \\-- zide.set("color_status_error_bg", "#e06c75")   -- Error (something failed): the block
         \\-- zide.set("color_status_error_fg", "#210c0e")   -- Error: its text
         \\
+        \\-- === Find bar matches ===
+        \\-- zide.set("color_find_match_bg", "#e5c07b46")     -- Every match, with All on (see-through)
+        \\-- zide.set("color_find_match_border", "#e5c07b")   -- Outline of the match you are on; scroll-bar marks
+        \\
     ) catch {};
 }
 
@@ -342,6 +346,10 @@ fn createTuiThemeTemplate(path: [:0]const u8) void {
         \\-- zide.set("tui_color_status_warning_fg", "#000000") -- Warning: its text
         \\-- zide.set("tui_color_status_error_bg", "#ff5f5f")   -- Error (something failed): the block
         \\-- zide.set("tui_color_status_error_fg", "#000000")   -- Error: its text
+        \\
+        \\-- === Find bar matches (the one you are on shows as the selection) ===
+        \\-- zide.set("tui_color_find_match_bg", "#ffd787")     -- Every match, with All on
+        \\-- zide.set("tui_color_find_match_fg", "#000000")     -- Its text
         \\
         \\-- === Overlay panels (find, palette, go-to-line) ===
         \\-- zide.set("tui_color_overlay_bg", "#282830")     -- Panel background
@@ -858,7 +866,7 @@ pub fn getFieldRaw(lua: *Lua, index: i32, key: [:0]const u8) zlua.LuaType {
 }
 
 /// zide.set(key, value)
-/// Supported keys: "tab_width", "use_tabs", "word_wrap", "auto_close_brackets", "completion_auto", "completion_min_chars", "signature_help_auto", "review_stage_on_approve", "page_size", "status_message_seconds"
+/// Supported keys: "tab_width", "use_tabs", "word_wrap", "auto_close_brackets", "completion_auto", "completion_min_chars", "signature_help_auto", "review_stage_on_approve", "page_size", "status_message_seconds", "find_match_case", "find_whole_word", "find_highlight_all"
 fn luaSet(state: ?*zlua.LuaState) callconv(.c) c_int {
     var lua: *Lua = @ptrCast(@alignCast(state orelse return 0));
     const editor = getEditor(state) orelse return 0;
@@ -915,6 +923,15 @@ fn luaSet(state: ?*zlua.LuaState) callconv(.c) c_int {
         if (val >= 0 and val <= 30) {
             editor.status_message_seconds = @intCast(val);
         }
+    } else if (std.mem.eql(u8, key_str, "find_match_case")) {
+        // The find bar's buttons (Aa, W, All): how they start out. Flipping
+        // All in the bar writes its line to init.lua, like the panel sizes;
+        // Aa and W start from these two again on every launch.
+        editor.find_bar.options.match_case = lua.toBoolean(2);
+    } else if (std.mem.eql(u8, key_str, "find_whole_word")) {
+        editor.find_bar.options.whole_word = lua.toBoolean(2);
+    } else if (std.mem.eql(u8, key_str, "find_highlight_all")) {
+        editor.find_bar.highlight_all = lua.toBoolean(2);
     } else if (std.mem.eql(u8, key_str, "gutter_min_digits")) {
         const val = lua.toInteger(2) catch return 0;
         if (val >= 1 and val <= 10) {
@@ -1238,6 +1255,15 @@ fn luaGet(state: ?*zlua.LuaState) callconv(.c) c_int {
         return 1;
     } else if (std.mem.eql(u8, key_str, "status_message_seconds")) {
         lua.pushInteger(@intCast(editor.status_message_seconds));
+        return 1;
+    } else if (std.mem.eql(u8, key_str, "find_match_case")) {
+        lua.pushBoolean(editor.find_bar.options.match_case);
+        return 1;
+    } else if (std.mem.eql(u8, key_str, "find_whole_word")) {
+        lua.pushBoolean(editor.find_bar.options.whole_word);
+        return 1;
+    } else if (std.mem.eql(u8, key_str, "find_highlight_all")) {
+        lua.pushBoolean(editor.find_bar.highlight_all);
         return 1;
     } else if (std.mem.eql(u8, key_str, "gutter_min_digits")) {
         lua.pushInteger(@intCast(editor.gutter_min_digits));

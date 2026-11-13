@@ -146,6 +146,19 @@ pub fn allowsShiftFallback(combo: []const u8) bool {
     return c.shift and !(c.key.len == 1 and std.ascii.isLower(c.key[0]));
 }
 
+/// `combo` the way people write keys — "alt+c" as "Alt+C", "shift+f3" as
+/// "Shift+F3", "ctrl+page_down" as "Ctrl+Page Down" — written into `buf`
+/// ("" when it does not fit).
+pub fn displayCombo(combo: []const u8, buf: []u8) []const u8 {
+    if (combo.len > buf.len) return "";
+    var word_start = true;
+    for (combo, 0..) |ch, i| {
+        buf[i] = if (ch == '_') ' ' else if (word_start) std.ascii.toUpper(ch) else ch;
+        word_start = ch == '+' or ch == '_';
+    }
+    return buf[0..combo.len];
+}
+
 /// Data-driven keybinding map.
 /// Maps key combo strings (e.g. "ctrl+s") to action names. Combos are
 /// stored and looked up in canonical form (`canonicalize`), so "Shift+Ctrl+K"
@@ -220,6 +233,23 @@ pub const KeybindMap = struct {
         return self.map.get(combo.text);
     }
 
+    /// A key combo bound to `action`, in canonical form ("alt+c") — for
+    /// hints: the shortest one, the first in alphabetical order among
+    /// equals. Null when nothing is bound to it.
+    pub fn comboFor(self: *const KeybindMap, action: []const u8) ?[]const u8 {
+        var best: ?[]const u8 = null;
+        var iter = self.map.iterator();
+        while (iter.next()) |entry| {
+            if (!std.mem.eql(u8, entry.value_ptr.*, action)) continue;
+            const combo = entry.key_ptr.*;
+            if (best) |b| {
+                if (combo.len > b.len or (combo.len == b.len and std.mem.order(u8, combo, b) != .lt)) continue;
+            }
+            best = combo;
+        }
+        return best;
+    }
+
     /// Populate with CUA defaults.
     /// Keep main.zig's `welcome_text` hotkey reference in sync with this list.
     pub fn loadDefaults(self: *KeybindMap) !void {
@@ -239,6 +269,15 @@ pub const KeybindMap = struct {
         try self.set("ctrl+a", "select_all");
         try self.set("ctrl+f", "find");
         try self.set("ctrl+h", "find_replace");
+        // The find bar: next / previous match also with the bar closed, and
+        // its buttons (the letters are VS Code's, placeholders until the
+        // hotkey pass; Shift+F3 is explicit because an unbound Shift+F-key
+        // falls back to the plain one)
+        try self.set("f3", "find_next");
+        try self.set("shift+f3", "find_previous");
+        try self.set("alt+c", "find_toggle_case");
+        try self.set("alt+w", "find_toggle_whole_word");
+        try self.set("alt+a", "find_toggle_highlight_all");
         try self.set("ctrl+o", "file_open");
         try self.set("ctrl+p", "command_palette");
         try self.set("ctrl+e", "quick_open");
@@ -347,6 +386,29 @@ test "keybind map" {
     // Remove
     kb.remove("ctrl+s");
     try std.testing.expect(kb.get("ctrl+s") == null);
+}
+
+test "keybind hints: the key bound to an action, written the way people write keys" {
+    const allocator = std.testing.allocator;
+    var kb = KeybindMap.init(allocator);
+    defer kb.deinit();
+    try kb.loadDefaults();
+    try std.testing.expectEqualStrings("f3", kb.comboFor("find_next").?);
+    try std.testing.expectEqualStrings("alt+c", kb.comboFor("find_toggle_case").?);
+    // Several keys: the shortest, then the first by name
+    try std.testing.expectEqualStrings("f7", kb.comboFor("navigate_back").?);
+    try std.testing.expectEqualStrings("ctrl+y", kb.comboFor("redo").?);
+    try std.testing.expect(kb.comboFor("no_such_action") == null);
+    kb.remove("f3");
+    try std.testing.expect(kb.comboFor("find_next") == null);
+
+    var buf: [max_combo_len]u8 = undefined;
+    try std.testing.expectEqualStrings("Alt+C", displayCombo("alt+c", &buf));
+    try std.testing.expectEqualStrings("Shift+F3", displayCombo("shift+f3", &buf));
+    try std.testing.expectEqualStrings("Ctrl+Page Down", displayCombo("ctrl+page_down", &buf));
+    try std.testing.expectEqualStrings("Ctrl+`", displayCombo("ctrl+`", &buf));
+    var small: [3]u8 = undefined;
+    try std.testing.expectEqualStrings("", displayCombo("alt+c", &small));
 }
 
 test "keybind defaults" {

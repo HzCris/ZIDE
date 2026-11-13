@@ -98,6 +98,11 @@ pub const EditorTheme = struct {
     status_warning_fg: ThemeColor,
     status_error_bg: ThemeColor,
     status_error_fg: ThemeColor,
+
+    // The find bar: the soft fill behind every match (alpha matters) and
+    // the outline around the match the bar is on (also the scroll-bar marks)
+    find_match_bg: ThemeColor,
+    find_match_border: ThemeColor,
 };
 
 // ---------------------------------------------------------------------------
@@ -170,6 +175,10 @@ pub const TuiTheme = struct {
     status_error_bg: TuiColor,
     status_error_fg: TuiColor,
 
+    // The find bar's matches (the one the bar is on shows as the selection)
+    find_match_bg: TuiColor,
+    find_match_fg: TuiColor,
+
     // Overlays (find, palette, goto)
     overlay_bg: TuiColor,
     overlay_fg: TuiColor,
@@ -229,6 +238,9 @@ pub const gui_dark = EditorTheme{
     .status_warning_fg = .{ .r = 30, .g = 24, .b = 10 },
     .status_error_bg = .{ .r = 224, .g = 108, .b = 117 },
     .status_error_fg = .{ .r = 33, .g = 12, .b = 14 },
+
+    .find_match_bg = .{ .r = 229, .g = 192, .b = 123, .a = 70 },
+    .find_match_border = .{ .r = 229, .g = 192, .b = 123 },
 };
 
 /// Light theme.
@@ -275,6 +287,9 @@ pub const gui_light = EditorTheme{
     .status_warning_fg = .{ .r = 255, .g = 255, .b = 255 },
     .status_error_bg = .{ .r = 200, .g = 40, .b = 40 },
     .status_error_fg = .{ .r = 255, .g = 255, .b = 255 },
+
+    .find_match_bg = .{ .r = 255, .g = 200, .b = 0, .a = 90 },
+    .find_match_border = .{ .r = 190, .g = 130, .b = 0 },
 };
 
 /// High-contrast theme.
@@ -321,6 +336,9 @@ pub const gui_high_contrast = EditorTheme{
     .status_warning_fg = .{ .r = 0, .g = 0, .b = 0 },
     .status_error_bg = .{ .r = 255, .g = 80, .b = 80 },
     .status_error_fg = .{ .r = 0, .g = 0, .b = 0 },
+
+    .find_match_bg = .{ .r = 255, .g = 255, .b = 0, .a = 90 },
+    .find_match_border = .{ .r = 255, .g = 255, .b = 0 },
 };
 
 // ---------------------------------------------------------------------------
@@ -369,6 +387,9 @@ pub const tui_terminal = TuiTheme{
     .status_warning_fg = .{ .ansi = 16 }, // black
     .status_error_bg = .{ .ansi = 1 }, // red
     .status_error_fg = .{ .ansi = 15 }, // bright white
+
+    .find_match_bg = .{ .ansi = 3 }, // yellow
+    .find_match_fg = .{ .ansi = 16 }, // black
 
     .overlay_bg = .{ .ansi = 0 }, // black
     .overlay_fg = .{ .ansi = 14 }, // bright cyan
@@ -421,6 +442,9 @@ pub const tui_dark = TuiTheme{
     .status_error_bg = .{ .ansi = 203 }, // #ff5f5f
     .status_error_fg = .{ .rgb = .{ .r = 0, .g = 0, .b = 0 } },
 
+    .find_match_bg = .{ .ansi = 222 }, // #ffd787
+    .find_match_fg = .{ .rgb = .{ .r = 0, .g = 0, .b = 0 } },
+
     .overlay_bg = .{ .ansi = 235 }, // #262626
     .overlay_fg = .{ .rgb = .{ .r = 225, .g = 225, .b = 230 } },
     .overlay_accent = .{ .rgb = .{ .r = 147, .g = 221, .b = 250 } },
@@ -472,6 +496,9 @@ pub const tui_light = TuiTheme{
     .status_error_bg = .{ .ansi = 160 }, // #d70000
     .status_error_fg = .{ .ansi = 231 }, // #ffffff
 
+    .find_match_bg = .{ .ansi = 222 }, // #ffd787
+    .find_match_fg = .{ .ansi = 16 }, // #000000
+
     .overlay_bg = .{ .ansi = 255 }, // #eeeeee
     .overlay_fg = .{ .ansi = 16 }, // #000000
     .overlay_accent = .{ .ansi = 33 }, // #0087ff
@@ -522,6 +549,9 @@ pub const tui_high_contrast = TuiTheme{
     .status_warning_fg = .{ .rgb = .{ .r = 0, .g = 0, .b = 0 } },
     .status_error_bg = .{ .ansi = 203 }, // #ff5f5f
     .status_error_fg = .{ .rgb = .{ .r = 0, .g = 0, .b = 0 } },
+
+    .find_match_bg = .{ .ansi = 226 }, // #ffff00
+    .find_match_fg = .{ .rgb = .{ .r = 0, .g = 0, .b = 0 } },
 
     .overlay_bg = .{ .ansi = 16 }, // #000000
     .overlay_fg = .{ .rgb = .{ .r = 255, .g = 255, .b = 255 } },
@@ -1024,6 +1054,29 @@ test "status message blocks: every preset keeps its text readable, and the level
     var tui = tui_dark;
     try std.testing.expect(setTuiColor(&tui, "status_note_fg", .{ .r = 9, .g = 8, .b = 7 }));
     try std.testing.expectEqual(@as(u8, 9), statusBlock(&tui, .note).fg.rgb.r);
+}
+
+test "find matches: a tint that is not the selection, readable text in the terminal, a see-through fill in the GUI" {
+    for ([_]EditorTheme{ gui_dark, gui_light, gui_high_contrast }) |theme| {
+        // The text under a match keeps its syntax colors: the fill must let
+        // the pane show through; the outline is a solid line.
+        try std.testing.expect(theme.find_match_bg.a < 128);
+        try std.testing.expectEqual(@as(u8, 255), theme.find_match_border.a);
+        try std.testing.expect(!std.meta.eql(theme.find_match_border, theme.selection));
+    }
+    for ([_]TuiTheme{ tui_terminal, tui_dark, tui_light, tui_high_contrast }) |theme| {
+        try std.testing.expect(!std.meta.eql(theme.find_match_bg, theme.selection_bg));
+        try std.testing.expect(!std.meta.eql(theme.find_match_bg, theme.text_bg));
+        const bg = testFixedRgb(theme.find_match_bg) orelse continue;
+        const fg = testFixedRgb(theme.find_match_fg) orelse continue;
+        try std.testing.expect(testContrast(bg, fg) >= 4.5);
+    }
+    var gui = gui_dark;
+    try std.testing.expect(setEditorColor(&gui, "find_match_border", .{ .r = 1, .g = 2, .b = 3 }));
+    try std.testing.expectEqual(@as(u8, 3), gui.find_match_border.b);
+    var tui = tui_dark;
+    try std.testing.expect(setTuiColor(&tui, "find_match_bg", .{ .r = 9, .g = 8, .b = 7 }));
+    try std.testing.expectEqual(@as(u8, 8), tui.find_match_bg.rgb.g);
 }
 
 test "syntax theme colorForToken" {
