@@ -1,3 +1,6 @@
+//! When the main loop has to wake up without input: auto-save, the polls for
+//! files changed on disk, a status message that is due to settle. One struct
+//! of deadlines on the main thread, and no timer thread.
 const std = @import("std");
 
 /// Main-thread deadlines shared by frontends; no busy polling or timer thread.

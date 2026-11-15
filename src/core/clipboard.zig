@@ -1,3 +1,5 @@
+//! The system clipboard: the Win32 API on Windows, `wl-copy` / `xclip` /
+//! `xsel` on Linux, and an in-process fallback when neither is there.
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const builtin = @import("builtin");

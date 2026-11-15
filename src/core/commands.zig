@@ -1,3 +1,7 @@
+//! The command registry and every built-in command. A command is a name, a
+//! description for the palette and a function that takes the editor; key
+//! bindings, the palette, the menus and Lua's `zide.exec` all run commands by
+//! name.
 const std = @import("std");
 const builtin = @import("builtin");
 const Allocator = std.mem.Allocator;

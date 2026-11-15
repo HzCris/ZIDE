@@ -1,3 +1,7 @@
+//! A document: one text buffer with its cursors, its undo history and its file
+//! metadata (path, encoding, line endings, language, unsaved state). Every
+//! edit goes through here, so the cursors, the undo record and the change
+//! version stay consistent with the text.
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const Buffer = @import("buffer.zig").Buffer;
@@ -500,12 +504,6 @@ pub const Document = struct {
         if (text.len == 0) return;
         if (self.cursors.count() == 1) return self.insertAtCursor(text);
         try self.editAll(text, 0, false, false);
-    }
-    pub fn deleteForwardAll(self: *Document, count: usize) !void {
-        try self.editAll("", count, false, false);
-    }
-    pub fn deleteBackwardAll(self: *Document, count: usize) !void {
-        try self.editAll("", count, true, false);
     }
     pub fn deleteCharacterAll(self: *Document, backward: bool) !void {
         try self.editAll("", 0, backward, true);

@@ -1,3 +1,6 @@
+//! Tests that run snippets end to end through the real Lua runtime: the
+//! bundled Zig set, the user's own snippets file, the save-as-snippet form
+//! and the Tab walk through a snippet's blanks.
 const std = @import("std");
 const t = std.testing;
 const Editor = @import("editor.zig").Editor;

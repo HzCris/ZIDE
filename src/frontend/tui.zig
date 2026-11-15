@@ -1,3 +1,7 @@
+//! The TUI frontend on libvaxis: it draws the same editor state into terminal
+//! cells and hands keys, mouse events and pastes to commands. Tab bar, panes,
+//! status bar, the docked panels, the find bar and the prompt overlays. Its
+//! tests drive a fake screen through the same draw and key paths.
 const std = @import("std");
 const builtin = @import("builtin");
 const text_input = @import("../core/text_input.zig");

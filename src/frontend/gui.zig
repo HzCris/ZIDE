@@ -1,3 +1,9 @@
+//! The GUI frontend: one DVUI frame function on SDL3 that paints the editor's
+//! state and turns events into commands. It draws the menus, the tabs, the
+//! panes and their text (by hand: gutter, syntax colors, selections, carets),
+//! the file tree, the Snippets, search and terminal panels, the find bar, the
+//! tool views, the Settings dialog and the extra OS windows. Its tests run
+//! under `zig build test-gui`, in hidden windows.
 const std = @import("std");
 const text_input = @import("../core/text_input.zig");
 const build_options = @import("build_options");
@@ -239,9 +245,6 @@ const editor_sb_band: f32 = 12;
 const DragMode = enum { char, word, line, block };
 const blink_interval_ms: i128 = 530;
 
-/// Auto-save timer (nanosecond timestamp of last auto-save check).
-var last_auto_save_ns: i128 = 0;
-
 /// OS drag & drop staging slot (see onSdlDropFile). Fixed slots — a drop
 /// of more than 16 items imports the first 16.
 const DropSlot = struct { path: [1024]u8 = undefined, len: usize = 0, x: f32 = 0, y: f32 = 0 };
@@ -384,11 +387,6 @@ pub const GuiState = struct {
             if (w.sdl_window_id == sdl_id) return w;
         }
         return null;
-    }
-
-    /// State of the editor's focused window.
-    pub fn activeUi(self: *GuiState, editor: *Editor) *WinUi {
-        return self.find(editor.activeWindow().id) orelse self.primary();
     }
 
     /// Drop state for windows the core no longer has (never the primary).

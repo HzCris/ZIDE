@@ -115,10 +115,7 @@ pub const State = struct {
             .tasks => "Tasks — Enter runs / Esc closes",
             .debug => editor.dap.title(buf),
             .changes => if (editor.git.status().len > 0) editor.git.status() else "Changes: index / working tree | Enter diff / D staged diff / S stage / U unstage / R refresh",
-            .git_diff => blk: {
-                var mode_buf: [64]u8 = undefined;
-                break :blk std.fmt.bufPrint(buf, "{s}: {s}{s}{s}", .{ editor.git.preview_path orelse "Diff", editor.git.previewModeText(&mode_buf), if (editor.git.preview_job != null) " (loading)" else "", if (editor.git.preview.truncated) " (truncated)" else "" }) catch "Git diff";
-            },
+            .git_diff => std.fmt.bufPrint(buf, "{s}: {s}{s}{s}", .{ editor.git.preview_path orelse "Diff", editor.git.previewModeText(), if (editor.git.preview_job != null) " (loading)" else "", if (editor.git.preview.truncated) " (truncated)" else "" }) catch "Git diff",
             .task_output => blk: {
                 const run = editor.tasks.get(editor.tasks.selected_run orelse break :blk "Task output") orelse break :blk "Task output";
                 break :blk std.fmt.bufPrint(buf, "{s}: {s} (exit {any}){s} {s}{s}{s} | R reruns / S stops / Enter opens location", .{ run.config.options.name, @tagName(run.status), run.exit_code, if (run.truncated) " (output truncated)" else "", run.error_name orelse "", if (run.matcher_error != null) " problem matcher failed: " else "", run.matcher_error orelse "" }) catch run.config.options.name;

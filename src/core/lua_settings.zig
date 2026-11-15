@@ -1,3 +1,8 @@
+//! The Lua side of configuration: `zide.set` / `zide.get`, key bindings,
+//! language and language-server registration, and the loading of `init.lua`,
+//! the theme files and the extensions folder. It also writes single settings
+//! back to `init.lua` and installs the commented example files on first
+//! launch.
 const std = @import("std");
 const zlua = @import("zlua");
 const Editor = @import("editor.zig").Editor;
@@ -570,7 +575,7 @@ test "a quoted Windows path survives init.lua; an unquoted one is refused" {
     var buf: [64]u8 = undefined;
     try writeSettingAt(t.allocator, t.io, path, "filetree_root", quoteLuaString(&buf, "C:\\Users\\x\\t").?);
     // The old splice ("\"" ++ path ++ "\"") no longer reaches the file...
-    try t.expectError(error.InvalidSettingValue, writeSettingAt(t.allocator, t.io, path, "filetree_root", "\"C:\\Users\\GHz\\proj\""));
+    try t.expectError(error.InvalidSettingValue, writeSettingAt(t.allocator, t.io, path, "filetree_root", "\"C:\\Users\\me\\proj\""));
     // ...nor do keys that aren't identifiers.
     try t.expectError(error.InvalidSettingKey, writeSettingAt(t.allocator, t.io, path, "x\", 1) os.exit() --", "1"));
 

@@ -1,3 +1,6 @@
+//! The key map: canonical key-combo strings (`ctrl+shift+k`) mapped to command
+//! names, with the shipped defaults. Every Ctrl / Alt / F-key shortcut is
+//! data in here, which is what lets Lua rebind it.
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 

@@ -1,3 +1,10 @@
+//! The editor: everything both frontends share. `Editor` owns the open
+//! documents, the windows (each one a split layout with a focused pane), the
+//! current mode (prompts, pickers and dialogs are modes), the settings and
+//! themes, the command registry and the key map, and the services behind the
+//! panels: language servers, Git, tasks, the debugger, search, the file
+//! tree, terminals and crash recovery. The frontends call into it and paint
+//! its state; nothing in here draws.
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const Document = @import("document.zig").Document;
@@ -2428,12 +2435,6 @@ pub const Editor = struct {
                 self.setDocPath(doc, joined) catch {};
             }
         }
-    }
-
-    /// Close the active document. Returns false if it was the last one
-    /// (creates a new empty document in that case).
-    pub fn closeActiveDoc(self: *Editor) bool {
-        return self.closeDocAt(self.active_doc_idx);
     }
 
     /// Close the document at `doc_idx`, asking first when it has unsaved
@@ -5352,22 +5353,6 @@ pub const Editor = struct {
         try doc.setFilePath(path);
         self.relanguageDoc(doc);
         self.resolveFormatting(doc);
-    }
-
-    /// Save As: write `path`, adopt it, re-detect the language, then the
-    /// shared post-save bookkeeping (file tree, extensions). Nothing is
-    /// touched when the write fails except that the document is re-opened
-    /// on the LSP side under its old uri by the next sync (harmless).
-    pub fn saveDocAs(self: *Editor, doc: *Document, path: []const u8) !void {
-        switch (self.saveDocument(doc.id, .{ .path = path, .interactive = false })) {
-            .saved => {},
-            .formatting => return error.FormattingInProgress,
-            .destination_exists => return error.DestinationExists,
-            .unrepresentable => return error.UnrepresentableText,
-            .conflict => return error.ExternalChange,
-            .needs_path => return error.NoFilePath,
-            .failed => |err| return err,
-        }
     }
 
     /// Get the resolved GUI syntax theme for a language (per-lang override or global).

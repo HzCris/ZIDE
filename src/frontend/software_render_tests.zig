@@ -1,3 +1,6 @@
+//! Pixel tests for software rendering: they read back what SDL drew for atlas
+//! blits, fills, triangles and clipped or rotated text, and so guard the
+//! fixes ZIDE applies to SDL's software path (see tests/VALIDATION.md).
 const std = @import("std");
 const dvui = @import("dvui");
 const Backend = @import("sdl-backend");

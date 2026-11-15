@@ -1,3 +1,7 @@
+//! Themes: the color types, the editor's colors for the GUI (`EditorTheme`)
+//! and for the TUI (`TuiTheme`), the syntax colors, and the built-in presets
+//! (dark, light, high contrast, plus the TUI's "terminal" preset, which
+//! follows the terminal's own palette).
 const std = @import("std");
 const syntax = @import("syntax.zig");
 const StatusLevel = @import("status_message.zig").Level;

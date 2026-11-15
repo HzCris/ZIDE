@@ -1,3 +1,6 @@
+//! Split panes: a binary tree whose leaves are panes (a document or a
+//! terminal) and whose inner nodes are vertical or horizontal splits with a
+//! ratio. Every window has one.
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 

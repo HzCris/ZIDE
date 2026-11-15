@@ -422,20 +422,6 @@ pub const Session = struct {
             node.loading = true;
         }
     }
-    pub fn nodeVisible(self: *Session, index: usize) bool {
-        var parent = self.nodes.items[index].parent;
-        var depth: usize = 0;
-        while (parent) |id| {
-            if (depth >= max_variable_depth) return false;
-            const node = for (self.nodes.items) |item| {
-                if (item.id == id) break item;
-            } else return false;
-            if (!node.expanded) return false;
-            parent = node.parent;
-            depth += 1;
-        }
-        return true;
-    }
     fn event(self: *Session, editor: *Editor, name: []const u8, body: Value) !void {
         if (std.mem.eql(u8, name, "output")) {
             // DAP: telemetry output goes to telemetry, never to the user.

@@ -1,3 +1,6 @@
+//! Text storage: a gap buffer with an index of line starts. Byte offsets are
+//! the editor's universal position; this file converts between offsets and
+//! line / column and hands out slices of the text.
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 
@@ -72,21 +75,6 @@ pub const Buffer = struct {
         self.gap_start = text.len;
         self.version +%= 1;
         try self.rebuildLineIndex();
-    }
-
-    /// Load a file into the buffer.
-    pub fn loadFile(self: *Buffer, io: std.Io, path: []const u8) !void {
-        const decoded = try @import("text_file.zig").read(self.allocator, io, path, null, std.math.maxInt(usize));
-        defer self.allocator.free(decoded.text);
-        try self.loadText(decoded.text);
-    }
-
-    /// Save the buffer to a file.
-    pub fn saveFile(self: *const Buffer, io: std.Io, path: []const u8) !void {
-        const bytes = try self.allocator.alloc(u8, self.byteLen());
-        defer self.allocator.free(bytes);
-        for (bytes, 0..) |*b, i| b.* = self.byteAt(i).?;
-        try @import("text_file.zig").write(self.allocator, io, path, bytes, .{});
     }
 
     /// Total number of bytes in the buffer.

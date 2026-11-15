@@ -1,12 +1,18 @@
-# ---> Zig
+# Zig build output and caches
 .zig-cache/
 zig-out/
 # Zig 0.16 project-local package store (fetched deps; global cache keeps the tarballs)
 zig-pkg/
-references/
-ZideClaudeDesign/
 
 # Build artifacts / scratch output
 *.o
 build_*.txt
 
+# Local-only material: kept on the maintainer's disk, not part of the repository
+references/
+ZideClaudeDesign/
+testfiles/
+libs/font/
+/CodeDiffViewerIdea.md
+/Checklist.md
+.claude/settings.local.json

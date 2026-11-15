@@ -1,3 +1,6 @@
+//! Regression tests from code reviews. Each one pins down a bug that was found
+//! and fixed: documents closing or saving at the wrong moment, files changed
+//! on disk, search results gone stale, word commands, Lua settings, snippets.
 const std = @import("std");
 const t = std.testing;
 const Editor = @import("editor.zig").Editor;

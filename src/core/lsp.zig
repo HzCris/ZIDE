@@ -1,3 +1,8 @@
+//! Language Server Protocol client: server registrations, start-up and
+//! capability negotiation, document sync, and the requests behind
+//! diagnostics, completion, go to definition, references, symbols and
+//! signature help. Several servers can serve one language. The transport is
+//! `protocol.zig`; hover, rename and formatting are in `lsp_tools.zig`.
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const builtin = @import("builtin");

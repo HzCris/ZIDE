@@ -1,3 +1,8 @@
+//! ZIDE's entry point: command-line arguments, the log file, user
+//! configuration, and the choice of frontend. `zide` holds both frontends and
+//! opens the TUI when started from a terminal and the GUI when started from
+//! the desktop; `zide-tui` is the TUI alone. The welcome text lives here, and
+//! so does the list of files whose tests the test runner has to see.
 const std = @import("std");
 const builtin = @import("builtin");
 const build_options = @import("build_options");

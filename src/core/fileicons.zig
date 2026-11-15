@@ -1,9 +1,11 @@
+//! File-type classification for the file tree's rows: which kind of icon a
+//! name gets, by extension or by exact name. The GUI turns a kind into a
+//! vector icon and the TUI into a Nerd Font glyph; overrides from Lua's
+//! `zide.set_icon` are applied by the editor.
 const std = @import("std");
 
-/// Frontend-agnostic file-type classification for tree rows (and later
-/// tabs). The GUI maps kinds to TinyVG glyphs; the TUI can map the same
-/// kinds to nerdfont glyphs when custom icon integration lands. Kept as
-/// plain tables so a future `zide.set_icons` Lua hook can override them.
+/// The kinds of icon a tree row can have. The GUI draws a kind as a vector
+/// icon, the TUI as a Nerd Font glyph (with `tui_filetree_icons` on).
 pub const IconKind = enum {
     folder,
     code,

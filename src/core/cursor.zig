@@ -1,3 +1,6 @@
+//! Cursors: one caret with an optional selection anchor (`Cursor`), the set of
+//! them that multi-cursor editing works on (`CursorSet`), and the movement,
+//! word and character-boundary helpers both use.
 const std = @import("std");
 const Buffer = @import("buffer.zig").Buffer;
 const Allocator = std.mem.Allocator;
@@ -267,13 +270,6 @@ pub const CursorSet = struct {
         return self.cursors.items.len;
     }
 
-    /// Remove a cursor by index. Won't remove the last cursor.
-    pub fn removeCursor(self: *CursorSet, idx: usize) void {
-        if (self.cursors.items.len <= 1) return;
-        if (idx >= self.cursors.items.len) return;
-        _ = self.cursors.orderedRemove(idx);
-    }
-
     /// Replace all cursors with a block (column) selection: one cursor per
     /// line between `anchor_line` and `head_line`, each selecting the byte
     /// column span anchor_col..head_col (clamped to that line's length).
@@ -350,21 +346,6 @@ pub const CursorSet = struct {
         self.cursors.items.len = write;
     }
 
-    /// Fill `buf` with cursor indices sorted by offset descending (highest first).
-    /// Returns the filled slice. Caller provides buffer of at least `count()` entries.
-    pub fn sortedDescending(self: *const CursorSet, buf: []usize) []usize {
-        const n = self.cursors.items.len;
-        std.debug.assert(buf.len >= n);
-        for (0..n) |i| buf[i] = i;
-        const items = self.cursors.items;
-        std.mem.sort(usize, buf[0..n], items, struct {
-            fn cmp(ctx: []const Cursor, a: usize, b: usize) bool {
-                return ctx[a].offset > ctx[b].offset;
-            }
-        }.cmp);
-        return buf[0..n];
-    }
-
     /// Adjust all cursor offsets after an insert at `pos` of `len` bytes.
     pub fn adjustAfterInsert(self: *CursorSet, pos: usize, len: usize) void {
         for (self.cursors.items) |*c| {
@@ -396,32 +377,6 @@ pub const CursorSet = struct {
                     } else {
                         a.* = pos;
                     }
-                }
-            }
-        }
-    }
-
-    /// Adjust all cursor offsets EXCEPT `skip_idx` after an insert.
-    pub fn adjustOthersAfterInsert(self: *CursorSet, skip_idx: usize, pos: usize, len: usize) void {
-        for (self.cursors.items, 0..) |*c, i| {
-            if (i == skip_idx) continue;
-            if (c.offset >= pos) c.offset += len;
-            if (c.anchor) |*a| {
-                if (a.* >= pos) a.* += len;
-            }
-        }
-    }
-
-    /// Adjust all cursor offsets EXCEPT `skip_idx` after a delete.
-    pub fn adjustOthersAfterDelete(self: *CursorSet, skip_idx: usize, pos: usize, len: usize) void {
-        for (self.cursors.items, 0..) |*c, i| {
-            if (i == skip_idx) continue;
-            if (c.offset > pos) {
-                c.offset = if (c.offset >= pos + len) c.offset - len else pos;
-            }
-            if (c.anchor) |*a| {
-                if (a.* > pos) {
-                    a.* = if (a.* >= pos + len) a.* - len else pos;
                 }
             }
         }

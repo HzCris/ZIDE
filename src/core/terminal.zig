@@ -1,3 +1,6 @@
+//! The embedded terminal: a grid of cells fed by a reader thread that parses
+//! what the shell writes (`ansi.zig`) to a pseudo-terminal (`pty.zig`), and
+//! the encoding of the keys sent back to it.
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const builtin = @import("builtin");
@@ -277,13 +280,6 @@ pub const Terminal = struct {
 
         // Resize PTY
         self.pty.resize(new_cols, new_rows);
-    }
-
-    /// Get cell at position (for rendering). Locks mutex.
-    pub fn cellAt(self: *Terminal, row: u16, col: u16) Cell {
-        self.mutex.lockUncancelable(self.io);
-        defer self.mutex.unlock(self.io);
-        return self.cellAtUnsafe(row, col);
     }
 
     /// Get cell without locking (caller must hold mutex).

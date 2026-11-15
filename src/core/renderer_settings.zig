@@ -1,3 +1,6 @@
+//! The GUI's renderer choice (automatic, hardware accelerated, software),
+//! kept in `renderer.json` beside `init.lua`: it is needed at start-up, before
+//! the editor and its Lua settings exist.
 const std = @import("std");
 const text_file = @import("text_file.zig");
 

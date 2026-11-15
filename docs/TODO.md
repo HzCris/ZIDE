@@ -1,11 +1,17 @@
 # ZIDE TODO — the feature backlog
 
 The one place where not-yet-built features live, so nothing survives only in a chat log. Add new
-ideas here with a date; mark an item **DONE** (with the date) when it ships. Started 2026-09-30 as
-a consolidated suggestions list from three sources: that day's feature review (every "missing"
-claim checked against the code), the user-requested terminal items from the same conversation,
-and the feature list at the end of the 2026-09-28 bug scan (that report has since been deleted;
-every finding in it was fixed on 2026-09-29). Anything not marked DONE is not started.
+ideas here with a date; mark an item **DONE** (with the date) when it ships.
+
+Who is who: "the user" in this file is ZIDE's owner, who decides what gets built and tests it
+on screen; the notes are written by the AI assistant that implements it (see *How it is built*
+in the README). "User, 2026-10-08" on an item means the owner asked for it that day.
+
+History: started 2026-09-30 as a consolidated suggestions list from three sources: that day's
+feature review (every "missing" claim checked against the code), the user-requested terminal
+items from the same conversation, and the feature list at the end of the 2026-09-28 bug scan
+(that report has since been deleted; every finding in it was fixed on 2026-09-29). Anything not
+marked DONE is not started.
 
 One honesty note: the bug-scan list was written before the 2026-09-29 fix round, so sub-items
 that referenced scan bug IDs (selection indent, multi-cursor copy/cut distribution, GUI terminal
@@ -291,7 +297,7 @@ User-requested) — the keys are being redone anyway, so nothing here is built b
   already matches such patterns). Both are steps in the proposal under *Find and replace
   round-out*.
 
-## Snippets panel (user, 2026-10-14; plan in ~/.claude/plans/playful-herding-wave.md)
+## Snippets panel (user, 2026-10-14)
 
 A Kate-style Snippets side panel: syntax skeletons by plain name ("Print", "For each item")
 in collapsible groups, click to insert, a preview with plain-language notes — so a learner
@@ -334,7 +340,7 @@ does not need to know the syntax before completion can finish it.
 - **Task/Problems quality of life** (N, S). Auto-open Problems when a task fails; clickable
   Task Output locations for Lua matchers (Enter works today, clicking doesn't).
 
-## Git area (you commit via lazygit — nothing here replaces that)
+## Git area (commits stay in lazygit — nothing here replaces that)
 
 - Branch name in the status bar, and staging individual hunks from the Changes panel (N, M).
   The bug scan also suggested a commit box in the panel — treat as low priority given the
@@ -342,7 +348,7 @@ does not need to know the syntax before completion can finish it.
 - Make status handling survive huge untracked trees — today it gives up entirely past the size
   cap and retries every 10 s (N, S).
 
-## Code review reader (user, 2026-10-08; brief + plan notes in CodeDiffViewerIdea.md)
+## Code review reader (user, 2026-10-08; the original brief is kept outside the repository)
 
 - **Phase 1 — foundation: DONE 2026-10-08.** `review` view (Ctrl+F8) with verdict glyphs
   `[x]` / `[!]` / `[ ]`, `n/N reviewed`, A / W toggles, D classic diff, O / Enter open,

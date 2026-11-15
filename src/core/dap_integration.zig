@@ -1,3 +1,6 @@
+//! Integration test against a real debugger (LLDB's `lldb-dap`): it compiles
+//! a small Zig program, then checks a breakpoint, a local variable, stepping,
+//! attach and detach. It runs only with `-Dtest-tools=true`.
 const std = @import("std");
 const t = std.testing;
 const dap = @import("dap.zig");

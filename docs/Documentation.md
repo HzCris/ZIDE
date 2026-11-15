@@ -1,5 +1,22 @@
 # ZIDE Feature Documentation
 
+Everything ZIDE does, as built. The [README](../README.md) is the short introduction and has
+the build and install steps; [TODO.md](TODO.md) is the backlog of what is not built yet.
+
+**Contents**
+
+- [Recovery, formatting, and language-server edits](#recovery-formatting-and-language-server-edits)
+- [Tasks, Problems, Git and debugging](#tasks-problems-git-and-debugging)
+- [TUI Frontend](#tui-frontend) — the keyboard shortcuts, then what the terminal version does
+- [GUI Frontend](#gui-frontend) — what the desktop version does
+- [Syntax Highlighting](#syntax-highlighting) — token types, themes, and the Lua extension system
+- [LSP Support](#lsp-support)
+- [Shared / Core](#shared--core) — architecture, build targets, saving and encodings, the find bar, status messages, the command tables
+- [Snippets](#snippets)
+- [Embedded Terminal](#embedded-terminal)
+- [File Tree](#file-tree)
+- [Performance](#performance)
+
 ## Recovery, formatting, and language-server edits
 
 Recovery snapshots are enabled by default, independently of autosave and session persistence. Dirty named and untitled buffers are captured after two seconds without edits or at most ten seconds during continuous editing. Each workspace and instance has a separate recovery directory and an OS lock; snapshots are encoded off the main thread. A clean exit removes the instance's recovery directory, and directories of dead instances that hold no snapshots are deleted at the next start. On restart, both frontends offer Recover, Discard, or Later; `recover_documents` opens the prompt again. Recovered documents stay dirty and use the normal save/conflict checks; cursors, scroll position and the file's encoding are restored, and a file that changed on disk since the snapshot comes back flagged as externally changed. A document already open **clean** at the same path is replaced in place; a dirty one is preserved and the recovered version opens as an untitled copy. Recover and Discard act on every snapshot at once — there is no per-file choice — and choosing Discard in the quit prompt deletes the instance's snapshots and stops snapshotting for the rest of the session. The workspace is the file-tree root at startup (`zide <folder>`, else `filetree_root`, else the current directory); re-rooting the tree later does not move recovery. Snapshots live under `~/.config/zide/recovery/`; a document over 32 MiB or with more than 4096 cursors is skipped (`Recovery: SnapshotTooLarge; earlier snapshots retained`) and retried every 10 seconds, and at most 4096 snapshots are offered. Damaged snapshots remain on disk and errors are reported. `zide.set("recovery", false)` disables new snapshots.
@@ -271,7 +288,7 @@ Windows terminals commonly intercept Alt combos (Windows Terminal binds Alt+arro
 - Bracketed paste on Windows: vaxis's Windows reader forwards no paste markers, so a paste made by the terminal arrives as typed keys
 - Terminal scrollback (the emulator keeps no scrolled-off rows — the GUI shares this gap)
 
-Cross-frontend gaps are tracked in [TODO.md](TODO.md) (verified backlog: navigation back/forward, code folding, matching-bracket highlight, LSP references/signature help/symbols, regex search, Open Folder dialog and recent projects, dockable/multiple terminals, and more).
+Cross-frontend gaps are tracked in [TODO.md](TODO.md) (the verified backlog: code folding, regular expressions in find and search, the replace row of the find bar, code actions, rearrangeable panels, and more).
 
 ---
 
@@ -882,6 +899,7 @@ Press **F12** to jump to the definition of the symbol under the cursor. If the d
 | File | Purpose |
 |------|---------|
 | `src/main.zig` | Entry point, CLI parsing, mode detection |
+| `src/recovery_probe.zig` | Test-only helper program: proves recovery survives an abrupt process end |
 | `src/core/buffer.zig` | Text storage (gap buffer) |
 | `src/core/document.zig` | Document model (buffer + cursors + undo + metadata) |
 | `src/core/cursor.zig` | Cursor and CursorSet (multi-cursor data model) |
@@ -889,6 +907,11 @@ Press **F12** to jump to the definition of the symbol under the cursor. If the d
 | `src/core/commands.zig` | Command registry and all built-in commands |
 | `src/core/editor.zig` | Editor state (documents, windows — each a split layout + focused pane, mode, settings) |
 | `src/core/keybind.zig` | Data-driven keybinding map |
+| `src/core/picker.zig` | Generic pick-list overlay (title, fuzzy filter, rows, callback) — go to symbol uses it |
+| `src/core/nav_history.zig` | Back / forward navigation history of the carets that jumps leave behind |
+| `src/core/brackets.zig` | Matching-bracket lookup (highlight, `goto_matching_bracket`, smart Enter) |
+| `src/core/status_message.zig` | The status bar's message slot: how long a new message stays highlighted, and its level |
+| `src/core/text_input.zig` | Bounded single-line UTF-8 input for the prompts |
 | `src/core/syntax.zig` | Syntax highlighting engine (tokenizer, LanguageDef, built-in Zig) |
 | `src/core/theme.zig` | Theme system (ThemeColor, EditorTheme, TuiTheme, SyntaxTheme, presets) |
 | `src/core/layout.zig` | Split pane layout tree (binary tree of panes + splits) |
@@ -908,6 +931,7 @@ Press **F12** to jump to the definition of the symbol under the cursor. If the d
 | `src/core/breakpoints.zig` | Per-workspace source-breakpoint persistence |
 | `src/core/task_lua.zig` | zide.register_task / run_task / cancel_task bridge |
 | `src/core/tool_panel.zig` | Shared Tasks / Problems / Changes / Review / References / Debug views (rows, selection, keys) |
+| `src/core/tool_output.zig` | Bounded, indexed UTF-8 output of tools (tasks, the debugger) |
 | `src/core/lsp_tools.zig` | Hover, rename, formatting and format-on-save request flows |
 | `src/core/workspace_edit.zig` | Workspace-edit preview/apply (rename and server `applyEdit`) |
 | `src/core/line_diff.zig` | Buffer-vs-index line diff behind the Git gutter marks |
@@ -917,10 +941,15 @@ Press **F12** to jump to the definition of the symbol under the cursor. If the d
 | `src/core/walk_ignore.zig` | Top-level `.gitignore` pruning for quick open and workspace search |
 | `src/core/snippets.zig` | Snippet templates: parsing, indentation-aware insertion, field tracking |
 | `src/core/snippet_panel.zig` | Snippets side panel model: the registry's definitions for one document as collapsible group rows, selection and preview |
+| `src/core/snippet_file.zig` | The user's own snippets file (`extensions/my-snippets.lua`): one marked block per snippet, written, rewritten and removed |
+| `src/core/snippet_form.zig` | The "Save as snippet" form's fields and prepared body |
 | `src/core/recovery.zig` | Crash-recovery snapshots (per-workspace/instance dirs, off-thread encode) |
 | `src/core/editorconfig.zig` | EditorConfig resolution and save-time normalization |
 | `src/core/text_file.zig` | File read/write: encoding detection and conversion, atomic saves |
 | `src/core/file_uri.zig` | file:// URI encoding/decoding (VS Code-compatible) |
+| `src/core/file_identity.zig` | File identity, apart from the path used for display and saving |
+| `src/core/file_operations.zig` | Non-replacing rename / move for the file tree, failing safely where a filesystem cannot do it |
+| `src/core/renderer_settings.zig` | The GUI's renderer choice in `renderer.json` |
 | `src/core/deadlines.zig` | Background deadlines (auto-save, external-change and tree polls, Git refresh) |
 | `src/core/filetree.zig` | File tree model (rows, expansion, file operations, git roll-up) |
 | `src/core/fileicons.zig` | File/folder icon classification shared by both frontends |
@@ -932,7 +961,14 @@ Press **F12** to jump to the definition of the symbol under the cursor. If the d
 | `src/core/lua_api.zig` | Extension runtime API (zide.command/on/exec/status, register_snippet, buffer API, run/spawn, set_diagnostics, set_icon) |
 | `src/frontend/tui.zig` | TUI frontend (libvaxis) |
 | `src/frontend/gui.zig` | GUI frontend (DVUI + SDL3) |
+| `src/frontend/renderer.zig` | GUI start-up: picks and starts the renderer before documents and extensions load |
 | `src/frontend/icons.zig` | The GUI's icon set: public-domain CFPB Design System SVGs in `src/icons/svg` plus ZIDE's own shapes in `src/icons/svg/zide` (no attribution needed for either), converted to TinyVG on first use, with icon-button helpers |
+
+Tests live beside the code they test. Three files hold only tests:
+`src/core/review_regressions.zig` (bugs found in reviews, pinned down),
+`src/core/snippet_integration_tests.zig` (snippets end to end through Lua) and
+`src/core/dap_integration.zig` (a real debugger, with `-Dtest-tools=true`);
+`src/frontend/software_render_tests.zig` reads back pixels from the software renderer.
 
 ### Build Targets
 
@@ -959,7 +995,7 @@ Their transitive deps (SDL3, freetype, Lua 5.4, zigimg, uucode, translate-c,
 Migration conventions from the 0.16 `std.Io` era, for anyone touching core:
 
 - **`Editor.io: std.Io`** is threaded through like an Allocator: file I/O
-  (`Document.open/save`, `Buffer.loadFile/saveFile`), process spawning
+  (`Document.open/save`, `text_file.read/write`), process spawning
   (LSP, "open folder"), and timestamps (`std.Io.Clock.now(.awake, io)`)
   all take or use it. Tests use `std.testing.io`.
 - **Mutexes** are `std.Io.Mutex` locked with `lockUncancelable(io)` /

@@ -1,3 +1,6 @@
+//! Parser for the VT / ANSI escape sequences a shell writes: CSI, OSC and DCS
+//! sequences, colors and attributes, cursor movement, erasing. The terminal
+//! applies the actions it yields to its cell grid.
 const std = @import("std");
 
 /// Parameters parsed from a CSI sequence (e.g., \e[1;31m).

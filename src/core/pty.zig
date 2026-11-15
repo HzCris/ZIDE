@@ -1,3 +1,6 @@
+//! Pseudo-terminals on both platforms: ConPTY on Windows, POSIX ptys
+//! elsewhere. It starts the shell and gives the terminal a read end and a
+//! write end.
 const std = @import("std");
 const builtin = @import("builtin");
 const Allocator = std.mem.Allocator;

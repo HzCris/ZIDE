@@ -1,3 +1,6 @@
+//! Syntax highlighting: a line tokenizer driven by `LanguageDef` tables
+//! (keywords, comment and string rules), the built-in Zig and Markdown
+//! definitions, and the registry that Lua's `zide.register_language` adds to.
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 

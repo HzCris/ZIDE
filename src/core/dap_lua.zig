@@ -1,3 +1,5 @@
+//! Lua bridge for debugging: `zide.register_debug_adapter`,
+//! `zide.register_debug_config`, `zide.start_debug` and `zide.stop_debug`.
 const std = @import("std");
 const zlua = @import("zlua");
 const Lua = zlua.Lua;

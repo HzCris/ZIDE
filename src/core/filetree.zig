@@ -1,3 +1,6 @@
+//! The file tree side panel's model, shared by both frontends: the visible
+//! rows, expansion, selection and multi-selection, create / rename / delete /
+//! move, the file clipboard, and the Git status rolled up into folders.
 const std = @import("std");
 const builtin = @import("builtin");
 const Allocator = std.mem.Allocator;

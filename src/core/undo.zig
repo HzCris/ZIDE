@@ -1,3 +1,6 @@
+//! Undo and redo: a history of inserts and deletes, grouped so that one user
+//! action (a multi-cursor edit, a replace-all) is one step, with the cursors
+//! before and after each step and a marker for the saved state.
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const Buffer = @import("buffer.zig").Buffer;
